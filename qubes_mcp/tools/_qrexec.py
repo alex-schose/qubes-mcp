@@ -54,10 +54,16 @@ def call_service(qube: str, service: str, payload: dict | None = None, timeout: 
 def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float = 60.0) -> dict:
     """Invoke an `admin.*` qrexec method targeted at a named VM.
 
-    Used for lifecycle methods (admin.vm.Start, Shutdown, Remove, ...) that
-    are tag-scoped at the policy layer. If the target isn't ai-managed, the
+    Used for lifecycle methods (admin.vm.Start, Shutdown, Remove, ...) and
+    Stage C firewall methods (admin.vm.firewall.Get/Set/Reload). All are
+    tag-scoped at the policy layer. If the target isn't ai-managed, the
     call returns a generic refusal — surfaced here as "not found or refused"
     to keep the response shape opaque.
+
+    Admin-API response framing: every admin.* call returns a small header
+    on stdout — `b"0\\x00"` on success or `b"2\\x00<msg>"` on in-band
+    failure — followed by the payload. We strip the header so callers see
+    clean stdout. In-band failures collapse to "not found or refused" too.
     """
     proc = subprocess.run(
         [QREXEC_CLIENT, vm_name, method],
@@ -65,6 +71,19 @@ def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float =
         capture_output=True,
         timeout=timeout,
     )
-    if proc.returncode == 0:
-        return {"ok": True, "stdout": proc.stdout.decode()}
-    return {"ok": False, "error": "not found or refused"}
+    if proc.returncode != 0:
+        return {"ok": False, "error": "not found or refused"}
+
+    raw = proc.stdout
+    # Admin API framing: <status-byte>\x00<payload>. status byte is the
+    # ASCII char "0" for ok, "2" (and a few other codes) for error.
+    if len(raw) >= 2 and raw[1:2] == b"\x00":
+        if raw[0:1] == b"0":
+            payload_out = raw[2:]
+        else:
+            return {"ok": False, "error": "not found or refused"}
+    else:
+        # Unframed response (some services skip the header). Pass through.
+        payload_out = raw
+
+    return {"ok": True, "stdout": payload_out.decode(errors="replace")}

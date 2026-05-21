@@ -8,8 +8,19 @@ Input  (stdin, JSON): {
     "name":     "<alphanumeric-dashes, 1-31 chars>",
     "template": "<ai-managed TemplateVM name>",
     "label":    "<color>",            (optional, default "gray")
-    "netvm":    "<ai-managed netvm>", (optional)
+    "netvm":    "<ai-managed netvm>", (optional; see netvm defaulting below)
 }
+
+Netvm defaulting (Stage C):
+  - "netvm" key omitted → defaults to "ai-net-router" if it exists AND
+    is ai-managed; otherwise no netvm (qube has no network).
+  - "netvm" key present and null → explicit "no network"; never defaulted.
+  - "netvm" key present and a string → used as-is; must be ai-managed.
+
+  ai-net-router is the single egress qube the operator configures; AI's
+  qubes inherit it by default. AI cannot retarget ai-net-router itself
+  (the SetPropertyAIManaged wrapper refuses netvm changes on any qube
+  whose provides_network is true).
 Output (stdout, JSON):
     {"ok": true,  "name": "<new-vm-name>"}
     {"ok": true,  "name": "<new-vm-name>", "warning": "..."}   (created+tagged but netvm failed)
@@ -36,6 +47,7 @@ import sys
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
 ALLOWED_LABELS = {"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"}
 STAGE_A_KLASS = "AppVM"
+DEFAULT_NETVM = "ai-net-router"
 
 
 def fail(msg: str) -> int:
@@ -70,6 +82,10 @@ def main() -> int:
     name = req.get("name", "")
     template = req.get("template", "")
     label = req.get("label", "gray")
+    # Distinguish "key omitted" (default to ai-sys-firewall if usable) from
+    # "key explicitly null" (the caller wants no network). req.get("netvm")
+    # collapses both to None; we need the key-presence check.
+    netvm_specified = "netvm" in req
     netvm = req.get("netvm")
 
     if not NAME_RE.match(name):
@@ -93,6 +109,13 @@ def main() -> int:
         return fail(f"template '{template}' is not ai-managed")
     if tpl.klass != "TemplateVM":
         return fail(f"'{template}' is not a TemplateVM (klass={tpl.klass})")
+
+    # Stage C default: when the caller omitted netvm, try ai-net-router.
+    # We only apply this when it exists AND is ai-managed; otherwise we leave
+    # netvm unset (the qube comes up with no network — caller can fix later).
+    if not netvm_specified:
+        if DEFAULT_NETVM in app.domains and "ai-managed" in app.domains[DEFAULT_NETVM].tags:
+            netvm = DEFAULT_NETVM
 
     if netvm is not None:
         if netvm not in app.domains:
@@ -122,19 +145,25 @@ def main() -> int:
             f"manual cleanup of qube '{name}' required in dom0"
         )
 
-    # ----- Step 3: optional netvm assignment (best-effort; doesn't unspawn) -----
-    if netvm is not None:
-        try:
+    # ----- Step 3: netvm assignment (always explicit — qvm-create silently
+    # inherits the system default netvm, which would put AI traffic through
+    # the operator's chosen upstream. We override unconditionally so the
+    # request shape determines the netvm: ai-net-router (default), a
+    # specified ai-managed qube, or None.) -----
+    try:
+        if netvm is None:
+            new_vm.netvm = None
+        else:
             new_vm.netvm = app.domains[netvm]
-        except Exception as e:
-            # Tag is already applied — qube IS in ai-managed scope. Leave it.
-            # AI can fix netvm later via qmcp.SetPropertyAIManaged.
-            print(json.dumps({
-                "ok": True,
-                "name": name,
-                "warning": f"qube created and tagged but netvm assignment failed: {e}",
-            }))
-            return 0
+    except Exception as e:
+        # Tag is already applied — qube IS in ai-managed scope. Leave it.
+        # AI can fix netvm later via qmcp.SetPropertyAIManaged.
+        print(json.dumps({
+            "ok": True,
+            "name": name,
+            "warning": f"qube created and tagged but netvm assignment failed: {e}",
+        }))
+        return 0
 
     print(json.dumps({"ok": True, "name": name}))
     return 0

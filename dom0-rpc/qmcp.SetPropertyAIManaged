@@ -6,11 +6,17 @@ default_dispvm}, the value (a qube name) must itself be ai-managed.
 This prevents AI from reaching out of its sandbox by pointing its
 qubes' template/netvm/dispvm at the operator's qubes.
 
+Egress-qube invariant (Stage C): netvm changes are refused on any
+ai-managed qube whose provides_network is true. The intent is that
+the operator-designated egress qube (ai-net-router by convention) has
+its upstream chosen by the operator in dom0; AI cannot reroute its
+own traffic by mutating that pointer.
+
 Input  (stdin, JSON): {"name": "<qube>", "property": "<prop>", "value": <value>}
 Output (stdout, JSON):
     {"ok": true}
     {"ok": false, "error": "not found"}    -- target not ai-managed (indistinguishable from nonexistent)
-    {"ok": false, "error": "<reason>"}     -- cross-ref violation, set failure, etc.
+    {"ok": false, "error": "<reason>"}     -- cross-ref violation, egress invariant, set failure, etc.
 """
 from __future__ import annotations
 
@@ -49,6 +55,18 @@ def main() -> int:
     vm = app.domains[name]
     if "ai-managed" not in vm.tags:
         return emit(NOT_FOUND)
+
+    # Egress invariant: AI may not retarget the upstream of a network-providing
+    # qube. The operator owns that pointer (in dom0) so they can route all AI
+    # traffic through Tor, a VPN, or sys-firewall by flipping one prefs line.
+    if prop == "netvm":
+        try:
+            provides_net = bool(getattr(vm, "provides_network", False))
+        except Exception:
+            provides_net = False
+        if provides_net:
+            return emit({"ok": False,
+                         "error": "netvm of a network-providing qube is operator-only"})
 
     # Cross-reference validation: resolve qube-name values to VM objects and
     # refuse if the referenced VM isn't ai-managed.

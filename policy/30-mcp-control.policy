@@ -1,5 +1,5 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B — minimal sandbox with command execution and inter-qube file copy.
+# Stages A + B + C — sandbox with exec, file copy, and tag-scoped firewall control.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
@@ -44,6 +44,17 @@ qmcp.CopyToAIManaged         *  mcp-control      @tag:ai-managed  allow  user=ro
 # Source AND target both tagged ai-managed; nothing crosses out of the sandbox.
 
 qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
+
+# --- Stage C: per-qube firewall rule management on ai-managed qubes.
+# target=@adminvm routes the call to dom0 (firewall rules live in dom0's
+# qubes.xml; the firewall VM enforces them via iptables on its boot/reload).
+# The tag-scoped source-or-rather-argument means AI can only read/write
+# rules for qubes carrying ai-managed. Untagged qubes are invisible at the
+# firewall surface, matching the lifecycle/property surfaces.
+
+admin.vm.firewall.Get       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.firewall.Set       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.firewall.Reload    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to
@@ -147,10 +158,8 @@ admin.vm.feature.Remove          *  mcp-control  @anyvm  deny
 admin.vm.feature.List            *  mcp-control  @anyvm  deny
 admin.vm.feature.CheckWithTemplate  *  mcp-control  @anyvm  deny
 
-# Firewall — denied in Stages A/B; allowed tag-scoped in Stage C.
-admin.vm.firewall.Get            *  mcp-control  @anyvm  deny
-admin.vm.firewall.Set            *  mcp-control  @anyvm  deny
-admin.vm.firewall.Reload         *  mcp-control  @anyvm  deny
+# Firewall — Stage C allows tag-scoped above; the catch-all below still
+# refuses untagged targets, so no explicit deny needed here.
 
 # Device API — denied; introduced in Stage E with wrapper.
 admin.vm.device.pci.Attach       *  mcp-control  @anyvm  deny

@@ -174,7 +174,18 @@ qubes_mcp/                          # repo root
   services), `qubes.Filecopy` policy allow for ai-managed → ai-managed, and
   MCP tools `qubes_run` / `qubes_copy` / `qubes_install_pkg`. All PASS markers
   in `deploy/test-stage-b.py` green.
-- **Stage C onward** — designed, not yet implemented. See the stage rollout
+- **Stage C — DONE (tested).** Single-egress topology: `ai-net-router` is the
+  only ai-managed network-providing qube. The operator chooses its upstream
+  in dom0 (sys-firewall for clearnet, or a Tor/VPN qube to force all AI
+  traffic through that route). MCP tools `qubes_firewall_get` /
+  `qubes_firewall_set` wrap `admin.vm.firewall.Get/Set/Reload`,
+  policy-allowed only for `@tag:ai-managed` targets. `qmcp.SpawnAIManagedQube`
+  defaults new qubes' netvm to `ai-net-router` (explicit `null` opts out;
+  explicit string requires an ai-managed value). `qmcp.SetPropertyAIManaged`
+  refuses netvm changes on any ai-managed qube with `provides_network=true`,
+  keeping the egress chokepoint operator-only. All 8 PASS markers in
+  `deploy/test-stage-c.py` green.
+- **Stage D onward** — designed, not yet implemented. See the stage rollout
   table above.
 
 ## References
