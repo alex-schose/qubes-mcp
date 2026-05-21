@@ -1,0 +1,32 @@
+[project]
+name = "qubes-mcp"
+version = "0.1.0"
+description = "Tag-scoped Qubes Admin API sandbox for AI assistants"
+authors = [{name = "Alex Schose", email = "alexschose@atomicmail.io"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["fastmcp"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Security",
+    "Topic :: System :: Operating System Kernels",
+]
+
+[project.urls]
+Homepage = "https://github.com/alex-schose/qubes-mcp"
+Issues = "https://github.com/alex-schose/qubes-mcp/issues"
+
+[project.scripts]
+qubes-mcp-server = "qubes_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["qubes_mcp*"]
+exclude = ["deploy*", "dom0-rpc*", "template-rpc*", "policy*"]

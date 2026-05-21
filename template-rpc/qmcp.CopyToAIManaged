@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""qmcp.CopyToAIManaged — copy a path from this qube to another ai-managed qube.
+
+Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. Runs as root in the
+source qube. Uses qvm-copy-to-vm which internally invokes the standard
+qubes.Filecopy qrexec service; policy 30-mcp-control.policy adds an allow
+line for qubes.Filecopy between @tag:ai-managed qubes so this transfers
+without a operator-side confirmation dialog.
+
+Input  (stdin, JSON): {
+    "target": "<ai-managed qube name>",
+    "path":   "<absolute path on this qube>",
+}
+Output (stdout, JSON):
+    {"ok": true,  "target": "...", "path": "..."}
+    {"ok": false, "error": "<reason>"}
+
+The transferred file lands on the target at:
+    /home/user/QubesIncoming/<this-qube-name>/<basename(path)>
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON: {e}"})
+
+    target = req.get("target")
+    path = req.get("path")
+    if not target or not path:
+        return emit({"ok": False, "error": "missing 'target' or 'path'"})
+    if not isinstance(target, str) or not isinstance(path, str):
+        return emit({"ok": False, "error": "'target' and 'path' must be strings"})
+    if not os.path.exists(path):
+        return emit({"ok": False, "error": f"path '{path}' does not exist on this qube"})
+
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/qvm-copy-to-vm", target, path],
+            capture_output=True,
+            timeout=300,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return emit({"ok": False, "error": "copy timed out after 300s"})
+    except FileNotFoundError:
+        return emit({"ok": False, "error": "qvm-copy-to-vm not installed in this qube"})
+    except Exception as e:
+        return emit({"ok": False, "error": str(e)})
+
+    if proc.returncode != 0:
+        return emit({
+            "ok": False,
+            "error": f"copy failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}",
+        })
+
+    return emit({"ok": True, "target": target, "path": path})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

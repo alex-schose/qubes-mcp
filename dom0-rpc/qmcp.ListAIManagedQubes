@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""qmcp.ListAIManagedQubes — return ai-managed qubes.
+
+Runs in dom0 with full Admin authority but filters output to qubes
+carrying the `ai-managed` tag. Anything untagged is invisible.
+
+Input  (stdin):  ignored (no payload).
+Output (stdout): {"ok": true, "qubes": [{name, klass, label, template, power_state}, ...]}
+                 {"ok": false, "error": "<reason>"}
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+
+def main() -> int:
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+        out = []
+        for vm in app.domains:
+            if "ai-managed" not in vm.tags:
+                continue
+            try:
+                state = vm.get_power_state()
+            except Exception:
+                state = "unknown"
+            template = getattr(vm, "template", None)
+            out.append({
+                "name": vm.name,
+                "klass": vm.klass,
+                "label": vm.label.name if vm.label else None,
+                "template": template.name if template else None,
+                "power_state": state,
+            })
+        print(json.dumps({"ok": True, "qubes": out}))
+        return 0
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

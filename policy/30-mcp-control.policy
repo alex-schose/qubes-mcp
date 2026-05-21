@@ -1,0 +1,194 @@
+# /etc/qubes/policy.d/30-mcp-control.policy
+# Stages A + B — minimal sandbox with command execution and inter-qube file copy.
+# Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
+# MCP server NEVER edits this file. Operator-installed in dom0.
+#
+# Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
+# Ordering inside THIS file:
+#   1. ALLOW block  (Stage A + B surface)
+#   2. EXPLICIT DENIES  (documented dangerous methods)
+#   3. CATCH-ALL DENY  (default-deny backstop for mcp-control)
+#
+# The catch-all is load-bearing — do not move any allow line below it.
+
+# =========================================================================
+# ALLOW BLOCK
+# =========================================================================
+
+# --- Stage A: lifecycle on ai-managed qubes.
+# target=@adminvm clause redirects execution to dom0 without starting the
+# target qube (load-bearing — omitting it triggers spurious VM starts).
+
+admin.vm.Start              *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.Shutdown           *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.Kill               *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.Pause              *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.Unpause            *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.Remove             *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+# --- Stage A: custom dom0 RPC services.
+
+qmcp.ListAIManagedQubes      *  mcp-control  @adminvm         allow
+qmcp.SpawnAIManagedQube      *  mcp-control  @adminvm         allow
+qmcp.GetPropertyAIManaged    *  mcp-control  @adminvm         allow
+qmcp.SetPropertyAIManaged    *  mcp-control  @adminvm         allow
+
+# --- Stage B: command execution and file transfer inside ai-managed qubes.
+# qmcp.RunInAIManaged and qmcp.CopyToAIManaged are services installed in
+# ai-managed templates (NOT dom0) — they execute in the target qube as root.
+
+qmcp.RunInAIManaged          *  mcp-control      @tag:ai-managed  allow  user=root
+qmcp.CopyToAIManaged         *  mcp-control      @tag:ai-managed  allow  user=root
+
+# Allow qubes.Filecopy directly between ai-managed qubes (skip operator popup).
+# Source AND target both tagged ai-managed; nothing crosses out of the sandbox.
+
+qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
+
+# --- System service allows ---
+# Background qubes-core-agent services that any normal qube needs to
+# function (time sync, app menu updates, notifications, icons). All target
+# dom0 (@adminvm); all are read/notification-only — AI cannot exploit them
+# via MCP tools because no tool wraps qubes.* services. Allowed without an
+# `ask` dialog because they fire frequently in the background and prompting
+# the operator on each would be unworkable.
+
+qubes.GetDate                   *  mcp-control  @adminvm      allow
+qubes.GetImageRGBA              *  mcp-control  @adminvm      allow
+qubes.WaitForSession            *  mcp-control  @adminvm      allow
+qubes.SyncAppMenus              *  mcp-control  @adminvm      allow
+qubes.NotifyTools               *  mcp-control  @adminvm      allow
+qubes.NotifyUpdates             *  mcp-control  @adminvm      allow
+
+# --- Operator UX allows ---
+# Without these, the human operator can't perform normal Qubes workflows
+# (file copy out, USB attach, clipboard, open-in-VM) from inside mcp-control,
+# because the catch-all DENY at the bottom of this file blocks every
+# unlisted call. Each line uses `ask` so dom0 shows a confirmation dialog
+# per action — the human is always in the loop.
+#
+# AI cannot exploit these: no MCP tool wraps qubes.* services, and the
+# stdio-via-SSH transport doesn't expose an interactive shell. The dialogs
+# would surface any AI attempt anyway.
+
+qubes.Filecopy                  *  mcp-control  @anyvm        ask
+qubes.OpenInVM                  *  mcp-control  @anyvm        ask
+qubes.OpenURL                   *  mcp-control  @anyvm        ask
+qubes.ClipboardCopy             *  mcp-control  @anyvm        ask
+qubes.ClipboardPaste            *  mcp-control  @anyvm        ask
+
+# USB attach to mcp-control itself (the typical case for the human at
+# the terminal). Attaching to OTHER qubes from mcp-control falls through
+# to the explicit deny below.
+#
+# Two services are involved: the Admin API gate (admin.vm.device.usb.*)
+# AND the data-plane service (qubes.USB) that carries the actual USB
+# stream between sys-usb and the consuming qube. Both must be allowed.
+admin.vm.device.usb.Attach      *  mcp-control  mcp-control   ask    target=@adminvm
+admin.vm.device.usb.Detach      *  mcp-control  mcp-control   ask    target=@adminvm
+admin.vm.device.usb.Available   *  mcp-control  @adminvm      allow  target=@adminvm
+admin.vm.device.usb.List        *  mcp-control  @adminvm      allow  target=@adminvm
+qubes.USB                       *  mcp-control  sys-usb       ask
+
+# =========================================================================
+# EXPLICIT DENIES — documented; the catch-all below would cover these too,
+# but listing them explicitly makes intent visible to anyone auditing.
+# =========================================================================
+
+# Policy management — AI must never read or rewrite policy.
+policy.Get                       *  mcp-control  @anyvm  deny
+policy.GetFiles                  *  mcp-control  @anyvm  deny
+policy.List                      *  mcp-control  @anyvm  deny
+policy.Replace                   *  mcp-control  @anyvm  deny
+policy.RegisterArgument          *  mcp-control  @anyvm  deny
+policy.UnregisterArgument        *  mcp-control  @anyvm  deny
+policy.EvalSimulate              *  mcp-control  @anyvm  deny
+policy.EvalGUI                   *  mcp-control  @anyvm  deny
+
+# Pool & volume manipulation — could overwrite filesystems or exfiltrate.
+admin.pool.List                  *  mcp-control  @anyvm  deny
+admin.pool.Info                  *  mcp-control  @anyvm  deny
+admin.pool.Add                   *  mcp-control  @anyvm  deny
+admin.pool.Remove                *  mcp-control  @anyvm  deny
+admin.pool.volume.Import         *  mcp-control  @anyvm  deny
+admin.vm.volume.Import           *  mcp-control  @anyvm  deny
+admin.vm.volume.CloneFrom        *  mcp-control  @anyvm  deny
+admin.vm.volume.Revert           *  mcp-control  @anyvm  deny
+admin.vm.volume.Clear            *  mcp-control  @anyvm  deny
+
+# Backup execution — bulk exfiltration vector.
+admin.backup.Execute             *  mcp-control  @anyvm  deny
+admin.backup.Info                *  mcp-control  @anyvm  deny
+
+# Direct creation / clone — denied; AI uses qmcp.SpawnAIManagedQube / qmcp.CloneAIManagedQube.
+admin.vm.Create.AppVM            *  mcp-control  @anyvm  deny
+admin.vm.Create.StandaloneVM     *  mcp-control  @anyvm  deny
+admin.vm.Create.TemplateVM       *  mcp-control  @anyvm  deny
+admin.vm.Create.DispVMTemplate   *  mcp-control  @anyvm  deny
+admin.vm.CreateDisposable        *  mcp-control  @anyvm  deny
+admin.vm.Clone                   *  mcp-control  @anyvm  deny
+
+# Tag mutation — denied always.
+admin.vm.tag.Set                 *  mcp-control  @anyvm  deny
+admin.vm.tag.Remove              *  mcp-control  @anyvm  deny
+
+# Property read/write — denied direct; AI uses qmcp.{Get,Set}PropertyAIManaged.
+admin.vm.property.Get            *  mcp-control  @anyvm  deny
+admin.vm.property.GetAll         *  mcp-control  @anyvm  deny
+admin.vm.property.Set            *  mcp-control  @anyvm  deny
+admin.vm.property.Reset          *  mcp-control  @anyvm  deny
+admin.vm.property.Help           *  mcp-control  @anyvm  deny
+admin.vm.property.List           *  mcp-control  @anyvm  deny
+
+# Feature read/write — denied entirely. Wrapped in Stage F.
+admin.vm.feature.Get             *  mcp-control  @anyvm  deny
+admin.vm.feature.Set             *  mcp-control  @anyvm  deny
+admin.vm.feature.Remove          *  mcp-control  @anyvm  deny
+admin.vm.feature.List            *  mcp-control  @anyvm  deny
+admin.vm.feature.CheckWithTemplate  *  mcp-control  @anyvm  deny
+
+# Firewall — denied in Stages A/B; allowed tag-scoped in Stage C.
+admin.vm.firewall.Get            *  mcp-control  @anyvm  deny
+admin.vm.firewall.Set            *  mcp-control  @anyvm  deny
+admin.vm.firewall.Reload         *  mcp-control  @anyvm  deny
+
+# Device API — denied; introduced in Stage E with wrapper.
+admin.vm.device.pci.Attach       *  mcp-control  @anyvm  deny
+admin.vm.device.pci.Detach       *  mcp-control  @anyvm  deny
+admin.vm.device.pci.List         *  mcp-control  @anyvm  deny
+admin.vm.device.pci.Available    *  mcp-control  @anyvm  deny
+admin.vm.device.block.Attach     *  mcp-control  @anyvm  deny
+admin.vm.device.block.Detach     *  mcp-control  @anyvm  deny
+admin.vm.device.block.List       *  mcp-control  @anyvm  deny
+admin.vm.device.block.Available  *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Attach       *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Detach       *  mcp-control  @anyvm  deny
+admin.vm.device.mic.List         *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Available    *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Attach       *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Detach       *  mcp-control  @anyvm  deny
+admin.vm.device.usb.List         *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Available    *  mcp-control  @anyvm  deny
+
+# Global discovery — denied to enforce invisibility.
+admin.vm.List                    *  mcp-control  @anyvm  deny
+admin.vm.Stats                   *  mcp-control  @anyvm  deny
+admin.label.List                 *  mcp-control  @anyvm  deny
+admin.label.Get                  *  mcp-control  @anyvm  deny
+admin.label.Index                *  mcp-control  @anyvm  deny
+admin.Events                     *  mcp-control  @anyvm  deny
+
+# Volume info/resize — denied Stage A/B; allowed tag-scoped from Stage E.
+admin.vm.volume.List             *  mcp-control  @anyvm  deny
+admin.vm.volume.Info             *  mcp-control  @anyvm  deny
+admin.vm.volume.Resize           *  mcp-control  @anyvm  deny
+
+# Tag reads — denied direct (qmcp.ListAIManagedQubes is canonical discovery).
+admin.vm.tag.Get                 *  mcp-control  @anyvm  deny
+admin.vm.tag.List                *  mcp-control  @anyvm  deny
+
+# =========================================================================
+# CATCH-ALL DENY — default-deny backstop for mcp-control.
+# =========================================================================
+
+*  *  mcp-control  @anyvm  deny

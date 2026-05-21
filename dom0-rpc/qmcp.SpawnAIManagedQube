@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""qmcp.SpawnAIManagedQube — create an AppVM and tag it ai-managed.
+
+Stage A: AppVM class only. TemplateVM / StandaloneVM / DispVMTemplate
+support added in Stage D via the same script (controlled by `klass`).
+
+Input  (stdin, JSON): {
+    "name":     "<alphanumeric-dashes, 1-31 chars>",
+    "template": "<ai-managed TemplateVM name>",
+    "label":    "<color>",            (optional, default "gray")
+    "netvm":    "<ai-managed netvm>", (optional)
+}
+Output (stdout, JSON):
+    {"ok": true,  "name": "<new-vm-name>"}
+    {"ok": true,  "name": "<new-vm-name>", "warning": "..."}   (created+tagged but netvm failed)
+    {"ok": false, "error": "<reason>"}
+
+Refuses on: malformed name, name collision, template not ai-managed,
+netvm not ai-managed, invalid label, or Admin API failure.
+
+Atomicity: there is a brief window between qube creation and tag application
+during which the new qube exists untagged. If tag application fails for any
+reason, the script rolls back by removing the qube before returning an
+error. A post-condition check confirms the tag is visible before declaring
+success; if the post-check fails, the qube is rolled back too. The window
+is still visible to concurrent dom0 admin tools (e.g. an operator manually
+running qubes-manager during a spawn) but cannot be observed by AI through
+the qrexec policy surface.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
+ALLOWED_LABELS = {"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"}
+STAGE_A_KLASS = "AppVM"
+
+
+def fail(msg: str) -> int:
+    print(json.dumps({"ok": False, "error": msg}))
+    return 1
+
+
+def best_effort_remove(app, name: str) -> bool:
+    """Try to remove a qube created by this script. Returns True on success."""
+    try:
+        vm = app.domains[name]
+    except Exception:
+        return True  # already gone
+    try:
+        if vm.is_running():
+            vm.kill()
+    except Exception:
+        pass
+    try:
+        del app.domains[name]
+        return True
+    except Exception:
+        return False
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return fail(f"invalid JSON input: {e}")
+
+    name = req.get("name", "")
+    template = req.get("template", "")
+    label = req.get("label", "gray")
+    netvm = req.get("netvm")
+
+    if not NAME_RE.match(name):
+        return fail("name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric")
+    if label not in ALLOWED_LABELS:
+        return fail(f"label must be one of: {sorted(ALLOWED_LABELS)}")
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return fail(f"qubesadmin import failed: {e}")
+
+    if name in app.domains:
+        return fail(f"qube '{name}' already exists")
+
+    if template not in app.domains:
+        return fail(f"template '{template}' not found")
+    tpl = app.domains[template]
+    if "ai-managed" not in tpl.tags:
+        return fail(f"template '{template}' is not ai-managed")
+    if tpl.klass != "TemplateVM":
+        return fail(f"'{template}' is not a TemplateVM (klass={tpl.klass})")
+
+    if netvm is not None:
+        if netvm not in app.domains:
+            return fail(f"netvm '{netvm}' not found")
+        if "ai-managed" not in app.domains[netvm].tags:
+            return fail(f"netvm '{netvm}' is not ai-managed")
+
+    # ----- Step 1: create the qube -----
+    try:
+        new_vm = app.add_new_vm(STAGE_A_KLASS, name, label, template=template)
+    except Exception as e:
+        return fail(f"create failed: {e}")
+
+    # ----- Step 2: apply ai-managed tag (race window starts here) -----
+    try:
+        new_vm.tags.add("ai-managed")
+        # Post-condition: the tag must be visible after add.
+        if "ai-managed" not in new_vm.tags:
+            raise RuntimeError("tag.add returned but tag not visible on refresh")
+    except Exception as e:
+        # Roll back: untagged qube must not persist.
+        removed = best_effort_remove(app, name)
+        if removed:
+            return fail(f"tag application failed (rolled back): {e}")
+        return fail(
+            f"tag application failed AND rollback failed: {e}; "
+            f"manual cleanup of qube '{name}' required in dom0"
+        )
+
+    # ----- Step 3: optional netvm assignment (best-effort; doesn't unspawn) -----
+    if netvm is not None:
+        try:
+            new_vm.netvm = app.domains[netvm]
+        except Exception as e:
+            # Tag is already applied — qube IS in ai-managed scope. Leave it.
+            # AI can fix netvm later via qmcp.SetPropertyAIManaged.
+            print(json.dumps({
+                "ok": True,
+                "name": name,
+                "warning": f"qube created and tagged but netvm assignment failed: {e}",
+            }))
+            return 0
+
+    print(json.dumps({"ok": True, "name": name}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

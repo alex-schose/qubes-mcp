@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""qmcp.RunInAIManaged — execute a command in this qube.
+
+Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. All AppVMs based on
+those templates inherit the service; AppVMs based on the operator's templates
+do not have it. Policy gates source=mcp-control → target=@tag:ai-managed
+with user=root, so commands execute with root authority inside the sandbox.
+
+Input  (stdin, JSON): {
+    "cmd":     ["bin", "arg", ...] | "shell string",
+    "shell":   false | true                  (optional, default false)
+    "timeout": <seconds>                     (optional, default 60)
+    "stdin":   "<text>"                      (optional, default "")
+}
+Output (stdout, JSON):
+    {"ok": true,  "rc": <int>, "stdout": "...", "stderr": "..."}
+    {"ok": false, "error": "<reason>"}
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON: {e}"})
+
+    cmd = req.get("cmd")
+    shell = bool(req.get("shell", False))
+    timeout = req.get("timeout", 60)
+    stdin_input = req.get("stdin", "")
+
+    if cmd is None:
+        return emit({"ok": False, "error": "missing 'cmd'"})
+
+    if shell:
+        if not isinstance(cmd, str):
+            return emit({"ok": False, "error": "'cmd' must be a string when shell=true"})
+    else:
+        if not isinstance(cmd, list) or not all(isinstance(x, str) for x in cmd):
+            return emit({"ok": False, "error": "'cmd' must be a list of strings (or set shell=true)"})
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=stdin_input.encode() if isinstance(stdin_input, str) else stdin_input,
+            capture_output=True,
+            timeout=timeout,
+            shell=shell,
+        )
+    except subprocess.TimeoutExpired:
+        return emit({"ok": False, "error": f"timeout after {timeout}s"})
+    except FileNotFoundError as e:
+        return emit({"ok": False, "error": f"command not found: {e}"})
+    except Exception as e:
+        return emit({"ok": False, "error": str(e)})
+
+    return emit({
+        "ok": True,
+        "rc": proc.returncode,
+        "stdout": proc.stdout.decode(errors="replace"),
+        "stderr": proc.stderr.decode(errors="replace"),
+    })
+
+
+if __name__ == "__main__":
+    sys.exit(main())

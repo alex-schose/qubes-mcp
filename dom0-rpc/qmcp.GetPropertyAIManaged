@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""qmcp.GetPropertyAIManaged — read a property from an ai-managed qube.
+
+Input  (stdin, JSON):  {"name": "<qube>", "property": "<prop>"}
+Output (stdout, JSON):
+    {"ok": true,  "value": <value>}
+    {"ok": false, "error": "not found"}     -- name missing OR not ai-managed (indistinguishable)
+    {"ok": false, "error": "<reason>"}      -- malformed input, property doesn't exist on this vm, etc.
+
+The "not found" branch is load-bearing: AI must not be able to use the
+read surface as an existence oracle for the operator's qubes. A qube that
+doesn't exist and a qube that exists-but-isn't-tagged return byte-identical
+responses.
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return emit(NOT_FOUND)  # opaque on parse errors too
+
+    name = req.get("name", "")
+    prop = req.get("property", "")
+    if not name or not prop:
+        return emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    if name not in app.domains:
+        return emit(NOT_FOUND)
+    vm = app.domains[name]
+    if "ai-managed" not in vm.tags:
+        return emit(NOT_FOUND)
+
+    # Special pseudo-properties not exposed via attribute access.
+    if prop == "power_state":
+        try:
+            value = vm.get_power_state()
+        except Exception as e:
+            return emit({"ok": False, "error": f"power_state read failed: {e}"})
+        return emit({"ok": True, "value": value})
+
+    try:
+        value = getattr(vm, prop)
+    except AttributeError:
+        return emit({"ok": False, "error": f"property '{prop}' does not exist"})
+    except Exception as e:
+        return emit({"ok": False, "error": f"read failed: {e}"})
+
+    # JSON-serialise: VM objects → their name, collections → list of names.
+    if hasattr(value, "name") and not isinstance(value, (str, bytes)):
+        value = value.name
+    elif isinstance(value, (list, tuple, set)):
+        value = [getattr(v, "name", v) for v in value]
+
+    return emit({"ok": True, "value": value})
+
+
+if __name__ == "__main__":
+    sys.exit(main())
