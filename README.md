@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A and B (below) are tested and working on Qubes R4.3-era systems.
-Stages C–H are designed but not yet implemented.
+Stages A, B, and C (below) are tested and working on Qubes R4.3-era
+systems. Stages D–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -56,6 +56,25 @@ and qrexec policy R4.2+), the three concrete questions I'd value review on:
    tag-scoped admin allows, qrexec attempts to start the target VM during
    read-only operations. This is subtle, easy to miss, and not surfaced in
    current Qubes docs. Worth a docs PR? Happy to write it.
+4. **Single-egress chokepoint + `provides_network` egress invariant.**
+   Stage C designates one ai-managed qube (`ai-net-router`) with
+   `provides_network=true` as the only egress AI sees, then refuses (via
+   `qmcp.SetPropertyAIManaged`) any netvm mutation on ai-managed qubes
+   carrying `provides_network=true`. Intent: only the operator changes
+   the route, in dom0. Is this invariant tight enough — are there paths
+   AI could use to bypass it (creating another provides_network qube
+   through a side door, mutating `provides_network` through a property
+   wrapper I haven't blocked, abusing network-stack properties I haven't
+   thought of)?
+5. **Single-egress vs. cascade as a Qubes idiom.** The original Stage C
+   design was a cascade (`ai-sys-firewall` ← `ai-sys-tor` / `ai-sys-vpn`)
+   with multiple ai-managed network qubes. The implemented design is one
+   egress qube with the operator-chosen upstream (`sys-firewall` /
+   `sys-whonix` / a VPN qube / null). Documented Qubes patterns lean on
+   cascades; is the single-egress chokepoint an established pattern I
+   missed, or a reinvention? Are there reasons (memory pressure, boot
+   ordering, sys-net interactions) the cascade is preferred that I'm not
+   seeing?
 
 ## Status
 
@@ -63,7 +82,7 @@ and qrexec policy R4.2+), the three concrete questions I'd value review on:
 |---|---|---|
 | A | Tag-scoped lifecycle + spawn + wrapped property read/write + existence hiding | tested |
 | B | Root command execution + inter-qube file transfer inside ai-managed qubes | tested |
-| C | Network sandbox (`ai-sys-firewall` cascade, tag-validated netvm) | designed |
+| C | Single-egress network sandbox (`ai-net-router` chokepoint, operator-chosen upstream, tag-scoped firewall control) | tested |
 | D | Template cloning + DispVM support | designed |
 | E | Device attach (block/USB/mic) between ai-managed qubes | designed |
 | F | Wrapped `feature.Set` (deny `internal`, validate cross-ref) + filtered event stream | designed |
@@ -170,7 +189,46 @@ Then from mcp-control:
 
 Four more PASS markers.
 
-### Step 5 — Connect a client
+### Step 5 — (Optional) Deploy Stage C for the single-egress network sandbox
+
+Stage C creates one ai-managed network qube — `ai-net-router` — that all
+AI qubes route through by default. The operator chooses ai-net-router's
+upstream in dom0 (`sys-firewall` for clearnet, `sys-whonix` for Tor, a
+VPN qube, or `""` for offline); AI cannot change this. AI can still read
+and set firewall rules on `ai-net-router` and on its own qubes.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-c.sh' > /tmp/install-c.sh
+EGRESS_UPSTREAM=sys-firewall bash /tmp/install-c.sh mcp-control ~user/qubes_mcp
+```
+
+Configurable via env vars (with defaults):
+
+- `EGRESS_UPSTREAM=sys-firewall` — ai-net-router's netvm (any existing qube, or `""`).
+- `EGRESS_TEMPLATE=fedora-43-xfce` — the AppVM template for ai-net-router.
+- `EGRESS_LABEL=red` — Qubes colour.
+- `EGRESS_MEMORY=500` — RAM in MiB.
+
+Switch the upstream any time:
+
+```
+qvm-prefs ai-net-router netvm <new-upstream>
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-c.py
+```
+
+Eight PASS markers — egress visibility, default-netvm application,
+explicit-null preservation, egress-qube lock, AI-qube netvm retarget,
+firewall rules round-trip, untagged-target refusal, and former-ai-sys
+invisibility.
+
+### Step 6 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

@@ -68,8 +68,14 @@ A. Policy + qmcp (List/Spawn/GetProperty/SetProperty/GetPoolStats) + tag-scoped
    template.
 B. qmcp.RunInAIManaged + qmcp.CopyToAIManaged. AI gets root inside its qubes
    and can move files between them.
-C. Network sandbox: ai-sys-firewall + ai-sys-vpn + ai-sys-tor cascade. AI's
-   qubes get tag-scoped netvm validation in SetPropertyAIManaged.
+C. Single-egress network sandbox. `ai-net-router` is the only ai-managed
+   qube with `provides_network=true`; AI's qubes default to it as netvm.
+   The operator chooses ai-net-router's upstream in dom0 (sys-firewall,
+   sys-whonix, a VPN qube, or null for offline) — that one prefs flip
+   reroutes all AI traffic. Tag-scoped `admin.vm.firewall.{Get,Set,Reload}`
+   allows AI to read and write firewall rules on its own qubes and on
+   ai-net-router; SetPropertyAIManaged refuses netvm mutation on any
+   ai-managed qube with `provides_network=true` (egress invariant).
 D. qmcp.CloneAIManagedQube + DispVM template support. AI manages its own
    template lineage.
 E. qmcp.AttachDeviceAIManaged + Detach. Virtual block/USB/mic between
@@ -132,7 +138,9 @@ qubes_mcp/                          # repo root
 │       ├── qubes_remove.py
 │       ├── qubes_run.py            # Stage B
 │       ├── qubes_copy.py           # Stage B
-│       └── qubes_install_pkg.py    # Stage B convenience
+│       ├── qubes_install_pkg.py    # Stage B convenience
+│       ├── qubes_firewall_get.py   # Stage C
+│       └── qubes_firewall_set.py   # Stage C
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -149,7 +157,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-a.py
     ├── install-stage-b.sh
     ├── uninstall-stage-b.sh
-    └── test-stage-b.py
+    ├── test-stage-b.py
+    ├── install-stage-c.sh
+    ├── uninstall-stage-c.sh
+    └── test-stage-c.py
 ```
 
 ## Operating protocol
