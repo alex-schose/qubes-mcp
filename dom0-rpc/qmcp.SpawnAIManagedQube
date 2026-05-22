@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
-"""qmcp.SpawnAIManagedQube — create an AppVM and tag it ai-managed.
+"""qmcp.SpawnAIManagedQube — create a qube and tag it ai-managed.
 
-Stage A: AppVM class only. TemplateVM / StandaloneVM / DispVMTemplate
-support added in Stage D via the same script (controlled by `klass`).
+Stage A: AppVM only.
+Stage D: also DispVMTemplate (persistent disposable template) and DispVM
+         (persistent named disposable).
 
 Input  (stdin, JSON): {
     "name":     "<alphanumeric-dashes, 1-31 chars>",
-    "template": "<ai-managed TemplateVM name>",
+    "template": "<source qube name>",
+    "klass":    "AppVM" | "DispVMTemplate" | "DispVM",   (optional, default "AppVM")
     "label":    "<color>",            (optional, default "gray")
     "netvm":    "<ai-managed netvm>", (optional; see netvm defaulting below)
 }
+
+`template` constraints by klass:
+  - AppVM           → template must be a TemplateVM that is ai-managed.
+  - DispVMTemplate  → template must be a TemplateVM that is ai-managed.
+                      Internally created as klass=AppVM and then
+                      template_for_dispvms is set True. This is the
+                      version-agnostic canonical form for a DispVM
+                      template (the AppVM-plus-flag pattern works on
+                      Qubes 4.0 through 4.3+; some Qubes versions expose
+                      admin.vm.Create.DispVMTemplate but with payload
+                      requirements that vary across releases).
+  - DispVM          → template must be ai-managed AND have
+                      template_for_dispvms=True (i.e., a DispVM template,
+                      whether the klass is AppVM-with-flag or the distinct
+                      DispVMTemplate klass).
 
 Netvm defaulting (Stage C):
   - "netvm" key omitted → defaults to "ai-net-router" if it exists AND
@@ -21,13 +38,15 @@ Netvm defaulting (Stage C):
   qubes inherit it by default. AI cannot retarget ai-net-router itself
   (the SetPropertyAIManaged wrapper refuses netvm changes on any qube
   whose provides_network is true).
+
 Output (stdout, JSON):
     {"ok": true,  "name": "<new-vm-name>"}
-    {"ok": true,  "name": "<new-vm-name>", "warning": "..."}   (created+tagged but netvm failed)
+    {"ok": true,  "name": "<new-vm-name>", "warning": "..."}   (created+tagged but a post-step failed)
     {"ok": false, "error": "<reason>"}
 
-Refuses on: malformed name, name collision, template not ai-managed,
-netvm not ai-managed, invalid label, or Admin API failure.
+Refuses on: malformed name, name collision, unsupported klass, template not
+ai-managed or wrong-shape for the klass, netvm not ai-managed, invalid
+label, or Admin API failure.
 
 Atomicity: there is a brief window between qube creation and tag application
 during which the new qube exists untagged. If tag application fails for any
@@ -46,7 +65,7 @@ import sys
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
 ALLOWED_LABELS = {"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"}
-STAGE_A_KLASS = "AppVM"
+ALLOWED_KLASSES = {"AppVM", "DispVMTemplate", "DispVM"}
 DEFAULT_NETVM = "ai-net-router"
 
 
@@ -73,6 +92,24 @@ def best_effort_remove(app, name: str) -> bool:
         return False
 
 
+def validate_template(klass: str, tpl, tpl_name: str) -> str | None:
+    """Return an error string if `tpl` is unsuitable as a template for `klass`,
+    else None. Caller has already verified that `tpl` is ai-managed."""
+    if klass in ("AppVM", "DispVMTemplate"):
+        if tpl.klass != "TemplateVM":
+            return (f"template '{tpl_name}' must be a TemplateVM for klass={klass} "
+                    f"(klass is {tpl.klass})")
+    elif klass == "DispVM":
+        try:
+            cap = bool(getattr(tpl, "template_for_dispvms", False))
+        except Exception:
+            cap = False
+        if not cap:
+            return (f"template '{tpl_name}' must have template_for_dispvms=True "
+                    f"to be a DispVM source (klass is {tpl.klass})")
+    return None
+
+
 def main() -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -81,8 +118,9 @@ def main() -> int:
 
     name = req.get("name", "")
     template = req.get("template", "")
+    klass = req.get("klass", "AppVM")
     label = req.get("label", "gray")
-    # Distinguish "key omitted" (default to ai-sys-firewall if usable) from
+    # Distinguish "key omitted" (default to ai-net-router if usable) from
     # "key explicitly null" (the caller wants no network). req.get("netvm")
     # collapses both to None; we need the key-presence check.
     netvm_specified = "netvm" in req
@@ -90,6 +128,8 @@ def main() -> int:
 
     if not NAME_RE.match(name):
         return fail("name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric")
+    if klass not in ALLOWED_KLASSES:
+        return fail(f"klass must be one of: {sorted(ALLOWED_KLASSES)}")
     if label not in ALLOWED_LABELS:
         return fail(f"label must be one of: {sorted(ALLOWED_LABELS)}")
 
@@ -107,8 +147,9 @@ def main() -> int:
     tpl = app.domains[template]
     if "ai-managed" not in tpl.tags:
         return fail(f"template '{template}' is not ai-managed")
-    if tpl.klass != "TemplateVM":
-        return fail(f"'{template}' is not a TemplateVM (klass={tpl.klass})")
+    tpl_err = validate_template(klass, tpl, template)
+    if tpl_err is not None:
+        return fail(tpl_err)
 
     # Stage C default: when the caller omitted netvm, try ai-net-router.
     # We only apply this when it exists AND is ai-managed; otherwise we leave
@@ -124,8 +165,13 @@ def main() -> int:
             return fail(f"netvm '{netvm}' is not ai-managed")
 
     # ----- Step 1: create the qube -----
+    # DispVMTemplate is created as klass=AppVM and then promoted via
+    # template_for_dispvms=True in Step 3. The dedicated DispVMTemplate
+    # admin endpoint exists on some Qubes versions but its payload shape
+    # varies; the AppVM-plus-flag pattern is the version-agnostic form.
+    create_klass = "AppVM" if klass == "DispVMTemplate" else klass
     try:
-        new_vm = app.add_new_vm(STAGE_A_KLASS, name, label, template=template)
+        new_vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
         return fail(f"create failed: {e}")
 
@@ -145,7 +191,24 @@ def main() -> int:
             f"manual cleanup of qube '{name}' required in dom0"
         )
 
-    # ----- Step 3: netvm assignment (always explicit — qvm-create silently
+    # ----- Step 3: for DispVMTemplate, force-set template_for_dispvms=True.
+    # The "DispVMTemplate" klass enables this automatically in current Qubes,
+    # but we set it explicitly so the post-condition is unambiguous and so the
+    # script keeps working if the klass-default ever drifts. Non-fatal: the
+    # tag is already applied, so the qube IS in the ai-managed scope.
+    if klass == "DispVMTemplate":
+        try:
+            if not getattr(new_vm, "template_for_dispvms", False):
+                new_vm.template_for_dispvms = True
+        except Exception as e:
+            print(json.dumps({
+                "ok": True,
+                "name": name,
+                "warning": f"qube created and tagged but template_for_dispvms set failed: {e}",
+            }))
+            return 0
+
+    # ----- Step 4: netvm assignment (always explicit — qvm-create silently
     # inherits the system default netvm, which would put AI traffic through
     # the operator's chosen upstream. We override unconditionally so the
     # request shape determines the netvm: ai-net-router (default), a

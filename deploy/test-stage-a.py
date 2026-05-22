@@ -19,7 +19,7 @@ from pathlib import Path
 # qubes_mcp/ package directory). If you've run `pip install -e .` inside
 # your venv, this insert is harmless and the package resolves via the venv.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from qubes_mcp.tools._qrexec import call_qmcp, call_admin  # noqa: E402
+from qubes_mcp.tools._qrexec import call_qmcp  # noqa: E402
 
 
 # ====================================================================
@@ -60,9 +60,9 @@ print(f"  qrexec-client-vm exists: {os.path.exists('/usr/lib/qubes/qrexec-client
 pre = call_qmcp("qmcp.GetPropertyAIManaged", {"name": "ai-scratch-1", "property": "klass"})
 if pre.get("ok"):
     print("  ai-scratch-1 lingers from a prior run — cleaning up...")
-    call_admin("admin.vm.Kill", "ai-scratch-1")
+    call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "kill"})
     time.sleep(2)
-    call_admin("admin.vm.Remove", "ai-scratch-1")
+    call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "remove"})
     time.sleep(1)
 
 # ----------------------------------------------------- 1. existence leak
@@ -108,21 +108,41 @@ names2 = [q["name"] for q in r2.get("qubes", [])]
 print(f"  After spawn, list: {names2}")
 
 # ----------------------------------- 4. cross-ref refusal on template
-header(f"4. Cross-ref refusal — ai-scratch-1.template = {UNTAGGED_TEMPLATE} (exists, untagged)")
-r = call_qmcp("qmcp.SetPropertyAIManaged", {
-    "name": "ai-scratch-1",
-    "property": "template",
-    "value": UNTAGGED_TEMPLATE,
-})
-show(f"set template={UNTAGGED_TEMPLATE}", r)
+# UNTAGGED_TEMPLATE must exist on the system AND be untagged so the wrapper
+# fires the "is not ai-managed" branch. If it doesn't exist (e.g. operators
+# whose Debian template has a different name), fall back to PROBE_UNTAGGED_1
+# (sys-firewall by default) — also untagged, also exists in every default
+# Qubes install. The wrapper validates the ai-managed tag before qubesadmin
+# type-checks template, so passing an AppVM-not-TemplateVM still exercises
+# the cross-ref refusal path correctly.
+def cross_ref_probe(value: str) -> dict:
+    return call_qmcp("qmcp.SetPropertyAIManaged", {
+        "name": "ai-scratch-1",
+        "property": "template",
+        "value": value,
+    })
+
+
+probe_value = UNTAGGED_TEMPLATE
+header(f"4. Cross-ref refusal — ai-scratch-1.template = {probe_value} (exists, untagged)")
+r = cross_ref_probe(probe_value)
+show(f"set template={probe_value}", r)
+
+# If the configured probe doesn't exist on this system, retry with a qube
+# we know exists in every default Qubes install.
+if (not r.get("ok")) and "not found" in r.get("error", "") \
+        and "is not ai-managed" not in r.get("error", ""):
+    fallback = PROBE_UNTAGGED_1
+    print(f"  (probe {probe_value!r} not present; falling back to {fallback!r})")
+    probe_value = fallback
+    r = cross_ref_probe(probe_value)
+    show(f"set template={probe_value}", r)
+
 correct = (not r.get("ok")) and "is not ai-managed" in r.get("error", "")
-opaque = (not r.get("ok")) and r.get("error") == "not found"
 if correct:
-    print("  PASS: refused with 'is not ai-managed'.")
-elif opaque:
-    print(f"  AMBIGUOUS: refused with 'not found' — check that {UNTAGGED_TEMPLATE!r} actually exists on your system.")
+    print(f"  PASS: refused with 'is not ai-managed' against {probe_value!r}.")
 else:
-    print(f"  FAIL: did not refuse: {r}")
+    print(f"  FAIL: did not refuse with the expected cross-ref message: {r}")
 
 # ----------------------------------- 4b. control — nonexistent
 header("4b. Control — ai-scratch-1.template = nonexistent")
@@ -147,8 +167,8 @@ print(f"  {'PASS' if nf else 'FAIL'}: returned 'not found' (indistinguishable fr
 
 # ----------------------------------------------------- 6. qubes_start
 header("6. Start ai-scratch-1")
-r = call_admin("admin.vm.Start", "ai-scratch-1")
-show("admin.vm.Start ai-scratch-1", r)
+r = call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "start"})
+show("lifecycle start ai-scratch-1", r)
 
 for i in range(15):
     s = call_qmcp("qmcp.GetPropertyAIManaged", {"name": "ai-scratch-1", "property": "power_state"})
@@ -159,8 +179,8 @@ for i in range(15):
 
 # --------------------------------------------------- 7. qubes_shutdown
 header("7. Shutdown ai-scratch-1 (clean)")
-r = call_admin("admin.vm.Shutdown", "ai-scratch-1")
-show("admin.vm.Shutdown", r)
+r = call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "shutdown"})
+show("lifecycle shutdown ai-scratch-1", r)
 
 for i in range(15):
     s = call_qmcp("qmcp.GetPropertyAIManaged", {"name": "ai-scratch-1", "property": "power_state"})
@@ -172,13 +192,13 @@ for i in range(15):
 final = call_qmcp("qmcp.GetPropertyAIManaged", {"name": "ai-scratch-1", "property": "power_state"})
 if final.get("value") != "Halted":
     print("  shutdown didn't complete cleanly; force-killing...")
-    call_admin("admin.vm.Kill", "ai-scratch-1")
+    call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "kill"})
     time.sleep(2)
 
 # ----------------------------------------------------- 8. qubes_remove
 header("8. Remove ai-scratch-1")
-r = call_admin("admin.vm.Remove", "ai-scratch-1")
-show("admin.vm.Remove", r)
+r = call_qmcp("qmcp.LifecycleAIManaged", {"name": "ai-scratch-1", "action": "remove"})
+show("lifecycle remove ai-scratch-1", r)
 
 r3 = call_qmcp("qmcp.ListAIManagedQubes")
 names3 = [q["name"] for q in r3.get("qubes", [])]

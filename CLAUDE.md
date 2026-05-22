@@ -17,9 +17,13 @@ this directory.**
   are hard-denied at the policy layer. Tagging happens only in two places:
   1. The `qmcp.SpawnAIManagedQube` dom0 script (force-tags every qube it creates).
   2. The operator's hand in dom0 (`qvm-tags <vm> add|del ai-managed`).
-- AI never has direct access to admin write methods. Every state-changing call
-  is either tag-scoped via qrexec policy (lifecycle: Start/Shutdown/Remove/etc.)
-  or routed through a `qmcp.*` dom0 RPC wrapper that enforces invariants in dom0.
+- AI never has direct access to admin write methods. Every state-changing
+  call is routed through a `qmcp.*` dom0 RPC wrapper that enforces
+  invariants in dom0 (forced tagging on creation, cross-reference
+  validation, ai-managed-tag check, opaque error responses). The few
+  remaining tag-scoped qrexec policy allows (`admin.vm.firewall.*` reads
+  and writes, `qubes.Filecopy` between ai-managed qubes) are surfaces
+  where the qrexec `@tag:` matcher is sufficient.
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
   but no privilege inside `mcp-control` itself. mcp-control is an RPC gateway,
   not a workhorse. Locking down `mcp-control` is Stage G.
@@ -48,13 +52,15 @@ this directory.**
 | Service | Purpose | Stage |
 |---|---|---|
 | `qmcp.ListAIManagedQubes` | Discovery — returns only qubes carrying `ai-managed`. | A |
-| `qmcp.SpawnAIManagedQube` | Create AppVM (A); other classes in D. Auto-tags. Validates name + template + (optional) netvm. | A → D |
+| `qmcp.SpawnAIManagedQube` | Create AppVM (A); DispVMTemplate + DispVM klasses (D). Auto-tags. Validates name + klass + template (incl. `template_for_dispvms` cross-ref for DispVM) + (optional) netvm. | A → D |
 | `qmcp.GetPropertyAIManaged` | Wrapped read. `"not found"` is indistinguishable from `"not tagged"`. | A |
 | `qmcp.SetPropertyAIManaged` | Wrapped write with cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
+| `qmcp.LifecycleAIManaged` | start/shutdown/kill/pause/unpause/remove on ai-managed qubes. Replaces direct `admin.vm.*` lifecycle in Stage D — qrexec's `@tag:` matcher doesn't reach klass=DispVM targets, so we do the tag check in dom0. | D |
 | `qmcp.GetPoolStats` | Free-space pressure on the default pool. | A |
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
 | `qmcp.CopyToAIManaged` | File transfer; both source and target must be ai-managed. | B |
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
+| `qmcp.SpawnDisposableAIManaged` | Ephemeral DispVM creation via `admin.vm.CreateDisposable`. DVMT must be ai-managed; the auto-named disposable is force-tagged before AI sees it. | E |
 | `qmcp.AttachDeviceAIManaged` | Virtual device attach. Both qubes (provider and consumer) must be ai-managed. | E |
 | `qmcp.DetachDeviceAIManaged` | Mirror of Attach. | E |
 | `qmcp.SetFeatureAIManaged` | `feature.Set` with `internal`-key denied + cross-ref validation. | F |
@@ -76,10 +82,17 @@ C. Single-egress network sandbox. `ai-net-router` is the only ai-managed
    allows AI to read and write firewall rules on its own qubes and on
    ai-net-router; SetPropertyAIManaged refuses netvm mutation on any
    ai-managed qube with `provides_network=true` (egress invariant).
-D. qmcp.CloneAIManagedQube + DispVM template support. AI manages its own
-   template lineage.
-E. qmcp.AttachDeviceAIManaged + Detach. Virtual block/USB/mic between
-   ai-managed qubes.
+D. qmcp.CloneAIManagedQube + DispVMTemplate/DispVM klass support in
+   qmcp.SpawnAIManagedQube + qmcp.LifecycleAIManaged (uniform
+   dom0-mediated lifecycle covering klass=DispVM, which qrexec's
+   `@tag:` selector won't reach). AI manages its own template lineage
+   and the full lifecycle of every klass it can create.
+E. qmcp.AttachDeviceAIManaged + Detach (virtual block/USB/mic between
+   ai-managed qubes) + qmcp.SpawnDisposableAIManaged (ephemeral
+   `admin.vm.CreateDisposable`-backed DispVMs; Stage D ships only
+   persistent klass=DispVM disposables, this adds the typical
+   "spin up, run, auto-destroy" pattern with a DVMT-must-be-ai-managed
+   precondition).
 F. qmcp.SetFeatureAIManaged (deny `internal`, validate cross-ref keys
    `audiovm`/`guivm`) + qmcp.AIManagedEvents.
 G. mcp-control hardening (sudo lockdown, dedicated MCP user) + Tor hidden
@@ -140,14 +153,17 @@ qubes_mcp/                          # repo root
 │       ├── qubes_copy.py           # Stage B
 │       ├── qubes_install_pkg.py    # Stage B convenience
 │       ├── qubes_firewall_get.py   # Stage C
-│       └── qubes_firewall_set.py   # Stage C
+│       ├── qubes_firewall_set.py   # Stage C
+│       └── qubes_clone.py          # Stage D
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
 │   ├── qmcp.ListAIManagedQubes
-│   ├── qmcp.SpawnAIManagedQube      # atomic tag-on-create + post-condition check
+│   ├── qmcp.SpawnAIManagedQube      # atomic tag-on-create + klass extension (Stage D)
 │   ├── qmcp.GetPropertyAIManaged
-│   └── qmcp.SetPropertyAIManaged
+│   ├── qmcp.SetPropertyAIManaged
+│   ├── qmcp.CloneAIManagedQube     # Stage D
+│   └── qmcp.LifecycleAIManaged     # Stage D (start/shutdown/kill/pause/unpause/remove)
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -160,7 +176,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-b.py
     ├── install-stage-c.sh
     ├── uninstall-stage-c.sh
-    └── test-stage-c.py
+    ├── test-stage-c.py
+    ├── install-stage-d.sh
+    ├── uninstall-stage-d.sh
+    └── test-stage-d.py
 ```
 
 ## Operating protocol
@@ -180,7 +199,10 @@ qubes_mcp/                          # repo root
 
 - **Stage A — DONE.** Policy + 4 qmcp.* dom0 RPC services + tag-scoped lifecycle.
   AI can list / spawn / inspect / lifecycle ai-managed qubes; untagged qubes
-  are invisible. All PASS markers in `deploy/test-stage-a.py` green.
+  are invisible. All PASS markers in `deploy/test-stage-a.py` green. (Stage D
+  later replaced the tag-scoped `admin.vm.*` lifecycle policy lines with a
+  dom0 wrapper, `qmcp.LifecycleAIManaged`, to handle klass=DispVM targets
+  uniformly. The Stage A test still passes and exercises the new wrapper.)
 - **Stage B — DONE.** `qmcp.RunInAIManaged` + `qmcp.CopyToAIManaged` (template-side
   services), `qubes.Filecopy` policy allow for ai-managed → ai-managed, and
   MCP tools `qubes_run` / `qubes_copy` / `qubes_install_pkg`. All PASS markers
@@ -196,7 +218,37 @@ qubes_mcp/                          # repo root
   refuses netvm changes on any ai-managed qube with `provides_network=true`,
   keeping the egress chokepoint operator-only. All 8 PASS markers in
   `deploy/test-stage-c.py` green.
-- **Stage D onward** — designed, not yet implemented. See the stage rollout
+- **Stage D — DONE (tested).** Three concrete changes:
+  - `qmcp.CloneAIManagedQube` (new) — atomic clone + force-tag mirroring
+    `qmcp.SpawnAIManagedQube`. Source must be ai-managed, else the opaque
+    `"not found"`.
+  - `qmcp.SpawnAIManagedQube` extended to accept `klass="DispVMTemplate"`
+    (creates an AppVM with `template_for_dispvms` force-set True — the
+    version-agnostic canonical form) and `klass="DispVM"` (a persistent
+    named disposable; template must have `template_for_dispvms=True`).
+  - `qmcp.LifecycleAIManaged` (new) — six-action wrapper covering
+    start/shutdown/kill/pause/unpause/remove on ai-managed qubes,
+    replacing the Stage A `admin.vm.*` tag-scoped allow lines. The
+    rewrite was forced by Qubes R4.3 behaviour: qrexec's `@tag:`
+    selector does NOT match klass=DispVM targets, even when the tag
+    is set directly on the DispVM and visible via the Admin API from
+    dom0. The wrapper does the ai-managed check in dom0 with qubesadmin
+    authority, so the qrexec quirk doesn't apply and lifecycle works
+    uniformly across all klasses.
+
+  Policy: removes the six `admin.vm.{Start,Shutdown,Kill,Pause,Unpause,Remove}`
+  tag-scoped allow lines (they were silently broken for klass=DispVM);
+  adds two allow lines for `qmcp.CloneAIManagedQube` and
+  `qmcp.LifecycleAIManaged`. MCP tools: new `qubes_clone` (Ring.CLONE);
+  `qubes_spawn` gains a `klass` parameter;
+  `qubes_start`/`qubes_shutdown`/`qubes_remove` route through
+  `qmcp.LifecycleAIManaged`. Deploy: `deploy/install-stage-d.sh`. All
+  6 PASS markers in `deploy/test-stage-d.py` green, including end-to-end
+  DispVM start + run-as-root + shutdown — the ai-debian-13 → DVMT →
+  DispVM service-inheritance chain works end-to-end. Stages A/B/C
+  tests (4/4, 4/4, 8/8) also exercise the new lifecycle wrapper and
+  remain green.
+- **Stage E onward** — designed, not yet implemented. See the stage rollout
   table above.
 
 ## References

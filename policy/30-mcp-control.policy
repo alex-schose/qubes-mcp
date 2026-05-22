@@ -1,11 +1,12 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C — sandbox with exec, file copy, and tag-scoped firewall control.
+# Stages A + B + C + D — sandbox with dom0-mediated lifecycle, exec, file
+# copy, tag-scoped firewall control, and cloning.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
 # Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
 # Ordering inside THIS file:
-#   1. ALLOW block  (Stage A + B surface)
+#   1. ALLOW block  (Stages A + B + C + D surface)
 #   2. EXPLICIT DENIES  (documented dangerous methods)
 #   3. CATCH-ALL DENY  (default-deny backstop for mcp-control)
 #
@@ -15,23 +16,19 @@
 # ALLOW BLOCK
 # =========================================================================
 
-# --- Stage A: lifecycle on ai-managed qubes.
-# target=@adminvm clause redirects execution to dom0 without starting the
-# target qube (load-bearing — omitting it triggers spurious VM starts).
-
-admin.vm.Start              *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.Shutdown           *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.Kill               *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.Pause              *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.Unpause            *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.Remove             *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-
-# --- Stage A: custom dom0 RPC services.
+# --- Stage A: custom dom0 RPC services (lifecycle, discovery, properties).
+# Lifecycle (start/shutdown/kill/pause/unpause/remove) routes through
+# qmcp.LifecycleAIManaged rather than the tag-scoped admin.vm.* surface.
+# Reason: qrexec's `@tag:` selector does not match klass=DispVM targets
+# on at least Qubes R4.3 — the wrapper does the ai-managed check in
+# dom0 with qubesadmin authority instead, giving uniform behaviour
+# across all klasses.
 
 qmcp.ListAIManagedQubes      *  mcp-control  @adminvm         allow
 qmcp.SpawnAIManagedQube      *  mcp-control  @adminvm         allow
 qmcp.GetPropertyAIManaged    *  mcp-control  @adminvm         allow
 qmcp.SetPropertyAIManaged    *  mcp-control  @adminvm         allow
+qmcp.LifecycleAIManaged      *  mcp-control  @adminvm         allow
 
 # --- Stage B: command execution and file transfer inside ai-managed qubes.
 # qmcp.RunInAIManaged and qmcp.CopyToAIManaged are services installed in
@@ -55,6 +52,13 @@ qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
 admin.vm.firewall.Get       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 admin.vm.firewall.Set       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 admin.vm.firewall.Reload    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+# --- Stage D: clone an ai-managed qube into a new ai-managed qube.
+# qmcp.CloneAIManagedQube force-tags the clone in dom0 using the same
+# atomic + rollback pattern as qmcp.SpawnAIManagedQube. Source-tag check
+# happens inside the script; the policy only routes the call to dom0.
+
+qmcp.CloneAIManagedQube      *  mcp-control  @adminvm         allow
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to
@@ -150,6 +154,17 @@ admin.vm.property.Set            *  mcp-control  @anyvm  deny
 admin.vm.property.Reset          *  mcp-control  @anyvm  deny
 admin.vm.property.Help           *  mcp-control  @anyvm  deny
 admin.vm.property.List           *  mcp-control  @anyvm  deny
+
+# Lifecycle — denied direct; AI uses qmcp.LifecycleAIManaged.
+# Stage D moved lifecycle into a dom0 wrapper because qrexec's @tag:
+# selector doesn't reach klass=DispVM targets on Qubes R4.3 (the wrapper
+# does the ai-managed check in dom0 with qubesadmin authority instead).
+admin.vm.Start                   *  mcp-control  @anyvm  deny
+admin.vm.Shutdown                *  mcp-control  @anyvm  deny
+admin.vm.Kill                    *  mcp-control  @anyvm  deny
+admin.vm.Pause                   *  mcp-control  @anyvm  deny
+admin.vm.Unpause                 *  mcp-control  @anyvm  deny
+admin.vm.Remove                  *  mcp-control  @anyvm  deny
 
 # Feature read/write — denied entirely. Wrapped in Stage F.
 admin.vm.feature.Get             *  mcp-control  @anyvm  deny

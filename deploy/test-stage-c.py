@@ -60,9 +60,9 @@ def show(label: str, r: dict) -> None:
 
 def cleanup(*qube_names: str) -> None:
     for n in qube_names:
-        call_admin("admin.vm.Kill", n)
+        call_qmcp("qmcp.LifecycleAIManaged", {"name": n, "action": "kill"})
         time.sleep(1)
-        call_admin("admin.vm.Remove", n)
+        call_qmcp("qmcp.LifecycleAIManaged", {"name": n, "action": "remove"})
 
 
 # ---------------------------------------------------------------- preamble

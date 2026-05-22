@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""qmcp.CloneAIManagedQube — clone an ai-managed qube into a new ai-managed qube.
+
+Stage D. Mirrors qmcp.SpawnAIManagedQube's atomic-tag-on-create pattern:
+clone, force-tag the clone, post-condition check, rollback on failure.
+
+Input  (stdin, JSON): {
+    "source":  "<existing ai-managed qube name>",
+    "name":    "<new qube name; alphanumeric+dashes, 1-31 chars>",
+}
+
+Output (stdout, JSON):
+    {"ok": true,  "name": "<new-vm-name>"}
+    {"ok": false, "error": "not found"}     -- source missing or not ai-managed
+    {"ok": false, "error": "<reason>"}
+
+The source's existence-or-tag is hidden behind the literal "not found"
+to match qmcp.GetPropertyAIManaged's existence-oracle stance: AI cannot
+use the clone surface to probe whether a named qube exists untagged.
+
+Inheritance: clone copies the source's prefs (template, netvm, memory, …).
+Since the source is ai-managed, its netvm is either None or itself
+ai-managed (the SetPropertyAIManaged wrapper enforces that on every set),
+so the clone's inherited netvm is already inside the sandbox without
+needing a separate retarget step.
+
+Atomicity: there is a brief window between qube creation and tag application
+during which the new qube exists untagged. If tag application fails for any
+reason, the script rolls back by removing the clone before returning an
+error. A post-condition check confirms the tag is visible before declaring
+success; if the post-check fails, the clone is rolled back too. The window
+is visible to concurrent dom0 admin tools but not observable by AI via the
+qrexec policy surface.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def best_effort_remove(app, name: str) -> bool:
+    """Try to remove a qube created by this script. Returns True on success."""
+    try:
+        vm = app.domains[name]
+    except Exception:
+        return True  # already gone
+    try:
+        if vm.is_running():
+            vm.kill()
+    except Exception:
+        pass
+    try:
+        del app.domains[name]
+        return True
+    except Exception:
+        return False
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+
+    source = req.get("source", "")
+    name = req.get("name", "")
+
+    if not NAME_RE.match(name):
+        return emit({"ok": False, "error":
+            "name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric"})
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    # Source visibility check — collapse "doesn't exist" and "not ai-managed"
+    # to the same opaque "not found" so the clone surface cannot be used as
+    # an existence oracle for untagged qubes.
+    if source not in app.domains:
+        return emit(NOT_FOUND)
+    src_vm = app.domains[source]
+    if "ai-managed" not in src_vm.tags:
+        return emit(NOT_FOUND)
+
+    if name in app.domains:
+        return emit({"ok": False, "error": f"qube '{name}' already exists"})
+
+    # ----- Step 1: clone the qube -----
+    try:
+        new_vm = app.clone_vm(src_vm, name)
+    except Exception as e:
+        return emit({"ok": False, "error": f"clone failed: {e}"})
+
+    # ----- Step 2: apply ai-managed tag (race window starts here) -----
+    try:
+        new_vm.tags.add("ai-managed")
+        if "ai-managed" not in new_vm.tags:
+            raise RuntimeError("tag.add returned but tag not visible on refresh")
+    except Exception as e:
+        removed = best_effort_remove(app, name)
+        if removed:
+            return emit({"ok": False,
+                         "error": f"tag application failed (rolled back): {e}"})
+        return emit({"ok": False, "error":
+            f"tag application failed AND rollback failed: {e}; "
+            f"manual cleanup of qube '{name}' required in dom0"})
+
+    return emit({"ok": True, "name": name})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

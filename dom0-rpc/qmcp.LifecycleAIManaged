@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""qmcp.LifecycleAIManaged — perform a lifecycle action on an ai-managed qube.
+
+Stage D refactor: lifecycle operations (start/shutdown/kill/pause/unpause/
+remove) are routed through this dom0 wrapper instead of direct
+admin.vm.* qrexec calls with `target=@adminvm allow @tag:ai-managed`.
+
+Reason: qrexec's `@tag:` selector does NOT match klass=DispVM targets
+on at least Qubes R4.3 (verified empirically). The tag is set directly
+on the DispVM and visible via the Admin API from dom0, but qrexec
+policy evaluation refuses the admin.vm.* call with "Request refused".
+Routing through this wrapper makes the tag check explicit (it runs in
+dom0 with qubesadmin authority, so the qrexec quirk doesn't apply) and
+gives uniform klass-independent lifecycle control. Same posture as
+qmcp.{Get,Set}PropertyAIManaged, qmcp.SpawnAIManagedQube, and
+qmcp.CloneAIManagedQube.
+
+Input  (stdin, JSON): {
+    "name":   "<ai-managed qube>",
+    "action": "start" | "shutdown" | "kill" | "pause" | "unpause" | "remove",
+}
+
+Output (stdout, JSON):
+    {"ok": true}
+    {"ok": false, "error": "not found"}   -- target missing or not ai-managed
+    {"ok": false, "error": "<reason>"}
+
+The literal "not found" string is opaque for both missing and untagged
+targets, matching qmcp.GetPropertyAIManaged's existence-oracle stance.
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+ALLOWED_ACTIONS = {"start", "shutdown", "kill", "pause", "unpause", "remove"}
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+
+    name = req.get("name", "")
+    action = req.get("action", "")
+
+    if action not in ALLOWED_ACTIONS:
+        return emit({"ok": False,
+                     "error": f"action must be one of: {sorted(ALLOWED_ACTIONS)}"})
+    if not name:
+        return emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    if name not in app.domains:
+        return emit(NOT_FOUND)
+    vm = app.domains[name]
+    if "ai-managed" not in vm.tags:
+        return emit(NOT_FOUND)
+
+    try:
+        if action == "remove":
+            # Removing a running qube fails inside qubesadmin too; caller's
+            # responsibility to kill+wait first. Not auto-killed here to
+            # avoid hiding ordering bugs in client code.
+            del app.domains[name]
+        elif action == "kill":
+            vm.kill()
+        elif action == "start":
+            vm.start()
+        elif action == "shutdown":
+            vm.shutdown()
+        elif action == "pause":
+            vm.pause()
+        elif action == "unpause":
+            vm.unpause()
+    except Exception as e:
+        return emit({"ok": False, "error": f"{action} failed: {e}"})
+
+    return emit({"ok": True})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

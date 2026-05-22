@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A, B, and C (below) are tested and working on Qubes R4.3-era
-systems. Stages D–H are designed but not yet implemented.
+Stages A through D (below) are tested and working on Qubes R4.3-era
+systems. Stages E–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -42,7 +42,7 @@ systems. Stages D–H are designed but not yet implemented.
 ## Reviewer asks
 
 If you're a Qubes engineer (core team or otherwise familiar with the Admin API
-and qrexec policy R4.2+), the three concrete questions I'd value review on:
+and qrexec policy R4.2+), the concrete questions I'd value review on:
 
 1. **Wrapped-reads existence-hiding.** Is returning a uniform `"not found"`
    from a dom0 qmcp wrapper a robust primitive against existence oracles, or
@@ -75,6 +75,25 @@ and qrexec policy R4.2+), the three concrete questions I'd value review on:
    missed, or a reinvention? Are there reasons (memory pressure, boot
    ordering, sys-net interactions) the cascade is preferred that I'm not
    seeing?
+6. **`@tag:` matching on klass=DispVM targets.** Stage D testing
+   surfaced this: a persistent DispVM (`app.add_new_vm("DispVM", …)`)
+   carries the `ai-managed` tag directly (verified via the Admin API
+   from dom0), but qrexec policy refuses
+   `admin.vm.Remove * mcp-control @tag:ai-managed allow target=@adminvm`
+   with "Request refused" — i.e., the rule never matches a klass=DispVM
+   target on Qubes R4.3. The same rule works for klass=AppVM and
+   klass=TemplateVM. The same effect was observed for
+   `admin.vm.{Start,Shutdown,Kill,Pause,Unpause}`. We worked around
+   this in Stage D by routing all lifecycle through a single dom0
+   wrapper (`qmcp.LifecycleAIManaged`) that does the ai-managed check
+   in dom0 with qubesadmin authority, sidestepping qrexec policy
+   evaluation entirely — same posture as
+   `qmcp.{Get,Set}PropertyAIManaged`. Is the underlying qrexec
+   `@tag:`-on-DispVM behaviour intentional (lifecycle of disposables
+   restricted to dom0 by design?), a bug, or a configuration step I'm
+   missing? Even with the workaround in place, a definitive answer
+   would let us decide whether the wrapper is permanent architecture
+   or temporary scaffolding.
 
 ## Status
 
@@ -83,7 +102,7 @@ and qrexec policy R4.2+), the three concrete questions I'd value review on:
 | A | Tag-scoped lifecycle + spawn + wrapped property read/write + existence hiding | tested |
 | B | Root command execution + inter-qube file transfer inside ai-managed qubes | tested |
 | C | Single-egress network sandbox (`ai-net-router` chokepoint, operator-chosen upstream, tag-scoped firewall control) | tested |
-| D | Template cloning + DispVM support | designed |
+| D | Clone (`qmcp.CloneAIManagedQube`) + DispVMTemplate/DispVM klass support in `qmcp.SpawnAIManagedQube` + dom0 lifecycle wrapper (`qmcp.LifecycleAIManaged`) covering klass=DispVM uniformly | tested |
 | E | Device attach (block/USB/mic) between ai-managed qubes | designed |
 | F | Wrapped `feature.Set` (deny `internal`, validate cross-ref) + filtered event stream | designed |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
@@ -163,7 +182,7 @@ cd ~/qubes_mcp
 .venv/bin/python deploy/test-stage-a.py
 ```
 
-(Both test scripts work from any cwd — they self-locate the package.)
+(All four test scripts work from any cwd — they self-locate the package.)
 
 Expect four PASS markers. If one fails, the test script's docstring describes
 what each step verifies.
@@ -228,7 +247,38 @@ explicit-null preservation, egress-qube lock, AI-qube netvm retarget,
 firewall rules round-trip, untagged-target refusal, and former-ai-sys
 invisibility.
 
-### Step 6 — Connect a client
+### Step 6 — (Optional) Deploy Stage D for cloning + DispVM klass support
+
+Stage D adds three things: `qmcp.CloneAIManagedQube` (clone an ai-managed
+qube into a new ai-managed qube), the `DispVMTemplate` and `DispVM`
+klasses in `qmcp.SpawnAIManagedQube`, and `qmcp.LifecycleAIManaged` (a
+dom0 wrapper that replaces the Stage A `admin.vm.*` tag-scoped lifecycle
+allow lines because qrexec's `@tag:` selector doesn't reach klass=DispVM
+targets — see reviewer ask #6). No new dom0 provisioning — only the
+policy + RPC scripts change.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-d.sh' > /tmp/install-d.sh
+bash /tmp/install-d.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-d.py
+```
+
+Six PASS markers — clone of ai-managed succeeds, clone of untagged
+refuses opaquely, DispVMTemplate spawn sets `template_for_dispvms`,
+DispVM spawn inherits template + ai-managed tag, DispVM from a plain
+TemplateVM is refused by the `template_for_dispvms` cross-ref, and
+end-to-end usability (start ai-dvm + run `whoami` as root inside via
+`qmcp.RunInAIManaged` + clean shutdown — proves the
+ai-debian-13 → DVMT → DispVM service-inheritance chain).
+
+### Step 7 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

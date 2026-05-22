@@ -17,7 +17,7 @@ from pathlib import Path
 # Make `qubes_mcp` importable when the repo isn't `pip install -e .`'d.
 # Walks: deploy/test-stage-b.py → deploy/ → repo_root/ (containing qubes_mcp/).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from qubes_mcp.tools._qrexec import call_qmcp, call_admin, call_service  # noqa: E402
+from qubes_mcp.tools._qrexec import call_qmcp, call_service  # noqa: E402
 
 
 # ====================================================================
@@ -43,9 +43,9 @@ def show(label: str, r: dict) -> None:
 
 def cleanup(*qube_names: str) -> None:
     for n in qube_names:
-        call_admin("admin.vm.Kill", n)
+        call_qmcp("qmcp.LifecycleAIManaged", {"name": n, "action": "kill"})
         time.sleep(1)
-        call_admin("admin.vm.Remove", n)
+        call_qmcp("qmcp.LifecycleAIManaged", {"name": n, "action": "remove"})
 
 
 def wait_for_state(qube: str, state: str, max_seconds: int = 30) -> str:
@@ -72,7 +72,7 @@ for name in ("ai-scratch-1", "ai-scratch-2"):
         sys.exit(1)
 
 for name in ("ai-scratch-1", "ai-scratch-2"):
-    r = call_admin("admin.vm.Start", name)
+    r = call_qmcp("qmcp.LifecycleAIManaged", {"name": name, "action": "start"})
     show(f"start {name}", r)
     s = wait_for_state(name, "Running", 20)
     print(f"    {name} power_state: {s}")
