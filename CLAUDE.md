@@ -22,8 +22,9 @@ this directory.**
   invariants in dom0 (forced tagging on creation, cross-reference
   validation, ai-managed-tag check, opaque error responses). The few
   remaining tag-scoped qrexec policy allows (`admin.vm.firewall.*` reads
-  and writes, `qubes.Filecopy` between ai-managed qubes) are surfaces
-  where the qrexec `@tag:` matcher is sufficient.
+  and writes, `admin.vm.device.{block,usb,mic}.{List,Available}` reads,
+  `qubes.Filecopy` between ai-managed qubes) are surfaces where the
+  qrexec `@tag:` matcher is sufficient.
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
   but no privilege inside `mcp-control` itself. mcp-control is an RPC gateway,
   not a workhorse. Locking down `mcp-control` is Stage G.
@@ -60,9 +61,9 @@ this directory.**
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
 | `qmcp.CopyToAIManaged` | File transfer; both source and target must be ai-managed. | B |
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
-| `qmcp.SpawnDisposableAIManaged` | Ephemeral DispVM creation via `admin.vm.CreateDisposable`. DVMT must be ai-managed; the auto-named disposable is force-tagged before AI sees it. | E |
-| `qmcp.AttachDeviceAIManaged` | Virtual device attach. Both qubes (provider and consumer) must be ai-managed. | E |
-| `qmcp.DetachDeviceAIManaged` | Mirror of Attach. | E |
+| `qmcp.AttachDeviceAIManaged` | Virtual device attach. Both qubes (backend and frontend) must be ai-managed; dom0 wrapper enforces the tag check on both ends, then shells out to `qvm-device` (absorbs DeviceAssignment-API drift across Qubes 4.1 → 4.2 → 4.3). | E1 |
+| `qmcp.DetachDeviceAIManaged` | Mirror of Attach. | E1 |
+| `qmcp.SpawnDisposableAIManaged` | Ephemeral DispVM creation via `admin.vm.CreateDisposable`. DVMT must be ai-managed; the auto-named disposable is force-tagged before AI sees it; auto-removed on shutdown. | E2 |
 | `qmcp.SetFeatureAIManaged` | `feature.Set` with `internal`-key denied + cross-ref validation. | F |
 | `qmcp.AIManagedEvents` | Filtered event stream — events whose subject is `@tag:ai-managed`. | F |
 
@@ -87,12 +88,24 @@ D. qmcp.CloneAIManagedQube + DispVMTemplate/DispVM klass support in
    dom0-mediated lifecycle covering klass=DispVM, which qrexec's
    `@tag:` selector won't reach). AI manages its own template lineage
    and the full lifecycle of every klass it can create.
-E. qmcp.AttachDeviceAIManaged + Detach (virtual block/USB/mic between
-   ai-managed qubes) + qmcp.SpawnDisposableAIManaged (ephemeral
-   `admin.vm.CreateDisposable`-backed DispVMs; Stage D ships only
-   persistent klass=DispVM disposables, this adds the typical
-   "spin up, run, auto-destroy" pattern with a DVMT-must-be-ai-managed
-   precondition).
+E1. qmcp.AttachDeviceAIManaged + qmcp.DetachDeviceAIManaged (virtual
+    block/USB/mic between ai-managed qubes). Both endpoints must be
+    ai-managed — dom0 wrapper does the tag check on backend AND
+    frontend (qrexec policy can only gate one side of the call), then
+    shells out to `qvm-device` which absorbs the DeviceAssignment-API
+    drift across Qubes 4.1 → 4.2 → 4.3. Read-only enumeration is
+    tag-scoped via policy (same shape as Stage C firewall.Get). New
+    Ring.DEVICE. In practice the block class is the useful default;
+    USB/mic require operator opt-in (`sys-usb` / audio-backend
+    ai-managed tag), which the trust model leaves to the operator.
+E2. qmcp.SpawnDisposableAIManaged — ephemeral DispVMs via
+    `admin.vm.CreateDisposable`. Stage D ships persistent klass=DispVM
+    disposables; this adds the typical "spin up, run, auto-destroy on
+    shutdown" pattern, with a DVMT-must-be-ai-managed precondition and
+    forced-tagging of the auto-named disposable before AI sees it. No
+    new ring (Ring.LIFECYCLE covers it). MCP also ships a
+    `qubes_run_disposable(template, cmd)` one-shot that composes
+    spawn + start + run + shutdown without adding dom0 surface.
 F. qmcp.SetFeatureAIManaged (deny `internal`, validate cross-ref keys
    `audiovm`/`guivm`) + qmcp.AIManagedEvents.
 G. mcp-control hardening (sudo lockdown, dedicated MCP user) + Tor hidden
@@ -154,7 +167,10 @@ qubes_mcp/                          # repo root
 │       ├── qubes_install_pkg.py    # Stage B convenience
 │       ├── qubes_firewall_get.py   # Stage C
 │       ├── qubes_firewall_set.py   # Stage C
-│       └── qubes_clone.py          # Stage D
+│       ├── qubes_clone.py          # Stage D
+│       ├── qubes_device_list.py    # Stage E1
+│       ├── qubes_device_attach.py  # Stage E1
+│       └── qubes_device_detach.py  # Stage E1
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -162,8 +178,10 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.SpawnAIManagedQube      # atomic tag-on-create + klass extension (Stage D)
 │   ├── qmcp.GetPropertyAIManaged
 │   ├── qmcp.SetPropertyAIManaged
-│   ├── qmcp.CloneAIManagedQube     # Stage D
-│   └── qmcp.LifecycleAIManaged     # Stage D (start/shutdown/kill/pause/unpause/remove)
+│   ├── qmcp.CloneAIManagedQube       # Stage D
+│   ├── qmcp.LifecycleAIManaged       # Stage D (start/shutdown/kill/pause/unpause/remove)
+│   ├── qmcp.AttachDeviceAIManaged    # Stage E1
+│   └── qmcp.DetachDeviceAIManaged    # Stage E1
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -179,7 +197,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-c.py
     ├── install-stage-d.sh
     ├── uninstall-stage-d.sh
-    └── test-stage-d.py
+    ├── test-stage-d.py
+    ├── install-stage-e1.sh
+    ├── uninstall-stage-e1.sh
+    └── test-stage-e1.py
 ```
 
 ## Operating protocol
@@ -248,8 +269,28 @@ qubes_mcp/                          # repo root
   DispVM service-inheritance chain works end-to-end. Stages A/B/C
   tests (4/4, 4/4, 8/8) also exercise the new lifecycle wrapper and
   remain green.
-- **Stage E onward** — designed, not yet implemented. See the stage rollout
-  table above.
+- **Stage E1 — DONE (tested).** Two new dom0 wrappers
+  (`qmcp.AttachDeviceAIManaged`, `qmcp.DetachDeviceAIManaged`) attach
+  virtual block/USB/mic devices between two ai-managed qubes; both
+  ends must carry the tag, with the wrapper collapsing missing-or-
+  untagged on either side to the same opaque `"not found"` so the
+  device surface is not an existence oracle. The wrappers shell out
+  to `qvm-device` rather than building DeviceAssignment objects in
+  Python — qvm-device is the stable surface across Qubes 4.1 → 4.2 →
+  4.3, while the Python class moved between `qubesadmin.devices` and
+  `qubes.device_protocol` across releases. Read-only enumeration
+  (`admin.vm.device.{block,usb,mic}.{List,Available}`) is tag-scoped
+  via policy directly — same shape as Stage C `admin.vm.firewall.Get`.
+  MCP tools: new `qubes_device_list` / `qubes_device_attach` /
+  `qubes_device_detach`, all in a new `Ring.DEVICE`. Test plan in
+  `deploy/test-stage-e1.py` has six HARD pass criteria (list-on-
+  ai-managed-ok, list-on-untagged-opaque, attach-refuses-bad-frontend,
+  attach-refuses-bad-backend, detach-refuses-bad-frontend, detach-
+  refuses-bad-backend) plus a SOFT block exercising a real loop-device
+  round-trip (informational because qubes-core-agent's block
+  enumerator may not auto-expose `/dev/loop*` on a given template).
+- **Stage E2 onward** — designed, not yet implemented. See the stage
+  rollout table above.
 
 ## References
 

@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through D (below) are tested and working on Qubes R4.3-era
-systems. Stages E–H are designed but not yet implemented.
+Stages A through E1 (below) are tested and working on Qubes R4.3-era
+systems. Stages E2–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -103,7 +103,8 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
 | B | Root command execution + inter-qube file transfer inside ai-managed qubes | tested |
 | C | Single-egress network sandbox (`ai-net-router` chokepoint, operator-chosen upstream, tag-scoped firewall control) | tested |
 | D | Clone (`qmcp.CloneAIManagedQube`) + DispVMTemplate/DispVM klass support in `qmcp.SpawnAIManagedQube` + dom0 lifecycle wrapper (`qmcp.LifecycleAIManaged`) covering klass=DispVM uniformly | tested |
-| E | Device attach (block/USB/mic) between ai-managed qubes | designed |
+| E1 | Device attach/detach (`qmcp.AttachDeviceAIManaged` / `qmcp.DetachDeviceAIManaged`) between ai-managed qubes, plus tag-scoped block/usb/mic enumeration | tested |
+| E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | designed |
 | F | Wrapped `feature.Set` (deny `internal`, validate cross-ref) + filtered event stream | designed |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
@@ -182,7 +183,7 @@ cd ~/qubes_mcp
 .venv/bin/python deploy/test-stage-a.py
 ```
 
-(All four test scripts work from any cwd — they self-locate the package.)
+(All test scripts work from any cwd — they self-locate the package.)
 
 Expect four PASS markers. If one fails, the test script's docstring describes
 what each step verifies.
@@ -278,7 +279,44 @@ end-to-end usability (start ai-dvm + run `whoami` as root inside via
 `qmcp.RunInAIManaged` + clean shutdown — proves the
 ai-debian-13 → DVMT → DispVM service-inheritance chain).
 
-### Step 7 — Connect a client
+### Step 7 — (Optional) Deploy Stage E1 for device attach between ai-managed qubes
+
+Stage E1 adds two dom0 wrappers (`qmcp.AttachDeviceAIManaged`,
+`qmcp.DetachDeviceAIManaged`) that attach virtual block/USB/mic devices
+between ai-managed qubes. Both backend and frontend must be ai-managed;
+the wrapper collapses missing/untagged on either side to opaque
+`"not found"`. Read-only enumeration (`admin.vm.device.{class}.{List,
+Available}`) is tag-scoped at the policy layer — same shape as Stage C
+firewall reads. No new qube provisioning.
+
+In practice, **block** is the useful case (e.g. shared scratch volume
+between two ai-managed AppVMs). **USB** requires `sys-usb` to be
+ai-managed and **mic** requires the audio backend to be ai-managed —
+both operator opt-ins. Default install leaves these dormant; the
+wrappers are ready when the operator chooses to tag those backends.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e1.sh' > /tmp/install-e1.sh
+bash /tmp/install-e1.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-e1.py
+```
+
+Six PASS markers (hard): tag-scoped list on ai-managed backend
+succeeds; list on untagged refuses opaquely; attach refuses when
+either endpoint is untagged; same for detach. Plus a SOFT block of
+informational checks for a real loop-device round-trip (template-
+dependent — qubes-core-agent's block enumerator may or may not
+auto-expose `/dev/loop*` on a given Debian build, so those are
+reported but not counted toward the pass total).
+
+### Step 8 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""qmcp.DetachDeviceAIManaged — detach a virtual device previously attached
+between two ai-managed qubes.
+
+Mirror of qmcp.AttachDeviceAIManaged. Same trust invariant (both backend
+and frontend must be ai-managed); same opaque "not found" on missing or
+untagged either side.
+
+Input  (stdin, JSON): {
+    "device_class": "block" | "usb" | "mic",
+    "backend":      "<ai-managed qube exposing the device>",
+    "device_id":    "<port_id used at attach time>",
+    "frontend":     "<ai-managed qube currently holding the device>",
+}
+
+Output (stdout, JSON):
+    {"ok": true}
+    {"ok": false, "error": "not found"}     -- backend or frontend missing/untagged
+    {"ok": false, "error": "<reason>"}
+
+Implementation matches Attach: dom0 tag check via qubesadmin, then
+shell out to `qvm-device <class> detach <frontend> <backend>:<port_id>`.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+
+ALLOWED_CLASSES = {"block", "usb", "mic"}
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def normalise_mic_port(device_class: str, device_id: str) -> str:
+    if device_class == "mic" and not device_id:
+        return "mic"
+    return device_id
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+
+    device_class = req.get("device_class", "")
+    backend = req.get("backend", "")
+    device_id = req.get("device_id", "")
+    frontend = req.get("frontend", "")
+
+    if device_class not in ALLOWED_CLASSES:
+        return emit({"ok": False,
+                     "error": f"device_class must be one of: {sorted(ALLOWED_CLASSES)}"})
+
+    device_id = normalise_mic_port(device_class, device_id)
+    if not device_id:
+        return emit({"ok": False, "error": "device_id is required"})
+    if not backend or not frontend:
+        return emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    for name in (backend, frontend):
+        if name not in app.domains:
+            return emit(NOT_FOUND)
+        if "ai-managed" not in app.domains[name].tags:
+            return emit(NOT_FOUND)
+
+    if shutil.which("qvm-device") is None:
+        return emit({"ok": False, "error": "qvm-device CLI not present in dom0"})
+
+    cmd = ["qvm-device", device_class, "detach", frontend, f"{backend}:{device_id}"]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return emit({"ok": False, "error": "qvm-device detach timed out"})
+    except Exception as e:
+        return emit({"ok": False, "error": f"qvm-device detach failed to launch: {e}"})
+
+    if proc.returncode != 0:
+        msg = (proc.stderr.decode(errors="replace").strip()
+               or proc.stdout.decode(errors="replace").strip()
+               or f"qvm-device exit {proc.returncode}")
+        return emit({"ok": False, "error": f"detach failed: {msg}"})
+
+    return emit({"ok": True})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

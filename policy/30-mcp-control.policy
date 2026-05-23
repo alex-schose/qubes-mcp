@@ -1,12 +1,13 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D — sandbox with dom0-mediated lifecycle, exec, file
-# copy, tag-scoped firewall control, and cloning.
+# Stages A + B + C + D + E1 — sandbox with dom0-mediated lifecycle, exec,
+# file copy, tag-scoped firewall control, cloning, and device attach/detach
+# between ai-managed qubes.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
 # Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
 # Ordering inside THIS file:
-#   1. ALLOW block  (Stages A + B + C + D surface)
+#   1. ALLOW block  (Stages A + B + C + D + E1 surface)
 #   2. EXPLICIT DENIES  (documented dangerous methods)
 #   3. CATCH-ALL DENY  (default-deny backstop for mcp-control)
 #
@@ -59,6 +60,30 @@ admin.vm.firewall.Reload    *  mcp-control  @tag:ai-managed  allow  target=@admi
 # happens inside the script; the policy only routes the call to dom0.
 
 qmcp.CloneAIManagedQube      *  mcp-control  @adminvm         allow
+
+# --- Stage E1: device attach/detach between ai-managed qubes.
+# Attach/Detach route through qmcp wrappers because both endpoints must
+# be ai-managed (the wrapper does the tag check on backend AND frontend
+# in dom0 with qubesadmin authority — qrexec policy can only gate one
+# side of the call). The wrappers shell out to qvm-device under the
+# hood, which absorbs the DeviceAssignment-API drift across Qubes 4.1
+# → 4.2 → 4.3.
+#
+# Read-only enumeration (List, Available) is tag-scoped at the policy
+# layer directly — pure dom0 admin reads, same pattern as Stage C's
+# admin.vm.firewall.Get. Untagged backends fall through to the
+# explicit-deny block below (which still lists the Attach/Detach
+# methods, denied for any direct caller bypassing the wrapper).
+
+qmcp.AttachDeviceAIManaged       *  mcp-control  @adminvm         allow
+qmcp.DetachDeviceAIManaged       *  mcp-control  @adminvm         allow
+
+admin.vm.device.block.List       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.device.block.Available  *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.device.usb.List         *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.device.usb.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.device.mic.List         *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.device.mic.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to
@@ -176,23 +201,25 @@ admin.vm.feature.CheckWithTemplate  *  mcp-control  @anyvm  deny
 # Firewall — Stage C allows tag-scoped above; the catch-all below still
 # refuses untagged targets, so no explicit deny needed here.
 
-# Device API — denied; introduced in Stage E with wrapper.
+# Device API
+#  - block/usb/mic: Stage E1 wraps Attach/Detach via qmcp; List/Available
+#    are tag-scoped allows above. The Attach/Detach denies here catch any
+#    direct caller that bypasses the wrapper (the tag-scoped reads above
+#    already make the list/available denies unreachable, so they are
+#    omitted to keep the deny block honest about what it still gates).
+#  - pci: stays fully denied — PCI passthrough has a different trust
+#    model (requires no_strict_reset, qube reboot, dom0-side risk
+#    assessment) and is out of Stage E scope. A future stage may wrap it.
 admin.vm.device.pci.Attach       *  mcp-control  @anyvm  deny
 admin.vm.device.pci.Detach       *  mcp-control  @anyvm  deny
 admin.vm.device.pci.List         *  mcp-control  @anyvm  deny
 admin.vm.device.pci.Available    *  mcp-control  @anyvm  deny
 admin.vm.device.block.Attach     *  mcp-control  @anyvm  deny
 admin.vm.device.block.Detach     *  mcp-control  @anyvm  deny
-admin.vm.device.block.List       *  mcp-control  @anyvm  deny
-admin.vm.device.block.Available  *  mcp-control  @anyvm  deny
 admin.vm.device.mic.Attach       *  mcp-control  @anyvm  deny
 admin.vm.device.mic.Detach       *  mcp-control  @anyvm  deny
-admin.vm.device.mic.List         *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Available    *  mcp-control  @anyvm  deny
 admin.vm.device.usb.Attach       *  mcp-control  @anyvm  deny
 admin.vm.device.usb.Detach       *  mcp-control  @anyvm  deny
-admin.vm.device.usb.List         *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Available    *  mcp-control  @anyvm  deny
 
 # Global discovery — denied to enforce invisibility.
 admin.vm.List                    *  mcp-control  @anyvm  deny
@@ -202,7 +229,9 @@ admin.label.Get                  *  mcp-control  @anyvm  deny
 admin.label.Index                *  mcp-control  @anyvm  deny
 admin.Events                     *  mcp-control  @anyvm  deny
 
-# Volume info/resize — denied Stage A/B; allowed tag-scoped from Stage E.
+# Volume info/resize — denied. Not currently surfaced by any stage; a
+# future stage may wrap these tag-scoped for AI-visible disk-pressure
+# diagnostics, but the current rollout has no need.
 admin.vm.volume.List             *  mcp-control  @anyvm  deny
 admin.vm.volume.Info             *  mcp-control  @anyvm  deny
 admin.vm.volume.Resize           *  mcp-control  @anyvm  deny

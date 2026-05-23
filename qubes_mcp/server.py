@@ -12,12 +12,15 @@ class Ring(str, Enum):
     EXEC      = "exec"           # Stage B (RunInAIManaged, CopyToAIManaged, install_pkg)
     NETWORK   = "network"        # Stage C (firewall mgmt on ai-managed qubes)
     CLONE     = "clone"          # Stage D (CloneAIManagedQube)
-    # DEVICE    = "device"       # Stage E
+    DEVICE    = "device"         # Stage E1 (AttachDevice/DetachDevice/device_list)
     # FEATURE   = "feature"      # Stage F
     # EVENTS    = "events"       # Stage F
 
 
-ACTIVE_RINGS: set[Ring] = {Ring.READ_ONLY, Ring.LIFECYCLE, Ring.EXEC, Ring.NETWORK, Ring.CLONE}
+ACTIVE_RINGS: set[Ring] = {
+    Ring.READ_ONLY, Ring.LIFECYCLE, Ring.EXEC,
+    Ring.NETWORK, Ring.CLONE, Ring.DEVICE,
+}
 
 
 # Per-ring budgets — None means unlimited (the default for every active ring
@@ -32,6 +35,7 @@ _RING_BUDGETS: dict[Ring, int | None] = {
     Ring.EXEC:      None,
     Ring.NETWORK:   None,
     Ring.CLONE:     None,
+    Ring.DEVICE:    None,
 }
 
 
@@ -87,5 +91,8 @@ def main() -> None:
         qubes_firewall_get,
         qubes_firewall_set,
         qubes_clone,
+        qubes_device_list,
+        qubes_device_attach,
+        qubes_device_detach,
     )
     mcp.run()
