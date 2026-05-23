@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""qmcp.SpawnDisposableAIManaged — create an ephemeral DispVM from an
+ai-managed DVMT, force-tag it, and return the auto-assigned name.
+
+Stage E2. Complements Stage D's klass=DispVM support in
+qmcp.SpawnAIManagedQube: that ships persistent named disposables;
+this ships the "spin up, run, auto-destroy on shutdown" pattern via
+`admin.vm.CreateDisposable`. The created qube has auto_cleanup=True
+by the Admin API default, so dom0 removes it when it halts.
+
+Input  (stdin, JSON): {
+    "template": "<ai-managed DVMT — must have template_for_dispvms=True>"
+}
+
+Output (stdout, JSON):
+    {"ok": true,  "name": "<auto-assigned name, e.g. disp1234>"}
+    {"ok": false, "error": "not found"}     -- template missing or not ai-managed
+    {"ok": false, "error": "<reason>"}      -- includes the template_for_dispvms
+                                               cross-ref message when applicable
+
+The template's existence-or-tag is hidden behind the literal "not found"
+to match qmcp.GetPropertyAIManaged's existence-oracle stance — AI
+cannot use this surface to probe whether a named qube exists untagged.
+
+Atomicity: the new disposable is created by qubesd, then this script
+applies the ai-managed tag via a direct admin call. Between those two
+steps the qube exists untagged. If tag application fails, the script
+rolls back by killing the qube (auto_cleanup then removes it). A
+post-condition check confirms the tag is visible before declaring
+success. The race window is visible to concurrent dom0 admin tools
+but not observable by AI via the qrexec policy surface.
+
+All admin operations on the new disposable use `app.qubesd_call(name,
+...)` directly rather than going through `app.domains[name]`. The
+qubesadmin `VMCollection` populates lazily and does NOT refresh
+synchronously after a CreateDisposable, so `app.domains[disp_name]`
+transiently raises KeyError immediately after creation. Routing
+through qubesd_call sidesteps that cache entirely. (Note: this path
+also bypasses the `admin.vm.tag.Set` qrexec policy deny — that deny
+only applies to inter-qube calls; we are running inside dom0 talking
+to qubesd over the local socket, with full admin authority.)
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def create_disposable(app, tpl) -> str:
+    """Invoke admin.vm.CreateDisposable for `tpl`; return the assigned name.
+
+    Routes through the qubesd-call surface directly rather than via any
+    high-level qubesadmin helper, because the helper's name has drifted
+    between qubesadmin versions (create_disposable_vm vs. create_dispvm
+    vs. a method on the template VM). The qubesd_call shape is the
+    stable Admin API contract."""
+    raw = app.qubesd_call(tpl.name, "admin.vm.CreateDisposable")
+    name = raw.decode(errors="replace").strip()
+    if not name:
+        raise RuntimeError("CreateDisposable returned empty name")
+    return name
+
+
+def apply_tag_direct(app, vm_name: str, tag: str) -> None:
+    """Set a tag via direct admin call — bypasses the domains cache."""
+    app.qubesd_call(vm_name, "admin.vm.tag.Set", tag)
+
+
+def has_tag_direct(app, vm_name: str, tag: str) -> bool:
+    """Read tags via direct admin call. Returns True iff `tag` is set."""
+    raw = app.qubesd_call(vm_name, "admin.vm.tag.List")
+    tags = set(raw.decode(errors="replace").split())
+    return tag in tags
+
+
+def kill_direct(app, vm_name: str) -> None:
+    """Kill a VM via direct admin call. auto_cleanup=True disposables
+    are removed by qubesd once halted, so kill alone suffices."""
+    app.qubesd_call(vm_name, "admin.vm.Kill")
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+
+    template = req.get("template", "")
+    if not template:
+        return emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    # Template visibility check — collapse missing/untagged to opaque "not found"
+    # so the disposable-spawn surface cannot be used as an existence oracle.
+    if template not in app.domains:
+        return emit(NOT_FOUND)
+    tpl = app.domains[template]
+    if "ai-managed" not in tpl.tags:
+        return emit(NOT_FOUND)
+
+    # Cross-ref: a DVMT must have template_for_dispvms=True. This is NOT
+    # hidden behind "not found" — the template is ai-managed (AI can see
+    # it via ListAIManagedQubes), so a more informative error is fine and
+    # matches the Stage D klass=DispVM cross-ref behaviour in
+    # SpawnAIManagedQube.
+    try:
+        is_dvmt = bool(getattr(tpl, "template_for_dispvms", False))
+    except Exception:
+        is_dvmt = False
+    if not is_dvmt:
+        return emit({"ok": False, "error":
+            f"template '{template}' must have template_for_dispvms=True "
+            f"to be a DispVM source (klass is {tpl.klass})"})
+
+    # ----- Step 1: create the disposable -----
+    try:
+        disp_name = create_disposable(app, tpl)
+    except Exception as e:
+        return emit({"ok": False, "error": f"CreateDisposable failed: {e}"})
+
+    # ----- Step 2: apply ai-managed tag (race window starts here) -----
+    # Direct admin calls — see module docstring for why we bypass
+    # `app.domains[disp_name]` here (the VMCollection cache lags
+    # CreateDisposable and raises KeyError for several seconds).
+    try:
+        apply_tag_direct(app, disp_name, "ai-managed")
+        if not has_tag_direct(app, disp_name, "ai-managed"):
+            raise RuntimeError("tag.Set returned but tag not visible on refresh")
+    except Exception as tag_err:
+        try:
+            kill_direct(app, disp_name)
+            return emit({"ok": False,
+                         "error": f"tag application failed (rolled back): {tag_err}"})
+        except Exception as kill_err:
+            return emit({"ok": False, "error":
+                f"tag application failed AND kill failed: "
+                f"tag-err={tag_err}, kill-err={kill_err}; "
+                f"manual cleanup of qube '{disp_name}' required in dom0"})
+
+    return emit({"ok": True, "name": disp_name})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

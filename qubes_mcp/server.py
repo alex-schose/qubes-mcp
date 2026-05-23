@@ -94,5 +94,7 @@ def main() -> None:
         qubes_device_list,
         qubes_device_attach,
         qubes_device_detach,
+        qubes_spawn_disposable,
+        qubes_run_disposable,
     )
     mcp.run()

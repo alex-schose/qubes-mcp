@@ -1,13 +1,13 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 — sandbox with dom0-mediated lifecycle, exec,
-# file copy, tag-scoped firewall control, cloning, and device attach/detach
-# between ai-managed qubes.
+# Stages A + B + C + D + E1 + E2 — sandbox with dom0-mediated lifecycle,
+# exec, file copy, tag-scoped firewall control, cloning, device attach/
+# detach between ai-managed qubes, and ephemeral disposables.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
 # Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
 # Ordering inside THIS file:
-#   1. ALLOW block  (Stages A + B + C + D + E1 surface)
+#   1. ALLOW block  (Stages A + B + C + D + E1 + E2 surface)
 #   2. EXPLICIT DENIES  (documented dangerous methods)
 #   3. CATCH-ALL DENY  (default-deny backstop for mcp-control)
 #
@@ -84,6 +84,16 @@ admin.vm.device.usb.List         *  mcp-control  @tag:ai-managed  allow  target=
 admin.vm.device.usb.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 admin.vm.device.mic.List         *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 admin.vm.device.mic.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+# --- Stage E2: ephemeral disposables via admin.vm.CreateDisposable.
+# The wrapper validates the DVMT is ai-managed AND has
+# template_for_dispvms=True, then calls CreateDisposable in dom0 and
+# force-tags the auto-named result before returning. auto_cleanup=True
+# is the Admin API default, so dom0 removes the qube on shutdown.
+# admin.vm.CreateDisposable stays in the explicit-deny block — the
+# wrapper is the only allowed path.
+
+qmcp.SpawnDisposableAIManaged    *  mcp-control  @adminvm         allow
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to

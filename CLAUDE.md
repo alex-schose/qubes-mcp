@@ -15,7 +15,11 @@ this directory.**
   properties, and events do not leak to AI.
 - **Tag mutation is forbidden** for AI. `admin.vm.tag.Set` and `admin.vm.tag.Remove`
   are hard-denied at the policy layer. Tagging happens only in two places:
-  1. The `qmcp.SpawnAIManagedQube` dom0 script (force-tags every qube it creates).
+  1. The dom0 `qmcp.*` create-and-tag wrappers (`qmcp.SpawnAIManagedQube`,
+     `qmcp.CloneAIManagedQube`, `qmcp.SpawnDisposableAIManaged`), which
+     force-tag every qube they create. Each wrapper applies the tag via
+     direct admin authority in dom0; the policy deny only gates inter-qube
+     calls coming in over qrexec, which the wrappers don't use.
   2. The operator's hand in dom0 (`qvm-tags <vm> add|del ai-managed`).
 - AI never has direct access to admin write methods. Every state-changing
   call is routed through a `qmcp.*` dom0 RPC wrapper that enforces
@@ -170,7 +174,9 @@ qubes_mcp/                          # repo root
 │       ├── qubes_clone.py          # Stage D
 │       ├── qubes_device_list.py    # Stage E1
 │       ├── qubes_device_attach.py  # Stage E1
-│       └── qubes_device_detach.py  # Stage E1
+│       ├── qubes_device_detach.py  # Stage E1
+│       ├── qubes_spawn_disposable.py  # Stage E2
+│       └── qubes_run_disposable.py    # Stage E2 (one-shot composition)
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -181,7 +187,8 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.CloneAIManagedQube       # Stage D
 │   ├── qmcp.LifecycleAIManaged       # Stage D (start/shutdown/kill/pause/unpause/remove)
 │   ├── qmcp.AttachDeviceAIManaged    # Stage E1
-│   └── qmcp.DetachDeviceAIManaged    # Stage E1
+│   ├── qmcp.DetachDeviceAIManaged    # Stage E1
+│   └── qmcp.SpawnDisposableAIManaged # Stage E2
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -200,7 +207,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-d.py
     ├── install-stage-e1.sh
     ├── uninstall-stage-e1.sh
-    └── test-stage-e1.py
+    ├── test-stage-e1.py
+    ├── install-stage-e2.sh
+    ├── uninstall-stage-e2.sh
+    └── test-stage-e2.py
 ```
 
 ## Operating protocol
@@ -289,7 +299,41 @@ qubes_mcp/                          # repo root
   refuses-bad-backend) plus a SOFT block exercising a real loop-device
   round-trip (informational because qubes-core-agent's block
   enumerator may not auto-expose `/dev/loop*` on a given template).
-- **Stage E2 onward** — designed, not yet implemented. See the stage
+- **Stage E2 — DONE (tested).** `qmcp.SpawnDisposableAIManaged` is a
+  thin dom0 wrapper around `admin.vm.CreateDisposable`: it validates
+  the source is ai-managed AND has `template_for_dispvms=True`, calls
+  the Admin API directly via `qubesd_call(tpl, "admin.vm.CreateDisposable")`
+  (the stable Admin-protocol surface — qubesadmin's high-level helper
+  name has drifted across versions), force-tags the auto-named result
+  (`dispXXXX`), and rolls back (kill → auto_cleanup-removal) if the
+  tag fails to apply. **All admin operations on the new disposable
+  use `app.qubesd_call(disp_name, ...)` directly, NOT
+  `app.domains[disp_name]`.** The qubesadmin `VMCollection` populates
+  lazily and does not refresh synchronously after CreateDisposable —
+  `app.domains[disp_name]` raises `KeyError(disp_name)` for several
+  seconds post-create. Going through qubesd_call sidesteps the cache
+  entirely. (This path also bypasses the `admin.vm.tag.Set @anyvm
+  deny` policy line, which is fine: the deny gates inter-qube calls
+  via qrexec, while qubesd_call uses the local dom0 socket with full
+  admin authority.) The created qube inherits `auto_cleanup=True`
+  from the Admin API default, so dom0 removes it when it halts — no
+  separate cleanup wrapper needed. The trust posture mirrors
+  `qmcp.SpawnAIManagedQube`: opaque `"not found"` for missing or
+  untagged source, informative cross-ref message when the source IS
+  ai-managed but lacks `template_for_dispvms`. `admin.vm.CreateDisposable`
+  stays denied — the wrapper is the only allowed path. No new ring;
+  disposable spawn fits Ring.LIFECYCLE. MCP tools: `qubes_spawn_disposable`
+  (1:1 with the wrapper) and `qubes_run_disposable` (pure MCP-side
+  composition: spawn → start + wait Running → RunInAIManaged → shutdown,
+  with kill-as-fallback so a stuck disposable doesn't orphan after an
+  error). Test plan in `deploy/test-stage-e2.py`: five PASS criteria
+  covering full lifecycle invariants (klass + template + auto_cleanup),
+  run-and-auto-remove cycle, plain-TemplateVM cross-ref refusal,
+  untagged opaque refusal, and an end-to-end one-shot smoke test.
+  Preamble cleanup is order-aware: it removes any leftover disposable
+  tied to the test DVMT before removing the DVMT itself (Qubes refuses
+  to remove a DVMT while any qube references it as `template`).
+- **Stage F onward** — designed, not yet implemented. See the stage
   rollout table above.
 
 ## References

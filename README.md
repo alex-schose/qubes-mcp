@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through E1 (below) are tested and working on Qubes R4.3-era
-systems. Stages E2–H are designed but not yet implemented.
+Stages A through E2 (below) are tested and working on Qubes R4.3-era
+systems. Stages F–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -94,6 +94,27 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
    missing? Even with the workaround in place, a definitive answer
    would let us decide whether the wrapper is permanent architecture
    or temporary scaffolding.
+7. **qubesadmin `VMCollection` cache lag after
+   `admin.vm.CreateDisposable`.** Stage E2's `qmcp.SpawnDisposableAIManaged`
+   wrapper calls `admin.vm.CreateDisposable` via `qubesd_call`, gets
+   back the new disposable's name, and then needs to set the
+   `ai-managed` tag on it before returning. The natural code —
+   `app.domains[disp_name].tags.add("ai-managed")` — raises
+   `KeyError(disp_name)` for several seconds after creation: the
+   `qubesadmin.app.VMCollection` populates lazily and doesn't refresh
+   synchronously after CreateDisposable. We worked around it by
+   routing tag.Set / tag.List / Kill through
+   `app.qubesd_call(disp_name, ...)` directly, bypassing the cache.
+   Is the lazy `VMCollection` the intended client-side contract
+   (callers expected to handle the read-after-write lag themselves),
+   or is it a missing cache-invalidation hook in the Admin client?
+   A definitive answer would let us decide whether the direct-call
+   pattern should propagate to other "create-then-mutate" wrappers
+   (`SpawnAIManagedQube`, `CloneAIManagedQube`) that may have the
+   same latent bug — we haven't hit it there because they apply the
+   tag through the VM object returned by `add_new_vm`/`clone_vm`,
+   which is freshly-fetched and doesn't go through the collection
+   cache.
 
 ## Status
 
@@ -104,7 +125,7 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
 | C | Single-egress network sandbox (`ai-net-router` chokepoint, operator-chosen upstream, tag-scoped firewall control) | tested |
 | D | Clone (`qmcp.CloneAIManagedQube`) + DispVMTemplate/DispVM klass support in `qmcp.SpawnAIManagedQube` + dom0 lifecycle wrapper (`qmcp.LifecycleAIManaged`) covering klass=DispVM uniformly | tested |
 | E1 | Device attach/detach (`qmcp.AttachDeviceAIManaged` / `qmcp.DetachDeviceAIManaged`) between ai-managed qubes, plus tag-scoped block/usb/mic enumeration | tested |
-| E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | designed |
+| E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | tested |
 | F | Wrapped `feature.Set` (deny `internal`, validate cross-ref) + filtered event stream | designed |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
@@ -316,7 +337,39 @@ dependent — qubes-core-agent's block enumerator may or may not
 auto-expose `/dev/loop*` on a given Debian build, so those are
 reported but not counted toward the pass total).
 
-### Step 8 — Connect a client
+### Step 8 — (Optional) Deploy Stage E2 for ephemeral DispVMs
+
+Stage E2 adds `qmcp.SpawnDisposableAIManaged` — a dom0 wrapper around
+`admin.vm.CreateDisposable`. The DVMT (DispVMTemplate, created in
+Stage D) must be ai-managed and have `template_for_dispvms=True`;
+the auto-named disposable (`dispXXXX`) is force-tagged before AI
+sees it; `auto_cleanup=True` is the Admin API default, so dom0
+removes the qube once it halts. `admin.vm.CreateDisposable` stays
+denied — the wrapper is the only allowed path.
+
+MCP also ships `qubes_run_disposable(template, cmd)` — a one-shot
+that composes spawn → start → run → shutdown without adding any
+new dom0 surface. The typical "fire a throwaway, get its output,
+move on" pattern collapses to a single call.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e2.sh' > /tmp/install-e2.sh
+bash /tmp/install-e2.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-e2.py
+```
+
+Five PASS markers: spawn+tag+klass+template+auto_cleanup; start+
+whoami=root+shutdown+auto-removed; plain-TemplateVM cross-ref
+refusal; untagged-DVMT opaque refusal; one-shot end-to-end.
+
+### Step 9 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):
