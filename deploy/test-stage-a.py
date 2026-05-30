@@ -107,14 +107,12 @@ r2 = call_qmcp("qmcp.ListAIManagedQubes")
 names2 = [q["name"] for q in r2.get("qubes", [])]
 print(f"  After spawn, list: {names2}")
 
-# ----------------------------------- 4. cross-ref refusal on template
-# UNTAGGED_TEMPLATE must exist on the system AND be untagged so the wrapper
-# fires the "is not ai-managed" branch. If it doesn't exist (e.g. operators
-# whose Debian template has a different name), fall back to PROBE_UNTAGGED_1
-# (sys-firewall by default) — also untagged, also exists in every default
-# Qubes install. The wrapper validates the ai-managed tag before qubesadmin
-# type-checks template, so passing an AppVM-not-TemplateVM still exercises
-# the cross-ref refusal path correctly.
+# ----------------------------------- 4. SetProperty cross-ref OPAQUE COLLAPSE
+# The wrapper's cross-ref refusal must collapse "missing" and "untagged"
+# into one byte-identical message that does NOT echo the value name —
+# otherwise this surface is an existence oracle on every untagged qube
+# in dom0. Probe both branches and assert the responses are identical
+# AND neither response contains the probed name.
 def cross_ref_probe(value: str) -> dict:
     return call_qmcp("qmcp.SetPropertyAIManaged", {
         "name": "ai-scratch-1",
@@ -124,35 +122,70 @@ def cross_ref_probe(value: str) -> dict:
 
 
 probe_value = UNTAGGED_TEMPLATE
-header(f"4. Cross-ref refusal — ai-scratch-1.template = {probe_value} (exists, untagged)")
-r = cross_ref_probe(probe_value)
-show(f"set template={probe_value}", r)
+header("4. SetProperty cross-ref OPAQUE — untagged vs. missing must be identical")
+r_untagged = cross_ref_probe(probe_value)
+show(f"set template={probe_value} (untagged)", r_untagged)
 
-# If the configured probe doesn't exist on this system, retry with a qube
-# we know exists in every default Qubes install.
-if (not r.get("ok")) and "not found" in r.get("error", "") \
-        and "is not ai-managed" not in r.get("error", ""):
-    fallback = PROBE_UNTAGGED_1
-    print(f"  (probe {probe_value!r} not present; falling back to {fallback!r})")
-    probe_value = fallback
-    r = cross_ref_probe(probe_value)
-    show(f"set template={probe_value}", r)
+# If the configured probe doesn't exist, fall back to a qube every default
+# install has (sys-firewall). With the opaque collapse there is no longer
+# a "not found" vs "is not ai-managed" branch to distinguish — both
+# branches return the same string — so we can't auto-detect the fallback
+# from the response. The default value is left as a hint for operators
+# with an unusual template name.
+r_missing = cross_ref_probe(PROBE_NONEXISTENT)
+show(f"set template={PROBE_NONEXISTENT} (missing)", r_missing)
 
-correct = (not r.get("ok")) and "is not ai-managed" in r.get("error", "")
-if correct:
-    print(f"  PASS: refused with 'is not ai-managed' against {probe_value!r}.")
+opaque_phrase = "must reference an ai-managed qube"
+both_opaque = (
+    (not r_untagged.get("ok")) and (not r_missing.get("ok"))
+    and opaque_phrase in r_untagged.get("error", "")
+    and opaque_phrase in r_missing.get("error", "")
+)
+no_leak = (
+    probe_value not in r_untagged.get("error", "")
+    and PROBE_NONEXISTENT not in r_missing.get("error", "")
+)
+identical = r_untagged.get("error") == r_missing.get("error")
+opaque_pass = both_opaque and no_leak and identical
+if opaque_pass:
+    print(f"  PASS: both refused with the opaque message, byte-identical, neither leaks the value.")
 else:
-    print(f"  FAIL: did not refuse with the expected cross-ref message: {r}")
+    print(f"  FAIL: opaque collapse expected but got\n"
+          f"        untagged: {r_untagged}\n"
+          f"        missing:  {r_missing}")
 
-# ----------------------------------- 4b. control — nonexistent
-header("4b. Control — ai-scratch-1.template = nonexistent")
-r = call_qmcp("qmcp.SetPropertyAIManaged", {
-    "name": "ai-scratch-1",
-    "property": "template",
-    "value": PROBE_NONEXISTENT,
-})
-show(f"set template={PROBE_NONEXISTENT}", r)
-print("  (must return 'not found' — confirms two error paths are distinguishable)")
+# ----------------------------------- 4b. Spawn template cross-ref OPAQUE
+# Spawn was leaking the same way before the F2-bundle backport. Verify
+# it now collapses too. Use a unique candidate name so we don't collide
+# with the test qube above.
+header("4b. Spawn template cross-ref OPAQUE — untagged vs. missing must be identical")
+def spawn_template_probe(value: str) -> dict:
+    return call_qmcp("qmcp.SpawnAIManagedQube", {
+        "name": "ai-scratch-spawnprobe",
+        "template": value,
+        "label": "gray",
+    })
+
+
+s_untagged = spawn_template_probe(UNTAGGED_TEMPLATE)
+s_missing = spawn_template_probe(PROBE_NONEXISTENT)
+show(f"spawn template={UNTAGGED_TEMPLATE} (untagged)", s_untagged)
+show(f"spawn template={PROBE_NONEXISTENT} (missing)", s_missing)
+
+spawn_opaque_phrase = "template must reference an ai-managed qube"
+spawn_opaque_pass = (
+    (not s_untagged.get("ok")) and (not s_missing.get("ok"))
+    and s_untagged.get("error") == s_missing.get("error")
+    and spawn_opaque_phrase in s_untagged.get("error", "")
+    and UNTAGGED_TEMPLATE not in s_untagged.get("error", "")
+    and PROBE_NONEXISTENT not in s_missing.get("error", "")
+)
+if spawn_opaque_pass:
+    print("  PASS: Spawn template cross-ref is byte-identical opaque.")
+else:
+    print(f"  FAIL: Spawn template cross-ref opaque expected but got\n"
+          f"        untagged: {s_untagged}\n"
+          f"        missing:  {s_missing}")
 
 # ----------------------------------- 5. policy refusal on untagged qube
 header(f"5. Policy refusal — {PROBE_UNTAGGED_2}.label = red (not ai-managed)")
@@ -207,4 +240,5 @@ print(f"  {'PASS' if 'ai-scratch-1' not in names3 else 'FAIL'}: ai-scratch-1 rem
 
 # ------------------------------------------------------ rollup
 header("Stage A test plan — summary")
-print("  Expected: 4 PASS markers (existence-leak, cross-ref refusal, policy refusal, remove confirmation).")
+print("  Expected: 5 PASS markers (existence-leak, SetProperty cross-ref opaque,")
+print("            Spawn template cross-ref opaque, policy refusal, remove confirmation).")

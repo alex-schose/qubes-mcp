@@ -46,7 +46,13 @@ Output (stdout, JSON):
 
 Refuses on: malformed name, name collision, unsupported klass, template not
 ai-managed or wrong-shape for the klass, netvm not ai-managed, invalid
-label, or Admin API failure.
+label, or Admin API failure. The template and netvm cross-ref refusals
+are OPAQUE — missing and untagged collapse to one message that does not
+echo the referenced value — so spawn is not an existence oracle on
+untagged qube names (aligned with the Set{Property,Feature}AIManaged
+cross-refs). Klass-mismatch and template_for_dispvms-missing stay
+informative: those fire only after the referenced qube has been
+confirmed ai-managed, so AI already knows it exists.
 
 Atomicity: there is a brief window between qube creation and tag application
 during which the new qube exists untagged. If tag application fails for any
@@ -142,11 +148,15 @@ def main() -> int:
     if name in app.domains:
         return fail(f"qube '{name}' already exists")
 
-    if template not in app.domains:
-        return fail(f"template '{template}' not found")
+    # Cross-ref: template must be ai-managed. Collapse missing + untagged
+    # into one opaque message that does not echo the value — without this
+    # collapse, AI can probe the existence of every untagged qube name in
+    # dom0 by attempting spawns. Klass-mismatch (validate_template) stays
+    # informative: it fires only after the ai-managed check has passed, so
+    # AI already knows the referenced template exists.
+    if template not in app.domains or "ai-managed" not in app.domains[template].tags:
+        return fail("template must reference an ai-managed qube")
     tpl = app.domains[template]
-    if "ai-managed" not in tpl.tags:
-        return fail(f"template '{template}' is not ai-managed")
     tpl_err = validate_template(klass, tpl, template)
     if tpl_err is not None:
         return fail(tpl_err)
@@ -158,11 +168,10 @@ def main() -> int:
         if DEFAULT_NETVM in app.domains and "ai-managed" in app.domains[DEFAULT_NETVM].tags:
             netvm = DEFAULT_NETVM
 
+    # Same opaque-cross-ref pattern as template above.
     if netvm is not None:
-        if netvm not in app.domains:
-            return fail(f"netvm '{netvm}' not found")
-        if "ai-managed" not in app.domains[netvm].tags:
-            return fail(f"netvm '{netvm}' is not ai-managed")
+        if netvm not in app.domains or "ai-managed" not in app.domains[netvm].tags:
+            return fail("netvm must reference an ai-managed qube")
 
     # ----- Step 1: create the qube -----
     # DispVMTemplate is created as klass=AppVM and then promoted via

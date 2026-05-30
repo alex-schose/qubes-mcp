@@ -4,19 +4,24 @@
 Cross-reference validation: if the property is one of {template, netvm,
 default_dispvm}, the value (a qube name) must itself be ai-managed.
 This prevents AI from reaching out of its sandbox by pointing its
-qubes' template/netvm/dispvm at the operator's qubes.
+qubes' template/netvm/dispvm at the operator's qubes. The cross-ref
+refusal is OPAQUE — missing and untagged collapse to one message that
+does not echo the referenced value — so this surface is not an
+existence oracle (aligned with qmcp.SetFeatureAIManaged's cross-ref).
 
 Egress-qube invariant (Stage C): netvm changes are refused on any
 ai-managed qube whose provides_network is true. The intent is that
 the operator-designated egress qube (ai-net-router by convention) has
 its upstream chosen by the operator in dom0; AI cannot reroute its
-own traffic by mutating that pointer.
+own traffic by mutating that pointer. This message stays informative —
+it fires only after the target has been confirmed ai-managed, so AI
+already has the bit it would learn from it.
 
 Input  (stdin, JSON): {"name": "<qube>", "property": "<prop>", "value": <value>}
 Output (stdout, JSON):
     {"ok": true}
     {"ok": false, "error": "not found"}    -- target not ai-managed (indistinguishable from nonexistent)
-    {"ok": false, "error": "<reason>"}     -- cross-ref violation, egress invariant, set failure, etc.
+    {"ok": false, "error": "<reason>"}     -- cross-ref violation (opaque), egress invariant, set failure, etc.
 """
 from __future__ import annotations
 
@@ -69,15 +74,22 @@ def main() -> int:
                          "error": "netvm of a network-providing qube is operator-only"})
 
     # Cross-reference validation: resolve qube-name values to VM objects and
-    # refuse if the referenced VM isn't ai-managed.
+    # refuse if the referenced VM isn't ai-managed. The refusal collapses
+    # "missing" and "untagged" to a single opaque message that does not
+    # echo the referenced value — same shape as qmcp.SetFeatureAIManaged.
+    # Without the collapse this surface is an existence oracle on every
+    # untagged qube name in dom0.
     if prop in CROSS_REF_PROPS:
         if value is not None:
             if not isinstance(value, str):
-                return emit({"ok": False, "error": f"{prop} value must be a qube name string or null"})
-            if value not in app.domains:
-                return emit({"ok": False, "error": f"referenced qube '{value}' not found"})
-            if "ai-managed" not in app.domains[value].tags:
-                return emit({"ok": False, "error": f"referenced qube '{value}' is not ai-managed"})
+                return emit({"ok": False,
+                             "error": f"{prop} value must be a qube name string or null"})
+            opaque = {"ok": False,
+                      "error": f"cross-ref property '{prop}' must reference an ai-managed qube"}
+            if not value:
+                return emit(opaque)
+            if value not in app.domains or "ai-managed" not in app.domains[value].tags:
+                return emit(opaque)
             value = app.domains[value]
 
     try:
