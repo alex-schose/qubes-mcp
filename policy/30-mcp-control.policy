@@ -1,8 +1,9 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 + F1 — sandbox with dom0-mediated
+# Stages A + B + C + D + E1 + E2 + F1 + F2 — sandbox with dom0-mediated
 # lifecycle, exec, file copy, tag-scoped firewall control, cloning,
 # device attach/detach between ai-managed qubes, ephemeral disposables,
-# and feature.Set on ai-managed qubes.
+# feature.Set on ai-managed qubes, and bounded-window event streaming
+# scoped to ai-managed subjects.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
@@ -107,6 +108,20 @@ qmcp.SpawnDisposableAIManaged    *  mcp-control  @adminvm         allow
 # wrapper echoes the post-set value so no separate read is needed.
 
 qmcp.SetFeatureAIManaged         *  mcp-control  @adminvm         allow
+
+# --- Stage F2: bounded-window event streaming scoped to ai-managed qubes.
+# qmcp.AIManagedEvents subscribes to admin.Events in dom0 with full
+# admin authority, filters every event by the ai-managed tag on its
+# subject, and returns the collected batch when the caller-given
+# duration elapses (clamped to [1, 120] seconds in the wrapper). No
+# persistent dom0 process — one wrapper invocation, one window, one
+# response, exit. Direct admin.Events stays denied below (same pattern
+# as feature.Set / CreateDisposable / property.Set) — the wrapper is
+# the only path. The wrapper does the security-boundary tag filter
+# itself; the qrexec `@tag:` selector cannot gate this call because
+# admin.Events has no per-VM target argument.
+
+qmcp.AIManagedEvents             *  mcp-control  @adminvm         allow
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to

@@ -14,12 +14,12 @@ class Ring(str, Enum):
     CLONE     = "clone"          # Stage D (CloneAIManagedQube)
     DEVICE    = "device"         # Stage E1 (AttachDevice/DetachDevice/device_list)
     FEATURE   = "feature"        # Stage F1 (SetFeatureAIManaged)
-    # EVENTS    = "events"       # Stage F2
+    EVENTS    = "events"         # Stage F2 (AIManagedEvents — blocking-for-duration)
 
 
 ACTIVE_RINGS: set[Ring] = {
     Ring.READ_ONLY, Ring.LIFECYCLE, Ring.EXEC,
-    Ring.NETWORK, Ring.CLONE, Ring.DEVICE, Ring.FEATURE,
+    Ring.NETWORK, Ring.CLONE, Ring.DEVICE, Ring.FEATURE, Ring.EVENTS,
 }
 
 
@@ -37,6 +37,7 @@ _RING_BUDGETS: dict[Ring, int | None] = {
     Ring.CLONE:     None,
     Ring.DEVICE:    None,
     Ring.FEATURE:   None,
+    Ring.EVENTS:    None,
 }
 
 
@@ -98,5 +99,6 @@ def main() -> None:
         qubes_spawn_disposable,
         qubes_run_disposable,
         qubes_feature_set,
+        qubes_events,
     )
     mcp.run()

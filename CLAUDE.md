@@ -24,11 +24,19 @@ this directory.**
 - AI never has direct access to admin write methods. Every state-changing
   call is routed through a `qmcp.*` dom0 RPC wrapper that enforces
   invariants in dom0 (forced tagging on creation, cross-reference
-  validation, ai-managed-tag check, opaque error responses). The few
-  remaining tag-scoped qrexec policy allows (`admin.vm.firewall.*` reads
-  and writes, `admin.vm.device.{block,usb,mic}.{List,Available}` reads,
-  `qubes.Filecopy` between ai-managed qubes) are surfaces where the
-  qrexec `@tag:` matcher is sufficient.
+  validation, ai-managed-tag check, opaque error responses). The
+  remaining tag-scoped qrexec policy allows are surfaces where the qrexec
+  `@tag:` matcher is sufficient:
+  - `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged` from `mcp-control`
+    to any `@tag:ai-managed` qube (Stage B — exec and file-copy land in
+    the target's qubes-rpc service, which only ai-managed templates
+    install);
+  - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-managed` (Stage B
+    — inter-ai-managed transfer without the operator dialog);
+  - `admin.vm.firewall.{Get,Set,Reload}` on `@tag:ai-managed` targets
+    (Stage C);
+  - `admin.vm.device.{block,usb,mic}.{List,Available}` on
+    `@tag:ai-managed` targets (Stage E1, read-only enumeration).
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
   but no privilege inside `mcp-control` itself. mcp-control is an RPC gateway,
   not a workhorse. Locking down `mcp-control` is Stage G.
@@ -61,7 +69,7 @@ this directory.**
 | `qmcp.GetPropertyAIManaged` | Wrapped read. `"not found"` is indistinguishable from `"not tagged"`. | A |
 | `qmcp.SetPropertyAIManaged` | Wrapped write with cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
 | `qmcp.LifecycleAIManaged` | start/shutdown/kill/pause/unpause/remove on ai-managed qubes. Replaces direct `admin.vm.*` lifecycle in Stage D — qrexec's `@tag:` matcher doesn't reach klass=DispVM targets, so we do the tag check in dom0. | D |
-| `qmcp.GetPoolStats` | Free-space pressure on the default pool. | A |
+| `qmcp.GetPoolStats` | Free-space pressure on the default pool. Side-channel: aggregate pool usage leaks operator disk footprint. Three candidate shapes (raw stats / free-only / AI-scoped sum) — decision pending. | designed, deferred |
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
 | `qmcp.CopyToAIManaged` | File transfer; both source and target must be ai-managed. | B |
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
@@ -74,9 +82,10 @@ this directory.**
 ## Stage rollout (locked)
 
 ```
-A. Policy + qmcp (List/Spawn/GetProperty/SetProperty/GetPoolStats) + tag-scoped
+A. Policy + qmcp (List/Spawn/GetProperty/SetProperty) + tag-scoped
    lifecycle (Start/Shutdown/Kill/Pause/Unpause/Remove). Prereq: one ai-managed
-   template.
+   template. (qmcp.GetPoolStats was scoped here but deferred — the side-
+   channel shape is unresolved; see the catalog row.)
 B. qmcp.RunInAIManaged + qmcp.CopyToAIManaged. AI gets root inside its qubes
    and can move files between them.
 C. Single-egress network sandbox. `ai-net-router` is the only ai-managed
@@ -192,7 +201,8 @@ qubes_mcp/                          # repo root
 │       ├── qubes_device_detach.py  # Stage E1
 │       ├── qubes_spawn_disposable.py  # Stage E2
 │       ├── qubes_run_disposable.py    # Stage E2 (one-shot composition)
-│       └── qubes_feature_set.py       # Stage F1
+│       ├── qubes_feature_set.py       # Stage F1
+│       └── qubes_events.py            # Stage F2
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -205,7 +215,8 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.AttachDeviceAIManaged    # Stage E1
 │   ├── qmcp.DetachDeviceAIManaged    # Stage E1
 │   ├── qmcp.SpawnDisposableAIManaged # Stage E2
-│   └── qmcp.SetFeatureAIManaged      # Stage F1
+│   ├── qmcp.SetFeatureAIManaged      # Stage F1
+│   └── qmcp.AIManagedEvents          # Stage F2
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -230,7 +241,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-e2.py
     ├── install-stage-f1.sh
     ├── uninstall-stage-f1.sh
-    └── test-stage-f1.py
+    ├── test-stage-f1.py
+    ├── install-stage-f2.sh
+    ├── uninstall-stage-f2.sh
+    └── test-stage-f2.py
 ```
 
 ## Operating protocol
@@ -296,9 +310,10 @@ qubes_mcp/                          # repo root
   `qmcp.LifecycleAIManaged`. Deploy: `deploy/install-stage-d.sh`. All
   6 PASS markers in `deploy/test-stage-d.py` green, including end-to-end
   DispVM start + run-as-root + shutdown — the ai-debian-13 → DVMT →
-  DispVM service-inheritance chain works end-to-end. Stages A/B/C
-  tests (4/4, 4/4, 8/8) also exercise the new lifecycle wrapper and
-  remain green.
+  DispVM service-inheritance chain works end-to-end. The prior Stages
+  A/B/C tests also exercise the new lifecycle wrapper and remain green.
+  (Stage A's test plan later grew to 5 PASS markers in the F2 bundle;
+  B and C are unchanged.)
 - **Stage E1 — DONE (tested).** Two new dom0 wrappers
   (`qmcp.AttachDeviceAIManaged`, `qmcp.DetachDeviceAIManaged`) attach
   virtual block/USB/mic devices between two ai-managed qubes; both
@@ -360,9 +375,11 @@ qubes_mcp/                          # repo root
   refused (operator-only; AI setting it could hide a qube from the
   operator's menus), and the cross-VM keys `audiovm`/`guivm` must
   reference an ai-managed qube, refused *opaquely* (missing and untagged
-  collapse to one message — unlike `SetPropertyAIManaged`'s cross-ref,
-  which currently distinguishes the two; that divergence is logged as a
-  reviewer ask / backport candidate). Values coerce to the Qubes string
+  collapse to one message — same posture every cross-ref across the
+  write/spawn surfaces now ships with; the older `SetPropertyAIManaged`
+  and `SpawnAIManagedQube` cross-refs originally distinguished the two
+  and got the same opaque collapse in the Stage F2 bundle, closing
+  reviewer ask #8). Values coerce to the Qubes string
   convention (bool True→`"1"`, False→`""`); `null` is rejected (set
   only — `admin.vm.feature.Remove` stays denied, removal is the
   operator's call). The response echoes the post-set value read back
@@ -374,7 +391,53 @@ qubes_mcp/                          # repo root
   bool coercion; `internal` refused; cross-ref to ai-managed accepted;
   cross-ref to untagged AND nonexistent both opaque + non-leaking;
   untagged target opaque `"not found"`). 5/5 green.
-- **Stage F2 onward** — designed, not yet implemented. See the stage
+- **Stage F2 — DONE (tested).** `qmcp.AIManagedEvents` is a
+  bounded-window event-stream wrapper. AI passes a `duration` (clamped
+  to `[1, 120]` seconds) and optional `qube` / `events` filters; the
+  wrapper subscribes to `admin.Events` in dom0 with full admin
+  authority, filters every event by the ai-managed tag on its subject,
+  and returns the collected batch when the window closes. No
+  persistent dom0 process — one invocation, one window, one JSON
+  response, exit. The tag filter is layered: live `vm.tags` check at
+  handler time, with a fallback to a snapshot of ai-managed names
+  taken at window-open for subjects that have vanished
+  (`domain-shutdown` / `domain-delete` fire after the VM is gone). A
+  special case includes `domain-tag-delete:ai-managed` when the
+  subject was in the snapshot — that event IS the boundary
+  revocation, the very signal AI most needs to see, and a strict
+  live-tag-check would drop it. Payload is minimal:
+  `{event, subject, subject_klass, ts}`, with the `tag` kwarg
+  whitelisted for `domain-tag-add` / `domain-tag-delete` so AI can
+  tell which tag changed. All other kwargs are dropped — a downstream
+  stage can whitelist specific fields if a clear use case surfaces
+  (reviewer ask #9). Direct `admin.Events` stays denied — the wrapper
+  is the only path. New `Ring.EVENTS` (budget None — the
+  block-for-duration shape is itself the rate limit). MCP tool
+  `qubes_events(duration, qube=None, events=None)` returns the parsed
+  batch. The bounded-window model trades inter-call event coverage for
+  a stateless dom0 footprint; AI catches the immediate consequence of
+  an action by opening the window FIRST (a concurrent tool call) and
+  then acting. Test plan in `deploy/test-stage-f2.py`: five PASS
+  criteria (basic surfacing, no untagged-subject leak, qube-filter
+  positive, qube-filter opaque byte-identical, events-filter
+  prefix-or-exact). 5/5 green.
+
+  Shipped alongside the **opaque-cross-ref backport** to
+  `qmcp.SetPropertyAIManaged` (template/netvm/default_dispvm) and
+  `qmcp.SpawnAIManagedQube` (template/netvm): both wrappers'
+  cross-ref errors used to distinguish `"not found"` from `"is not
+  ai-managed"`, a latent existence oracle on every untagged qube
+  name in dom0 (the same gap F1 deliberately closed on
+  `SetFeatureAIManaged`). The backport collapses them to one opaque
+  message that does not echo the value — consistent with the F1
+  posture. Klass-mismatch / `template_for_dispvms`-missing /
+  egress-invariant messages stay informative: they fire only after
+  the referenced qube has been confirmed ai-managed, so AI already
+  has the bit they would reveal. `deploy/test-stage-a.py` updated to
+  assert byte-identical opaqueness on both SetProperty and Spawn
+  cross-refs (5/5 green; reviewer ask #8 resolved).
+
+- **Stage G onward** — designed, not yet implemented. See the stage
   rollout table above.
 
 ## References

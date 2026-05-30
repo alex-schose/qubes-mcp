@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through F1 (below) are tested and working on Qubes R4.3-era
-systems. Stages F2–H are designed but not yet implemented.
+Stages A through F2 (below) are tested and working on Qubes R4.3-era
+systems. Stages G–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -115,22 +115,54 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
    tag through the VM object returned by `add_new_vm`/`clone_vm`,
    which is freshly-fetched and doesn't go through the collection
    cache.
-8. **Cross-ref error messages as an existence oracle.** Stage F1's
-   `qmcp.SetFeatureAIManaged` collapses a cross-VM-key value that is
-   missing vs. existing-but-untagged to a single opaque refusal, so AI
-   cannot probe whether an arbitrary qube name exists. But the older
-   `qmcp.SetPropertyAIManaged` cross-ref (on `template`/`netvm`/
-   `default_dispvm`) returns distinct strings — `"referenced qube '<x>'
-   not found"` vs. `"...is not ai-managed"` — which *does* distinguish
-   the two, a latent existence oracle on the property-write surface.
-   Both wrappers run in dom0 with full authority; the question is the
-   right policy for *write-side* refusals. The read and lifecycle
-   surfaces are uniformly opaque (`"not found"`); should every
-   write-side cross-ref refusal be too, even at the cost of less
-   actionable errors for the operator's own AI? We're inclined to make
-   them all opaque — interested in whether reviewers see a reason the
-   property surface was left distinguishing, or a sharper line between
-   "leaks an untagged qube exists" and "leaks a typo'd name doesn't."
+8. **Cross-ref error messages as an existence oracle — RESOLVED in
+   Stage F2 bundle.** Stage F1's `qmcp.SetFeatureAIManaged` collapsed
+   cross-VM-key cross-refs to a single opaque refusal so AI cannot
+   probe whether an arbitrary qube name exists; the older
+   `qmcp.SetPropertyAIManaged` and `qmcp.SpawnAIManagedQube` wrappers
+   distinguished `"not found"` from `"is not ai-managed"` on their
+   cross-refs, a latent existence oracle on the write/spawn surface.
+   The Stage F2 bundle backports the same opaque collapse to both
+   older wrappers (template/netvm/default_dispvm for SetProperty,
+   template/netvm for Spawn). Klass-mismatch and egress-invariant
+   messages stay informative: they fire only after the referenced
+   qube has been confirmed ai-managed, so AI already has the bit
+   they would reveal. The read and lifecycle surfaces remain
+   uniformly opaque; cross-ref refusals on every write/spawn surface
+   are now opaque too. Reviewers welcome to flag any remaining
+   distinguishable refusal on the write side.
+
+9. **Event-stream payload — kwargs whitelist.** Stage F2's
+   `qmcp.AIManagedEvents` returns a minimal payload per event:
+   `{event, subject, subject_klass, ts}`, plus a whitelisted `tag`
+   kwarg for `domain-tag-add` / `domain-tag-delete` (the one piece
+   of payload data that's load-bearing — AI must see which tag
+   changed to act on a boundary revocation). All other kwargs are
+   dropped by default because some events (notably `property-set`)
+   carry references to other qube names that could leak operator
+   qubes into AI's view. Is the no-kwargs default the right cut, or
+   are there specific kwargs a downstream stage will need (e.g.
+   `exit_code` on `domain-stopped`, `value` on property-set)? Easy
+   to expand the whitelist; hard to retract leaked fields. We're
+   inclined to expand only with a concrete use case and a per-event
+   leak analysis.
+
+10. **Event-stream tag check for vanished subjects.** Admin events
+    like `domain-shutdown` / `domain-delete` fire *after* the VM
+    is removed from the dom0 collection, so a live `vm.tags` check
+    at handler time raises `KeyError`. Our wrapper falls back to a
+    snapshot of ai-managed names taken at window-open. Live wins
+    over snapshot when the VM still exists, so newly-tagged
+    qubes surface their post-tag events and newly-untagged qubes
+    drop out (except for `domain-tag-delete:ai-managed` itself —
+    the boundary-revocation event has a special case that includes
+    it when the subject was in the snapshot). The snapshot is
+    never refreshed during the window. Cost: a `domain-tag-add`
+    + immediate delete on a qube that was *not* in the snapshot
+    drops the delete event (snapshot says no, live says no
+    because the VM is gone). The bounded duration `[1, 120]s`
+    keeps this window small; reviewers welcome to flag a tighter
+    design.
 
 ## Status
 
@@ -143,7 +175,7 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
 | E1 | Device attach/detach (`qmcp.AttachDeviceAIManaged` / `qmcp.DetachDeviceAIManaged`) between ai-managed qubes, plus tag-scoped block/usb/mic enumeration | tested |
 | E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | tested |
 | F1 | Wrapped `feature.Set` (`qmcp.SetFeatureAIManaged`) — `internal` denied (operator-only), opaque cross-ref for `audiovm`/`guivm`, echoes post-set value; direct `feature.Set` stays denied | tested |
-| F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch of ai-managed-tagged events | designed |
+| F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch (duration clamped `[1, 120]s`) of admin events whose subject is ai-managed; minimal `{event, subject, subject_klass, ts}` payload with whitelisted `tag` kwarg for tag-add/delete; ships with the opaque-cross-ref backport on `SetPropertyAIManaged` + `SpawnAIManagedQube` (closes reviewer ask #8) | tested |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
 
@@ -223,8 +255,15 @@ cd ~/qubes_mcp
 
 (All test scripts work from any cwd — they self-locate the package.)
 
-Expect four PASS markers. If one fails, the test script's docstring describes
-what each step verifies.
+Expect five PASS markers: existence-leak hidden; SetProperty cross-ref
+opaque byte-identical; Spawn template cross-ref opaque byte-identical;
+policy refusal on untagged; remove confirmation. The opaque-cross-ref
+assertions land in the Stage A wrappers that `install-stage-a.sh`
+ships today (they were backported in the Stage F2 bundle — see
+reviewer ask #8), so a fresh install passes 5/5. If you're upgrading
+an older deployment, expect the SetProperty and Spawn cross-ref
+markers to FAIL until you ship Step 10 (which replaces the older
+wrappers with the opaque-collapse versions).
 
 ### Step 4 — (Optional) Deploy Stage B for command exec + file transfer
 
@@ -416,7 +455,47 @@ cross-ref to an untagged AND a nonexistent qube both refused with the
 same opaque message (no existence leak); feature.Set on an untagged
 qube refused with the opaque `"not found"`.
 
-### Step 10 — Connect a client
+### Step 10 — (Optional) Deploy Stage F2 for filtered event streaming
+
+Stage F2 adds `qmcp.AIManagedEvents` — a dom0 wrapper that subscribes
+to `admin.Events` with full admin authority, filters every event by
+the ai-managed tag on its subject, and returns the collected batch
+when the caller-given duration (clamped to `[1, 120]` seconds)
+elapses. No persistent dom0 process — one invocation, one window,
+one JSON response, exit. Direct `admin.Events` stays denied — the
+wrapper is the only path. AI catches the immediate consequence of an
+action by opening the window FIRST (a concurrent tool call) and then
+acting; the bounded-window model trades inter-call event coverage for
+a stateless dom0 footprint.
+
+This step also backports the opaque-cross-ref collapse to
+`qmcp.SetPropertyAIManaged` and `qmcp.SpawnAIManagedQube` (closes
+reviewer ask #8 — the same existence-oracle gap F1 closed on
+SetFeatureAIManaged, finally aligned across all write/spawn surfaces).
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f2.sh' > /tmp/install-f2.sh
+bash /tmp/install-f2.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-a.py    # 5 PASS — re-verifies the opaque-collapse backport
+.venv/bin/python deploy/test-stage-f1.py   # 5 PASS — unchanged
+.venv/bin/python deploy/test-stage-f2.py   # 5 PASS — new events surface
+```
+
+Stage F2's five PASS markers: ai-managed `domain-start` IS surfaced
+inside the window; no event with a non-ai-managed subject leaks
+through; `qube` filter restricts the batch to the requested qube;
+`qube` filter is opaque on missing/untagged (byte-identical
+`"not found"`); `events` filter restricts the batch to event names
+matching exactly OR as a `"<entry>:"` prefix.
+
+### Step 11 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):
