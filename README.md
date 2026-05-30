@@ -16,8 +16,8 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through E2 (below) are tested and working on Qubes R4.3-era
-systems. Stages F–H are designed but not yet implemented.
+Stages A through F1 (below) are tested and working on Qubes R4.3-era
+systems. Stages F2–H are designed but not yet implemented.
 
 ## Design highlights
 
@@ -115,6 +115,22 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
    tag through the VM object returned by `add_new_vm`/`clone_vm`,
    which is freshly-fetched and doesn't go through the collection
    cache.
+8. **Cross-ref error messages as an existence oracle.** Stage F1's
+   `qmcp.SetFeatureAIManaged` collapses a cross-VM-key value that is
+   missing vs. existing-but-untagged to a single opaque refusal, so AI
+   cannot probe whether an arbitrary qube name exists. But the older
+   `qmcp.SetPropertyAIManaged` cross-ref (on `template`/`netvm`/
+   `default_dispvm`) returns distinct strings — `"referenced qube '<x>'
+   not found"` vs. `"...is not ai-managed"` — which *does* distinguish
+   the two, a latent existence oracle on the property-write surface.
+   Both wrappers run in dom0 with full authority; the question is the
+   right policy for *write-side* refusals. The read and lifecycle
+   surfaces are uniformly opaque (`"not found"`); should every
+   write-side cross-ref refusal be too, even at the cost of less
+   actionable errors for the operator's own AI? We're inclined to make
+   them all opaque — interested in whether reviewers see a reason the
+   property surface was left distinguishing, or a sharper line between
+   "leaks an untagged qube exists" and "leaks a typo'd name doesn't."
 
 ## Status
 
@@ -126,7 +142,8 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
 | D | Clone (`qmcp.CloneAIManagedQube`) + DispVMTemplate/DispVM klass support in `qmcp.SpawnAIManagedQube` + dom0 lifecycle wrapper (`qmcp.LifecycleAIManaged`) covering klass=DispVM uniformly | tested |
 | E1 | Device attach/detach (`qmcp.AttachDeviceAIManaged` / `qmcp.DetachDeviceAIManaged`) between ai-managed qubes, plus tag-scoped block/usb/mic enumeration | tested |
 | E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | tested |
-| F | Wrapped `feature.Set` (deny `internal`, validate cross-ref) + filtered event stream | designed |
+| F1 | Wrapped `feature.Set` (`qmcp.SetFeatureAIManaged`) — `internal` denied (operator-only), opaque cross-ref for `audiovm`/`guivm`, echoes post-set value; direct `feature.Set` stays denied | tested |
+| F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch of ai-managed-tagged events | designed |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
 
@@ -369,7 +386,37 @@ Five PASS markers: spawn+tag+klass+template+auto_cleanup; start+
 whoami=root+shutdown+auto-removed; plain-TemplateVM cross-ref
 refusal; untagged-DVMT opaque refusal; one-shot end-to-end.
 
-### Step 9 — Connect a client
+### Step 9 — (Optional) Deploy Stage F1 for feature.Set
+
+Stage F1 adds `qmcp.SetFeatureAIManaged` — a dom0 wrapper around
+`admin.vm.feature.Set` on ai-managed qubes. The `internal` feature is
+refused (operator-only — AI must not hide a qube from your menus), and
+the cross-VM keys `audiovm`/`guivm` must point at an ai-managed qube
+(refused opaquely otherwise). Direct `admin.vm.feature.Set` stays
+denied — the wrapper is the only path — and no feature-read surface is
+exposed (the wrapper echoes the post-set value instead). No new dom0
+provisioning — only the policy + RPC script change.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f1.sh' > /tmp/install-f1.sh
+bash /tmp/install-f1.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-f1.py
+```
+
+Five PASS markers: round-trip set + value echo + boolean coercion;
+`internal` refused; cross-ref to an ai-managed qube accepted;
+cross-ref to an untagged AND a nonexistent qube both refused with the
+same opaque message (no existence leak); feature.Set on an untagged
+qube refused with the opaque `"not found"`.
+
+### Step 10 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

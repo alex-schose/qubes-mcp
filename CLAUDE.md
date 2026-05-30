@@ -68,8 +68,8 @@ this directory.**
 | `qmcp.AttachDeviceAIManaged` | Virtual device attach. Both qubes (backend and frontend) must be ai-managed; dom0 wrapper enforces the tag check on both ends, then shells out to `qvm-device` (absorbs DeviceAssignment-API drift across Qubes 4.1 → 4.2 → 4.3). | E1 |
 | `qmcp.DetachDeviceAIManaged` | Mirror of Attach. | E1 |
 | `qmcp.SpawnDisposableAIManaged` | Ephemeral DispVM creation via `admin.vm.CreateDisposable`. DVMT must be ai-managed; the auto-named disposable is force-tagged before AI sees it; auto-removed on shutdown. | E2 |
-| `qmcp.SetFeatureAIManaged` | `feature.Set` with `internal`-key denied + cross-ref validation. | F |
-| `qmcp.AIManagedEvents` | Filtered event stream — events whose subject is `@tag:ai-managed`. | F |
+| `qmcp.SetFeatureAIManaged` | `feature.Set` on ai-managed qubes. `internal` denied (operator-only); cross-VM keys (`audiovm`/`guivm`) must reference an ai-managed qube via an opaque refusal; echoes the post-set value back (no feature-read surface). | F1 |
+| `qmcp.AIManagedEvents` | Filtered event stream — events whose subject is `@tag:ai-managed`. Bounded-window batch: tool blocks for a caller-given duration, wrapper collects ai-managed-filtered events, returns the batch. | F2 |
 
 ## Stage rollout (locked)
 
@@ -110,8 +110,23 @@ E2. qmcp.SpawnDisposableAIManaged — ephemeral DispVMs via
     new ring (Ring.LIFECYCLE covers it). MCP also ships a
     `qubes_run_disposable(template, cmd)` one-shot that composes
     spawn + start + run + shutdown without adding dom0 surface.
-F. qmcp.SetFeatureAIManaged (deny `internal`, validate cross-ref keys
-   `audiovm`/`guivm`) + qmcp.AIManagedEvents.
+F1. qmcp.SetFeatureAIManaged — feature.Set on ai-managed qubes.
+    `internal` is denied (operator-only — AI must not hide a qube from
+    the operator's app menu / qube manager); the cross-VM keys
+    `audiovm`/`guivm` must reference an ai-managed qube, refused
+    *opaquely* (missing and untagged collapse to one message so the
+    surface is not an existence oracle); booleans coerce to Qubes
+    convention (True→"1", False→""); the response echoes the post-set
+    value read back from qubesd, so no feature-read surface is needed
+    (admin.vm.feature.Get stays denied). Direct admin.vm.feature.Set
+    stays denied — the wrapper is the only path. New Ring.FEATURE.
+F2. qmcp.AIManagedEvents — filtered event stream. Bounded-window batch
+    model: the tool blocks for a caller-given duration while a dom0
+    wrapper subscribes to admin.Events and collects only events whose
+    subject carries the ai-managed tag, then returns the batch and
+    exits (no persistent dom0 daemon — admin.Events is denied to AI, so
+    the wrapper sees everything and the tag filter is a security
+    boundary kept small and stateless). New Ring.EVENTS.
 G. mcp-control hardening (sudo lockdown, dedicated MCP user) + Tor hidden
    service for sshd → mobile CLI reach.
 H. FastMCP HTTP/SSE transport bound to a second .onion → mobile-app reach.
@@ -141,7 +156,7 @@ until the current one's tests pass.
 - **No `.DS_Store`** or other Mac-platform files committed.
 - **No third-party SaaS / SSO.** Self-host everything (e.g., Headscale instead
   of Tailscale-corp; own VPN; own Tor).
-- **No `admin.Events` direct subscription.** Use `qmcp.AIManagedEvents` (Stage F)
+- **No `admin.Events` direct subscription.** Use `qmcp.AIManagedEvents` (Stage F2)
   for filtered streaming.
 
 ## File layout
@@ -176,7 +191,8 @@ qubes_mcp/                          # repo root
 │       ├── qubes_device_attach.py  # Stage E1
 │       ├── qubes_device_detach.py  # Stage E1
 │       ├── qubes_spawn_disposable.py  # Stage E2
-│       └── qubes_run_disposable.py    # Stage E2 (one-shot composition)
+│       ├── qubes_run_disposable.py    # Stage E2 (one-shot composition)
+│       └── qubes_feature_set.py       # Stage F1
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -188,7 +204,8 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.LifecycleAIManaged       # Stage D (start/shutdown/kill/pause/unpause/remove)
 │   ├── qmcp.AttachDeviceAIManaged    # Stage E1
 │   ├── qmcp.DetachDeviceAIManaged    # Stage E1
-│   └── qmcp.SpawnDisposableAIManaged # Stage E2
+│   ├── qmcp.SpawnDisposableAIManaged # Stage E2
+│   └── qmcp.SetFeatureAIManaged      # Stage F1
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -210,7 +227,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-e1.py
     ├── install-stage-e2.sh
     ├── uninstall-stage-e2.sh
-    └── test-stage-e2.py
+    ├── test-stage-e2.py
+    ├── install-stage-f1.sh
+    ├── uninstall-stage-f1.sh
+    └── test-stage-f1.py
 ```
 
 ## Operating protocol
@@ -333,7 +353,28 @@ qubes_mcp/                          # repo root
   Preamble cleanup is order-aware: it removes any leftover disposable
   tied to the test DVMT before removing the DVMT itself (Qubes refuses
   to remove a DVMT while any qube references it as `template`).
-- **Stage F onward** — designed, not yet implemented. See the stage
+- **Stage F1 — DONE (tested).** `qmcp.SetFeatureAIManaged` wraps
+  `admin.vm.feature.Set` on ai-managed qubes with the same posture as
+  `qmcp.SetPropertyAIManaged`: opaque `"not found"` for a missing or
+  untagged target. Two key classes get extra handling — `internal` is
+  refused (operator-only; AI setting it could hide a qube from the
+  operator's menus), and the cross-VM keys `audiovm`/`guivm` must
+  reference an ai-managed qube, refused *opaquely* (missing and untagged
+  collapse to one message — unlike `SetPropertyAIManaged`'s cross-ref,
+  which currently distinguishes the two; that divergence is logged as a
+  reviewer ask / backport candidate). Values coerce to the Qubes string
+  convention (bool True→`"1"`, False→`""`); `null` is rejected (set
+  only — `admin.vm.feature.Remove` stays denied, removal is the
+  operator's call). The response echoes the post-set value read back
+  live from qubesd, so the round-trip is verifiable without a separate
+  feature-read surface (`admin.vm.feature.Get` stays denied). Direct
+  `admin.vm.feature.Set` stays denied — the wrapper is the only path.
+  MCP tool `qubes_feature_set` in a new `Ring.FEATURE`. Test plan in
+  `deploy/test-stage-f1.py`: five PASS criteria (round-trip + echo +
+  bool coercion; `internal` refused; cross-ref to ai-managed accepted;
+  cross-ref to untagged AND nonexistent both opaque + non-leaking;
+  untagged target opaque `"not found"`). 5/5 green.
+- **Stage F2 onward** — designed, not yet implemented. See the stage
   rollout table above.
 
 ## References

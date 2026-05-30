@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""qmcp.SetFeatureAIManaged — set a feature on an ai-managed qube.
+
+Stage F1. Wraps admin.vm.feature.Set the same way SetPropertyAIManaged
+wraps property.Set: the target must be ai-managed (else the opaque
+"not found"), and two classes of feature key get extra handling.
+
+  1. Denied keys (operator-only). `internal` is refused: it hides a
+     qube from the operator's app menu / qube manager, which would let
+     AI shrink its own visibility to the human. Setting it is the
+     operator's call, not AI's. (DENIED_FEATURE_KEYS is the extension
+     point for any other security-sensitive key a future stage finds.)
+
+  2. Cross-VM keys. A feature whose value names another qube
+     (`audiovm`, `guivm`) must point at an ai-managed qube, mirroring
+     SetPropertyAIManaged's cross-ref check on template/netvm/
+     default_dispvm — AI must not reach out of its sandbox by pointing
+     a cross-VM feature at an operator qube. NOTE: Qubes features are
+     a free-form key/value store; `audiovm`/`guivm` are normally VM
+     *properties*, not features, so this is defensive validation that
+     costs nothing on the happy path and closes the door if those keys
+     ever become feature-shaped. The refusal is OPAQUE — missing and
+     untagged collapse to one message — so this surface is not an
+     existence oracle (cf. the reviewer-ask note: SetPropertyAIManaged
+     currently distinguishes "not found" from "not ai-managed" on its
+     cross-ref, a latent oracle worth aligning later).
+
+Value coercion: feature values are strings in Qubes. Booleans map to
+Qubes convention (True -> "1", False -> "" i.e. unset-equivalent);
+ints/strings pass through str(). `null` is rejected — this wrapper
+sets, it does not remove (admin.vm.feature.Remove stays denied; removal
+is the operator's call).
+
+The response echoes the post-set value read back live from qubesd, so
+the MCP side (and the test plan) can confirm the round-trip without a
+separate feature-read surface — admin.vm.feature.Get stays denied to AI.
+
+Input  (stdin, JSON): {"name": "<qube>", "feature": "<key>", "value": <value>}
+Output (stdout, JSON):
+    {"ok": true,  "feature": "<key>", "value": "<readback>"}
+    {"ok": false, "error": "not found"}   -- target missing or not ai-managed
+    {"ok": false, "error": "<reason>"}    -- denied key, cross-ref, set failure
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+# Operator-only feature keys. AI setting `internal` could hide a qube
+# from the operator's menus / manager, undermining human oversight.
+DENIED_FEATURE_KEYS = {"internal"}
+
+# Feature keys whose value names another qube; the value must be an
+# ai-managed qube. Defensive — see module docstring.
+CROSS_REF_FEATURE_KEYS = {"audiovm", "guivm"}
+
+NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def coerce_value(value) -> str:
+    """Coerce a JSON value to the Qubes feature string convention.
+
+    True -> "1", False -> "" (the unset-equivalent falsy value Qubes
+    reads as off), everything else -> str(value). `None` is handled by
+    the caller (rejected) before reaching here."""
+    if isinstance(value, bool):
+        return "1" if value else ""
+    return str(value)
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception as e:
+        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+
+    name = req.get("name", "")
+    feature = req.get("feature", "")
+    value = req.get("value")
+    if not name or not feature:
+        return emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    # Existence-or-tag check — opaque "not found" for missing or untagged,
+    # matching qmcp.GetPropertyAIManaged's existence-oracle stance.
+    if name not in app.domains:
+        return emit(NOT_FOUND)
+    vm = app.domains[name]
+    if "ai-managed" not in vm.tags:
+        return emit(NOT_FOUND)
+
+    # Denied keys — the target IS ai-managed (AI can see it via
+    # ListAIManagedQubes), so an informative refusal leaks nothing about
+    # other qubes.
+    if feature in DENIED_FEATURE_KEYS:
+        return emit({"ok": False, "error": f"feature '{feature}' is operator-only"})
+
+    # Cross-VM keys — value must name an ai-managed qube. Collapse
+    # "missing" and "untagged" to one opaque message so AI cannot probe
+    # the existence of untagged qubes through this surface.
+    if feature in CROSS_REF_FEATURE_KEYS:
+        opaque = {"ok": False,
+                  "error": f"cross-VM feature '{feature}' must reference an ai-managed qube"}
+        if not isinstance(value, str) or not value:
+            return emit(opaque)
+        # Short-circuit: don't index app.domains[value] unless value is present.
+        if value not in app.domains or "ai-managed" not in app.domains[value].tags:
+            return emit(opaque)
+
+    if value is None:
+        return emit({"ok": False, "error":
+                     "value must be a string, integer, or boolean "
+                     "(null/remove is operator-only)"})
+
+    value_str = coerce_value(value)
+
+    try:
+        vm.features[feature] = value_str
+    except Exception as e:
+        return emit({"ok": False, "error": f"feature.Set failed: {e}"})
+
+    # Live read-back from qubesd (Features.__getitem__ is not cached) so
+    # the caller can confirm the round-trip.
+    try:
+        readback = vm.features.get(feature, None)
+    except Exception:
+        readback = None
+
+    return emit({"ok": True, "feature": feature, "value": readback})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

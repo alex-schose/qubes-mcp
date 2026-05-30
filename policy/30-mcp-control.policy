@@ -1,7 +1,8 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 — sandbox with dom0-mediated lifecycle,
-# exec, file copy, tag-scoped firewall control, cloning, device attach/
-# detach between ai-managed qubes, and ephemeral disposables.
+# Stages A + B + C + D + E1 + E2 + F1 — sandbox with dom0-mediated
+# lifecycle, exec, file copy, tag-scoped firewall control, cloning,
+# device attach/detach between ai-managed qubes, ephemeral disposables,
+# and feature.Set on ai-managed qubes.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
@@ -94,6 +95,18 @@ admin.vm.device.mic.Available    *  mcp-control  @tag:ai-managed  allow  target=
 # wrapper is the only allowed path.
 
 qmcp.SpawnDisposableAIManaged    *  mcp-control  @adminvm         allow
+
+# --- Stage F1: feature.Set on ai-managed qubes.
+# qmcp.SetFeatureAIManaged validates the target is ai-managed, refuses
+# the operator-only `internal` key (AI must not hide a qube from the
+# operator's menus), and cross-ref-validates cross-VM feature keys
+# (audiovm/guivm) against the ai-managed set with an opaque refusal.
+# Direct admin.vm.feature.Set stays denied below — the wrapper is the
+# only path (same pattern as property.Set / CreateDisposable). The
+# feature READ surface (Get/List/CheckWithTemplate) stays denied; the
+# wrapper echoes the post-set value so no separate read is needed.
+
+qmcp.SetFeatureAIManaged         *  mcp-control  @adminvm         allow
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to
@@ -201,7 +214,12 @@ admin.vm.Pause                   *  mcp-control  @anyvm  deny
 admin.vm.Unpause                 *  mcp-control  @anyvm  deny
 admin.vm.Remove                  *  mcp-control  @anyvm  deny
 
-# Feature read/write — denied entirely. Wrapped in Stage F.
+# Feature read/write — direct access denied. Set is wrapped by
+# qmcp.SetFeatureAIManaged (Stage F1, allowed above); the direct
+# admin.vm.feature.Set deny stays so the wrapper is the only path
+# (same pattern as CreateDisposable / property.Set). Get / List /
+# Remove / CheckWithTemplate stay fully denied — no stage surfaces a
+# feature read (the Set wrapper echoes its post-set value instead).
 admin.vm.feature.Get             *  mcp-control  @anyvm  deny
 admin.vm.feature.Set             *  mcp-control  @anyvm  deny
 admin.vm.feature.Remove          *  mcp-control  @anyvm  deny
