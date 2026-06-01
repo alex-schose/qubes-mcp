@@ -100,5 +100,6 @@ def main() -> None:
         qubes_run_disposable,
         qubes_feature_set,
         qubes_events,
+        qubes_get_pool_stats,
     )
     mcp.run()

@@ -1,9 +1,10 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 + F1 + F2 — sandbox with dom0-mediated
-# lifecycle, exec, file copy, tag-scoped firewall control, cloning,
-# device attach/detach between ai-managed qubes, ephemeral disposables,
-# feature.Set on ai-managed qubes, and bounded-window event streaming
-# scoped to ai-managed subjects.
+# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 — sandbox with dom0-
+# mediated lifecycle, exec, file copy, tag-scoped firewall control,
+# cloning, device attach/detach between ai-managed qubes, ephemeral
+# disposables, feature.Set on ai-managed qubes, bounded-window event
+# streaming scoped to ai-managed subjects, and AI-scoped disk-budget
+# visibility (provisioned-bytes sum + operator-set cap).
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
@@ -122,6 +123,21 @@ qmcp.SetFeatureAIManaged         *  mcp-control  @adminvm         allow
 # admin.Events has no per-VM target argument.
 
 qmcp.AIManagedEvents             *  mcp-control  @adminvm         allow
+
+# --- Stage F3: AI-scoped disk-budget visibility.
+# qmcp.GetPoolStats runs in dom0 with full admin authority and returns
+# the sum of provisioned bytes across every volume on every ai-managed
+# qube, plus an operator-set cap read from /etc/qmcp/pool-cap. The
+# response shape is `{used, cap, headroom}` — no pool names, no
+# free-space, no operator-side volumes; AI sees only its own footprint
+# and the budget the operator allocated it. Direct admin.pool.* and
+# admin.vm.volume.{List,Info,Resize} stay denied below — the wrapper
+# is the only path (same pattern as feature.Set / CreateDisposable /
+# property.Set). The cap is a contract operator → AI, not a sensor
+# AI → operator; AI cannot mutate the cap (it's an operator-edited
+# file in dom0).
+
+qmcp.GetPoolStats                *  mcp-control  @adminvm         allow
 
 # --- System service allows ---
 # Background qubes-core-agent services that any normal qube needs to
@@ -272,9 +288,13 @@ admin.label.Get                  *  mcp-control  @anyvm  deny
 admin.label.Index                *  mcp-control  @anyvm  deny
 admin.Events                     *  mcp-control  @anyvm  deny
 
-# Volume info/resize — denied. Not currently surfaced by any stage; a
-# future stage may wrap these tag-scoped for AI-visible disk-pressure
-# diagnostics, but the current rollout has no need.
+# Volume info/resize — direct access denied. Stage F3's
+# qmcp.GetPoolStats wraps the read surface AI-scoped (sums provisioned
+# bytes only across ai-managed qubes, returns just the aggregate +
+# operator cap); the wrapper runs in dom0 with admin authority and
+# bypasses qrexec for the underlying volume calls, so these denies
+# still gate any direct AI-side call attempt. Resize stays fully
+# denied (no stage wraps it).
 admin.vm.volume.List             *  mcp-control  @anyvm  deny
 admin.vm.volume.Info             *  mcp-control  @anyvm  deny
 admin.vm.volume.Resize           *  mcp-control  @anyvm  deny

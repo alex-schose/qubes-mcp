@@ -16,7 +16,7 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through F2 (below) are tested and working on Qubes R4.3-era
+Stages A through F3 (below) are tested and working on Qubes R4.3-era
 systems. Stages G–H are designed but not yet implemented.
 
 ## Design highlights
@@ -164,6 +164,33 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
     keeps this window small; reviewers welcome to flag a tighter
     design.
 
+11. **Cap-as-contract vs. free-space-as-sensor for AI disk
+    budgeting.** Stage F3's `qmcp.GetPoolStats` returns
+    `{used, cap, headroom}` where `used` sums provisioned bytes
+    across ai-managed qubes and `cap` is read from
+    `/etc/qmcp/pool-cap` (a single integer the operator edits in
+    dom0; re-read per call). We deliberately did NOT expose
+    `free_bytes` of the underlying pool because that's a streaming
+    operator-side oracle (free bytes drop whenever the operator
+    creates a VM, untars a backup, etc., so AI polling free_bytes
+    would have a sensor into operator behaviour). The cap goes the
+    other direction: it's a contract operator → AI (the budget the
+    operator allocated AI for spawn loops), not a sensor AI →
+    operator. (a) Is this the right cut, or is there a Qubes idiom
+    for tag-scoped resource accounting that already solves this
+    cleanly? (b) `vol.size` is provisioned size, so for thin-LVM
+    over-provisioning AI seeing 20 GiB headroom isn't a
+    write-success guarantee — we've treated this as correctly
+    operator-side (the cap is what the operator allocated; whether
+    the underlying pool can fulfill it is operator concern). Is
+    that the right division, or would AI benefit from a
+    physically-grounded headroom number that doesn't widen the
+    side-channel? (c) Cap-file format: single integer in a
+    plain-text file, edited with `sudo sh -c 'echo N > ...'`.
+    Anything more structured (TOML, per-pool caps, time-window
+    quotas) feels like premature complexity, but happy to be told
+    otherwise.
+
 ## Status
 
 | Stage | Capability | State |
@@ -176,6 +203,7 @@ and qrexec policy R4.2+), the concrete questions I'd value review on:
 | E2 | Ephemeral DispVMs via `qmcp.SpawnDisposableAIManaged` (auto-cleanup on shutdown) + `qubes_run_disposable` one-shot | tested |
 | F1 | Wrapped `feature.Set` (`qmcp.SetFeatureAIManaged`) — `internal` denied (operator-only), opaque cross-ref for `audiovm`/`guivm`, echoes post-set value; direct `feature.Set` stays denied | tested |
 | F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch (duration clamped `[1, 120]s`) of admin events whose subject is ai-managed; minimal `{event, subject, subject_klass, ts}` payload with whitelisted `tag` kwarg for tag-add/delete; ships with the opaque-cross-ref backport on `SetPropertyAIManaged` + `SpawnAIManagedQube` (closes reviewer ask #8) | tested |
+| F3 | AI-scoped disk-budget visibility (`qmcp.GetPoolStats`) — sum of provisioned bytes on every ai-managed qube + operator-set cap from `/etc/qmcp/pool-cap` (single int, re-read per call, no daemon restart on operator edits); returns `{used, cap, headroom}`; pool topology and operator-side volumes intentionally absent. Cap is a contract operator → AI, not a sensor in the other direction. | tested |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
 
@@ -495,7 +523,53 @@ through; `qube` filter restricts the batch to the requested qube;
 `"not found"`); `events` filter restricts the batch to event names
 matching exactly OR as a `"<entry>:"` prefix.
 
-### Step 11 — Connect a client
+### Step 11 — (Optional) Deploy Stage F3 for AI disk-budget visibility
+
+Stage F3 adds `qmcp.GetPoolStats` — a dom0 wrapper that returns the
+total *provisioned* size across every volume on every ai-managed
+qube, plus an operator-set ceiling read from `/etc/qmcp/pool-cap`.
+AI gets `{used, cap, headroom}` and can self-throttle spawn loops
+before the cap is hit. Pool names, free-space, total-pool-size, and
+any operator-side volume are intentionally absent — the wrapper
+returns only AI's own footprint and the budget the operator gave it.
+
+The cap is operator-defined, not operator-observed (a "free-space"
+shape would have been a streaming operator-side oracle — free bytes
+drop whenever the operator does anything). The cap file is a single
+integer (bytes); the install script seeds it with 50 GiB if absent,
+and the wrapper re-reads it on every call so operator edits take
+effect immediately with no daemon restart. Direct `admin.pool.*` and
+`admin.vm.volume.{List,Info}` stay denied — the wrapper bypasses
+those over the local dom0 socket. No new dom0 provisioning beyond
+the wrapper + policy + cap file.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
+bash /tmp/install-f3.sh mcp-control ~user/qubes_mcp
+```
+
+To change the budget any time (no redeploy needed):
+
+```
+sudo sh -c 'echo 107374182400 > /etc/qmcp/pool-cap'   # 100 GiB
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-f3.py
+```
+
+Four PASS markers: response shape + arithmetic invariant
+(`used + headroom == cap` when within cap); untagged operator
+volumes excluded (sanity bound); spawn-delta positive + remove
+returns to baseline; payload ignored (empty kwargs whitelist).
+Plus a SOFT manual block confirming cap-file edits take effect on
+the next call without a policy-daemon restart.
+
+### Step 12 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

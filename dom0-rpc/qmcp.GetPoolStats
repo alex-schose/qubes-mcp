@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""qmcp.GetPoolStats — AI-scoped disk-budget visibility.
+
+Stage F3. AI sees the total *provisioned* size of all volumes attached
+to qubes carrying the `ai-managed` tag, plus an operator-set ceiling
+read from a dom0 config file. Untagged qubes' volumes are not summed
+and not enumerated.
+
+Shape decision (see NEXT.md): AI-scoped sum + operator cap.
+
+  - Shape (2) "free-space-only" was rejected: `free_bytes` moves
+    whenever the operator does anything, so AI polling it would be a
+    streaming operator-side oracle. The F2 backport closed comparable
+    oracles on cross-refs; re-opening one here for ergonomics walks
+    the wrong direction. Pool *names* can also leak.
+  - Shape (3) alone is posture-perfect but not actionable: AI sees a
+    usage number with no target to throttle against.
+  - Shape (3) + operator cap fixes the gap with no posture cost.
+    The cap is operator-DEFINED, not operator-OBSERVED — reading it
+    back tells AI only what it deserves to know: "this is the budget
+    you were given." AI gets a deterministic `(used, cap, headroom)`
+    triple it can throttle on; pool topology stays opaque.
+
+Cap source: `/etc/qmcp/pool-cap`, a single line containing an integer
+number of bytes. The install script seeds it with 50 GiB if absent so
+the wrapper is never in an "unconfigured" state. The operator can
+edit the file any time — re-read per call, no daemon to restart.
+
+What `vol.size` reports: PROVISIONED size, not on-disk write bytes.
+For thin-LVM pools the operator may over-provision the underlying
+pool; whether 20 GiB of headroom can actually be written sits on the
+operator's side of the trust line. The cap *is* what the operator
+allocated AI; whether the pool can fulfill it is operator concern.
+
+Why no policy change to admin.pool.* / admin.vm.volume.*: this wrapper
+runs in dom0 with full admin authority via the qmcp.GetPoolStats
+qrexec service (one new policy allow line, dom0-mediated like every
+other qmcp.* wrapper). Inside dom0, qubesadmin talks to qubesd over
+the local socket — qrexec policy does NOT gate those calls. So the
+existing admin.pool.* / admin.vm.volume.* denies stay in force for
+any *direct* AI-side call attempt; the wrapper is the only path.
+
+Input  (stdin, JSON): {} (no kwargs accepted; empty whitelist).
+Output (stdout, JSON):
+    {"ok": true,
+     "ai_managed_bytes_used": <int>,
+     "ai_managed_bytes_cap":  <int>,
+     "ai_managed_bytes_headroom": <int>}    -- max(0, cap - used)
+    {"ok": false, "error": "pool cap not configured"}  -- opaque on cap read failure
+    {"ok": false, "error": "<reason>"}                  -- qubesadmin import, sum failure
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+CAP_PATH = "/etc/qmcp/pool-cap"
+
+
+def emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def read_cap() -> int | None:
+    """Read the operator-set cap. Returns None on any failure (opaque
+    error surfaced by caller — never leak path or parse details to AI).
+    """
+    try:
+        with open(CAP_PATH, "r") as f:
+            raw = f.read().strip()
+        # Allow trailing comment after a `#` for operator legibility:
+        #   53687091200  # 50 GiB
+        head = raw.split("#", 1)[0].strip()
+        n = int(head)
+        if n < 0:
+            return None
+        return n
+    except Exception:
+        return None
+
+
+def sum_ai_managed_volume_bytes(app) -> int:
+    """Sum vol.size across every volume of every ai-managed qube.
+
+    `vol.size` is the provisioned size (qubesadmin proxies the value
+    from `admin.vm.volume.Info` over the local dom0 socket). We don't
+    care about volume kind here — disposable vs. persistent vs. snap
+    all consume budget the same way from AI's spawn-loop perspective.
+    """
+    total = 0
+    for vm in app.domains:
+        try:
+            tags = vm.tags
+        except Exception:
+            continue
+        if "ai-managed" not in tags:
+            continue
+        try:
+            volumes = vm.volumes
+        except Exception:
+            # Some klasses (e.g. AdminVM) lack volumes; harmless skip.
+            continue
+        for vol in volumes.values():
+            try:
+                size = int(vol.size or 0)
+            except Exception:
+                size = 0
+            total += size
+    return total
+
+
+def main() -> int:
+    # Empty kwargs whitelist — read-only surface, no inputs expected.
+    # We still tolerate {} for callers that send an empty object; any
+    # non-empty payload is ignored (read-only, can't smuggle anything).
+    try:
+        sys.stdin.read()
+    except Exception:
+        pass
+
+    cap = read_cap()
+    if cap is None:
+        return emit({"ok": False, "error": "pool cap not configured"})
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+
+    try:
+        used = sum_ai_managed_volume_bytes(app)
+    except Exception as e:
+        return emit({"ok": False, "error": f"volume sum failed: {e}"})
+
+    headroom = max(0, cap - used)
+    return emit({
+        "ok": True,
+        "ai_managed_bytes_used": used,
+        "ai_managed_bytes_cap":  cap,
+        "ai_managed_bytes_headroom": headroom,
+    })
+
+
+if __name__ == "__main__":
+    sys.exit(main())

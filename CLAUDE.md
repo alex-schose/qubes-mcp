@@ -69,7 +69,7 @@ this directory.**
 | `qmcp.GetPropertyAIManaged` | Wrapped read. `"not found"` is indistinguishable from `"not tagged"`. | A |
 | `qmcp.SetPropertyAIManaged` | Wrapped write with cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
 | `qmcp.LifecycleAIManaged` | start/shutdown/kill/pause/unpause/remove on ai-managed qubes. Replaces direct `admin.vm.*` lifecycle in Stage D — qrexec's `@tag:` matcher doesn't reach klass=DispVM targets, so we do the tag check in dom0. | D |
-| `qmcp.GetPoolStats` | Free-space pressure on the default pool. Side-channel: aggregate pool usage leaks operator disk footprint. Three candidate shapes (raw stats / free-only / AI-scoped sum) — decision pending. | designed, deferred |
+| `qmcp.GetPoolStats` | AI-scoped disk-budget visibility — sum of provisioned bytes on every ai-managed qube, plus an operator-set cap from `/etc/qmcp/pool-cap` (re-read per call). Returns `{used, cap, headroom}`; no pool names, no free-space, no operator-side volumes. Cap is an operator → AI contract, not a sensor in the other direction. | F3 |
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
 | `qmcp.CopyToAIManaged` | File transfer; both source and target must be ai-managed. | B |
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
@@ -84,8 +84,8 @@ this directory.**
 ```
 A. Policy + qmcp (List/Spawn/GetProperty/SetProperty) + tag-scoped
    lifecycle (Start/Shutdown/Kill/Pause/Unpause/Remove). Prereq: one ai-managed
-   template. (qmcp.GetPoolStats was scoped here but deferred — the side-
-   channel shape is unresolved; see the catalog row.)
+   template. (qmcp.GetPoolStats was scoped here but deferred for shape
+   reasons — ships as Stage F3 with an AI-scoped sum + operator cap.)
 B. qmcp.RunInAIManaged + qmcp.CopyToAIManaged. AI gets root inside its qubes
    and can move files between them.
 C. Single-egress network sandbox. `ai-net-router` is the only ai-managed
@@ -136,6 +136,20 @@ F2. qmcp.AIManagedEvents — filtered event stream. Bounded-window batch
     exits (no persistent dom0 daemon — admin.Events is denied to AI, so
     the wrapper sees everything and the tag filter is a security
     boundary kept small and stateless). New Ring.EVENTS.
+F3. qmcp.GetPoolStats — AI-scoped disk-budget visibility. Closes the
+    F band. Returns the sum of provisioned bytes across every volume
+    on every ai-managed qube, plus an operator-set ceiling from
+    `/etc/qmcp/pool-cap` (single integer, re-read per call — operator
+    edits take effect with no daemon restart). Response is
+    `{used, cap, headroom}`; pool names, free space, and operator-side
+    volumes are intentionally absent. The cap is a contract operator
+    → AI (operator allocates a budget) rather than a sensor in the
+    other direction (which a "free-space" shape would have been —
+    free_bytes moves when the operator acts and would be a streaming
+    operator-side oracle). Direct admin.pool.* and
+    admin.vm.volume.{List,Info} stay denied; the wrapper bypasses
+    those over the local dom0 socket (qrexec policy does not gate
+    in-dom0 calls). No new ring — fits Ring.READ_ONLY.
 G. mcp-control hardening (sudo lockdown, dedicated MCP user) + Tor hidden
    service for sshd → mobile CLI reach.
 H. FastMCP HTTP/SSE transport bound to a second .onion → mobile-app reach.
@@ -202,7 +216,8 @@ qubes_mcp/                          # repo root
 │       ├── qubes_spawn_disposable.py  # Stage E2
 │       ├── qubes_run_disposable.py    # Stage E2 (one-shot composition)
 │       ├── qubes_feature_set.py       # Stage F1
-│       └── qubes_events.py            # Stage F2
+│       ├── qubes_events.py            # Stage F2
+│       └── qubes_get_pool_stats.py    # Stage F3
 ├── policy/
 │   └── 30-mcp-control.policy       # draft → /etc/qubes/policy.d/ in dom0
 ├── dom0-rpc/                       # drafts → /etc/qubes-rpc/ in dom0
@@ -216,7 +231,8 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.DetachDeviceAIManaged    # Stage E1
 │   ├── qmcp.SpawnDisposableAIManaged # Stage E2
 │   ├── qmcp.SetFeatureAIManaged      # Stage F1
-│   └── qmcp.AIManagedEvents          # Stage F2
+│   ├── qmcp.AIManagedEvents          # Stage F2
+│   └── qmcp.GetPoolStats             # Stage F3
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -244,7 +260,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-f1.py
     ├── install-stage-f2.sh
     ├── uninstall-stage-f2.sh
-    └── test-stage-f2.py
+    ├── test-stage-f2.py
+    ├── install-stage-f3.sh
+    ├── uninstall-stage-f3.sh
+    └── test-stage-f3.py
 ```
 
 ## Operating protocol
@@ -436,6 +455,38 @@ qubes_mcp/                          # repo root
   has the bit they would reveal. `deploy/test-stage-a.py` updated to
   assert byte-identical opaqueness on both SetProperty and Spawn
   cross-refs (5/5 green; reviewer ask #8 resolved).
+
+- **Stage F3 — DONE (tested).** `qmcp.GetPoolStats` closes the F band
+  with an AI-scoped disk-budget read: it returns the sum of
+  provisioned bytes across every volume on every ai-managed qube,
+  plus an operator-set ceiling from `/etc/qmcp/pool-cap` (single
+  integer, re-read per call — operator edits take effect immediately
+  with no daemon restart). The response shape is `{used, cap,
+  headroom}`; pool names, free-space, total-pool-size, and any
+  operator-side volume are intentionally absent. The cap is a
+  contract operator → AI (the budget the operator allocates AI for
+  spawn loops); the wrapper does NOT expose free-space, because a
+  free-space shape would have been a streaming operator-side oracle
+  (free bytes drop whenever the operator does anything). Headroom
+  clamps to 0 when used > cap (the cap is advisory; AI may already
+  exceed it when the operator lowers it). Direct `admin.pool.*` and
+  `admin.vm.volume.{List,Info}` stay denied — the wrapper bypasses
+  them via the local dom0 socket (qrexec policy does not gate
+  in-dom0 calls). No new ring (Ring.READ_ONLY covers it). The
+  install script seeds the cap file with 50 GiB if absent so the
+  wrapper is never in an "unconfigured" state; the uninstall script
+  preserves the cap file as operator state. Two intentional
+  non-features (locked): no per-volume breakdown (a breakdown would
+  let AI infer disposable-vs-persistent provisioning), and no
+  thin-pool reality check (provisioned size is what AI gets; whether
+  the underlying thin pool can fulfill the cap sits on the
+  operator's side of the trust line). Test plan in
+  `deploy/test-stage-f3.py`: four PASS criteria (response-shape +
+  arithmetic invariant; untagged volumes excluded via sanity bound;
+  spawn-delta positive + remove-baseline; payload ignored). Offline-
+  validation pass covered 16 cases (mocked qubesadmin) before slot
+  deploy. New reviewer ask #11 added on cap-as-contract vs.
+  free-space-as-sensor.
 
 - **Stage G onward** — designed, not yet implemented. See the stage
   rollout table above.
