@@ -75,6 +75,24 @@ ALLOWED_KLASSES = {"AppVM", "DispVMTemplate", "DispVM"}
 DEFAULT_NETVM = "ai-net-router"
 
 
+def _load_budget_lib():
+    """Load the sibling qmcp_budget helper by path.
+
+    Stage I-0. The helper lives next to this wrapper in /etc/qubes-rpc/
+    (production) and in public/dom0-rpc/ (offline-validation). Loading
+    via importlib avoids any sys.path or PYTHONPATH dependency.
+    """
+    import importlib.util
+    import os.path
+    here = os.path.dirname(os.path.realpath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "qmcp_budget", os.path.join(here, "qmcp_budget.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def fail(msg: str) -> int:
     print(json.dumps({"ok": False, "error": msg}))
     return 1
@@ -172,6 +190,23 @@ def main() -> int:
     if netvm is not None:
         if netvm not in app.domains or "ai-managed" not in app.domains[netvm].tags:
             return fail("netvm must reference an ai-managed qube")
+
+    # ----- I-0 budget gate -----
+    # Refuse if projected post-create provisioned-sum would exceed the
+    # operator-set cap (`/etc/qmcp/pool-cap`). Measurement mirrors
+    # qmcp.GetPoolStats exactly so AI's view of (used, cap, headroom)
+    # predicts this refusal. Cap-missing fails closed with the same
+    # opaque message GetPoolStats surfaces. Estimate is the conservative
+    # sum of the TEMPLATE's vol.size (root + private + volatile + …) —
+    # the new qube's volumes inherit from the template, and F3's `used`
+    # counts those same bytes once they're attached to the new qube.
+    try:
+        budget = _load_budget_lib()
+    except Exception as e:
+        return fail(f"budget helper load failed: {e}")
+    cap_err = budget.check_cap_for_create(app, tpl)
+    if cap_err is not None:
+        return fail(cap_err)
 
     # ----- Step 1: create the qube -----
     # DispVMTemplate is created as klass=AppVM and then promoted via

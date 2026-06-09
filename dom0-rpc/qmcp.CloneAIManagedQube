@@ -42,6 +42,24 @@ NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
 NOT_FOUND = {"ok": False, "error": "not found"}
 
 
+def _load_budget_lib():
+    """Load the sibling qmcp_budget helper by path.
+
+    Stage I-0. The helper lives next to this wrapper in /etc/qubes-rpc/
+    (production) and in public/dom0-rpc/ (offline-validation). Loading
+    via importlib avoids any sys.path or PYTHONPATH dependency.
+    """
+    import importlib.util
+    import os.path
+    here = os.path.dirname(os.path.realpath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "qmcp_budget", os.path.join(here, "qmcp_budget.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def emit(payload: dict) -> int:
     print(json.dumps(payload))
     return 0 if payload.get("ok") else 1
@@ -95,6 +113,20 @@ def main() -> int:
 
     if name in app.domains:
         return emit({"ok": False, "error": f"qube '{name}' already exists"})
+
+    # ----- I-0 budget gate -----
+    # Refuse if projected post-clone provisioned-sum would exceed the
+    # operator-set cap (`/etc/qmcp/pool-cap`). Clone inherits the
+    # source's volumes, so the conservative estimate is the source's
+    # full vol.size sum. Cap-missing fails closed with the same opaque
+    # message GetPoolStats surfaces.
+    try:
+        budget = _load_budget_lib()
+    except Exception as e:
+        return emit({"ok": False, "error": f"budget helper load failed: {e}"})
+    cap_err = budget.check_cap_for_create(app, src_vm)
+    if cap_err is not None:
+        return emit({"ok": False, "error": cap_err})
 
     # ----- Step 1: clone the qube -----
     try:

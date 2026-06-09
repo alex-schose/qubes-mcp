@@ -157,3 +157,40 @@ GitHub issue.
     Anything more structured (TOML, per-pool caps, time-window
     quotas) feels like premature complexity, but happy to be told
     otherwise.
+
+12. **Sibling-import for shared dom0 helpers vs. installed-package
+    convention.** Stage I-0 introduces a shared dom0 helper
+    (`qmcp_budget.py`) consumed by three create wrappers
+    (`qmcp.SpawnAIManagedQube` / `CloneAIManagedQube` /
+    `SpawnDisposableAIManaged`) via
+    `importlib.util.spec_from_file_location` against
+    `os.path.dirname(os.path.realpath(__file__))`. The same loader
+    works in `/etc/qubes-rpc/` (production) and in
+    `public/dom0-rpc/` (offline-validation) without any sys.path or
+    PYTHONPATH dependency. This deviates from Qubes' own
+    convention: every Python script in
+    `qubes-core-admin/qubes-rpc/` (e.g. `qubes.GetDate`) and every
+    tool in `qubes-core-admin-client/qubesadmin/tools/` (e.g.
+    `qvm_run.py`) is self-contained — shared infrastructure is
+    consumed via the globally installed `qubesadmin` package, and
+    no qubes-rpc script sibling-imports another. We deviate
+    because our deployment is tarball + slot runner, not RPM, so
+    installing a shared Python module under
+    `/usr/lib/python3/dist-packages/` per slot adds packaging
+    overhead disproportionate to a ~150-line helper. As Stage I
+    grows (I-1 tier-resolution helper, I-3 wrapper-surface
+    enforcement, I-4+ action gate), the shared-helper surface
+    grows too. (a) Is the sibling-import workaround acceptable for
+    a project of this scope, or is shipping a tiny
+    `qubes-mcp-helpers` RPM the cleaner long-term answer once the
+    helper count justifies it (rough threshold: >300 shared lines
+    or >3 helpers)? (b) If we stay sibling-import, is the explicit
+    `importlib.util.spec_from_file_location` we chose preferable
+    to the more idiomatic
+    `sys.path.insert(0, helper_dir); import qmcp_budget` — i.e.
+    are there `__file__` / sys.path edge cases in the qrexec
+    policy-daemon's invocation environment (symlinks under
+    `/usr/local/etc/qubes-rpc/`, chdir, custom argv[0]) that argue
+    for the more explicit form? (c) Either way: any direct
+    precedent in the Qubes ecosystem we should be borrowing from
+    that we missed?

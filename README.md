@@ -89,6 +89,23 @@ Where this has been discussed:
 
 ## Status
 
+Stages A through F3 land the binary trust boundary: a qube tagged
+`ai-managed` is visible and acted on through the `qmcp.*` wrappers;
+an untagged qube is invisible. The F band closes that surface with
+disk-budget visibility (F3).
+
+**Stage I (graduated authority) is the current work line.** It adds
+*graduated* authority within `ai-managed` — resource tiers, an
+action gate (per-call consent for destructive ops), per-trust-class
+source qubes, a sign-only secrets vault, and persona presets — so a
+hallucinating or prompt-injected agent cannot destroy real data
+*inside* the boundary just because it has a qrexec channel.
+Stage I lands as sub-stages I-0..I-9 in three waves; I-0 (cap-as-
+gate) is done and listed below. **Stages G and H are deferred until
+Stage I completes** — both depend on a non-binary trust model (G's
+mcp-control lockdown is per-tier; H's remote reach needs Stage I's
+dom0 gate-lift) and are re-scoped once Stage I lands.
+
 | Stage | Capability | State |
 |---|---|---|
 | A | Tag-scoped lifecycle + spawn + wrapped property read/write + existence hiding | tested |
@@ -100,8 +117,9 @@ Where this has been discussed:
 | F1 | Wrapped `feature.Set` (`qmcp.SetFeatureAIManaged`) — `internal` denied (operator-only), opaque cross-ref for `audiovm`/`guivm`, echoes post-set value; direct `feature.Set` stays denied | tested |
 | F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch (duration clamped `[1, 120]s`) of admin events whose subject is ai-managed; minimal `{event, subject, subject_klass, ts}` payload with whitelisted `tag` kwarg for tag-add/delete; ships with the opaque-cross-ref backport on `SetPropertyAIManaged` + `SpawnAIManagedQube` (closes reviewer ask #8) | tested |
 | F3 | AI-scoped disk-budget visibility (`qmcp.GetPoolStats`) — sum of provisioned bytes on every ai-managed qube + operator-set cap from `/etc/qmcp/pool-cap` (single int, re-read per call, no daemon restart on operator edits); returns `{used, cap, headroom}`; pool topology and operator-side volumes intentionally absent. Cap is a contract operator → AI, not a sensor in the other direction. | tested |
-| G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed |
-| H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed |
+| I-0 | F3 cap promoted from advisory signal to a hard gate on every create path (`qmcp.SpawnAIManagedQube` / `qmcp.CloneAIManagedQube` / `qmcp.SpawnDisposableAIManaged`). Each wrapper computes the projected post-create `used` and refuses with opaque `"pool cap exceeded"` before invoking the Admin API. Estimate is the conservative `sum(vol.size)` of the template/source; measurement is byte-identical to F3 so AI's `(used, cap, headroom)` view predicts the gate. Shared dom0 helper (`qmcp_budget.py`) sibling-loaded by each wrapper. Cross-ref refusal still wins (no new existence oracle); cap-missing fails closed. No new RPC, no policy change. First sub-stage of Stage I (graduated authority). | tested |
+| G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
+| H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
 See `CLAUDE.md` for the full design document — trust model, anti-goals, file
 layout, and operating protocol.
@@ -465,7 +483,80 @@ returns to baseline; payload ignored (empty kwargs whitelist).
 Plus a SOFT manual block confirming cap-file edits take effect on
 the next call without a policy-daemon restart.
 
-### Step 12 — Connect a client
+### Step 12 — (Optional) Deploy Stage I-0 to enforce the F3 pool cap
+
+Stage I-0 promotes the F3 pool cap from an advisory signal that AI
+is expected to self-throttle on into a hard gate that runs in every
+create wrapper before the Admin API call. Without this, a
+hallucinating or prompt-injected agent can ignore F3's
+`(used, cap, headroom)` and spawn past the budget (the F-1 finding
+that motivated this sub-stage). With it, every
+`qmcp.SpawnAIManagedQube`, `qmcp.CloneAIManagedQube`, and
+`qmcp.SpawnDisposableAIManaged` call computes
+`projected = current_ai_managed_used + estimate_from(template_or_source)`
+and refuses with the opaque `"pool cap exceeded"` if
+`projected > cap`. The estimate is the conservative
+`sum(vol.size for vol in src.volumes.values())` — the full
+provisioned size of the template/source, because the new qube's
+volumes inherit from that source and F3's `used` counts those same
+bytes once they're attached.
+
+Measurement is byte-identical to F3's `qmcp.GetPoolStats`, so AI's
+view of `(used, cap, headroom)` predicts the gate's behaviour
+exactly — there's no new oracle. The cross-ref refusal still fires
+first, so an untagged template surfaces the same opaque cross-ref
+message before the gate runs. Cap-missing/malformed/negative fail
+closed with F3's existing `"pool cap not configured"` (F3's install
+seeds the cap, so the unconfigured state is a deliberate operator
+action). The enforcement logic lives in a shared dom0 helper
+(`/etc/qubes-rpc/qmcp_budget.py`) sibling-loaded by each wrapper.
+
+I-0 does **not** add a new RPC service, does **not** change the
+qrexec policy, and does **not** restart the policy daemon.
+`qmcp.GetPoolStats` stays read-only — enforcement lives in the
+writes, the read is the signal.
+
+Stage F3 is a prerequisite (it seeds `/etc/qmcp/pool-cap`).
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
+bash /tmp/install-I-0.sh mcp-control ~user/qubes_mcp
+```
+
+Then from mcp-control:
+
+```
+.venv/bin/python deploy/test-stage-I-0.py
+```
+
+Four probes (Spawn / Clone / SpawnDisposable + GetPoolStats
+shape). Each probe always attempts its create surface and
+classifies the response across three valid outcomes:
+
+- `ok=True` → wrapper proceeded under headroom (HARD).
+- `"pool cap exceeded"` → gate fired under cap pressure (SOFT S1).
+- `"pool cap not configured"` → gate fired fail-closed (SOFT S2).
+
+Any other response is a FAIL. The same test therefore PASSes
+under every cap state; reading the response JSON above each
+probe tells you which gate path actually fired.
+
+Two SOFT operator-driven cap manipulations exercise S1 and S2:
+
+1. **Lower the cap below the current `used`** (in dom0:
+   `sudo sh -c 'echo <NEW_BYTES> > /etc/qmcp/pool-cap'`), re-run
+   the test, and the response lines now carry
+   `"error": "pool cap exceeded"` across all three create
+   surfaces.
+2. **Remove the cap file** (`sudo rm /etc/qmcp/pool-cap`), re-run,
+   and the response lines now carry
+   `"error": "pool cap not configured"`.
+
+Restore the original cap value after testing.
+
+### Step 13 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):
@@ -519,5 +610,9 @@ agents managing Qubes-isolated workloads). It is not a hardened product. The
 threat model assumes the MCP source qube (`mcp-control`) is itself the trust
 boundary — compromising it does not let AI escape the `ai-managed` tag scope
 at the dom0/policy layer, but the AI in question can do anything inside its
-sandbox. Stage G adds further hardening (sudo lockdown, dedicated MCP user).
+sandbox. Stage I (graduated authority — current work line) addresses the
+"anything inside its sandbox" half of that by tiering authority below the
+umbrella tag; Stage G (mcp-control hardening — sudo lockdown, dedicated
+MCP user) is deferred until Stage I lands, because the lockdown becomes
+meaningfully per-tier once the tier model exists.
 Run on your own infrastructure; report bugs in issues.

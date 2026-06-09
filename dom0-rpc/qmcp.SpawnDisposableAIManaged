@@ -48,6 +48,24 @@ import sys
 NOT_FOUND = {"ok": False, "error": "not found"}
 
 
+def _load_budget_lib():
+    """Load the sibling qmcp_budget helper by path.
+
+    Stage I-0. The helper lives next to this wrapper in /etc/qubes-rpc/
+    (production) and in public/dom0-rpc/ (offline-validation). Loading
+    via importlib avoids any sys.path or PYTHONPATH dependency.
+    """
+    import importlib.util
+    import os.path
+    here = os.path.dirname(os.path.realpath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "qmcp_budget", os.path.join(here, "qmcp_budget.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def emit(payload: dict) -> int:
     print(json.dumps(payload))
     return 0 if payload.get("ok") else 1
@@ -123,6 +141,23 @@ def main() -> int:
         return emit({"ok": False, "error":
             f"template '{template}' must have template_for_dispvms=True "
             f"to be a DispVM source (klass is {tpl.klass})"})
+
+    # ----- I-0 budget gate -----
+    # Refuse if projected post-create provisioned-sum would exceed the
+    # operator-set cap (`/etc/qmcp/pool-cap`). A disposable inherits its
+    # volumes from the DVMT (private comes from DVMT's private,
+    # volatile is created fresh), so the conservative estimate is the
+    # DVMT's full vol.size sum — same as SpawnAIManagedQube. F3's `used`
+    # will count those bytes once the disposable is provisioned.
+    # Cap-missing fails closed with the same opaque message
+    # GetPoolStats surfaces.
+    try:
+        budget = _load_budget_lib()
+    except Exception as e:
+        return emit({"ok": False, "error": f"budget helper load failed: {e}"})
+    cap_err = budget.check_cap_for_create(app, tpl)
+    if cap_err is not None:
+        return emit({"ok": False, "error": cap_err})
 
     # ----- Step 1: create the disposable -----
     try:
