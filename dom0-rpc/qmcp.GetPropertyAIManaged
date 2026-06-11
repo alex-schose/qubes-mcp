@@ -11,6 +11,14 @@ The "not found" branch is load-bearing: AI must not be able to use the
 read surface as an existence oracle for the operator's qubes. A qube that
 doesn't exist and a qube that exists-but-isn't-tagged return byte-identical
 responses.
+
+Scope redaction (Stage I-1, F-3): a property whose VALUE references another
+qube must not leak that qube's name either. Every VM-valued result is routed
+through qmcp_scope.scoped_value — a reference collapses to its name only when
+the referent is ai-managed, else to the opaque "<out-of-scope>" sentinel.
+Labels (whose .name is a colour, not a domain) and scalars pass through. The
+`tags` read is made deliberate (qmcp-vocabulary only) rather than relying on
+the accidental non-serialisability that hid it before.
 """
 from __future__ import annotations
 
@@ -18,6 +26,24 @@ import json
 import sys
 
 NOT_FOUND = {"ok": False, "error": "not found"}
+
+
+def _load_scope_lib():
+    """Load the sibling qmcp_scope helper by path.
+
+    Stage I-1. The helper lives next to this wrapper in /etc/qubes-rpc/
+    (production) and in public/dom0-rpc/ (offline-validation). Loading
+    via importlib avoids any sys.path or PYTHONPATH dependency.
+    """
+    import importlib.util
+    import os.path
+    here = os.path.dirname(os.path.realpath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "qmcp_scope", os.path.join(here, "qmcp_scope.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def emit(payload: dict) -> int:
@@ -42,6 +68,15 @@ def main() -> int:
     except Exception as e:
         return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
 
+    # Fail-closed: without the redactor we cannot serialise VM-valued
+    # results without risking a name leak, so refuse rather than fall
+    # back to the pre-I-1 behaviour. (The slot installs the helper next
+    # to this wrapper, so this only fires on a broken deploy.)
+    try:
+        scope = _load_scope_lib()
+    except Exception as e:
+        return emit({"ok": False, "error": f"scope lib load failed: {e}"})
+
     if name not in app.domains:
         return emit(NOT_FOUND)
     vm = app.domains[name]
@@ -56,6 +91,12 @@ def main() -> int:
             return emit({"ok": False, "error": f"power_state read failed: {e}"})
         return emit({"ok": True, "value": value})
 
+    # tags: filter to the qmcp vocabulary and return a JSON-safe list.
+    # Made deliberate in I-1 — previously hidden only because the Tags
+    # object is not JSON-serialisable (an accidental, fragile opacity).
+    if prop == "tags":
+        return emit({"ok": True, "value": scope.scoped_tags(vm.tags)})
+
     try:
         value = getattr(vm, prop)
     except AttributeError:
@@ -63,11 +104,11 @@ def main() -> int:
     except Exception as e:
         return emit({"ok": False, "error": f"read failed: {e}"})
 
-    # JSON-serialise: VM objects → their name, collections → list of names.
-    if hasattr(value, "name") and not isinstance(value, (str, bytes)):
-        value = value.name
-    elif isinstance(value, (list, tuple, set)):
-        value = [getattr(v, "name", v) for v in value]
+    # JSON-serialise with scope redaction (closes F-3, design §18.6):
+    # VM references → their name iff ai-managed, else "<out-of-scope>";
+    # labels and scalars pass through. Covers the single-value and the
+    # list/tuple/set branches alike.
+    value = scope.scoped_value(app, value)
 
     return emit({"ok": True, "value": value})
 

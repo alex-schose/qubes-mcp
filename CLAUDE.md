@@ -48,7 +48,18 @@ this directory.**
   or simply isn't tagged `ai-managed`. The MCP-side helper normalises all
   qrexec failures (policy deny, no-such-VM, transport) to the same opaque
   `"not found or refused"`, so AI cannot use either the read surface or the
-  lifecycle surface as an existence oracle.
+  lifecycle surface as an existence oracle. The same opacity holds on the
+  *value* channel (Stage I-1, finding F-3): when a property's value — or a
+  list field such as `qmcp.ListAIManagedQubes`' `template` — references
+  another qube, the wrapper emits that qube's name only if it is itself
+  ai-managed, else the opaque `<out-of-scope>` sentinel. So AI cannot read an
+  out-of-scope qube's name off an in-scope qube's `netvm` / `template` /
+  `default_dispvm` / `guivm` / `audiovm` / `management_dispvm`, and the `tags`
+  read is filtered to the qmcp vocabulary (no operator tags; no future tier
+  topology). This is the read-path sibling of the Stage F2 write-path
+  cross-ref opacity. *(Visibility ≠ capability: a held capability — e.g. a
+  future sign-only service — is not a name leak; it enumerates nothing it can
+  act on.)*
 
 ## What lives where
 
@@ -174,6 +185,23 @@ I-0. Pool-cap promoted from advisory signal to a hard gate on every
     offline-validation. No new RPC surface; no policy change; no new
     ring. First sub-stage of Stage I (graduated authority);
     backward-compatible.
+I-1. Close the read-surface name leak (finding F-3, design §18.6).
+    The wrapped reads were opaque on existence (missing/untagged →
+    "not found") but not on VALUE: any VM-valued property (netvm,
+    template, default_dispvm, guivm, audiovm, management_dispvm) and
+    qmcp.ListAIManagedQubes' `template` field serialised the
+    referent's raw name with no scope check, leaking out-of-scope
+    qube names. I-1 routes every VM-valued result through a shared
+    dom0 redactor (qmcp_scope.py, sibling-loaded like qmcp_budget):
+    a referenced qube's name survives only if it is itself
+    ai-managed, else collapses to the opaque "<out-of-scope>"
+    sentinel; `tags` reads are filtered to the qmcp vocabulary
+    (previously hidden only by an accidental serialisation crash).
+    The MCP tool layer is not a boundary — the fix is in the dom0
+    wrappers and the tools inherit it. Fail-closed: a read refuses
+    if the redactor can't load. The read-path sibling of the Stage
+    F2 write-path cross-ref opacity. No new RPC service; no policy
+    change; no new ring.
 G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
@@ -276,8 +304,10 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.SetFeatureAIManaged      # Stage F1
 │   ├── qmcp.AIManagedEvents          # Stage F2
 │   ├── qmcp.GetPoolStats             # Stage F3
-│   └── qmcp_budget.py                # Stage I-0 — shared cap-gate helper
+│   ├── qmcp_budget.py                # Stage I-0 — shared cap-gate helper
 │                                      # loaded by Spawn/Clone/SpawnDisposable
+│   └── qmcp_scope.py                 # Stage I-1 — shared read-scope redactor
+│                                      # loaded by GetProperty/List
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -311,7 +341,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-f3.py
     ├── install-stage-I-0.sh
     ├── uninstall-stage-I-0.sh
-    └── test-stage-I-0.py
+    ├── test-stage-I-0.py
+    ├── install-stage-I-1.sh
+    ├── uninstall-stage-I-1.sh
+    └── test-stage-I-1.py
 ```
 
 ## Operating protocol
@@ -588,6 +621,25 @@ qubes_mcp/                          # repo root
   missing all fail-closed, cross-ref-before-cap ordering
   preserved across all three wrappers.
 
+- **Stage I-1 — built; pending hardware test + ship decision.**
+  Closes finding F-3 (read-surface name leak, design §18.6). The two
+  read wrappers (`qmcp.GetPropertyAIManaged`, `qmcp.ListAIManagedQubes`)
+  now route every VM-valued result through a shared dom0 redactor
+  (`qmcp_scope.py`): a referenced qube's name survives only if it is
+  itself ai-managed, else collapses to the opaque `<out-of-scope>`
+  sentinel; the `tags` read is filtered to the qmcp vocabulary (it was
+  hidden before only by the accidental non-serialisability of the Tags
+  object — a latent authority-topology oracle once tier tags land in
+  I-3). Existence-hiding on the lookup channel is unchanged (untagged /
+  nonexistent → opaque `not found`); labels and scalars pass through
+  untouched. Fail-closed: a read refuses if the redactor can't load
+  rather than fall back to leaking. No new RPC service; no policy
+  change; no daemon restart; no new ring — the read-path sibling of the
+  Stage F2 write-path cross-ref opacity. Offline validation (mocked
+  qubesadmin, 30 checks) green; hardware test plan in
+  `deploy/test-stage-I-1.py` (round-trip invariant: no name a read
+  surface emits is one a direct lookup denies).
+
 - **Stages G and H — designed, deferred until Stage I completes.**
   Per the 2026-06-08 reordering (see the Stage rollout block above),
   Stage I (graduated authority within `ai-managed`) jumps ahead of
@@ -597,14 +649,19 @@ qubes_mcp/                          # repo root
   and H's remote reach needs the explicit dom0 gate-lift the action
   axis introduces. They will be re-scoped once Stage I is complete.
 
-- **Stage I — in progress.** Sub-stages I-0..I-9 in three waves.
-  Wave 1 (I-0..I-3) is the resource axis, backward-compatible by
-  design (untiered defaults preserve current behaviour through I-2;
-  the least-privilege flip lands in I-3 after the operator tiers
-  the fleet). Wave 2 (I-4..I-6) is the action axis + consent GUI.
-  Wave 3 (I-7..I-9) is the principal axis, secrets vault, and
-  persona presets. **I-0 done above.** I-1 (tier taxonomy + dom0
-  resolution helper, behaviour-neutral) is next.
+- **Stage I — in progress.** Graduated authority within `ai-managed`,
+  decomposed into sub-stages I-0..I-11 across three waves (full map in
+  the design docs). Wave 1 is the resource axis plus read/audit
+  hardening, backward-compatible by design. **I-0 done** (pool cap
+  promoted to a hard create-gate). **I-1 built** (above) — closes the
+  F-3 read-surface name leak. **I-2 next** — a hash-chained,
+  AI-unreachable dom0 audit log of every state-changing call
+  (foundational before the tier model; mandatory before the later
+  vault's SignTransaction). The tier taxonomy + resolution helper
+  (formerly numbered "I-1") is now **I-3**, where the least-privilege
+  flip lands after the operator tiers the fleet. Wave 2 is the action
+  gate + consent GUI; Wave 3 is the principal axis, secrets vault, and
+  persona presets.
 
 ## References
 

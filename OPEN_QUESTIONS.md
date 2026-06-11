@@ -14,7 +14,10 @@ GitHub issue.
 1. **Wrapped-reads existence-hiding.** Is returning a uniform `"not found"`
    from a dom0 qmcp wrapper a robust primitive against existence oracles, or
    are there qrexec-layer leaks (timing, error chains, side effects) I'm
-   missing?
+   missing? *(Stage I-1 extends this primitive to the read **value** channel:
+   a VM-valued property or list field that references an out-of-scope qube now
+   collapses to an opaque `<out-of-scope>` sentinel — the read-path sibling of
+   the F2 write-path cross-ref opacity in #8.)*
 2. **`qubes.Filecopy` `@tag:ai-managed → @tag:ai-managed` allow.** Stage B
    adds a policy line bypassing the default `ask` dialog for inter-qube file
    transfer between ai-managed qubes. Are there assumptions in

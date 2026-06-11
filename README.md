@@ -100,8 +100,9 @@ action gate (per-call consent for destructive ops), per-trust-class
 source qubes, a sign-only secrets vault, and persona presets — so a
 hallucinating or prompt-injected agent cannot destroy real data
 *inside* the boundary just because it has a qrexec channel.
-Stage I lands as sub-stages I-0..I-9 in three waves; I-0 (cap-as-
-gate) is done and listed below. **Stages G and H are deferred until
+Stage I lands as sub-stages I-0..I-11 in three waves; I-0 (cap-as-
+gate) and I-1 (read-surface scope redaction) are done and listed
+below. **Stages G and H are deferred until
 Stage I completes** — both depend on a non-binary trust model (G's
 mcp-control lockdown is per-tier; H's remote reach needs Stage I's
 dom0 gate-lift) and are re-scoped once Stage I lands.
@@ -118,6 +119,7 @@ dom0 gate-lift) and are re-scoped once Stage I lands.
 | F2 | Filtered event stream (`qmcp.AIManagedEvents`) — bounded-window batch (duration clamped `[1, 120]s`) of admin events whose subject is ai-managed; minimal `{event, subject, subject_klass, ts}` payload with whitelisted `tag` kwarg for tag-add/delete; ships with the opaque-cross-ref backport on `SetPropertyAIManaged` + `SpawnAIManagedQube` (closes reviewer ask #8) | tested |
 | F3 | AI-scoped disk-budget visibility (`qmcp.GetPoolStats`) — sum of provisioned bytes on every ai-managed qube + operator-set cap from `/etc/qmcp/pool-cap` (single int, re-read per call, no daemon restart on operator edits); returns `{used, cap, headroom}`; pool topology and operator-side volumes intentionally absent. Cap is a contract operator → AI, not a sensor in the other direction. | tested |
 | I-0 | F3 cap promoted from advisory signal to a hard gate on every create path (`qmcp.SpawnAIManagedQube` / `qmcp.CloneAIManagedQube` / `qmcp.SpawnDisposableAIManaged`). Each wrapper computes the projected post-create `used` and refuses with opaque `"pool cap exceeded"` before invoking the Admin API. Estimate is the conservative `sum(vol.size)` of the template/source; measurement is byte-identical to F3 so AI's `(used, cap, headroom)` view predicts the gate. Shared dom0 helper (`qmcp_budget.py`) sibling-loaded by each wrapper. Cross-ref refusal still wins (no new existence oracle); cap-missing fails closed. No new RPC, no policy change. First sub-stage of Stage I (graduated authority). | tested |
+| I-1 | Read-surface name-leak fix (finding F-3): every VM-valued property read (`netvm`/`template`/`default_dispvm`/`guivm`/`audiovm`/`management_dispvm`) and the list `template` field is routed through a shared dom0 redactor (`qmcp_scope.py`) — a referenced qube's name survives only if it is itself ai-managed, else collapses to the opaque `<out-of-scope>` sentinel; `tags` reads are filtered to the qmcp vocabulary. The read-path sibling of the F2 write-path cross-ref opacity. Patches the two read wrappers; no policy change, no new RPC. | tested |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
@@ -556,7 +558,49 @@ Two SOFT operator-driven cap manipulations exercise S1 and S2:
 
 Restore the original cap value after testing.
 
-### Step 13 — Connect a client
+### Step 13 — (Optional) Deploy Stage I-1 to close the read-surface name leak
+
+Stage I-1 closes finding F-3. The wrapped reads were opaque on a qube's
+*existence* (a missing or untagged target returns the uniform
+`"not found"`) but not on a property *value* that referenced another
+qube: `qmcp.GetPropertyAIManaged` serialised any VM-valued property
+(`netvm`, `template`, `default_dispvm`, `guivm`, `audiovm`,
+`management_dispvm`) to the referent's raw name, and
+`qmcp.ListAIManagedQubes` did the same for its `template` field — so a
+single read of an ai-managed qube could enumerate out-of-scope operator
+qube names.
+
+With I-1 both wrappers route every VM-valued result through a shared
+dom0 redactor (`/etc/qubes-rpc/qmcp_scope.py`): a referenced qube's name
+is emitted only if that qube is itself `ai-managed`, otherwise it
+collapses to the opaque `<out-of-scope>` sentinel. The `tags` read is
+filtered to the qmcp vocabulary (it was previously hidden only by the
+accidental non-serialisability of the `Tags` object). Labels and scalars
+pass through unchanged, and existence-hiding on the lookup channel is
+unchanged. This is the read-path sibling of the Stage F2 write-path
+cross-ref opacity, and it is fail-closed: a read refuses if the redactor
+can't load.
+
+I-1 does **not** add a new RPC service, change the qrexec policy, or
+restart the policy daemon.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
+bash /tmp/install-I-1.sh mcp-control ~user/qubes_mcp/public
+```
+
+Then verify from mcp-control:
+
+```sh
+.venv/bin/python deploy/test-stage-I-1.py     # 5 PASS
+```
+
+`deploy/uninstall-stage-I-1.sh` reverts (restore the pre-I-1 wrappers,
+then remove the helper).
+
+### Step 14 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):
