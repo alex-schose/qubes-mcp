@@ -101,8 +101,9 @@ source qubes, a sign-only secrets vault, and persona presets — so a
 hallucinating or prompt-injected agent cannot destroy real data
 *inside* the boundary just because it has a qrexec channel.
 Stage I lands as sub-stages I-0..I-11 in three waves; I-0 (cap-as-
-gate) and I-1 (read-surface scope redaction) are done and listed
-below. **Stages G and H are deferred until
+gate) and I-1 (read-surface scope redaction) are done, and I-2 (dom0
+audit log) is built and in hardware test — all listed below.
+**Stages G and H are deferred until
 Stage I completes** — both depend on a non-binary trust model (G's
 mcp-control lockdown is per-tier; H's remote reach needs Stage I's
 dom0 gate-lift) and are re-scoped once Stage I lands.
@@ -120,6 +121,7 @@ dom0 gate-lift) and are re-scoped once Stage I lands.
 | F3 | AI-scoped disk-budget visibility (`qmcp.GetPoolStats`) — sum of provisioned bytes on every ai-managed qube + operator-set cap from `/etc/qmcp/pool-cap` (single int, re-read per call, no daemon restart on operator edits); returns `{used, cap, headroom}`; pool topology and operator-side volumes intentionally absent. Cap is a contract operator → AI, not a sensor in the other direction. | tested |
 | I-0 | F3 cap promoted from advisory signal to a hard gate on every create path (`qmcp.SpawnAIManagedQube` / `qmcp.CloneAIManagedQube` / `qmcp.SpawnDisposableAIManaged`). Each wrapper computes the projected post-create `used` and refuses with opaque `"pool cap exceeded"` before invoking the Admin API. Estimate is the conservative `sum(vol.size)` of the template/source; measurement is byte-identical to F3 so AI's `(used, cap, headroom)` view predicts the gate. Shared dom0 helper (`qmcp_budget.py`) sibling-loaded by each wrapper. Cross-ref refusal still wins (no new existence oracle); cap-missing fails closed. No new RPC, no policy change. First sub-stage of Stage I (graduated authority). | tested |
 | I-1 | Read-surface name-leak fix (finding F-3): every VM-valued property read (`netvm`/`template`/`default_dispvm`/`guivm`/`audiovm`/`management_dispvm`) and the list `template` field is routed through a shared dom0 redactor (`qmcp_scope.py`) — a referenced qube's name survives only if it is itself ai-managed, else collapses to the opaque `<out-of-scope>` sentinel; `tags` reads are filtered to the qmcp vocabulary. The read-path sibling of the F2 write-path cross-ref opacity. Patches the two read wrappers; no policy change, no new RPC. | tested |
+| I-2 | Hash-chained, AI-unreachable dom0 audit log of every state-changing `qmcp.*` call. A shared dom0 helper (`qmcp_audit.py`) appends one JSON line per call to `/var/log/qmcp-audit.log` (`root:qubes` `0660`, `O_APPEND` + `flock`); each line carries the sha256 of the previous, so any edit/delete/reorder breaks the chain (`verify()` + a `python3 qmcp_audit.py verify` CLI re-check it). The 8 state-changing wrappers route their single `emit()` funnel through `audit()` and log a whitelisted summary (qube names / property + feature keys / action) — never a property/feature value. Best-effort (never blocks an op); AI-unreachable by construction (no service reads the log; no policy line exposes it). Foundational before the tier model. No new RPC, no policy change. | built (offline-validated 41/41; pending hardware test) |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
@@ -600,7 +602,61 @@ Then verify from mcp-control:
 `deploy/uninstall-stage-I-1.sh` reverts (restore the pre-I-1 wrappers,
 then remove the helper).
 
-### Step 14 — Connect a client
+### Step 14 — (Optional) Deploy Stage I-2 for the dom0 audit log
+
+Stage I-2 adds a tamper-evident, AI-unreachable record of every
+state-changing `qmcp.*` call. A shared dom0 helper
+(`/etc/qubes-rpc/qmcp_audit.py`) appends one JSON line per call to
+`/var/log/qmcp-audit.log` (`root:qubes` `0660`, `O_APPEND` + `flock`); each
+line carries the sha256 of the previous line, so any deletion or edit
+breaks the chain. The 8 state-changing wrappers (Spawn / Clone /
+SpawnDisposable / SetProperty / SetFeature / Lifecycle / Attach /
+Detach) each route their single response funnel through `audit()`, so
+every call leaves exactly one chained line, and log only a whitelisted
+summary (qube names / property + feature keys / action) — never a
+property or feature value.
+
+The log is owned `root:qubes` `0660`: dom0 qrexec services run as a
+non-root user that is in the `qubes` group (it must be, to reach
+qubesd), so group-write is what lets the wrappers append — a `root:0600`
+log would be silently unwritable by them. The installer sets this
+ownership; the wrappers only append.
+
+Logging is **best-effort**: a failure never blocks or alters an
+operation. The log is **AI-unreachable by construction** — no `qmcp.*`
+service reads or writes an arbitrary dom0 path and no policy line
+exposes it, so an ai-managed qube can neither read past entries nor
+forge new ones (AI has no dom0 file access at all; the `qubes`-group
+write applies only to dom0-local processes, never to AI). I-2 does
+**not** add a new RPC service, change the qrexec policy, or restart the
+policy daemon.
+
+From dom0:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
+bash /tmp/install-I-2.sh mcp-control ~user/qubes_mcp/public
+```
+
+Inspect and verify the trail in dom0:
+
+```sh
+sudo tail -n 5 /var/log/qmcp-audit.log
+sudo python3 /etc/qubes-rpc/qmcp_audit.py verify     # walks the chain
+```
+
+Then check transparency from mcp-control (the log is unreadable from
+here by design — chain integrity is verified in dom0, above):
+
+```sh
+.venv/bin/python deploy/test-stage-I-2.py     # 3 PASS
+```
+
+`deploy/uninstall-stage-I-2.sh` removes the helper (safe — the hook is
+best-effort, so the wrappers keep working without it); `/tmp/run.sh
+revert` restores the pre-I-2 wrapper source too.
+
+### Step 15 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):

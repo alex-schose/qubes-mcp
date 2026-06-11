@@ -60,6 +60,16 @@ this directory.**
   cross-ref opacity. *(Visibility ≠ capability: a held capability — e.g. a
   future sign-only service — is not a name leak; it enumerates nothing it can
   act on.)*
+- **Audit trail (Stage I-2).** Every state-changing `qmcp.*` call is recorded
+  on a hash-chained, AI-unreachable dom0 log (`/var/log/qmcp-audit.log`,
+  `root:qubes` `0660`): each line carries the sha256 of the previous, so deletion or edit
+  breaks the chain. The log is unreachable by construction — no `qmcp.*`
+  service reads or writes an arbitrary dom0 path and no policy line exposes it,
+  so AI can neither read past entries nor forge new ones. Entries log a
+  whitelisted summary (qube names / property + feature keys / action) and
+  **never a property or feature value**. Logging is best-effort — it never
+  blocks or alters an operation (the Stage I-10 vault upgrades to a fail-closed
+  variant for `SignTransaction`).
 
 ## What lives where
 
@@ -202,6 +212,25 @@ I-1. Close the read-surface name leak (finding F-3, design §18.6).
     if the redactor can't load. The read-path sibling of the Stage
     F2 write-path cross-ref opacity. No new RPC service; no policy
     change; no new ring.
+I-2. dom0 audit log. A hash-chained, AI-unreachable record of every
+    state-changing qmcp.* call (Spawn / Clone / SpawnDisposable /
+    SetProperty / SetFeature / Lifecycle / Attach / Detach). A shared
+    dom0 helper (qmcp_audit.py, sibling-loaded like qmcp_budget /
+    qmcp_scope) appends one JSON line per call to
+    /var/log/qmcp-audit.log (root:qubes, 0660 — group-writable by the
+    non-root qrexec wrapper user; O_APPEND + flock); each line
+    carries the sha256 of the previous, so any edit / delete / reorder
+    breaks the chain (verify() walks it; a CLI re-checks it). Each
+    wrapper routes its single response funnel through audit() and logs
+    a WHITELISTED summary — qube names / property + feature KEYS /
+    action — never a property or feature VALUE. AI-unreachable by
+    construction: no qmcp.* service reads or writes an arbitrary dom0
+    path and no policy line exposes the log, so AI can neither read
+    past entries nor forge new ones. Logging is best-effort — it never
+    blocks or alters an operation (the I-10 vault upgrades it to a
+    fail-closed variant for SignTransaction). Foundational before the
+    tier model (I-3+). No new RPC service; no policy change; no new
+    ring; read wrappers are not logged.
 G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
@@ -215,11 +244,12 @@ boundary is binary — a qube tagged `ai-managed` gets every right
 the policy + wrappers grant; an untagged qube is invisible. That's
 necessary but not sufficient against a hallucinating or
 prompt-injected agent that destroys real data inside the boundary.
-Stage I adds *graduated* authority within `ai-managed`: resource
-tiers (I-0 cap-as-gate above; I-1..I-3 the tier model + helper +
-write-surface enforcement); an action gate (I-4..I-6) for
-per-call/per-blast-radius consent; per-trust-class source qubes
-(I-7); a sign-only secrets vault (I-8); persona presets (I-9). G
+Stage I adds *graduated* authority within `ai-managed`: read/audit
+hardening (I-0 cap-as-gate, I-1 read-surface leak fix, I-2 dom0
+audit log) then resource tiers (I-3..I-5 the tier model + helper +
+write-surface enforcement); an action gate (I-6..I-8) for
+per-call/per-blast-radius consent; a per-trust-class principal axis
+(I-9); a sign-only secrets vault (I-10); persona presets (I-11). G
 and H both depend on a non-binary trust model: G's mcp-control
 lockdown becomes meaningfully different per-tier, and H's
 HTTP/SSE-over-Tor reach requires the explicit dom0 gate-lift the
@@ -306,8 +336,10 @@ qubes_mcp/                          # repo root
 │   ├── qmcp.GetPoolStats             # Stage F3
 │   ├── qmcp_budget.py                # Stage I-0 — shared cap-gate helper
 │                                      # loaded by Spawn/Clone/SpawnDisposable
-│   └── qmcp_scope.py                 # Stage I-1 — shared read-scope redactor
+│   ├── qmcp_scope.py                 # Stage I-1 — shared read-scope redactor
 │                                      # loaded by GetProperty/List
+│   └── qmcp_audit.py                 # Stage I-2 — shared hash-chained audit log
+│                                      # loaded by the 8 state-changing wrappers
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -344,7 +376,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-I-0.py
     ├── install-stage-I-1.sh
     ├── uninstall-stage-I-1.sh
-    └── test-stage-I-1.py
+    ├── test-stage-I-1.py
+    ├── install-stage-I-2.sh
+    ├── uninstall-stage-I-2.sh
+    └── test-stage-I-2.py
 ```
 
 ## Operating protocol
@@ -621,7 +656,7 @@ qubes_mcp/                          # repo root
   missing all fail-closed, cross-ref-before-cap ordering
   preserved across all three wrappers.
 
-- **Stage I-1 — built; pending hardware test + ship decision.**
+- **Stage I-1 — DONE (tested); shipped to public `origin/main` `5f67c8b`.**
   Closes finding F-3 (read-surface name leak, design §18.6). The two
   read wrappers (`qmcp.GetPropertyAIManaged`, `qmcp.ListAIManagedQubes`)
   now route every VM-valued result through a shared dom0 redactor
@@ -636,9 +671,42 @@ qubes_mcp/                          # repo root
   rather than fall back to leaking. No new RPC service; no policy
   change; no daemon restart; no new ring — the read-path sibling of the
   Stage F2 write-path cross-ref opacity. Offline validation (mocked
-  qubesadmin, 30 checks) green; hardware test plan in
-  `deploy/test-stage-I-1.py` (round-trip invariant: no name a read
-  surface emits is one a direct lookup denies).
+  qubesadmin, 30 checks) green; hardware verified 5/5
+  (`deploy/test-stage-I-1.py` — round-trip invariant: no name a read
+  surface emits is one a direct lookup denies). Shipped to public as a
+  `fix:` (it hardens already-public Stage A/C reads).
+
+- **Stage I-2 — built; pending hardware test (stages privately).** Adds a
+  hash-chained, AI-unreachable dom0 audit log of every state-changing
+  `qmcp.*` call. A shared dom0 helper (`qmcp_audit.py`, sibling-loaded
+  like `qmcp_budget`/`qmcp_scope`) exposes `audit(service, args_summary,
+  ok, error)`, which appends one JSON line per call to
+  `/var/log/qmcp-audit.log` (`root:qubes` `0660` — group-writable by the
+  non-root qrexec wrapper user; `O_APPEND` + `flock`); each
+  line carries the sha256 of the previous line and of its own canonical
+  body, so any edit / delete / reorder / insert breaks the chain.
+  `verify()` walks the chain from a fixed GENESIS anchor;
+  `python3 qmcp_audit.py verify [path]` is the CLI. The 8 state-changing
+  wrappers (Spawn / Clone / SpawnDisposable / SetProperty / SetFeature /
+  Lifecycle / Attach / Detach) each route their single response funnel
+  (`emit()`) through `audit()`, so every call leaves exactly one chained
+  line, and build the logged summary from a WHITELIST of structural
+  fields (qube names / property + feature keys / action / klass / device
+  port) — property and feature VALUES are never logged, by construction.
+  Logging is best-effort: a failure (helper missing, log unwritable)
+  never blocks or alters the operation — guarded in both `audit()` and
+  each wrapper's `emit()`. The log is AI-unreachable by construction: no
+  `qmcp.*` reads or writes an arbitrary dom0 path and no policy line
+  exposes it, so AI can neither read past entries nor forge new ones
+  (read wrappers are not logged — noise). No new RPC service; no policy
+  change; no daemon restart; no new ring. Foundational before the tier
+  model (I-3+); the I-10 vault upgrades this to a fail-closed variant
+  for `SignTransaction`. Offline validation (mocked qubesadmin, 41
+  checks — chain + every tamper mode + the no-value-leak invariant +
+  best-effort) green; `deploy/test-stage-I-2.py` checks AI-side
+  transparency + the absence of any audit-read surface from mcp-control,
+  while chain integrity is verified in dom0 (the log is AI-unreachable
+  by design, so mcp-control cannot read it).
 
 - **Stages G and H — designed, deferred until Stage I completes.**
   Per the 2026-06-08 reordering (see the Stage rollout block above),
@@ -651,17 +719,16 @@ qubes_mcp/                          # repo root
 
 - **Stage I — in progress.** Graduated authority within `ai-managed`,
   decomposed into sub-stages I-0..I-11 across three waves (full map in
-  the design docs). Wave 1 is the resource axis plus read/audit
-  hardening, backward-compatible by design. **I-0 done** (pool cap
-  promoted to a hard create-gate). **I-1 built** (above) — closes the
-  F-3 read-surface name leak. **I-2 next** — a hash-chained,
-  AI-unreachable dom0 audit log of every state-changing call
-  (foundational before the tier model; mandatory before the later
-  vault's SignTransaction). The tier taxonomy + resolution helper
-  (formerly numbered "I-1") is now **I-3**, where the least-privilege
-  flip lands after the operator tiers the fleet. Wave 2 is the action
-  gate + consent GUI; Wave 3 is the principal axis, secrets vault, and
-  persona presets.
+  the design docs). Wave 1 is read/audit hardening then the resource
+  axis, backward-compatible by design. **I-0 done** (pool cap promoted
+  to a hard create-gate) and **I-1 done** (F-3 read-surface leak closed)
+  — both shipped to public as fixes. **I-2 built** (above) — the
+  hash-chained, AI-unreachable dom0 audit log; foundational before the
+  tier model and mandatory before the later vault's `SignTransaction`.
+  **I-3 next** — the tier taxonomy + resolution helper, where the
+  least-privilege flip lands after the operator tiers the fleet. Wave 2
+  (I-6..I-8) is the action gate + consent GUI; Wave 3 (I-9..I-11) is the
+  principal axis, secrets vault, and persona presets.
 
 ## References
 

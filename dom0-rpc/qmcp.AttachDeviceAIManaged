@@ -42,7 +42,50 @@ ALLOWED_CLASSES = {"block", "usb", "mic"}
 NOT_FOUND = {"ok": False, "error": "not found"}
 
 
+_AUDIT_SERVICE = "qmcp.AttachDeviceAIManaged"
+#: Request-derived, whitelisted call summary (qube names / keys / actions
+#: only — never a property/feature *value*). main() fills it in; emit()
+#: hands it to the audit trail. Built by whitelist so a value field can
+#: never leak into the log by omission.
+_audit_summary: dict = {}
+
+
+def _load_audit_lib():
+    """Load the sibling qmcp_audit helper by path (Stage I-2).
+
+    Same sibling-import shim as qmcp_budget / qmcp_scope. Returns None on
+    any failure — auditing is strictly best-effort and must never block
+    or break the wrapped operation (STAGE-I-BUILD-PLAN.md §4 I-2).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_audit", os.path.join(here, "qmcp_audit.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_AUDIT = _load_audit_lib()
+
+
 def emit(payload: dict) -> int:
+    # Stage I-2: record this state-changing call on the hash-chained dom0
+    # audit trail before responding. Best-effort and defensively guarded
+    # so an audit failure can never change what AI sees or whether the
+    # operation ran (qmcp_audit.audit is itself non-raising; the guard is
+    # belt-and-suspenders at the security boundary).
+    if _AUDIT is not None:
+        try:
+            _AUDIT.audit(_AUDIT_SERVICE, _audit_summary,
+                         bool(payload.get("ok")), payload.get("error"))
+        except Exception:
+            pass
     print(json.dumps(payload))
     return 0 if payload.get("ok") else 1
 
@@ -66,6 +109,10 @@ def main() -> int:
     device_id = req.get("device_id", "")
     frontend = req.get("frontend", "")
     options = req.get("options") or {}
+    # Whitelist: structural identifiers only. `options` is not logged (it
+    # is a free-form key/value map the audit log need not retain).
+    _audit_summary.update({"device_class": device_class, "backend": backend,
+                           "frontend": frontend, "device_id": device_id})
 
     if device_class not in ALLOWED_CLASSES:
         return emit({"ok": False,
