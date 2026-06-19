@@ -41,6 +41,29 @@ _RING_BUDGETS: dict[Ring, int | None] = {
 }
 
 
+# Stage I-3: the resource tier each ring characteristically requires — the
+# minimum elevation tag (design §3.1 taxonomy) a qube must carry for the ring's
+# write surface. DECLARATIVE / DEVELOPER-UX ONLY. This is NOT a security
+# boundary: the Ring layer runs inside mcp-control (the untrusted side), so an
+# injected agent controlling this process bypasses it (design §4.1). The
+# authoritative tier check is the dom0 helper `dom0-rpc/qmcp_tier.py`, sourced
+# by the wrappers in Stage I-5. Two rings span tiers (their reads sit at the
+# `ai-ro` floor while their writes need the tag below): NETWORK's firewall.Get
+# and DEVICE's device-list are read-floor; the value here names each ring's
+# write requirement. Kept here, beside `_RING_BUDGETS`, so the per-ring
+# vocabulary carries its tier annotation for a future operator-facing config.
+_RING_MIN_TIER: dict[Ring, str] = {
+    Ring.READ_ONLY: "ai-ro",      # reads — the umbrella floor
+    Ring.LIFECYCLE: "ai-full",    # spawn / props_set / start / shutdown / remove
+    Ring.EXEC:      "ai-exec",    # RunInAIManaged / CopyToAIManaged / install_pkg
+    Ring.NETWORK:   "ai-net",     # firewall.Set/Reload (firewall.Get is ai-ro)
+    Ring.CLONE:     "ai-full",    # CloneAIManagedQube
+    Ring.DEVICE:    "ai-full",    # Attach/Detach (device-list is ai-ro)
+    Ring.FEATURE:   "ai-full",    # SetFeatureAIManaged
+    Ring.EVENTS:    "ai-ro",      # AIManagedEvents — a filtered read
+}
+
+
 mcp = FastMCP("qubes")
 
 

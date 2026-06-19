@@ -51,11 +51,19 @@ from __future__ import annotations
 #: qube and (after a fail-closed error) an unreadable one collapse to it.
 OUT_OF_SCOPE = "<out-of-scope>"
 
-#: Tags AI is allowed to observe on an ai-managed qube. Everything else
-#: (operator tags like `created-by-dom0`, and — once they exist — the
-#: I-3 tier tags AI must not be able to read off itself) is filtered out.
-#: I-3 extends this set with the tier vocabulary it introduces; until then
-#: every visible qube reports exactly `["ai-managed"]`.
+#: Tags AI is allowed to OBSERVE on an ai-managed qube. Everything else is
+#: filtered out: operator tags (e.g. `created-by-dom0`) and — the decision
+#: I-3 settles — the tier tags (`ai-exec`/`ai-net`/`ai-full`/`ai-dump`). This
+#: set is deliberately DISJOINT from the tier model's own namespace
+#: (`qmcp_tier.QMCP_TIER_TAGS`) except for the umbrella: tiers are ENFORCED off
+#: those tags in dom0 but never READ back by AI, so a `tags` read stays
+#: `["ai-managed"]` and the authority topology is not an AI-readable oracle.
+#: (Keystone invariant 2 already forbids AI MUTATING tags; this forbids AI
+#: reading the tier ones — knowing the fleet's tier map is recon an injected
+#: agent has no need for, and capability is discovered through opaque refusals,
+#: not a tag read.) So `QMCP_TAG_VOCABULARY` stays `{ai-managed}`: the I-1
+#: fail-closed filter (only listed tags pass) means the tier tags are hidden
+#: the moment they exist, with no change here.
 QMCP_TAG_VOCABULARY = frozenset({"ai-managed"})
 
 

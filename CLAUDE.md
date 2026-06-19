@@ -70,6 +70,33 @@ this directory.**
   **never a property or feature value**. Logging is best-effort — it never
   blocks or alters an operation (the Stage I-10 vault upgrades to a fail-closed
   variant for `SignTransaction`).
+- **Resource tiers (Stage I-3 — taxonomy landed; enforcement I-4/I-5).** The
+  binary boundary graduates into a tier ladder *within* `ai-managed` so a
+  hallucinating or prompt-injected agent need not hold full lifecycle authority
+  on every qube it can see. The taxonomy is umbrella + at most one elevation tag:
+  - `ai-managed` — umbrella: existence boundary **and** the read floor (= `ai-ro`).
+  - `ai-exec` — `+` run commands (`RunInAIManaged`/`CopyToAIManaged`/install-pkg).
+  - `ai-net` — `+` firewall write (`firewall.Set`/`Reload`).
+  - `ai-full` — `+` lifecycle / property-set / clone / spawn / feature / attach / detach.
+  - `ai-dump` — copy-IN only, a write-only sink (the Biba valve); **orthogonal**
+    to the ladder and **not** `ai-managed`, so it is invisible to reads.
+
+  The ladder is **cumulative** (`ai-net` ⊃ `ai-exec` ⊃ read floor): capabilities
+  nest, since anyone who may rewrite a qube's firewall may already run commands
+  in it. A genuine non-ladder capability is expressed as a separate orthogonal
+  tag (as `ai-dump` is), not by exploding every qube's tag set. **AI still cannot
+  mutate tags** (`admin.vm.tag.Set/Remove` denied) — tiers are operator-assigned,
+  the keystone that makes them un-self-escalatable — **and cannot read the tier
+  tags either**: a `tags` read stays `["ai-managed"]`, so the fleet's authority
+  topology is not an AI-readable oracle (capability is discovered through opaque
+  refusals, not a tag read). The resolver is a dom0 helper (`qmcp_tier.py`,
+  sibling-loaded like `qmcp_budget`/`qmcp_scope`/`qmcp_audit`) returning a
+  **capability set** — so the wrappers ask "is `full` granted?", decoupled from
+  the taxonomy. **Migration is two reversible phases (design §3.3):** I-3..I-5
+  ship in **compat** (an untiered `ai-managed` qube = `ai-full`, i.e. today's
+  boundary exactly), enforcement lands in I-4/I-5, then the operator tiers the
+  fleet and flips the dom0 flag `/etc/qmcp/tier-default` to `ro` for
+  least-privilege. No intermediate state is less safe than today.
 
 ## What lives where
 
@@ -231,6 +258,30 @@ I-2. dom0 audit log. A hash-chained, AI-unreachable record of every
     fail-closed variant for SignTransaction). Foundational before the
     tier model (I-3+). No new RPC service; no policy change; no new
     ring; read wrappers are not logged.
+I-3. Tier taxonomy + dom0 tier-resolution helper. The keystone of the
+    resource axis: the binary boundary graduates into a tier ladder
+    within ai-managed — ai-managed (umbrella + read floor) < ai-exec
+    (+commands) < ai-net (+firewall write) < ai-full (+lifecycle/
+    property/clone/spawn/feature/attach/detach); ai-dump is an
+    orthogonal copy-IN-only sink. The ladder is cumulative (net⊃exec):
+    capabilities nest, and a genuine non-ladder need is a separate
+    orthogonal tag, not a per-qube tag explosion. A new shared dom0
+    helper (qmcp_tier.py, sibling-loaded like qmcp_budget/qmcp_scope/
+    qmcp_audit) exposes effective_capabilities(vm) -> frozenset of
+    capability tokens; callers ask "is full granted?" so the resolver's
+    SET interface decouples the wrappers from the taxonomy (a future
+    non-ladder model swaps the helper internals, not the call sites).
+    BEHAVIOUR-NEUTRAL: the helper installs inert (no wrapper sources it
+    until I-5) in COMPAT mode — an untiered ai-managed qube resolves to
+    ai-full, exactly today's boundary, so every A–F3 surface is
+    unchanged. AI cannot mutate tags (keystone, unchanged) NOR read the
+    tier tags: a tags read stays ["ai-managed"], so the authority
+    topology is not an AI oracle. Migration is two reversible phases
+    (design §3.3): ship I-3..I-5 in compat; enforce in I-4/I-5; then the
+    operator tiers the fleet and flips the dom0 flag /etc/qmcp/
+    tier-default to "ro" for least privilege. The Ring enum gains a
+    declarative tier annotation (UX only — enforcement is dom0, §4.1).
+    No new RPC service; no policy change; no daemon restart; no new ring.
 G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
@@ -338,8 +389,10 @@ qubes_mcp/                          # repo root
 │                                      # loaded by Spawn/Clone/SpawnDisposable
 │   ├── qmcp_scope.py                 # Stage I-1 — shared read-scope redactor
 │                                      # loaded by GetProperty/List
-│   └── qmcp_audit.py                 # Stage I-2 — shared hash-chained audit log
+│   ├── qmcp_audit.py                 # Stage I-2 — shared hash-chained audit log
 │                                      # loaded by the 8 state-changing wrappers
+│   └── qmcp_tier.py                  # Stage I-3 — shared tier-resolution helper
+│                                      # (inert until I-5 sources it in the wrappers)
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -379,7 +432,10 @@ qubes_mcp/                          # repo root
     ├── test-stage-I-1.py
     ├── install-stage-I-2.sh
     ├── uninstall-stage-I-2.sh
-    └── test-stage-I-2.py
+    ├── test-stage-I-2.py
+    ├── install-stage-I-3.sh
+    ├── uninstall-stage-I-3.sh
+    └── test-stage-I-3.py
 ```
 
 ## Operating protocol
@@ -676,7 +732,7 @@ qubes_mcp/                          # repo root
   surface emits is one a direct lookup denies). Shipped to public as a
   `fix:` (it hardens already-public Stage A/C reads).
 
-- **Stage I-2 — built; pending hardware test (stages privately).** Adds a
+- **Stage I-2 — DONE (tested); committed to `stage-I-wave-1`, not pushed.** Adds a
   hash-chained, AI-unreachable dom0 audit log of every state-changing
   `qmcp.*` call. A shared dom0 helper (`qmcp_audit.py`, sibling-loaded
   like `qmcp_budget`/`qmcp_scope`) exposes `audit(service, args_summary,
@@ -708,6 +764,34 @@ qubes_mcp/                          # repo root
   while chain integrity is verified in dom0 (the log is AI-unreachable
   by design, so mcp-control cannot read it).
 
+- **Stage I-3 — DONE (tested); on `stage-I-wave-1`, not pushed.** The keystone
+  of the resource axis. Introduces the tier taxonomy (umbrella + at most one
+  elevation tag: `ai-managed` read floor < `ai-exec` < `ai-net` < `ai-full`,
+  cumulative; `ai-dump` an orthogonal copy-IN-only sink) and a shared dom0
+  tier-resolution helper (`qmcp_tier.py`, sibling-loaded like `qmcp_budget`/
+  `qmcp_scope`/`qmcp_audit`). The helper's public entry point
+  `effective_capabilities(vm)` returns a **frozenset of capability tokens**,
+  not a tier rank, so the wrappers ask `CAP_FULL in caps` and stay decoupled
+  from the taxonomy (a future non-ladder model swaps the helper internals, not
+  the call sites). **BEHAVIOUR-NEUTRAL:** the helper ships **inert** — no
+  wrapper sources it yet (that is I-5) and no policy line changed — in **compat**
+  mode: with the operator flag `/etc/qmcp/tier-default` absent, an untiered
+  `ai-managed` qube resolves to `ai-full`, i.e. exactly today's binary boundary,
+  so every A–F3 surface is unchanged (verified by construction — no wrapper/
+  policy diff). AI cannot mutate tags (keystone, unchanged) NOR read the tier
+  tags — `tags` reads stay `["ai-managed"]`, so the authority topology is not an
+  AI oracle (the tier vocabulary is kept out of `qmcp_scope`'s AI-observable
+  set). The `Ring` enum gains a declarative tier annotation (`_RING_MIN_TIER`,
+  UX only — enforcement is dom0, design §4.1). Migration is two reversible
+  phases (design §3.3): ship I-3..I-5 in compat; enforce in I-4/I-5; then the
+  operator tiers the fleet and writes `ro` to the flag for least privilege.
+  Offline validation (mocked qubesadmin, **40 checks** — ladder, the cumulative
+  net⊃exec invariant, highest-wins, the two-phase flip, fail-closed, and the
+  no-topology-leak cross-check) green; `deploy/test-stage-I-3.py` proves the
+  AI-side invariants on hardware (**3/3** — tier tags not readable, reads
+  behaviour-neutral, no AI-facing tier surface). No new RPC service; no policy
+  change; no daemon restart; no new ring.
+
 - **Stages G and H — designed, deferred until Stage I completes.**
   Per the 2026-06-08 reordering (see the Stage rollout block above),
   Stage I (graduated authority within `ai-managed`) jumps ahead of
@@ -722,11 +806,14 @@ qubes_mcp/                          # repo root
   the design docs). Wave 1 is read/audit hardening then the resource
   axis, backward-compatible by design. **I-0 done** (pool cap promoted
   to a hard create-gate) and **I-1 done** (F-3 read-surface leak closed)
-  — both shipped to public as fixes. **I-2 built** (above) — the
-  hash-chained, AI-unreachable dom0 audit log; foundational before the
-  tier model and mandatory before the later vault's `SignTransaction`.
-  **I-3 next** — the tier taxonomy + resolution helper, where the
-  least-privilege flip lands after the operator tiers the fleet. Wave 2
+  — both shipped to public as fixes. **I-2 done** — the hash-chained,
+  AI-unreachable dom0 audit log; foundational before the tier model and
+  mandatory before the later vault's `SignTransaction`. **I-3 done**
+  (above) — the tier taxonomy + resolution helper, landed inert in compat
+  mode (behaviour-neutral). **I-4 next** — apply tiers to the policy-scoped
+  surfaces (reads / firewall / device-list), the first enforcement step;
+  then I-5 (wrapper surfaces + the least-privilege flip after the operator
+  tiers the fleet). Wave 2
   (I-6..I-8) is the action gate + consent GUI; Wave 3 (I-9..I-11) is the
   principal axis, secrets vault, and persona presets.
 
