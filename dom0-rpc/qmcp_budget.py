@@ -1,76 +1,90 @@
 """qmcp_budget — shared dom0 helper for the AI-scoped disk-budget gate.
 
-Stage I-0. The F3 pool cap (`/etc/qmcp/pool-cap`) was advisory: AI could
-read `(used, cap, headroom)` via `qmcp.GetPoolStats` and was expected to
-self-throttle. A hallucinating or prompt-injected agent could ignore the
-signal and spawn past the budget (design §18.3, F-1). I-0 promotes the
-cap to a hard gate by calling `check_cap_for_create()` from every create
-wrapper *before* it invokes the Admin API.
+Stage I-0 introduced the gate; the 2026-06-12 accounting correction (this
+version) changes WHAT it counts. The original gate summed `vol.size`
+(provisioned / max) across EVERY volume of every ai-managed qube — root,
+private, volatile alike. Measured against real on-disk usage that over-counted
+~8x (slot-53 on hardware): an AppVM's `root` is a COW snapshot of its template
+(real persistent delta ~0) and `volatile` is ephemeral (destroyed on shutdown),
+yet both were charged at full provisioned size. Two scratch qubes could exhaust
+a 120 GiB cap while really using <1 GiB.
 
-Trust posture mirrors F3 exactly:
-  - Cap source is the same operator-owned config file
-    (`/etc/qmcp/pool-cap`, re-read per call, no daemon restart).
-  - `used` is summed the same way (sum of `vol.size` across every
-    volume of every ai-managed qube — provisioned bytes, not on-disk).
-  - Missing/malformed cap → opaque "pool cap not configured" (fail
-    closed; F3's install seeds the cap, so the unconfigured state is
-    a deliberate operator action).
-  - Over-cap → opaque "pool cap exceeded"; no numbers echoed. AI can
-    call `qmcp.GetPoolStats` for the diagnostic triple if it wants —
-    we leak nothing new on top of what that surface already provides.
+The corrected basis counts only the PERSISTENT footprint:
 
-The new-qube estimate is the conservative one: the *full* provisioned
-size of the template/source (root + private + volatile + anything
-else `vm.volumes` enumerates), not just `private.size`. Root provisioned
-bytes already count against F3's `used`, so estimating only private
-would under-count and let AI slip past the cap. Some volumes are
-COW-shared with the template on disk; we still count them because
-F3's `used` does, and the estimate must speak the same language as
-the budget it is gated against.
+  - `private` (always) — /home + /rw, the only volume that accumulates real
+    persistent bytes for a template-based qube.
+  - `root` ONLY for klasses whose root persists — TemplateVM and StandaloneVM.
+    An AppVM / DispVM / DispVMTemplate root is COW from its template and is NOT
+    counted (real persistent delta ~0; slot-53 measured a live AppVM root at
+    0.00 GiB).
+  - `volatile` is never counted (ephemeral; reclaimed on shutdown; slot-53
+    measured 0.02 GiB on a running qube vs 10 GiB provisioned).
 
-Loaded by the wrappers via `importlib.util.spec_from_file_location`
-using a path derived from `__file__`, so the same code runs in dom0
-(`/etc/qubes-rpc/qmcp_budget.py`) and in offline-validation tests on
-mcp-control (`public/dom0-rpc/qmcp_budget.py`) without any sys.path
-or PYTHONPATH dependency.
+Because a volume cannot exceed its own `size`, summing provisioned
+`private.size` (+ persistent `root.size`) and capping the sum is a HARD ceiling
+on real persistent usage: real ≤ Σ size ≤ cap. The gate stays provisioned-based
+(stable and predictable for AI) but drops the volumes that don't persist, so the
+ceiling tracks reality instead of 8x-inflating it.
 
-Why sibling-import instead of an installed package: Qubes' own
-`/etc/qubes-rpc/` scripts (qubes.GetDate, admin.vm.Console) and the
-qubesadmin client tools (qvm-run, etc.) are self-contained — shared
-infrastructure is consumed via the globally installed `qubesadmin`
-package, and no qubes-rpc script sibling-imports another. We deviate
-from that convention because our deployment is a tarball + slot
-runner, not an RPM, so installing a shared Python module under
-`/usr/lib/python3/dist-packages/` per slot adds packaging overhead
-(spec files, dist-packages path drift across Qubes releases)
-disproportionate to a ~150-line helper. The trade-off is recorded
-as reviewer ask #12 in `public/README.md` so a Qubes reviewer can
-flag a better long-term answer (most likely: graduate to a tiny
-`qubes-mcp-helpers` RPM once the helper count crosses ~300 shared
-lines or ~3 distinct helpers, projected at Stage I-3 or so).
+Two operator-owned config files (both re-read per call, no daemon restart — the
+F3 `/etc/qmcp/pool-cap` pattern):
+  - `/etc/qmcp/pool-cap`     — the global cap (Σ persistent ≤ this).
+  - `/etc/qmcp/private-cap`  — the per-qube `private.size` ceiling P. A spawn may
+    request a larger private than the 2 GiB default, up to P; a request above P
+    is refused. This bounds any single qube's blast radius and lets AI spawn big
+    qubes *under the limit*.
+
+Trust posture mirrors F3 / I-0 exactly:
+  - Caps are operator-owned files AI cannot touch.
+  - Over-cap / over-P / missing-cap collapse to opaque messages; no numbers
+    echoed (AI can call `qmcp.GetPoolStats` for its `(used, cap, headroom)`).
+  - The new-qube estimate is conservative: a spawn counts the requested private
+    (clamped up to the 2 GiB default floor); a clone counts the source's full
+    persistent footprint (it copies those volumes).
+
+Loaded by the wrappers via `importlib.util.spec_from_file_location` using a path
+derived from `__file__`, so the same code runs in dom0
+(`/etc/qubes-rpc/qmcp_budget.py`) and in offline-validation on mcp-control
+(`public/dom0-rpc/qmcp_budget.py`) without any sys.path dependency.
+`qmcp.GetPoolStats` imports `sum_ai_managed_persistent_bytes` from here so the
+read surface and the gate can never drift (the F3 self-contained copy is gone —
+the klass-aware sum is too easy to duplicate wrong). Sibling-import rationale
+(deviation from Qubes' self-contained-rpc-script convention) is reviewer ask
+#12 in `public/README.md`.
 """
 from __future__ import annotations
 
 CAP_PATH = "/etc/qmcp/pool-cap"
+PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
+
+#: Default private size assumed for a spawn that doesn't request one — the Qubes
+#: default a new AppVM/DispVM receives (2 GiB). Also the floor the estimate
+#: clamps up to, since Qubes cannot shrink a volume below its created size, so a
+#: sub-default request still yields a default-sized private.
+DEFAULT_PRIVATE_BYTES = 2 * 1024 ** 3
+
+#: Klasses whose `root` volume persists real bytes (installed software /
+#: standalone disk) and therefore counts toward the budget. Every klass AI can
+#: create (AppVM, DispVM, DispVMTemplate) has a COW root and is absent here.
+PERSISTENT_ROOT_KLASSES = frozenset({"TemplateVM", "StandaloneVM"})
 
 ERR_CAP_MISSING = "pool cap not configured"
 ERR_CAP_EXCEEDED = "pool cap exceeded"
 ERR_STATS_UNAVAILABLE = "pool stats unavailable"
+ERR_PRIVATE_CAP_MISSING = "private cap not configured"
+ERR_PRIVATE_TOO_LARGE = "private size exceeds per-qube limit"
 
 
-def read_cap() -> int | None:
-    """Read the operator-set cap as integer bytes.
+def _read_int_file(path: str) -> int | None:
+    """Read a single non-negative integer (bytes) from an operator config file.
 
-    Returns None on any failure (missing file, parse error, negative
-    value). Callers must convert None into the opaque
-    ERR_CAP_MISSING message — never leak path or parse details to AI.
-
-    Format mirrors F3's: a single integer on the first line, optional
-    `# comment` trailer for operator legibility:
-        53687091200  # 50 GiB
+    Format mirrors F3's: an integer on the first line, optional `# comment`:
+        96636764160  # 90 GiB
+    Returns None on any failure (missing file, parse error, negative) — callers
+    convert None into the opaque "not configured" message, never leaking detail.
     """
     try:
-        with open(CAP_PATH, "r") as f:
+        with open(path, "r") as f:
             raw = f.read().strip()
         head = raw.split("#", 1)[0].strip()
         n = int(head)
@@ -81,13 +95,54 @@ def read_cap() -> int | None:
         return None
 
 
-def sum_ai_managed_volume_bytes(app) -> int:
-    """Sum vol.size across every volume of every ai-managed qube.
+def read_cap() -> int | None:
+    """The global pool cap (Σ persistent ≤ this)."""
+    return _read_int_file(CAP_PATH)
 
-    Byte-identical semantics to qmcp.GetPoolStats's
-    sum_ai_managed_volume_bytes — the gate and the read surface must
-    measure the same thing so AI's view of (used, cap, headroom)
-    predicts the gate's behaviour exactly.
+
+def read_private_cap() -> int | None:
+    """The per-qube private.size ceiling P."""
+    return _read_int_file(PRIVATE_CAP_PATH)
+
+
+def _vol_size(volumes, name: str) -> int:
+    try:
+        vol = volumes[name]
+    except Exception:
+        return 0
+    try:
+        return int(vol.size or 0)
+    except Exception:
+        return 0
+
+
+def persistent_bytes(vm) -> int:
+    """The persistent provisioned footprint of one qube.
+
+    `private.size` always, plus `root.size` only when the klass's root persists
+    (TemplateVM / StandaloneVM). `volatile` is never counted. Fail-safe: any
+    access error contributes 0 for that piece rather than aborting the sum.
+    """
+    try:
+        volumes = vm.volumes
+    except Exception:
+        return 0
+    total = _vol_size(volumes, "private")
+    try:
+        klass = vm.klass
+    except Exception:
+        klass = None
+    if klass in PERSISTENT_ROOT_KLASSES:
+        total += _vol_size(volumes, "root")
+    return total
+
+
+def sum_ai_managed_persistent_bytes(app) -> int:
+    """Σ `persistent_bytes` over every ai-managed qube.
+
+    `qmcp.GetPoolStats` imports and calls this exact function, so AI's
+    `(used, cap, headroom)` view predicts the gate's behaviour byte-for-byte —
+    a single source of truth, no duplicated klass-aware logic to drift.
     """
     total = 0
     for vm in app.domains:
@@ -97,71 +152,79 @@ def sum_ai_managed_volume_bytes(app) -> int:
             continue
         if "ai-managed" not in tags:
             continue
-        try:
-            volumes = vm.volumes
-        except Exception:
-            continue
-        for vol in volumes.values():
-            try:
-                size = int(vol.size or 0)
-            except Exception:
-                size = 0
-            total += size
+        total += persistent_bytes(vm)
     return total
 
 
-def estimate_new_qube_bytes(src_vm) -> int:
-    """Estimate provisioned bytes a new qube will consume.
+def estimate_spawn_bytes(requested_private: int | None) -> int:
+    """Persistent footprint a spawn / disposable will add: just the new qube's
+    private. The new qube's root is COW from its template (real persistent
+    delta ~0), so it is not counted — matching `sum_ai_managed_persistent_bytes`.
 
-    `src_vm` is the template (AppVM/DispVMTemplate/DispVM spawn,
-    SpawnDisposable) or the source (clone) — in both cases the new
-    qube's volumes inherit from this VM, so its full vol.size sum is
-    the conservative estimate.
-
-    Any access error returns 0 for that volume rather than aborting;
-    a wrapper that can't enumerate the source's volumes will under-
-    count the estimate (looser gate) but never refuse a legitimate
-    create on a bookkeeping error. The cap itself is the floor on
-    misbehaviour, not this estimate.
+    Clamped up to the default floor: a fresh qube's private is at least the
+    Qubes default, and Qubes cannot shrink it below that, so charging less than
+    the default would under-count what the qube actually gets.
     """
-    total = 0
-    try:
-        volumes = src_vm.volumes
-    except Exception:
-        return 0
-    for vol in volumes.values():
-        try:
-            size = int(vol.size or 0)
-        except Exception:
-            size = 0
-        total += size
-    return total
+    if requested_private is None:
+        return DEFAULT_PRIVATE_BYTES
+    return max(int(requested_private), DEFAULT_PRIVATE_BYTES)
 
 
-def check_cap_for_create(app, src_vm) -> str | None:
-    """The gate. Return None to allow the create, error string to refuse.
+def estimate_clone_bytes(src_vm) -> int:
+    """Persistent footprint a clone will add: the source's full persistent
+    footprint. A clone copies the source's volumes, so cloning a template
+    persists its root too (`persistent_bytes` already encodes the klass rule)."""
+    return persistent_bytes(src_vm)
+
+
+def check_private_size(requested_private: int | None) -> str | None:
+    """Refuse a spawn whose requested `private.size` exceeds the per-qube cap P.
+
+    None when no size was requested (the default is always within P) or the
+    request is within P. Fail-closed (`ERR_PRIVATE_CAP_MISSING`) if P is
+    unconfigured — the install seeds it, so an absent P is a deliberate
+    operator action, like the pool cap.
+    """
+    if requested_private is None:
+        return None
+    p = read_private_cap()
+    if p is None:
+        return ERR_PRIVATE_CAP_MISSING
+    if int(requested_private) > p:
+        return ERR_PRIVATE_TOO_LARGE
+    return None
+
+
+def check_cap_for_create(app, src_vm, requested_private: int | None = None,
+                         is_clone: bool = False) -> str | None:
+    """The global gate. Return None to allow the create, error string to refuse.
 
     Refuses iff:
-      - cap is missing/malformed (fail-closed; ERR_CAP_MISSING)
-      - current ai-managed provisioned sum can't be computed
-        (ERR_STATS_UNAVAILABLE; conservative — refuse rather than
-        allow a create we can't budget against)
-      - projected = used + estimate > cap (ERR_CAP_EXCEEDED)
+      - cap missing/malformed (fail-closed; ERR_CAP_MISSING)
+      - the current persistent sum can't be computed (ERR_STATS_UNAVAILABLE;
+        conservative — refuse rather than budget against an unknown)
+      - projected = used + estimate > cap (ERR_CAP_EXCEEDED; strict — equality
+        is allowed, the cap is the ceiling AI may reach but not exceed)
 
-    Note `projected > cap`, strict — equality is allowed (the cap is
-    the ceiling AI may reach but not exceed).
+    The estimate is the source's persistent footprint for a clone, else the
+    spawn's requested-or-default private. The per-qube `private` clamp is a
+    separate check (`check_private_size`), which Spawn runs first.
     """
     cap = read_cap()
     if cap is None:
         return ERR_CAP_MISSING
 
     try:
-        used = sum_ai_managed_volume_bytes(app)
+        used = sum_ai_managed_persistent_bytes(app)
     except Exception:
         return ERR_STATS_UNAVAILABLE
 
-    estimated_new = estimate_new_qube_bytes(src_vm)
-    if used + estimated_new > cap:
+    if is_clone:
+        estimate = estimate_clone_bytes(src_vm)
+    else:
+        estimate = estimate_spawn_bytes(requested_private)
+
+    if used + estimate > cap:
         return ERR_CAP_EXCEEDED
 
     return None

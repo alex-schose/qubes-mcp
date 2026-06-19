@@ -33,6 +33,8 @@ STAGE_DIR="/tmp/qubes-mcp-stage-f3"
 CAP_DIR="/etc/qmcp"
 CAP_FILE="$CAP_DIR/pool-cap"
 DEFAULT_CAP_BYTES="53687091200"  # 50 GiB
+PRIVATE_CAP_FILE="$CAP_DIR/private-cap"
+DEFAULT_PRIVATE_CAP_BYTES="21474836480"  # 20 GiB per-qube private ceiling
 
 echo "==> Stage F3 deploy starting"
 echo "    source qube:    $SOURCE_QUBE"
@@ -81,6 +83,20 @@ if [ ! -e "$CAP_FILE" ]; then
 else
     echo "    $CAP_FILE already exists — preserved (operator state):"
     echo "    $(cat "$CAP_FILE")"
+fi
+
+# Per-qube private ceiling P (the persistent-footprint accounting, 2026-06-12).
+# A spawn may request a larger `private` than the default, up to this; the dom0
+# wrapper refuses a request above it. Operator state — seed only if absent.
+if [ ! -e "$PRIVATE_CAP_FILE" ]; then
+    sudo install -d -m 0755 -o root -g root "$CAP_DIR"
+    sudo bash -c "echo '$DEFAULT_PRIVATE_CAP_BYTES  # 20 GiB per-qube private ceiling — edit to taste' > '$PRIVATE_CAP_FILE'"
+    sudo chmod 0644 "$PRIVATE_CAP_FILE"
+    sudo chown root:root "$PRIVATE_CAP_FILE"
+    echo "    Seeded $PRIVATE_CAP_FILE with $DEFAULT_PRIVATE_CAP_BYTES bytes (20 GiB)."
+else
+    echo "    $PRIVATE_CAP_FILE already exists — preserved (operator state):"
+    echo "    $(cat "$PRIVATE_CAP_FILE")"
 fi
 echo
 

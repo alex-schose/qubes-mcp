@@ -9,6 +9,7 @@ def qubes_spawn(
     klass: str = "AppVM",
     label: str = "gray",
     netvm: str | None = None,
+    private_size: int | None = None,
 ) -> dict:
     """Create a new AI-managed qube.
 
@@ -27,8 +28,17 @@ def qubes_spawn(
     Netvm defaulting:
       - not specified  → defaults to "ai-net-router" if it exists + ai-managed
       - explicit name  → used as-is; must be ai-managed
+
+    `private_size` (bytes, optional) grows the new qube's persistent `private`
+    volume beyond the Qubes default — for a qube that needs more working disk.
+    It is the only disk dimension that counts against the pool budget (root is
+    COW, volatile is ephemeral). The dom0 wrapper refuses a request above the
+    operator's per-qube limit, and the overall create still refuses if it would
+    exceed the pool cap. Omit it for the default size.
     """
     payload: dict = {"name": name, "template": template, "klass": klass, "label": label}
     if netvm is not None:
         payload["netvm"] = netvm
+    if private_size is not None:
+        payload["private_size"] = private_size
     return call_qmcp("qmcp.SpawnAIManagedQube", payload)

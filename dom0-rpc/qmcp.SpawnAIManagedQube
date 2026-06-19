@@ -196,8 +196,14 @@ def main() -> int:
     # collapses both to None; we need the key-presence check.
     netvm_specified = "netvm" in req
     netvm = req.get("netvm")
+    # Optional persistent-disk request (bytes). When given, the new qube's
+    # private volume is grown to it (up to the operator's per-qube cap P); when
+    # omitted, the qube keeps the Qubes default. AI declares max sizes freely —
+    # only the persistent `private` is metered and capped (qmcp_budget.py).
+    private_size = req.get("private_size")
     _audit_summary.update({"name": name, "template": template, "klass": klass,
-                           "netvm": netvm, "label": label})
+                           "netvm": netvm, "label": label,
+                           "private_size": private_size})
 
     if not NAME_RE.match(name):
         return fail("name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric")
@@ -205,6 +211,13 @@ def main() -> int:
         return fail(f"klass must be one of: {sorted(ALLOWED_KLASSES)}")
     if label not in ALLOWED_LABELS:
         return fail(f"label must be one of: {sorted(ALLOWED_LABELS)}")
+    if private_size is not None:
+        try:
+            private_size = int(private_size)
+        except Exception:
+            return fail("private_size must be an integer number of bytes")
+        if private_size <= 0:
+            return fail("private_size must be a positive number of bytes")
 
     try:
         import qubesadmin.app
@@ -240,20 +253,25 @@ def main() -> int:
         if netvm not in app.domains or "ai-managed" not in app.domains[netvm].tags:
             return fail("netvm must reference an ai-managed qube")
 
-    # ----- I-0 budget gate -----
-    # Refuse if projected post-create provisioned-sum would exceed the
-    # operator-set cap (`/etc/qmcp/pool-cap`). Measurement mirrors
-    # qmcp.GetPoolStats exactly so AI's view of (used, cap, headroom)
-    # predicts this refusal. Cap-missing fails closed with the same
-    # opaque message GetPoolStats surfaces. Estimate is the conservative
-    # sum of the TEMPLATE's vol.size (root + private + volatile + …) —
-    # the new qube's volumes inherit from the template, and F3's `used`
-    # counts those same bytes once they're attached to the new qube.
+    # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
+    # Two checks, both opaque-on-refuse:
+    #   1. Per-qube cap: a requested private_size above the operator's
+    #      `/etc/qmcp/private-cap` (P) is refused — AI may spawn big qubes, but
+    #      only under the limit.
+    #   2. Global cap: refuse if the projected persistent sum would exceed
+    #      `/etc/qmcp/pool-cap`. The estimate is just this qube's private (the
+    #      requested size, or the 2 GiB default) — its root is COW from the
+    #      template (real persistent delta ~0) and is not counted. Measurement
+    #      mirrors qmcp.GetPoolStats (which imports the same summer), so AI's
+    #      (used, cap, headroom) predicts this refusal. Cap-missing fails closed.
     try:
         budget = _load_budget_lib()
     except Exception as e:
         return fail(f"budget helper load failed: {e}")
-    cap_err = budget.check_cap_for_create(app, tpl)
+    psize_err = budget.check_private_size(private_size)
+    if psize_err is not None:
+        return fail(psize_err)
+    cap_err = budget.check_cap_for_create(app, tpl, requested_private=private_size)
     if cap_err is not None:
         return fail(cap_err)
 
@@ -318,6 +336,21 @@ def main() -> int:
             "name": name,
             "warning": f"qube created and tagged but netvm assignment failed: {e}",
         })
+
+    # ----- Step 5: grow the private volume if a (cap-checked) size was requested.
+    # Non-fatal: the qube is created, tagged, and in scope; a resize failure just
+    # leaves the Qubes-default private (the warning tells AI). Qubes only grows a
+    # volume, never shrinks, so a sub-default request is a harmless no-op. The
+    # size was already clamped to the per-qube cap P by check_private_size above.
+    if private_size is not None:
+        try:
+            new_vm.volumes["private"].resize(int(private_size))
+        except Exception as e:
+            return emit({
+                "ok": True,
+                "name": name,
+                "warning": f"qube created and tagged but private resize failed: {e}",
+            })
 
     return emit({"ok": True, "name": name})
 

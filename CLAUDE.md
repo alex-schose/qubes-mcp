@@ -97,6 +97,20 @@ this directory.**
   boundary exactly), enforcement lands in I-4/I-5, then the operator tiers the
   fleet and flips the dom0 flag `/etc/qmcp/tier-default` to `ro` for
   least-privilege. No intermediate state is less safe than today.
+- **Disk budget = persistent footprint, hard-capped (I-0/F3, corrected
+  2026-06-12).** AI cannot exhaust the host pool. The I-0 create-gate and
+  `qmcp.GetPoolStats` meter the **persistent** provisioned footprint of
+  ai-managed qubes — each `private` volume, plus `root` only for klasses whose
+  root persists (TemplateVM/StandaloneVM); a COW AppVM root and ephemeral
+  volatile are **not** counted (they were, and over-stated real usage ~8×).
+  Because a volume can't exceed its own size, Σ persistent ≤ `/etc/qmcp/pool-cap`
+  is a **hard ceiling on real persistent usage**. A second operator file,
+  `/etc/qmcp/private-cap`, bounds any single qube's `private`: a spawn may
+  request a larger persistent volume (`private_size`) up to that ceiling, so AI
+  can make big qubes *under the limit* but no qube can hog the pool. Both caps
+  are operator-owned; AI cannot read or change them (it sees only its
+  `(used, cap, headroom)`), and every create path fails closed if a cap is
+  unreadable.
 
 ## What lives where
 
@@ -116,11 +130,11 @@ this directory.**
 | Service | Purpose | Stage |
 |---|---|---|
 | `qmcp.ListAIManagedQubes` | Discovery — returns only qubes carrying `ai-managed`. | A |
-| `qmcp.SpawnAIManagedQube` | Create AppVM (A); DispVMTemplate + DispVM klasses (D). Auto-tags. Validates name + klass + template (incl. `template_for_dispvms` cross-ref for DispVM) + (optional) netvm. | A → D |
+| `qmcp.SpawnAIManagedQube` | Create AppVM (A); DispVMTemplate + DispVM klasses (D). Auto-tags. Validates name + klass + template (incl. `template_for_dispvms` cross-ref for DispVM) + (optional) netvm. Optional `private_size` grows the persistent volume up to the per-qube cap. | A → D |
 | `qmcp.GetPropertyAIManaged` | Wrapped read. `"not found"` is indistinguishable from `"not tagged"`. | A |
 | `qmcp.SetPropertyAIManaged` | Wrapped write with cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
 | `qmcp.LifecycleAIManaged` | start/shutdown/kill/pause/unpause/remove on ai-managed qubes. Replaces direct `admin.vm.*` lifecycle in Stage D — qrexec's `@tag:` matcher doesn't reach klass=DispVM targets, so we do the tag check in dom0. | D |
-| `qmcp.GetPoolStats` | AI-scoped disk-budget visibility — sum of provisioned bytes on every ai-managed qube, plus an operator-set cap from `/etc/qmcp/pool-cap` (re-read per call). Returns `{used, cap, headroom}`; no pool names, no free-space, no operator-side volumes. Cap is an operator → AI contract, not a sensor in the other direction. | F3 |
+| `qmcp.GetPoolStats` | AI-scoped disk-budget visibility — sum of the **persistent footprint** of every ai-managed qube (each `private`, plus `root` for klasses whose root persists; COW root + ephemeral volatile are not counted), plus an operator-set cap from `/etc/qmcp/pool-cap` (re-read per call). Returns `{used, cap, headroom}`; no pool names, no free-space, no operator-side volumes. Cap is an operator → AI contract, not a sensor in the other direction. | F3 |
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
 | `qmcp.CopyToAIManaged` | File transfer; both source and target must be ai-managed. | B |
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
@@ -628,7 +642,10 @@ qubes_mcp/                          # repo root
   assert byte-identical opaqueness on both SetProperty and Spawn
   cross-refs (5/5 green; reviewer ask #8 resolved).
 
-- **Stage F3 — DONE (tested).** `qmcp.GetPoolStats` closes the F band
+- **Stage F3 — DONE (tested); disk accounting corrected 2026-06-12 (now sums
+  the PERSISTENT footprint, not every volume's provisioned size — see the
+  "Disk budget" trust-model bullet; the historical description below is how F3
+  originally shipped).** `qmcp.GetPoolStats` closes the F band
   with an AI-scoped disk-budget read: it returns the sum of
   provisioned bytes across every volume on every ai-managed qube,
   plus an operator-set ceiling from `/etc/qmcp/pool-cap` (single
@@ -660,7 +677,10 @@ qubes_mcp/                          # repo root
   deploy. New reviewer ask #11 added on cap-as-contract vs.
   free-space-as-sensor.
 
-- **Stage I-0 — DONE (tested).** First sub-stage of Stage I
+- **Stage I-0 — DONE (tested); accounting corrected 2026-06-12 (persistent-
+  footprint basis + per-qube `private-cap`; the estimate is now the new qube's
+  private, not the template's full `sum(vol.size)` — see the "Disk budget"
+  trust-model bullet; below is how I-0 originally shipped).** First sub-stage of Stage I
   (graduated authority). Promotes the F3 pool cap from advisory
   signal to a hard gate on every create path. Three wrappers
   (`qmcp.SpawnAIManagedQube`, `qmcp.CloneAIManagedQube`,

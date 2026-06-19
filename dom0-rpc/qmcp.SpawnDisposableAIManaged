@@ -186,15 +186,14 @@ def main() -> int:
             f"template '{template}' must have template_for_dispvms=True "
             f"to be a DispVM source (klass is {tpl.klass})"})
 
-    # ----- I-0 budget gate -----
-    # Refuse if projected post-create provisioned-sum would exceed the
-    # operator-set cap (`/etc/qmcp/pool-cap`). A disposable inherits its
-    # volumes from the DVMT (private comes from DVMT's private,
-    # volatile is created fresh), so the conservative estimate is the
-    # DVMT's full vol.size sum — same as SpawnAIManagedQube. F3's `used`
-    # will count those bytes once the disposable is provisioned.
-    # Cap-missing fails closed with the same opaque message
-    # GetPoolStats surfaces.
+    # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
+    # Refuse if the projected persistent sum would exceed `/etc/qmcp/pool-cap`.
+    # A disposable's root is COW from the DVMT and its volatile is ephemeral, so
+    # the only persistent bytes it adds (while it exists) are its private — the
+    # spawn estimate (the Qubes default; disposables take no private_size param).
+    # The default gate call (no is_clone, no requested_private) selects exactly
+    # that. Measurement mirrors qmcp.GetPoolStats (shared summer); cap-missing
+    # fails closed with the same opaque message.
     try:
         budget = _load_budget_lib()
     except Exception as e:

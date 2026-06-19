@@ -158,17 +158,18 @@ def main() -> int:
     if name in app.domains:
         return emit({"ok": False, "error": f"qube '{name}' already exists"})
 
-    # ----- I-0 budget gate -----
-    # Refuse if projected post-clone provisioned-sum would exceed the
-    # operator-set cap (`/etc/qmcp/pool-cap`). Clone inherits the
-    # source's volumes, so the conservative estimate is the source's
-    # full vol.size sum. Cap-missing fails closed with the same opaque
-    # message GetPoolStats surfaces.
+    # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
+    # Refuse if the projected persistent sum would exceed `/etc/qmcp/pool-cap`.
+    # A clone COPIES the source's volumes, so its estimate is the source's full
+    # PERSISTENT footprint (private always; root too when the source's klass
+    # persists root — e.g. cloning a TemplateVM). is_clone=True selects that
+    # estimate. Measurement mirrors qmcp.GetPoolStats (shared summer); cap-
+    # missing fails closed with the same opaque message.
     try:
         budget = _load_budget_lib()
     except Exception as e:
         return emit({"ok": False, "error": f"budget helper load failed: {e}"})
-    cap_err = budget.check_cap_for_create(app, src_vm)
+    cap_err = budget.check_cap_for_create(app, src_vm, is_clone=True)
     if cap_err is not None:
         return emit({"ok": False, "error": cap_err})
 
