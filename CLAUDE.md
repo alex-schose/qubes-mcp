@@ -33,10 +33,14 @@ this directory.**
     install);
   - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-managed` (Stage B
     — inter-ai-managed transfer without the operator dialog);
-  - `admin.vm.firewall.{Get,Set,Reload}` on `@tag:ai-managed` targets
-    (Stage C);
+  - `admin.vm.firewall.Get` on `@tag:ai-managed` targets (Stage C; the
+    ro-floor) and `admin.vm.firewall.{Set,Reload}` on `@tag:ai-net` +
+    `@tag:ai-full` targets (Stage I-4 — graduated to the firewall-write
+    tier; plus a `@tag:ai-managed` compat backstop, removed at the flip);
   - `admin.vm.device.{block,usb,mic}.{List,Available}` on
-    `@tag:ai-managed` targets (Stage E1, read-only enumeration).
+    `@tag:ai-managed` targets (Stage E1, read-only enumeration — ro-floor);
+  - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-dump` (Stage I-4 —
+    the write-only sink; copy-IN only).
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
   but no privilege inside `mcp-control` itself. mcp-control is an RPC gateway,
   not a workhorse. Hardening `mcp-control` (sudo lockdown, dedicated MCP
@@ -97,6 +101,25 @@ this directory.**
   boundary exactly), enforcement lands in I-4/I-5, then the operator tiers the
   fleet and flips the dom0 flag `/etc/qmcp/tier-default` to `ro` for
   least-privilege. No intermediate state is less safe than today.
+  - **I-4 — tiers on the policy-scoped surfaces (landed).** The directly
+    `@tag:`-scoped surfaces graduate by a single-file policy diff: `firewall.Get`
+    + `device-list` stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}`
+    require `@tag:ai-net` or `@tag:ai-full`; and `ai-dump` gets a dedicated
+    copy-IN-only `qubes.Filecopy` line (the Biba valve — for a pure sink AI
+    pushes but cannot read back; rests on the operator invariant that an
+    `ai-dump` qube is never also `ai-managed`, which the installer checks). **The policy layer matches tags literally and cannot
+    call `qmcp_tier`,** so it cannot honour the helper's "untiered = `ai-full`
+    (compat)" default. I-4 therefore ships firewall-write with a `@tag:ai-managed`
+    **compat backstop** (Option A) that keeps untiered qubes writable during
+    migration — so A–F3 stays green and the live egress qube keeps firewall
+    control on deploy. The backstop subsumes the net/full lines, so firewall
+    write is behaviour-neutral in compat; the one new live capability is the
+    `ai-dump` valve. **The flip (end of I-5) deletes the two backstop lines AND
+    writes `ro` to `/etc/qmcp/tier-default` in one change**, so the policy
+    surface and the wrapper surface drop to least-privilege together — removing
+    only one leaves them incoherent. I-5 then tiers the wrapper surfaces
+    (lifecycle/property/clone/spawn/feature/attach/exec require `ai-full`; exec
+    requires `ai-exec`).
 - **Disk budget = persistent footprint, hard-capped (I-0/F3, corrected
   2026-06-12).** AI cannot exhaust the host pool. The I-0 create-gate and
   `qmcp.GetPoolStats` meter the **persistent** provisioned footprint of
@@ -296,6 +319,21 @@ I-3. Tier taxonomy + dom0 tier-resolution helper. The keystone of the
     tier-default to "ro" for least privilege. The Ring enum gains a
     declarative tier annotation (UX only — enforcement is dom0, §4.1).
     No new RPC service; no policy change; no daemon restart; no new ring.
+I-4. Tiers on the policy-scoped surfaces — the first enforcement step,
+    a single-file policy diff. firewall.Get + device-list stay at the
+    ai-managed ro-floor; firewall.Set/Reload graduate to @tag:ai-net +
+    @tag:ai-full; ai-dump gets a dedicated copy-IN-only qubes.Filecopy
+    line (the Biba write-only sink). The policy layer matches @tag:
+    selectors literally and cannot call qmcp_tier, so firewall-write
+    ships with a @tag:ai-managed COMPAT BACKSTOP (Option A) keeping
+    untiered umbrella qubes writable through migration — A–F3 stays
+    green, the live egress qube keeps firewall control on deploy, and
+    the WRITE surface stays behaviour-neutral in compat (the net/full
+    lines are subsumed until the flip). The one new live capability is
+    the ai-dump valve. THE FLIP (end of I-5) deletes the two backstop
+    lines AND writes "ro" to /etc/qmcp/tier-default in one change, so
+    the policy surface and the wrapper surface flip together. No new RPC
+    service; no new qube; no wrapper change; no new ring — policy-only.
 G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
@@ -812,6 +850,56 @@ qubes_mcp/                          # repo root
   behaviour-neutral, no AI-facing tier surface). No new RPC service; no policy
   change; no daemon restart; no new ring.
 
+- **Stage I-4 — DONE (tested); on `stage-I-wave-1`, not pushed.** The first
+  enforcement step of the resource axis — a single-file policy diff that
+  graduates the directly-`@tag:`-scoped surfaces. `firewall.Get` + device-list
+  stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}` move to
+  `@tag:ai-net` + `@tag:ai-full`; and `ai-dump` gets a dedicated copy-IN-only
+  `qubes.Filecopy * @tag:ai-managed @tag:ai-dump allow` (the Biba write-only
+  sink — for a **pure** sink, AI pushes data to it but cannot read it back,
+  list it, exec in it, or see it in `ListAIManagedQubes`, because it lacks the
+  umbrella). The write-only property rests on an **operator invariant**: an
+  `ai-dump` qube is never also `ai-managed`. A hybrid is readable (the inter-copy
+  line matches it as a source) — AI cannot create one (no tag mutation), and the
+  installer warns on any hybrid while I-5 machine-refuses it. **Option A
+  (compat backstop):** because the policy layer matches tags literally and
+  cannot call `qmcp_tier`, it cannot honour the helper's "untiered = `ai-full`
+  (compat)" default — so firewall-write ships with a `@tag:ai-managed` backstop
+  that keeps untiered umbrella qubes writable during migration. That keeps A–F3
+  green and the live egress qube's firewall control intact on deploy, and makes
+  the WRITE surface behaviour-neutral in compat (the backstop subsumes the
+  net/full lines). The one new live capability is the `ai-dump` valve. **The
+  flip (end of I-5)** deletes the two backstop lines AND writes `ro` to
+  `/etc/qmcp/tier-default` in one change, so the policy surface and the wrapper
+  surface drop to least-privilege together (removing only one leaves them
+  incoherent — firewall strict but lifecycle still loose). server.py is
+  untouched (the `_RING_MIN_TIER` annotation landed in I-3). Verification splits
+  three ways (the I-2/I-3 pattern, since the policy layer is the whole risk
+  surface): OFFLINE — `offline-validate-I-4.py` parses the real policy and
+  simulates qrexec first-match-wins for the full (surface × tier) matrix in
+  **both** compat and post-flip (**100 checks** green); the SLOT (slot-60) is the
+  positive per-tier proof on real qrexec with operator-tagged ro/exec/net/full/
+  dump fixtures, under the compat policy AND a throwaway no-backstop probe
+  policy (proving the flip), restored byte-exact via an EXIT trap; and
+  `deploy/test-stage-I-4.py` (mcp-control) proves the AI-side invariants that
+  hold in compat — firewall still works on umbrella qubes (behaviour-neutral),
+  every refusal is the same opaque sentinel (no tier/existence oracle), the
+  `ai-dump` sink is invisible to AI. No new RPC service; no new qube; no wrapper
+  change; no daemon-restart-time policy change beyond the single file; no new
+  ring — policy-only.
+
+  **Per-surface enforcement decision table (where each tier check lives):**
+
+  | Surface | Method(s) | Tier required | Enforced at |
+  |---|---|---|---|
+  | reads / discovery | `GetProperty`, `List`, `AIManagedEvents` | `ai-ro` (umbrella) | wrapper (dom0 tag-check) |
+  | firewall read | `firewall.Get` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
+  | device enumerate | `device.*.{List,Available}` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
+  | firewall write | `firewall.{Set,Reload}` | `ai-net` / `ai-full` | **policy (I-4)** `@tag:ai-net` + `@tag:ai-full` (+ compat backstop) |
+  | copy-IN sink | `qubes.Filecopy → ai-dump` | `ai-dump` (orthogonal) | **policy (I-4)** `@tag:ai-dump` target |
+  | exec / copy | `RunInAIManaged`, `CopyToAIManaged` | `ai-exec` | policy `@tag:` (tiered in **I-5**) |
+  | lifecycle / property / clone / spawn / feature / attach / detach | the `qmcp.*` `@adminvm` wrappers | `ai-full` | wrapper (dom0 tag-check, **I-5**) |
+
 - **Stages G and H — designed, deferred until Stage I completes.**
   Per the 2026-06-08 reordering (see the Stage rollout block above),
   Stage I (graduated authority within `ai-managed`) jumps ahead of
@@ -830,10 +918,13 @@ qubes_mcp/                          # repo root
   AI-unreachable dom0 audit log; foundational before the tier model and
   mandatory before the later vault's `SignTransaction`. **I-3 done**
   (above) — the tier taxonomy + resolution helper, landed inert in compat
-  mode (behaviour-neutral). **I-4 next** — apply tiers to the policy-scoped
-  surfaces (reads / firewall / device-list), the first enforcement step;
-  then I-5 (wrapper surfaces + the least-privilege flip after the operator
-  tiers the fleet). Wave 2
+  mode (behaviour-neutral). **I-4 done** (above) — tiers applied to the
+  policy-scoped surfaces (firewall write → ai-net/ai-full behind a compat
+  backstop; the ai-dump valve), the first enforcement step. **I-5 next** —
+  tier the `@adminvm` wrapper surfaces (lifecycle/property/clone/spawn/
+  feature/attach require `ai-full`; exec requires `ai-exec`), then the
+  coordinated least-privilege flip (delete the firewall backstop + write `ro`
+  to `/etc/qmcp/tier-default`) after the operator tiers the fleet. Wave 2
   (I-6..I-8) is the action gate + consent GUI; Wave 3 (I-9..I-11) is the
   principal axis, secrets vault, and persona presets.
 

@@ -1,12 +1,25 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 — sandbox with dom0-
+# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 + I-4 — sandbox with dom0-
 # mediated lifecycle, exec, file copy, tag-scoped firewall control,
 # cloning, device attach/detach between ai-managed qubes, ephemeral
 # disposables, feature.Set on ai-managed qubes, bounded-window event
-# streaming scoped to ai-managed subjects, and AI-scoped disk-budget
-# visibility (provisioned-bytes sum + operator-set cap).
+# streaming scoped to ai-managed subjects, AI-scoped disk-budget
+# visibility (provisioned-bytes sum + operator-set cap), and graduated
+# authority on the directly-tag-scoped surfaces (Stage I-4: firewall WRITE
+# graduates to the ai-net/ai-full tiers; the ai-dump write-only sink).
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
+#
+# Stage I-4 — the policy layer matches @tag: selectors LITERALLY and cannot
+# call the qmcp_tier dom0 helper, so the helper's "untiered umbrella =
+# ai-full (compat)" default has no reach here. Firewall WRITE therefore ships
+# with a @tag:ai-managed COMPAT BACKSTOP that preserves today's behaviour
+# (every umbrella qube may still write its firewall → the A–F3 regression
+# stays green); the ai-net/ai-full lines are inert while it is present.
+# THE FLIP (end of Stage I-5): delete the two firewall-WRITE backstop lines
+# AND write "ro" to /etc/qmcp/tier-default in the SAME change, so the policy
+# surface and the wrapper surface drop to least-privilege together. Removing
+# only one leaves the two surfaces incoherent (see CLAUDE.md, the I-4 block).
 #
 # Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
 # Ordering inside THIS file:
@@ -46,15 +59,53 @@ qmcp.CopyToAIManaged         *  mcp-control      @tag:ai-managed  allow  user=ro
 
 qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
 
-# --- Stage C: per-qube firewall rule management on ai-managed qubes.
+# --- Stage I-4: ai-dump — the write-only sink (Biba integrity valve).
+# An ai-dump qube is ORTHOGONAL to the tier ladder. The write-only guarantee
+# holds for a PURE sink — a qube tagged ai-dump and NOT ai-managed: it then
+# misses every read / exec / firewall / device surface (all scoped on the
+# ai-managed umbrella) by construction, so AI cannot read, list, enumerate, or
+# run in it. The ONE thing permitted is qubes.Filecopy INTO it from an
+# ai-managed source — AI may PUSH data to the sink but cannot read it back,
+# severing the exfiltration leg. Copy-IN only; nothing else.
+#
+# OPERATOR INVARIANT (load-bearing for the write-only property): an ai-dump
+# qube is NEVER also ai-managed. A HYBRID (ai-managed + ai-dump) is fully
+# readable — the ai-managed → ai-managed inter-copy line above matches it as a
+# SOURCE, so its contents could be copied back OUT, defeating the valve. AI
+# cannot create a hybrid (it cannot mutate tags — the keystone), so this is an
+# operator-misconfig guard, not a self-escalation path. install-stage-I-4.sh
+# WARNS on any hybrid at deploy; Stage I-5 machine-refuses it at fleet-tiering.
+
+qubes.Filecopy              *  @tag:ai-managed  @tag:ai-dump     allow
+
+# --- Stage C + I-4: per-qube firewall rule management on ai-managed qubes.
 # target=@adminvm routes the call to dom0 (firewall rules live in dom0's
 # qubes.xml; the firewall VM enforces them via iptables on its boot/reload).
-# The tag-scoped source-or-rather-argument means AI can only read/write
-# rules for qubes carrying ai-managed. Untagged qubes are invisible at the
-# firewall surface, matching the lifecycle/property surfaces.
+# The tag-scoped argument means AI can only read/write rules for qubes
+# carrying the matched tag. Untagged qubes are invisible at the firewall
+# surface, matching the lifecycle/property surfaces.
+#
+# Stage I-4 graduates the WRITE surface to the tier ladder:
+#   - firewall.Get        — stays at the ai-managed ro-floor (any tier reads).
+#   - firewall.Set/Reload — require ai-net OR ai-full (single-elevation ladder:
+#     an ai-full qube does NOT also carry ai-net, so both lines are needed).
+# The third @tag:ai-managed line on each WRITE method is the COMPAT BACKSTOP
+# (see the file header): it keeps untiered umbrella qubes writable during
+# migration so A–F3 stays green, and is DELETED at the flip (paired with the
+# tier-default → "ro" write). While present it subsumes the net/full lines,
+# so the WRITE surface is behaviour-neutral in compat; the net/full lines are
+# the enforcement that goes live the moment the backstop is removed.
 
 admin.vm.firewall.Get       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+admin.vm.firewall.Set       *  mcp-control  @tag:ai-net      allow  target=@adminvm
+admin.vm.firewall.Set       *  mcp-control  @tag:ai-full     allow  target=@adminvm
+# COMPAT backstop (firewall.Set) — DELETE at the I-5 flip, paired with tier-default → "ro":
 admin.vm.firewall.Set       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+admin.vm.firewall.Reload    *  mcp-control  @tag:ai-net      allow  target=@adminvm
+admin.vm.firewall.Reload    *  mcp-control  @tag:ai-full     allow  target=@adminvm
+# COMPAT backstop (firewall.Reload) — DELETE at the I-5 flip, paired with tier-default → "ro":
 admin.vm.firewall.Reload    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 
 # --- Stage D: clone an ai-managed qube into a new ai-managed qube.
@@ -257,8 +308,12 @@ admin.vm.feature.Remove          *  mcp-control  @anyvm  deny
 admin.vm.feature.List            *  mcp-control  @anyvm  deny
 admin.vm.feature.CheckWithTemplate  *  mcp-control  @anyvm  deny
 
-# Firewall — Stage C allows tag-scoped above; the catch-all below still
-# refuses untagged targets, so no explicit deny needed here.
+# Firewall — Stage C + I-4 allow tag-scoped above (Get at the ai-managed
+# ro-floor; Set/Reload at ai-net/ai-full plus the compat backstop). The
+# catch-all below refuses every untagged target AND, once the compat backstop
+# is removed at the flip, every WRITE on a qube below the ai-net tier — both
+# collapse to the same opaque refusal, so the firewall surface is no
+# existence/tier oracle. No explicit deny needed here.
 
 # Device API
 #  - block/usb/mic: Stage E1 wraps Attach/Detach via qmcp; List/Available

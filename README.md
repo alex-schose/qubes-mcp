@@ -124,6 +124,7 @@ dom0 gate-lift) and are re-scoped once Stage I lands.
 | I-1 | Read-surface name-leak fix (finding F-3): every VM-valued property read (`netvm`/`template`/`default_dispvm`/`guivm`/`audiovm`/`management_dispvm`) and the list `template` field is routed through a shared dom0 redactor (`qmcp_scope.py`) — a referenced qube's name survives only if it is itself ai-managed, else collapses to the opaque `<out-of-scope>` sentinel; `tags` reads are filtered to the qmcp vocabulary. The read-path sibling of the F2 write-path cross-ref opacity. Patches the two read wrappers; no policy change, no new RPC. | tested |
 | I-2 | Hash-chained, AI-unreachable dom0 audit log of every state-changing `qmcp.*` call. A shared dom0 helper (`qmcp_audit.py`) appends one JSON line per call to `/var/log/qmcp-audit.log` (`root:qubes` `0660`, `O_APPEND` + `flock`); each line carries the sha256 of the previous, so any edit/delete/reorder breaks the chain (`verify()` + a `python3 qmcp_audit.py verify` CLI re-check it). The 8 state-changing wrappers route their single `emit()` funnel through `audit()` and log a whitelisted summary (qube names / property + feature keys / action) — never a property/feature value. Best-effort (never blocks an op); AI-unreachable by construction (no service reads the log; no policy line exposes it). Foundational before the tier model. No new RPC, no policy change. | tested |
 | I-3 | Tier taxonomy + dom0 tier-resolution helper — the keystone of the resource axis. Graduates the binary boundary into a cumulative ladder within ai-managed: `ai-managed` (read floor) < `ai-exec` (+commands) < `ai-net` (+firewall write) < `ai-full` (+lifecycle/property/clone/spawn/feature/attach/detach); `ai-dump` is an orthogonal copy-IN-only sink. A shared dom0 helper (`qmcp_tier.py`, sibling-loaded like `qmcp_budget`/`qmcp_scope`/`qmcp_audit`) exposes `effective_capabilities(vm)` → a frozenset of capability tokens, so the wrappers ask `CAP_FULL in caps` and stay decoupled from the taxonomy. Behaviour-neutral: ships inert (no wrapper sources it until I-5) in compat mode (untiered ai-managed = full = today's boundary). AI can neither mutate tags (keystone) nor read the tier tags (a `tags` read stays `["ai-managed"]` — the authority topology is not an oracle). Two-phase migration: enforce in I-4/I-5, then flip `/etc/qmcp/tier-default` to `ro` for least privilege. No new RPC, no policy change. | tested |
+| I-4 | First enforcement step of the resource axis — a single-file policy diff graduating the directly-`@tag:`-scoped surfaces. `firewall.Get` + device-list stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`; `ai-dump` gets a dedicated copy-IN-only `qubes.Filecopy * @tag:ai-managed @tag:ai-dump allow` (the Biba write-only sink — a **pure** `ai-dump` qube is push-only and invisible to reads/list/exec because it lacks the umbrella; the write-only property rests on the operator invariant that an `ai-dump` qube is never also `ai-managed`, which the installer checks and I-5 enforces). The policy layer matches tags literally and cannot call `qmcp_tier`, so firewall-write ships with a `@tag:ai-managed` **compat backstop** (keeps untiered qubes writable through migration → A–F3 stays green and the live egress qube keeps firewall control on deploy; behaviour-neutral on firewall in compat — only the `ai-dump` valve is new live behaviour). The flip (end of I-5) deletes the backstop **and** writes `ro` to `/etc/qmcp/tier-default` in one change. Policy-only; no new RPC, no new qube, no wrapper change. Proven offline (100-check policy simulation, compat + post-flip), a per-tier hardware slot, and an AI-side transparency test. | tested |
 | G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
@@ -660,7 +661,60 @@ here by design — chain integrity is verified in dom0, above):
 best-effort, so the wrappers keep working without it); `/tmp/run.sh
 revert` restores the pre-I-2 wrapper source too.
 
-### Step 15 — Connect a client
+### Step 15 — (Optional) Deploy Stage I-4 for tiered policy surfaces
+
+Stage I-4 is the first enforcement step of the resource axis — a
+**single-file policy diff** (no new RPC script, no new qube, no wrapper
+change). It graduates the directly-`@tag:`-scoped surfaces:
+
+- `firewall.Get` and `device.*.{List,Available}` stay at the `ai-managed`
+  ro-floor (unchanged).
+- `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`.
+- `ai-dump` gets a dedicated `qubes.Filecopy * @tag:ai-managed @tag:ai-dump
+  allow` — a copy-IN-only sink. A **pure** `ai-dump` qube is **not** tagged
+  `ai-managed`, so every read / exec / firewall / device surface misses it
+  by construction: AI can push data to it but never read it back. **Operator
+  invariant:** an `ai-dump` qube must never also be `ai-managed` — a hybrid is
+  fully readable (the inter-copy line matches it as a source), defeating the
+  valve. AI cannot create one (it cannot mutate tags), and the installer warns
+  on any hybrid; I-5 machine-refuses it at fleet-tiering.
+
+The policy layer matches `@tag:` selectors literally and cannot call the
+`qmcp_tier` helper, so it cannot honour the helper's "untiered = `ai-full`
+(compat)" default. I-4 therefore ships firewall-write with a `@tag:ai-managed`
+**compat backstop** that keeps untiered umbrella qubes writable through
+migration — so the A–F3 regression stays green and the live egress qube keeps
+firewall control the moment you deploy. While the backstop is present the
+firewall-write surface is **behaviour-neutral**; the one new live capability is
+the `ai-dump` valve. The **flip** (end of Stage I-5) deletes the two backstop
+lines **and** writes `ro` to `/etc/qmcp/tier-default` in the same change, so the
+policy surface and the wrapper surface drop to least-privilege together. This
+step does not require the I-3 helper to be installed (the policy layer never
+sources it).
+
+From dom0 (the installer validates the policy before replacing the live file —
+a malformed policy can break all of qrexec):
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-4.sh' > /tmp/install-I-4.sh
+bash /tmp/install-I-4.sh mcp-control ~user/qubes_mcp/public
+```
+
+Then verify from mcp-control:
+
+```sh
+.venv/bin/python deploy/test-stage-I-4.py     # 4 PASS — compat invariance + oracle hygiene
+.venv/bin/python deploy/test-stage-c.py       # firewall regression: unchanged
+```
+
+The per-tier behaviour (ro/exec denied firewall-write after the flip;
+net/full allowed) is proven on dom0 hardware by the operator's slot with
+operator-tagged fixtures, and exhaustively offline by a policy simulator that
+parses the real file and checks the full (surface × tier) matrix for both
+compat and post-flip. `deploy/uninstall-stage-I-4.sh` reverts the policy
+(or `/tmp/run.sh revert` restores the pre-I-4 file byte-exact).
+
+### Step 16 — Connect a client
 
 From your workstation, configure an MCP client to invoke the server via
 SSH + stdio. Example for Claude Code (`~/.claude.json`):
