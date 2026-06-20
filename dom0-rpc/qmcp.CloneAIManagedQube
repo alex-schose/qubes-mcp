@@ -92,6 +92,73 @@ def _load_audit_lib():
 _AUDIT = _load_audit_lib()
 
 
+def _load_tier_lib():
+    """Load the sibling qmcp_tier helper by path (Stage I-5).
+
+    Same sibling-import shim as qmcp_audit / qmcp_budget. Returns None on
+    any failure; the tier gate then FAILS CLOSED (denies). Unlike the
+    best-effort audit hook, a missing tier resolver must NEVER grant
+    authority (STAGE-I-BUILD-PLAN.md §I-5).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_tier", os.path.join(here, "qmcp_tier.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_TIER = _load_tier_lib()
+
+
+def _require_full(vm) -> bool:
+    """Stage I-5: True iff `vm` grants CAP_FULL via the tier resolver.
+
+    FAIL-CLOSED: a missing/broken resolver (_TIER is None) or any tag-read
+    error denies. Behaviour-neutral in compat (untiered ai-managed = ai-full,
+    the I-3..I-5 default); becomes the live gate once the operator writes
+    "ro" to /etc/qmcp/tier-default. The call-site refusal collapses to the
+    same opaque message as an untagged target, so it is no tier oracle.
+    """
+    if _TIER is None:
+        return False
+    try:
+        return _TIER.has_capability(vm, _TIER.CAP_FULL)
+    except Exception:
+        return False
+
+
+def _tier_tags_to_strip() -> set:
+    """The qmcp tier tags a freshly-created qube must NOT carry — every tag in
+    the tier vocabulary except the umbrella. Read off qmcp_tier so it tracks
+    the taxonomy. _TIER is guaranteed loaded here: we only reach the create
+    path after _require_full passed, which denies when _TIER is None."""
+    return set(_TIER.QMCP_TIER_TAGS) - {_TIER.UMBRELLA}
+
+
+def strip_inherited_tier_tags(vm) -> None:
+    """Stage I-5 keystone enforcement. `app.clone_vm` copies the SOURCE's tags
+    verbatim (qubesadmin copies all but `created-by-*`), so a clone of an
+    `ai-full` source INHERITS `ai-full` — which would let AI mint a CAP_FULL
+    qube and, post-flip, fan out unbounded full-authority qubes, defeating the
+    un-self-escalatability keystone. Remove every elevation/orthogonal tier tag
+    so the clone is UNTIERED (= ai-full in compat, ai-ro post-flip — exactly a
+    fresh spawn). Raises if any tier tag survives, so the caller rolls the clone
+    back rather than ship an escalated qube."""
+    for tag in _tier_tags_to_strip():
+        if tag in vm.tags:
+            vm.tags.discard(tag)
+    leftover = _tier_tags_to_strip() & set(vm.tags)
+    if leftover:
+        raise RuntimeError(f"failed to strip inherited tier tags: {sorted(leftover)}")
+
+
 def emit(payload: dict) -> int:
     # Stage I-2: record this state-changing call on the hash-chained dom0
     # audit trail before responding. Best-effort and defensively guarded
@@ -155,6 +222,12 @@ def main() -> int:
     if "ai-managed" not in src_vm.tags:
         return emit(NOT_FOUND)
 
+    # Stage I-5: clone requires CAP_FULL on the SOURCE qube. Fail-closed;
+    # collapses to the same opaque NOT_FOUND as an untagged source (no tier
+    # oracle).
+    if not _require_full(src_vm):
+        return emit(NOT_FOUND)
+
     if name in app.domains:
         return emit({"ok": False, "error": f"qube '{name}' already exists"})
 
@@ -179,11 +252,15 @@ def main() -> int:
     except Exception as e:
         return emit({"ok": False, "error": f"clone failed: {e}"})
 
-    # ----- Step 2: apply ai-managed tag (race window starts here) -----
+    # ----- Step 2: apply ai-managed tag + strip inherited tiers (race window) -----
     try:
         new_vm.tags.add("ai-managed")
         if "ai-managed" not in new_vm.tags:
             raise RuntimeError("tag.add returned but tag not visible on refresh")
+        # Stage I-5: clone_vm copied the source's tags, so the clone may carry
+        # an inherited ai-full/ai-net/ai-exec/ai-dump. Strip them — a created
+        # qube is UNTIERED (umbrella only), never elevated. (See helper.)
+        strip_inherited_tier_tags(new_vm)
     except Exception as e:
         removed = best_effort_remove(app, name)
         if removed:

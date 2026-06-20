@@ -131,12 +131,25 @@ else:
     nonet_kept = False
 
 # ---------------------------- 5. egress invariant — netvm of router refused
-header(f"5. SetPropertyAIManaged: netvm of {EGRESS_QUBE} refused (egress invariant)")
+header(f"5. SetPropertyAIManaged: netvm of {EGRESS_QUBE} refused")
 r = call_qmcp("qmcp.SetPropertyAIManaged",
               {"name": EGRESS_QUBE, "property": "netvm", "value": None})
 show(f"try set {EGRESS_QUBE}.netvm = null", r)
-egress_locked = (not r.get("ok")) and "network-providing" in str(r.get("error", ""))
-print(f"  {'PASS' if egress_locked else 'FAIL'}: refused with the egress invariant message")
+# The security property is "AI cannot retarget the egress qube's upstream" — it
+# must be REFUSED. Two valid refusal layers, depending on the egress qube's tier:
+#   - Stage C egress invariant ("network-providing …") when the egress qube is
+#     ai-full / untiered: SetProperty is reachable and the invariant blocks netvm.
+#   - I-5 CAP_FULL tier gate (opaque "not found"), which fires FIRST and blocks
+#     ALL property writes when the egress qube is tiered BELOW ai-full (e.g. ai-net
+#     — firewall-only). This SUBSUMES the egress invariant: netvm is locked harder.
+# Either way netvm is locked. §1 already proved the qube is visible + ai-managed,
+# so a refusal here is never a genuine missing-qube.
+err = str(r.get("error", ""))
+egress_locked = (not r.get("ok")) and ("network-providing" in err or "not found" in err)
+layer = ("egress invariant" if "network-providing" in err
+         else "I-5 tier gate (egress tiered < ai-full)" if "not found" in err
+         else "NOT REFUSED — netvm leak!")
+print(f"  {'PASS' if egress_locked else 'FAIL'}: {EGRESS_QUBE}.netvm refused [{layer}]")
 
 # ---------------------------- 6. AI qube netvm → ai-net-router works
 header(f"6. SetPropertyAIManaged: AI qube netvm → {EGRESS_QUBE} works")

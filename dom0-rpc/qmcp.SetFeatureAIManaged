@@ -89,6 +89,48 @@ def _load_audit_lib():
 _AUDIT = _load_audit_lib()
 
 
+def _load_tier_lib():
+    """Load the sibling qmcp_tier helper by path (Stage I-5).
+
+    Same sibling-import shim as qmcp_audit / qmcp_budget. Returns None on
+    any failure; the tier gate then FAILS CLOSED (denies). Unlike the
+    best-effort audit hook, a missing tier resolver must NEVER grant
+    authority (STAGE-I-BUILD-PLAN.md §I-5).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_tier", os.path.join(here, "qmcp_tier.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_TIER = _load_tier_lib()
+
+
+def _require_full(vm) -> bool:
+    """Stage I-5: True iff `vm` grants CAP_FULL via the tier resolver.
+
+    FAIL-CLOSED: a missing/broken resolver (_TIER is None) or any tag-read
+    error denies. Behaviour-neutral in compat (untiered ai-managed = ai-full,
+    the I-3..I-5 default); becomes the live gate once the operator writes
+    "ro" to /etc/qmcp/tier-default. The call-site refusal collapses to the
+    same opaque message as an untagged target, so it is no tier oracle.
+    """
+    if _TIER is None:
+        return False
+    try:
+        return _TIER.has_capability(vm, _TIER.CAP_FULL)
+    except Exception:
+        return False
+
+
 def emit(payload: dict) -> int:
     # Stage I-2: record this state-changing call on the hash-chained dom0
     # audit trail before responding. Best-effort and defensively guarded
@@ -143,6 +185,12 @@ def main() -> int:
         return emit(NOT_FOUND)
     vm = app.domains[name]
     if "ai-managed" not in vm.tags:
+        return emit(NOT_FOUND)
+
+    # Stage I-5: feature-set requires CAP_FULL on the target. Fail-closed;
+    # collapses to the same opaque NOT_FOUND as an untagged target (no tier
+    # oracle), BEFORE the denied-key / cross-ref checks (authority first).
+    if not _require_full(vm):
         return emit(NOT_FOUND)
 
     # Denied keys — the target IS ai-managed (AI can see it via

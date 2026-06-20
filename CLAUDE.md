@@ -120,6 +120,26 @@ this directory.**
     only one leaves them incoherent. I-5 then tiers the wrapper surfaces
     (lifecycle/property/clone/spawn/feature/attach/exec require `ai-full`; exec
     requires `ai-exec`).
+  - **I-5 — tiers on the wrapper + exec surfaces (landed).** The eight
+    `@adminvm` state-changing wrappers now read the target's effective
+    capability in dom0 code and require `CAP_FULL` before the privileged op —
+    Lifecycle/SetProperty/SetFeature gate the **target**, Clone the **source**,
+    Spawn the **template**, SpawnDisposable the **DVMT**, Attach/Detach **both**
+    endpoints — **fail-closed** (a missing/broken `qmcp_tier` denies, the
+    opposite of the best-effort audit hook; a refusal is the same opaque
+    `"not found"` as an untagged target, so no tier oracle). The exec surfaces
+    (`RunInAIManaged`/`CopyToAIManaged`) graduate in **policy** to
+    `@tag:ai-exec`/`ai-net`/`ai-full` + a `@tag:ai-managed` compat backstop
+    (the I-4 firewall pattern). **Keystone enforcement on create:** because
+    `qubesadmin.clone_vm` copies the source's tags and `admin.vm.CreateDisposable`
+    inherits the DVMT's, every create path now **strips** every tier tag except
+    the umbrella (verify + roll back on failure) — so a created qube is always
+    **untiered** (= full in compat, ro post-flip). Without the strip, AI could
+    clone an `ai-full` qube into another `ai-full` qube and self-escalate past
+    the flip, defeating the un-self-escalatability keystone. **The flip now
+    deletes FOUR compat backstops** (firewall.Set/Reload from I-4, RunInAIManaged/
+    CopyToAIManaged from I-5) **and** writes `ro` to `/etc/qmcp/tier-default` in
+    one coupled change. Behaviour-neutral in compat; no new RPC/qube/ring.
 - **Disk budget = persistent footprint, hard-capped (I-0/F3, corrected
   2026-06-12).** AI cannot exhaust the host pool. The I-0 create-gate and
   `qmcp.GetPoolStats` meter the **persistent** provisioned footprint of
@@ -334,6 +354,25 @@ I-4. Tiers on the policy-scoped surfaces — the first enforcement step,
     lines AND writes "ro" to /etc/qmcp/tier-default in one change, so
     the policy surface and the wrapper surface flip together. No new RPC
     service; no new qube; no wrapper change; no new ring — policy-only.
+I-5. Tiers on the wrapper + exec surfaces — the second enforcement
+    step, completing the resource axis (Wave 1). The eight @adminvm
+    state-changing wrappers (Lifecycle/SetProperty/SetFeature gate the
+    target; Clone the source; Spawn the template; SpawnDisposable the
+    DVMT; Attach/Detach both endpoints) require CAP_FULL via the
+    sibling-loaded qmcp_tier helper, FAIL-CLOSED (a missing/broken
+    resolver denies — opposite of the best-effort audit hook). The exec
+    surfaces (RunInAIManaged/CopyToAIManaged) graduate in POLICY to
+    @tag:ai-exec/ai-net/ai-full + a @tag:ai-managed COMPAT BACKSTOP
+    (the I-4 firewall pattern). KEYSTONE enforcement on create: because
+    qubesadmin.clone_vm copies the source's tags and CreateDisposable
+    inherits the DVMT's, every create path STRIPS every tier tag except
+    the umbrella (verify + roll back on failure) — a created qube is
+    always untiered, so AI cannot clone an ai-full qube into another and
+    self-escalate past the flip. THE FLIP (separate operator slot, after
+    fleet-tiering) now deletes FOUR backstops (firewall.Set/Reload +
+    RunInAIManaged/CopyToAIManaged) AND writes "ro" to
+    /etc/qmcp/tier-default in one coupled change. Behaviour-neutral in
+    compat; no new RPC service, no new qube, no new ring.
 G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
@@ -444,7 +483,10 @@ qubes_mcp/                          # repo root
 │   ├── qmcp_audit.py                 # Stage I-2 — shared hash-chained audit log
 │                                      # loaded by the 8 state-changing wrappers
 │   └── qmcp_tier.py                  # Stage I-3 — shared tier-resolution helper
-│                                      # (inert until I-5 sources it in the wrappers)
+│                                      # (Stage I-5 sources it: the 8 wrappers gate
+│                                      # on CAP_FULL + strip inherited tier tags on
+│                                      # create. I-5 added NO new dom0-rpc file —
+│                                      # it modified the 8 wrappers + the policy.)
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -487,7 +529,13 @@ qubes_mcp/                          # repo root
     ├── test-stage-I-2.py
     ├── install-stage-I-3.sh
     ├── uninstall-stage-I-3.sh
-    └── test-stage-I-3.py
+    ├── test-stage-I-3.py
+    ├── install-stage-I-4.sh
+    ├── uninstall-stage-I-4.sh
+    ├── test-stage-I-4.py
+    ├── install-stage-I-5.sh
+    ├── uninstall-stage-I-5.sh
+    └── test-stage-I-5.py
 ```
 
 ## Operating protocol
@@ -897,8 +945,60 @@ qubes_mcp/                          # repo root
   | device enumerate | `device.*.{List,Available}` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
   | firewall write | `firewall.{Set,Reload}` | `ai-net` / `ai-full` | **policy (I-4)** `@tag:ai-net` + `@tag:ai-full` (+ compat backstop) |
   | copy-IN sink | `qubes.Filecopy → ai-dump` | `ai-dump` (orthogonal) | **policy (I-4)** `@tag:ai-dump` target |
-  | exec / copy | `RunInAIManaged`, `CopyToAIManaged` | `ai-exec` | policy `@tag:` (tiered in **I-5**) |
-  | lifecycle / property / clone / spawn / feature / attach / detach | the `qmcp.*` `@adminvm` wrappers | `ai-full` | wrapper (dom0 tag-check, **I-5**) |
+  | exec / copy | `RunInAIManaged`, `CopyToAIManaged` | `ai-exec` | **policy (I-5)** `@tag:ai-exec`/`ai-net`/`ai-full` (+ compat backstop) |
+  | lifecycle / property / clone / spawn / feature / attach / detach | the `qmcp.*` `@adminvm` wrappers | `ai-full` | **wrapper (dom0 CAP_FULL gate, I-5 — landed)** |
+
+  *Create paths (Spawn/Clone/SpawnDisposable) strip every inherited tier tag on
+  create, so a newly-created qube is always **untiered** (umbrella only) — never
+  an elevation tag AI could leverage to self-escalate (Stage I-5).*
+
+- **Stage I-5 — DONE (tested); on `stage-I-wave-1`, not pushed.** The second
+  enforcement step, completing the resource axis (Wave 1). Two layers:
+  - **Wrapper surfaces (dom0 code).** The eight `@adminvm` state-changing
+    wrappers sibling-load `qmcp_tier` and require `CAP_FULL` before the
+    privileged op: Lifecycle / SetProperty / SetFeature gate the **target**,
+    Clone the **source**, Spawn the **template**, SpawnDisposable the **DVMT**,
+    Attach / Detach **both** endpoints. The gate is **FAIL-CLOSED** — a missing
+    or broken `qmcp_tier` (or any tag-read error) denies, the deliberate opposite
+    of the best-effort audit hook (a security helper must never fail open). A
+    tier refusal returns the **same opaque `"not found"`** an untagged target
+    returns (Spawn: the same opaque cross-ref message), so the surface is no
+    tier oracle.
+  - **Exec surfaces (policy).** `RunInAIManaged` / `CopyToAIManaged` graduate to
+    `@tag:ai-exec` + `@tag:ai-net` + `@tag:ai-full` (cumulative ladder) plus a
+    `@tag:ai-managed` **compat backstop** — the same Option-A pattern I-4 used
+    for firewall write. So the **flip** now deletes **four** backstops
+    (firewall.Set/Reload + RunInAIManaged/CopyToAIManaged) and writes `ro` to
+    `/etc/qmcp/tier-default` in one coupled change.
+
+  **Create-path keystone fix (caught by an adversarial review).** The CAP_FULL
+  gate guards the *input* qube but not the *output*: `qubesadmin.clone_vm` copies
+  the source's tags (all but `created-by-*`) and `admin.vm.CreateDisposable`
+  inherits the DVMT's, so a clone/disposable of an `ai-full` source emerged
+  `ai-full` — letting AI mint unbounded full-authority qubes and self-escalate
+  past the flip, breaking the un-self-escalatability keystone. Invisible in compat
+  (untiered = full anyway), it would arm at the flip. The review found it by
+  reading the qubesadmin source; the original offline mock returned a tagless
+  clone and so could not see it. **Fix:** every create path now strips every
+  `QMCP_TIER_TAGS` member except the umbrella after create, verifies, and rolls
+  back if any survives — a created qube is always untiered. Spawn's strip is
+  defense-in-depth (`add_new_vm` doesn't inherit today, but version-robust).
+
+  **Verification (three-way split, since the strip's effect is AI-unreachable —
+  tier tags are hidden from AI reads):** OFFLINE (mcp-control, the bulk) —
+  `offline-validate-I-5.py` **58/58** (the surface×tier gate matrix, fail-closed,
+  the both-ends device gate, and the create-path strip with "teeth" checks that
+  prove the mock now reproduces the inheritance bug), `offline-validate-I-5-policy.py`
+  **102/102** (exec×tier in compat + the 4-backstop flip), and the I-4 policy
+  regression **100/100** (I-5 didn't move the firewall surface) — **260 checks**.
+  `deploy/test-stage-I-5.py` (mcp-control, hardware) proves the AI-side compat
+  invariants — every A–F3 op still works, refusals opaque, no tier oracle. The
+  SLOT (dom0) proves the per-tier gate on real qrexec **and reads back the
+  create-path strip via `qvm-tags`** (the only place it can be seen): hardware
+  **24/0 green** — gate bites (ai-exec refused opaque), behaviour-neutral
+  (untiered succeeds), clone + disposable both come back untiered, A–F3
+  regression all green. Behaviour-neutral in compat; no new RPC service, no new
+  qube, no new ring.
 
 - **Stages G and H — designed, deferred until Stage I completes.**
   Per the 2026-06-08 reordering (see the Stage rollout block above),
@@ -920,13 +1020,15 @@ qubes_mcp/                          # repo root
   (above) — the tier taxonomy + resolution helper, landed inert in compat
   mode (behaviour-neutral). **I-4 done** (above) — tiers applied to the
   policy-scoped surfaces (firewall write → ai-net/ai-full behind a compat
-  backstop; the ai-dump valve), the first enforcement step. **I-5 next** —
-  tier the `@adminvm` wrapper surfaces (lifecycle/property/clone/spawn/
-  feature/attach require `ai-full`; exec requires `ai-exec`), then the
-  coordinated least-privilege flip (delete the firewall backstop + write `ro`
-  to `/etc/qmcp/tier-default`) after the operator tiers the fleet. Wave 2
-  (I-6..I-8) is the action gate + consent GUI; Wave 3 (I-9..I-11) is the
-  principal axis, secrets vault, and persona presets.
+  backstop; the ai-dump valve), the first enforcement step. **I-5 done**
+  (above) — tiers on the `@adminvm` wrapper surfaces (CAP_FULL, fail-closed)
+  + the exec surfaces (policy), plus the create-path tag-strip that keeps a
+  created qube untiered (un-self-escalatable). **Wave 1 (I-0..I-5) is now
+  complete** — the resource axis is live and backward-compatible; it stays
+  behaviour-neutral until the operator tiers the fleet and runs the coordinated
+  least-privilege flip (delete the four compat backstops + write `ro` to
+  `/etc/qmcp/tier-default`). Wave 2 (I-6..I-8) is the action gate + consent GUI;
+  Wave 3 (I-9..I-11) is the principal axis, secrets vault, and persona presets.
 
 ## References
 

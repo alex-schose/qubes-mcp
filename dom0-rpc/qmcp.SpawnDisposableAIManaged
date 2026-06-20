@@ -98,6 +98,48 @@ def _load_audit_lib():
 _AUDIT = _load_audit_lib()
 
 
+def _load_tier_lib():
+    """Load the sibling qmcp_tier helper by path (Stage I-5).
+
+    Same sibling-import shim as qmcp_audit / qmcp_budget. Returns None on
+    any failure; the tier gate then FAILS CLOSED (denies). Unlike the
+    best-effort audit hook, a missing tier resolver must NEVER grant
+    authority (STAGE-I-BUILD-PLAN.md §I-5).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_tier", os.path.join(here, "qmcp_tier.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_TIER = _load_tier_lib()
+
+
+def _require_full(vm) -> bool:
+    """Stage I-5: True iff `vm` grants CAP_FULL via the tier resolver.
+
+    FAIL-CLOSED: a missing/broken resolver (_TIER is None) or any tag-read
+    error denies. Behaviour-neutral in compat (untiered ai-managed = ai-full,
+    the I-3..I-5 default); becomes the live gate once the operator writes
+    "ro" to /etc/qmcp/tier-default. The call-site refusal collapses to the
+    same opaque message as an untagged target, so it is no tier oracle.
+    """
+    if _TIER is None:
+        return False
+    try:
+        return _TIER.has_capability(vm, _TIER.CAP_FULL)
+    except Exception:
+        return False
+
+
 def emit(payload: dict) -> int:
     # Stage I-2: record this state-changing call on the hash-chained dom0
     # audit trail before responding. Best-effort and defensively guarded
@@ -141,6 +183,42 @@ def has_tag_direct(app, vm_name: str, tag: str) -> bool:
     return tag in tags
 
 
+def list_tags_direct(app, vm_name: str) -> set:
+    """All tags on `vm_name` via direct admin call (cache-lag-safe)."""
+    raw = app.qubesd_call(vm_name, "admin.vm.tag.List")
+    return set(raw.decode(errors="replace").split())
+
+
+def remove_tag_direct(app, vm_name: str, tag: str) -> None:
+    """Remove a tag via direct admin call — bypasses the domains cache."""
+    app.qubesd_call(vm_name, "admin.vm.tag.Remove", tag)
+
+
+def _tier_tags_to_strip() -> set:
+    """The qmcp tier tags a freshly-created qube must NOT carry — every tag in
+    the tier vocabulary except the umbrella. _TIER is guaranteed loaded here
+    (we passed _require_full, which denies when _TIER is None)."""
+    return set(_TIER.QMCP_TIER_TAGS) - {_TIER.UMBRELLA}
+
+
+def strip_inherited_tier_tags_direct(app, vm_name: str) -> None:
+    """Stage I-5 keystone enforcement. admin.vm.CreateDisposable INHERITS the
+    DVMT's tags (slot-16 confirmed `ai-managed` is inherited), so a disposable
+    from an `ai-full` DVMT also inherits `ai-full` — an ephemeral CAP_FULL grant
+    the gate is meant to withhold. Remove every elevation/orthogonal tier tag so
+    the disposable is UNTIERED. Uses direct qubesd calls for the same
+    VMCollection-cache-lag reason the rest of this wrapper does. Raises if any
+    tier tag survives, so the caller rolls the disposable back."""
+    # Read-first: only remove tags actually present, so this is robust whether
+    # admin.vm.tag.Remove is idempotent or errors on an absent tag.
+    present = list_tags_direct(app, vm_name)
+    for tag in (_tier_tags_to_strip() & present):
+        remove_tag_direct(app, vm_name, tag)
+    leftover = _tier_tags_to_strip() & list_tags_direct(app, vm_name)
+    if leftover:
+        raise RuntimeError(f"failed to strip inherited tier tags: {sorted(leftover)}")
+
+
 def kill_direct(app, vm_name: str) -> None:
     """Kill a VM via direct admin call. auto_cleanup=True disposables
     are removed by qubesd once halted, so kill alone suffices."""
@@ -170,6 +248,12 @@ def main() -> int:
         return emit(NOT_FOUND)
     tpl = app.domains[template]
     if "ai-managed" not in tpl.tags:
+        return emit(NOT_FOUND)
+
+    # Stage I-5: the DVMT must grant CAP_FULL to be a disposable source.
+    # Fail-closed; collapses to the same opaque NOT_FOUND as an untagged
+    # template (no tier oracle), before the template_for_dispvms cross-ref.
+    if not _require_full(tpl):
         return emit(NOT_FOUND)
 
     # Cross-ref: a DVMT must have template_for_dispvms=True. This is NOT
@@ -216,6 +300,10 @@ def main() -> int:
         apply_tag_direct(app, disp_name, "ai-managed")
         if not has_tag_direct(app, disp_name, "ai-managed"):
             raise RuntimeError("tag.Set returned but tag not visible on refresh")
+        # Stage I-5: CreateDisposable inherited the DVMT's tags, so the
+        # disposable may carry an inherited ai-full/ai-net/ai-exec/ai-dump.
+        # Strip them — a created qube is UNTIERED (umbrella only). (See helper.)
+        strip_inherited_tier_tags_direct(app, disp_name)
     except Exception as tag_err:
         try:
             kill_direct(app, disp_name)

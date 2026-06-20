@@ -1,25 +1,30 @@
 # /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 + I-4 — sandbox with dom0-
-# mediated lifecycle, exec, file copy, tag-scoped firewall control,
+# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 + I-4 + I-5 — sandbox with
+# dom0-mediated lifecycle, exec, file copy, tag-scoped firewall control,
 # cloning, device attach/detach between ai-managed qubes, ephemeral
 # disposables, feature.Set on ai-managed qubes, bounded-window event
 # streaming scoped to ai-managed subjects, AI-scoped disk-budget
 # visibility (provisioned-bytes sum + operator-set cap), and graduated
-# authority on the directly-tag-scoped surfaces (Stage I-4: firewall WRITE
-# graduates to the ai-net/ai-full tiers; the ai-dump write-only sink).
+# authority on the directly-tag-scoped surfaces (Stage I-4: firewall WRITE →
+# the ai-net/ai-full tiers + the ai-dump write-only sink; Stage I-5: exec /
+# file-copy → the ai-exec tier). The @adminvm wrapper surfaces are tiered in
+# dom0 CODE (qmcp_tier), not here — see CLAUDE.md.
 # Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
 # MCP server NEVER edits this file. Operator-installed in dom0.
 #
-# Stage I-4 — the policy layer matches @tag: selectors LITERALLY and cannot
+# Stage I-4/I-5 — the policy layer matches @tag: selectors LITERALLY and cannot
 # call the qmcp_tier dom0 helper, so the helper's "untiered umbrella =
-# ai-full (compat)" default has no reach here. Firewall WRITE therefore ships
-# with a @tag:ai-managed COMPAT BACKSTOP that preserves today's behaviour
-# (every umbrella qube may still write its firewall → the A–F3 regression
-# stays green); the ai-net/ai-full lines are inert while it is present.
-# THE FLIP (end of Stage I-5): delete the two firewall-WRITE backstop lines
-# AND write "ro" to /etc/qmcp/tier-default in the SAME change, so the policy
-# surface and the wrapper surface drop to least-privilege together. Removing
-# only one leaves the two surfaces incoherent (see CLAUDE.md, the I-4 block).
+# ai-full (compat)" default has no reach here. The directly-@tag:-scoped WRITE
+# surfaces (firewall Set/Reload — I-4; RunInAIManaged/CopyToAIManaged — I-5)
+# therefore each ship with a @tag:ai-managed COMPAT BACKSTOP that preserves
+# today's behaviour (every umbrella qube keeps firewall + exec → the A–F3
+# regression stays green); the tiered lines are inert while a backstop is
+# present.
+# THE FLIP (end of Stage I-5): delete the FOUR compat-backstop lines
+# (firewall.Set + firewall.Reload from I-4, RunInAIManaged + CopyToAIManaged
+# from I-5) AND write "ro" to /etc/qmcp/tier-default in the SAME change, so the
+# policy surface and the wrapper surface drop to least-privilege together.
+# Removing only some leaves the surfaces incoherent (see CLAUDE.md, I-4 block).
 #
 # Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
 # Ordering inside THIS file:
@@ -47,12 +52,33 @@ qmcp.GetPropertyAIManaged    *  mcp-control  @adminvm         allow
 qmcp.SetPropertyAIManaged    *  mcp-control  @adminvm         allow
 qmcp.LifecycleAIManaged      *  mcp-control  @adminvm         allow
 
-# --- Stage B: command execution and file transfer inside ai-managed qubes.
-# qmcp.RunInAIManaged and qmcp.CopyToAIManaged are services installed in
-# ai-managed templates (NOT dom0) — they execute in the target qube as root.
+# --- Stage B + I-5: command execution and file transfer inside ai-managed
+# qubes. qmcp.RunInAIManaged and qmcp.CopyToAIManaged are services installed
+# in ai-managed templates (NOT dom0) — they execute in the target qube as root.
+#
+# Stage I-5 graduates these EXEC surfaces to the tier ladder, exactly as Stage
+# I-4 graduated firewall WRITE. exec is the ai-exec rung; the ladder is
+# cumulative (ai-net ⊃ ai-exec, ai-full ⊃ ai-net), so a qube tagged ai-net or
+# ai-full also gets exec — hence all three elevation lines. The fourth
+# @tag:ai-managed line on each is the COMPAT BACKSTOP (see the file header):
+# it keeps untiered umbrella qubes executable during migration so A–F3 stays
+# green, and is DELETED at the flip (paired with tier-default → "ro"). While
+# present it subsumes the exec/net/full lines, so the EXEC surface is
+# behaviour-neutral in compat. (The wrapper @adminvm surfaces — lifecycle/
+# property/clone/spawn/feature/attach/detach — are tiered in dom0 CODE via
+# qmcp_tier, not here; only the directly-@tag:-scoped exec surfaces are policy.)
 
-qmcp.RunInAIManaged          *  mcp-control      @tag:ai-managed  allow  user=root
-qmcp.CopyToAIManaged         *  mcp-control      @tag:ai-managed  allow  user=root
+qmcp.RunInAIManaged          *  mcp-control  @tag:ai-exec     allow  user=root
+qmcp.RunInAIManaged          *  mcp-control  @tag:ai-net      allow  user=root
+qmcp.RunInAIManaged          *  mcp-control  @tag:ai-full     allow  user=root
+# COMPAT backstop (RunInAIManaged) — DELETE at the I-5 flip, paired with tier-default → "ro":
+qmcp.RunInAIManaged          *  mcp-control  @tag:ai-managed  allow  user=root
+
+qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-exec     allow  user=root
+qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-net      allow  user=root
+qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-full     allow  user=root
+# COMPAT backstop (CopyToAIManaged) — DELETE at the I-5 flip, paired with tier-default → "ro":
+qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-managed  allow  user=root
 
 # Allow qubes.Filecopy directly between ai-managed qubes (skip operator popup).
 # Source AND target both tagged ai-managed; nothing crosses out of the sandbox.
