@@ -22,9 +22,12 @@ The corrected basis counts only the PERSISTENT footprint:
 
 Because a volume cannot exceed its own `size`, summing provisioned
 `private.size` (+ persistent `root.size`) and capping the sum is a HARD ceiling
-on real persistent usage: real ≤ Σ size ≤ cap. The gate stays provisioned-based
-(stable and predictable for AI) but drops the volumes that don't persist, so the
-ceiling tracks reality instead of 8x-inflating it.
+on the PERSISTENT footprint only: persistent ≤ Σ size ≤ cap. A running qube's
+volatile + COW-root consume real pool space transiently (reclaimed on shutdown)
+and are intentionally NOT metered, so the cap bounds persistent exhaustion, not
+transient runtime pool pressure. The gate stays provisioned-based (stable and
+predictable for AI) but drops the volumes that don't persist, so the ceiling
+tracks reality instead of 8x-inflating it.
 
 Two operator-owned config files (both re-read per call, no daemon restart — the
 F3 `/etc/qmcp/pool-cap` pattern):
@@ -54,8 +57,17 @@ the klass-aware sum is too easy to duplicate wrong). Sibling-import rationale
 """
 from __future__ import annotations
 
+import fcntl
+import os
+
 CAP_PATH = "/etc/qmcp/pool-cap"
 PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
+#: Exclusive create lock — serializes the cap-check->create critical section
+#: across concurrent qmcp.* create PROCESSES (each qrexec call is its own
+#: process). The create wrappers hold it from the gate through the Admin API
+#: create; pre-created root:qubes 0660 at install so the non-root wrapper user
+#: can flock it. See acquire_create_lock.
+LOCK_PATH = "/etc/qmcp/budget.lock"
 
 #: Default private size assumed for a spawn that doesn't request one — the Qubes
 #: default a new AppVM/DispVM receives (2 GiB). Also the floor the estimate
@@ -170,6 +182,21 @@ def estimate_spawn_bytes(requested_private: int | None) -> int:
     return max(int(requested_private), DEFAULT_PRIVATE_BYTES)
 
 
+def dvmt_private_bytes(dvmt_vm) -> int:
+    """The `private.size` a disposable inherits from its DispVMTemplate.
+
+    A disposable provisions its `private` FROM the DVMT, so a cap estimate that
+    assumed the 2 GiB default under-counts a disposable spawned off an inflated
+    DVMT. SpawnDisposable passes this as `requested_private` so estimate_spawn_bytes
+    clamps it up to the floor and the projection matches what the disposable
+    actually provisions. Fail-safe: the default floor on any access error.
+    """
+    try:
+        return _vol_size(dvmt_vm.volumes, "private")
+    except Exception:
+        return DEFAULT_PRIVATE_BYTES
+
+
 def estimate_clone_bytes(src_vm) -> int:
     """Persistent footprint a clone will add: the source's full persistent
     footprint. A clone copies the source's volumes, so cloning a template
@@ -193,6 +220,52 @@ def check_private_size(requested_private: int | None) -> str | None:
     if int(requested_private) > p:
         return ERR_PRIVATE_TOO_LARGE
     return None
+
+
+def acquire_create_lock() -> int:
+    """Take the exclusive create lock, serializing the cap-check->create critical
+    section across concurrent qmcp.* create processes. Each qrexec invocation is
+    a separate dom0 process, so without this two spawns can both read the same
+    pre-create `used`, both pass the gate, and both create — overshooting the cap
+    by up to (N-1)x estimate. The wrappers acquire this BEFORE check_cap_for_create
+    and hold it through the Admin API create; the lock releases when the
+    short-lived wrapper PROCESS EXITS (a raw fd is not closed on GC), so callers
+    need not release it explicitly.
+
+    BEST-EFFORT: the cap is a soft, reclaimable ceiling (overshoot is a bounded
+    transient DoS, not a breakout), so a create still PROCEEDS if the lock can't
+    be taken — a broken lock file must never block all creates; it only loses
+    cross-process serialization. Returns the locked fd, or -1 on failure.
+    """
+    try:
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o660)
+    except Exception:
+        return -1
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        return -1
+    return fd
+
+
+def release_create_lock(fd: int) -> None:
+    """Release a lock taken by acquire_create_lock. The wrappers rely on process
+    exit and don't call this; it exists for offline tests and any long-lived
+    caller that must not hold the lock until exit."""
+    if fd is None or fd < 0:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
 
 
 def check_cap_for_create(app, src_vm, requested_private: int | None = None,

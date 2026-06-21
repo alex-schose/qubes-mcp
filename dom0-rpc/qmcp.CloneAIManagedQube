@@ -242,6 +242,9 @@ def main() -> int:
         budget = _load_budget_lib()
     except Exception as e:
         return emit({"ok": False, "error": f"budget helper load failed: {e}"})
+    # Serialize the gate->create critical section (see qmcp_budget.acquire_create_lock);
+    # held until this one-shot process exits. Best-effort.
+    _budget_lock_fd = budget.acquire_create_lock()
     cap_err = budget.check_cap_for_create(app, src_vm, is_clone=True)
     if cap_err is not None:
         return emit({"ok": False, "error": cap_err})

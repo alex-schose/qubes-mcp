@@ -273,16 +273,20 @@ def main() -> int:
     # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
     # Refuse if the projected persistent sum would exceed `/etc/qmcp/pool-cap`.
     # A disposable's root is COW from the DVMT and its volatile is ephemeral, so
-    # the only persistent bytes it adds (while it exists) are its private — the
-    # spawn estimate (the Qubes default; disposables take no private_size param).
-    # The default gate call (no is_clone, no requested_private) selects exactly
-    # that. Measurement mirrors qmcp.GetPoolStats (shared summer); cap-missing
-    # fails closed with the same opaque message.
+    # the only persistent bytes it adds (while it exists) are its private — which
+    # it provisions FROM the DVMT. So the estimate uses the DVMT's ACTUAL private
+    # (dvmt_private_bytes), not the 2 GiB default: an inflated DVMT yields an
+    # inflated disposable. Measurement mirrors qmcp.GetPoolStats (shared summer);
+    # cap-missing fails closed with the same opaque message.
     try:
         budget = _load_budget_lib()
     except Exception as e:
         return emit({"ok": False, "error": f"budget helper load failed: {e}"})
-    cap_err = budget.check_cap_for_create(app, tpl)
+    # Serialize the gate->create critical section (see qmcp_budget.acquire_create_lock);
+    # held until this one-shot process exits. Best-effort.
+    _budget_lock_fd = budget.acquire_create_lock()
+    cap_err = budget.check_cap_for_create(
+        app, tpl, requested_private=budget.dvmt_private_bytes(tpl))
     if cap_err is not None:
         return emit({"ok": False, "error": cap_err})
 

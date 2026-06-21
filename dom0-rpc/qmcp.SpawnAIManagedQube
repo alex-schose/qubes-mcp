@@ -342,6 +342,10 @@ def main() -> int:
     psize_err = budget.check_private_size(private_size)
     if psize_err is not None:
         return fail(psize_err)
+    # Serialize the gate->create critical section so concurrent spawns can't both
+    # pass the same pre-create `used` and overshoot the cap. Held until this
+    # one-shot process exits (best-effort; a create proceeds even unlocked).
+    _budget_lock_fd = budget.acquire_create_lock()
     cap_err = budget.check_cap_for_create(app, tpl, requested_private=private_size)
     if cap_err is not None:
         return fail(cap_err)
