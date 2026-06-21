@@ -101,6 +101,13 @@ qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
 # cannot create a hybrid (it cannot mutate tags — the keystone), so this is an
 # operator-misconfig guard, not a self-escalation path. install-stage-I-4.sh
 # WARNS on any hybrid at deploy; Stage I-5 machine-refuses it at fleet-tiering.
+#
+# SOURCE GATE = the umbrella @tag:ai-managed by design (NOT an elevation tag).
+# The upstream EXEC gate already bounds who can initiate a copy: qmcp.CopyToAIManaged
+# requires @tag:ai-exec post-flip, so only an exec-capable qube can drive a Filecopy
+# at all. Gating the SOURCE here on the umbrella (not ai-exec/ai-net/ai-full) keeps the
+# Biba valve reachable by any exec-capable qube without a redundant elevation
+# requirement. A future editor must NOT "graduate" this line to an elevation tag.
 
 qubes.Filecopy              *  @tag:ai-managed  @tag:ai-dump     allow
 

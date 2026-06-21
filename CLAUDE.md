@@ -114,7 +114,7 @@ this directory.**
     migration — so A–F3 stays green and the live egress qube keeps firewall
     control on deploy. The backstop subsumes the net/full lines, so firewall
     write is behaviour-neutral in compat; the one new live capability is the
-    `ai-dump` valve. **The flip (end of I-5) deletes the two backstop lines AND
+    `ai-dump` valve. **The flip (end of I-5) deletes the four compat backstops AND
     writes `ro` to `/etc/qmcp/tier-default` in one change**, so the policy
     surface and the wrapper surface drop to least-privilege together — removing
     only one leaves them incoherent. I-5 then tiers the wrapper surfaces
@@ -147,7 +147,10 @@ this directory.**
   root persists (TemplateVM/StandaloneVM); a COW AppVM root and ephemeral
   volatile are **not** counted (they were, and over-stated real usage ~8×).
   Because a volume can't exceed its own size, Σ persistent ≤ `/etc/qmcp/pool-cap`
-  is a **hard ceiling on real persistent usage**. A second operator file,
+  is a **hard ceiling on the persistent footprint** — but only that: a running
+  qube's volatile/COW-root is real pool space that the meter intentionally skips
+  (transient, reclaimed on shutdown), so the cap bounds **persistent**
+  exhaustion, not transient runtime pool pressure. A second operator file,
   `/etc/qmcp/private-cap`, bounds any single qube's `private`: a spawn may
   request a larger persistent volume (`private_size`) up to that ceiling, so AI
   can make big qubes *under the limit* but no qube can hog the pool. Both caps
@@ -350,8 +353,8 @@ I-4. Tiers on the policy-scoped surfaces — the first enforcement step,
     green, the live egress qube keeps firewall control on deploy, and
     the WRITE surface stays behaviour-neutral in compat (the net/full
     lines are subsumed until the flip). The one new live capability is
-    the ai-dump valve. THE FLIP (end of I-5) deletes the two backstop
-    lines AND writes "ro" to /etc/qmcp/tier-default in one change, so
+    the ai-dump valve. THE FLIP (end of I-5) deletes the four compat
+    backstops AND writes "ro" to /etc/qmcp/tier-default in one change, so
     the policy surface and the wrapper surface flip together. No new RPC
     service; no new qube; no wrapper change; no new ring — policy-only.
 I-5. Tiers on the wrapper + exec surfaces — the second enforcement

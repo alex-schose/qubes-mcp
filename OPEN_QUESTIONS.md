@@ -197,3 +197,17 @@ GitHub issue.
     for the more explicit form? (c) Either way: any direct
     precedent in the Qubes ecosystem we should be borrowing from
     that we missed?
+
+13. **Disk cap meters persistent footprint only — transient-volatile
+    caveat (acknowledged).** Following the cap-as-contract design in #11,
+    the disk budget meters the **persistent** footprint only (`private`
+    + persistent `root`); a running qube's volatile/COW-root is real pool
+    space that is **not** metered (transient, reclaimed on shutdown). We
+    acknowledge this as a bounded **transient DoS** — a running fleet can
+    apply real pool pressure that the cap does not count — **not**
+    persistent exhaustion: nothing AI writes into volatile/COW-root
+    survives shutdown, so the cap's guarantee (bounded persistent bytes)
+    holds. The basis is deliberate (metering provisioned volatile would
+    8×-inflate the figure, the very over-count #11/I-0 corrected), but
+    reviewers are welcome to flag whether bounding transient runtime pool
+    pressure separately is worth the added side-channel and complexity.

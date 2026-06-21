@@ -159,6 +159,17 @@ qvm-run --pass-io "$SOURCE_QUBE" \
     | sed 's/^/      /'
 after="$(sudo cat "$LOG" 2>/dev/null | wc -l)"
 echo "      audit lines: before=$before after=$after   (must grow by 1)"
+# ASSERT, don't just print: a non-root wrapper user that cannot write the log
+# (root:0600 instead of root:qubes 0660, or a wrapper fchmod) makes audit()
+# silently no-op — the exact I-2 v1 failure the sudo/offline smokes hid. Fail
+# the install loudly if the real qrexec write path did not record the attempt.
+if [ "$after" -ne "$((before + 1))" ]; then
+    echo "FATAL: audit log did NOT grow by exactly 1 over the real qrexec path." >&2
+    echo "       The non-root wrapper user cannot append to $LOG." >&2
+    echo "       Check: $LOG is root:qubes 0660 and no wrapper fchmod's it." >&2
+    rm -rf "$STAGE_DIR"; exit 1
+fi
+echo "      OK: log grew by exactly 1 — non-root qrexec write path verified."
 sudo python3 /etc/qubes-rpc/qmcp_audit.py verify "$LOG" | sed 's/^/      verify: /'
 if [ -e "$LOG" ]; then
     echo "      perms: $(sudo stat -c '%a %U:%G' "$LOG")   (expect 660 root:qubes)"

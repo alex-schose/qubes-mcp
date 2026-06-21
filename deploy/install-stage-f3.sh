@@ -22,12 +22,14 @@
 #
 # Run from dom0:
 #   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
-#   bash /tmp/install-f3.sh mcp-control ~user/qubes_mcp
+#   bash /tmp/install-f3.sh mcp-control ~user/qubes_mcp/public
 
 set -euo pipefail
 
 SOURCE_QUBE="${1:-mcp-control}"
-SOURCE_PATH="${2:-/home/user/qubes_mcp}"
+# The repo lives in public/ (post-2026-05-21 layout); policy/ and dom0-rpc/ are
+# under it. The default must point at public/, or the default-arg pull is empty.
+SOURCE_PATH="${2:-/home/user/qubes_mcp/public}"
 
 STAGE_DIR="/tmp/qubes-mcp-stage-f3"
 CAP_DIR="/etc/qmcp"
@@ -52,12 +54,58 @@ qvm-run --pass-io "$SOURCE_QUBE" \
 
 (cd "$STAGE_DIR" && tar -xf stage-f3.tar)
 
+# Guard against an empty/failed pull — installing an empty policy and then
+# reloading the daemon would break ALL qrexec.
+for f in policy/30-mcp-control.policy dom0-rpc/qmcp.GetPoolStats; do
+    [ -s "$STAGE_DIR/$f" ] || { echo "FATAL: pulled an empty file: $f" >&2; rm -rf "$STAGE_DIR"; exit 1; }
+done
+
 echo "==> SHA-256 of pulled files (record for your audit):"
 ( cd "$STAGE_DIR" && sha256sum policy/30-mcp-control.policy \
                                 dom0-rpc/qmcp.GetPoolStats )
 echo
 
-# ---------------------------------------------------------------- 2. install dom0 files
+# ---------------------------------------------------------------- 2. validate + install dom0 files
+# A malformed policy can break ALL qrexec, so validate the staged file BEFORE it
+# touches /etc/qubes/policy.d/. Prefer the authoritative qrexec parser; fall back
+# to a structural lint (every non-comment line >=5 fields + a valid action). Same
+# gate the I-4/I-5 installers use — f3 reloads the daemon too, so it needs it.
+echo "==> Validating staged policy syntax (before install)..."
+if python3 - "$STAGE_DIR/policy/30-mcp-control.policy" <<'PY'
+import sys
+path = sys.argv[1]
+try:
+    from qrexec.policy.parser import StringPolicy  # type: ignore
+    StringPolicy(policy={'30-mcp-control': open(path, encoding='utf-8').read()})
+    print("    qrexec parser: policy parses clean.")
+    sys.exit(0)
+except ImportError:
+    pass
+except Exception as e:  # parser present but rejected the file
+    print(f"FATAL: qrexec parser rejected the policy: {e}", file=sys.stderr)
+    sys.exit(1)
+bad = []
+for i, line in enumerate(open(path, encoding='utf-8'), 1):
+    s = line.strip()
+    if not s or s.startswith('#'):
+        continue
+    toks = s.split()
+    if len(toks) < 5 or toks[4] not in ('allow', 'deny', 'ask'):
+        bad.append((i, s))
+if bad:
+    for i, s in bad:
+        print(f"FATAL: malformed rule line {i}: {s!r}", file=sys.stderr)
+    sys.exit(1)
+print("    structural lint: all rule lines well-formed (>=5 fields, valid action).")
+PY
+then
+    echo "    policy validation OK."
+else
+    echo "FATAL: staged policy failed validation — NOT installing." >&2
+    rm -rf "$STAGE_DIR"; exit 1
+fi
+echo
+
 echo "==> Installing dom0 policy..."
 sudo install -m 0644 -o root -g root \
     "$STAGE_DIR/policy/30-mcp-control.policy" \

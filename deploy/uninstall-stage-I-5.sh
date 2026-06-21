@@ -47,9 +47,14 @@ if [ ! -f "$POLICY" ]; then
 fi
 
 # Back up the current file before surgery so a botched sed is recoverable.
+# OUTSIDE /etc/qubes/policy.d/ — a `30-mcp-control.policy.*` sibling left in the
+# policy dir risks the qrexec loader picking it up and is poor hygiene.
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-sudo cp -a "$POLICY" "$POLICY.pre-uninstall-I-5.$TS"
-echo "==> Backed up current policy to $POLICY.pre-uninstall-I-5.$TS"
+BK_DIR="/var/lib/qmcp-rollback"
+sudo mkdir -p "$BK_DIR"
+BK="$BK_DIR/$(basename "$POLICY").pre-uninstall-I-5.$TS"
+sudo cp -a "$POLICY" "$BK"
+echo "==> Backed up current policy to $BK"
 echo
 
 # Restore the EXEC surfaces (RunInAIManaged / CopyToAIManaged) to the single
@@ -83,12 +88,27 @@ sys.exit(1 if bad else 0)
 PY
 then
     echo "FATAL: revert produced a malformed policy. Restoring the pre-uninstall backup." >&2
-    sudo cp -a "$POLICY.pre-uninstall-I-5.$TS" "$POLICY"
+    sudo cp -a "$BK" "$POLICY"
     echo "       Restored. Use '/tmp/run.sh revert' for a clean revert instead." >&2
     exit 1
 fi
 echo "    reverted policy parses clean."
 echo
+
+# Coherence with the FLIP: I-5 leaves the wrapper CAP_FULL gates installed, so if
+# the fleet was flipped (/etc/qmcp/tier-default=ro) those gates keep enforcing
+# least-privilege on untiered qubes while this policy revert loosens the exec
+# surface — the split-brain the design forbids. Reset the flag to compat so the
+# still-installed wrapper gates resolve untiered=full again, coherent with the
+# reverted policy.
+FLAG="/etc/qmcp/tier-default"
+if [ -f "$FLAG" ] && [ "$(sudo awk 'NR==1{print $1}' "$FLAG" 2>/dev/null)" = "ro" ]; then
+    sudo cp -a "$FLAG" "$BK_DIR/tier-default.pre-uninstall-I-5.$TS"
+    sudo rm -f "$FLAG"
+    echo "==> Fleet was flipped (tier-default=ro); reset to compat (removed $FLAG)."
+    echo "    The still-installed wrapper gates now resolve untiered=full — no split-brain."
+    echo
+fi
 
 echo "==> Reloading qrexec policy daemon..."
 if sudo systemctl restart qubes-qrexec-policy-daemon 2>/dev/null; then
