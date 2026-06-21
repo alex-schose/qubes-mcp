@@ -16,8 +16,9 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through F3 (below) are tested and working on Qubes R4.3-era
-systems. Stages G–H are designed but not yet implemented.
+Stages A through F3 and the Stage I Wave-1 sub-stages (I-0..I-5) are tested and
+working on Qubes R4.3-era systems — see the Status table below. Stages G–H are
+designed but deferred until Stage I completes.
 
 ## Architecture
 
@@ -509,13 +510,14 @@ hallucinating or prompt-injected agent can ignore F3's
 that motivated this sub-stage). With it, every
 `qmcp.SpawnAIManagedQube`, `qmcp.CloneAIManagedQube`, and
 `qmcp.SpawnDisposableAIManaged` call computes
-`projected = current_ai_managed_used + estimate_from(template_or_source)`
+`projected = current_ai_managed_used + estimate_from(new_qube)`
 and refuses with the opaque `"pool cap exceeded"` if
-`projected > cap`. The estimate is the conservative
-`sum(vol.size for vol in src.volumes.values())` — the full
-provisioned size of the template/source, because the new qube's
-volumes inherit from that source and F3's `used` counts those same
-bytes once they're attached.
+`projected > cap`. *(Accounting corrected 2026-06-12 — matching the I-0
+row in the Status table above: `used` meters the **persistent**
+footprint (each `private`, plus `root` only for persistent-root
+klasses), the estimate is the new qube's `private`, and a per-qube
+`/etc/qmcp/private-cap` bounds any single qube. The form that shipped
+first summed every volume's provisioned size, ~8× over-counting.)*
 
 Measurement is byte-identical to F3's `qmcp.GetPoolStats`, so AI's
 view of `(used, cap, headroom)` predicts the gate's behaviour
