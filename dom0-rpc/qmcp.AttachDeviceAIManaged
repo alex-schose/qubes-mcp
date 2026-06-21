@@ -201,10 +201,16 @@ def main() -> int:
         return emit({"ok": False, "error": f"qvm-device attach failed to launch: {e}"})
 
     if proc.returncode != 0:
-        msg = (proc.stderr.decode(errors="replace").strip()
-               or proc.stdout.decode(errors="replace").strip()
-               or f"qvm-device exit {proc.returncode}")
-        return emit({"ok": False, "error": f"attach failed: {msg}"})
+        # Constant message — raw qvm-device stderr can name an out-of-scope
+        # qube ("already attached to <op-qube>") or distinguish which
+        # device_ids are real on the backend, an existence oracle that would
+        # bypass this wrapper's opaque-refusal posture. Detail goes to dom0
+        # stderr (operator-only), never to the AI-facing response.
+        detail = (proc.stderr.decode(errors="replace").strip()
+                  or proc.stdout.decode(errors="replace").strip()
+                  or f"qvm-device exit {proc.returncode}")
+        print(f"qmcp.AttachDeviceAIManaged: attach failed: {detail}", file=sys.stderr)
+        return emit({"ok": False, "error": "attach failed"})
 
     return emit({"ok": True})
 

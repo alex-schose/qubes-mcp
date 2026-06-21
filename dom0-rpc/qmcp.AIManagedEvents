@@ -31,13 +31,19 @@ qubes (their events stop surfacing immediately after the tag is gone,
 except for the tag-delete event itself, per (1) above).
 
 Payload shape is intentionally minimal: {event, subject, subject_klass,
-ts}. The `tag` kwarg is whitelisted for domain-tag-add and
-domain-tag-delete events because it's the one piece of payload data
-that's load-bearing for AI ("which tag was added/removed?"). All other
-kwargs are dropped — if a downstream stage finds a specific kwarg
-indispensable, it can be added to the whitelist with a clear leak
-analysis. Default-drop is safer than default-pass-through given that
-property-set kwargs can carry references to operator qubes.
+ts}, plus `tag` for tag-change events. Real qubesd tag events are
+COLON-SUFFIXED with the tag name — the wildcard handler receives
+"domain-tag-add:ai-full", so the tag rides in the event NAME (the `tag`
+kwarg is often absent). Tag-change events are therefore REDACTED to the
+AI-observable vocabulary (qmcp_scope.QMCP_TAG_VOCABULARY = {ai-managed}):
+a tier tag (ai-exec/ai-net/ai-full) or any operator tag is dropped WHOLE
+— value, kwarg, AND the suffixed event name — so the fleet's authority
+topology is not an event-stream oracle (trust model: AI "cannot read the
+tier tags"; I-1 closed the same leak on the static `tags` read). For an
+ai-managed grant/revoke the name is normalised to its bare base and the
+tag surfaced separately. All other kwargs are dropped — default-drop is
+safer than default-pass-through given that property-set kwargs can carry
+references to operator qubes. See split_tag_event / scoped_tag_event.
 
 Input  (stdin, JSON): {
     "duration": <int seconds, clamped to [1, 120]>,
@@ -65,10 +71,12 @@ import time
 DURATION_MIN = 1
 DURATION_MAX = 120
 
-# Events whose `tag` kwarg is whitelisted into the payload. These are
-# the only events where a kwarg is load-bearing for AI — the tag string
-# is the signal AI must see to act on a boundary change.
-TAG_KWARG_EVENTS = {"domain-tag-add", "domain-tag-delete"}
+# Base names of the tag-change events. The REAL qubesd event delivered to a
+# wildcard handler is colon-suffixed with the tag, e.g. "domain-tag-add:ai-full"
+# — so the tag rides in the event NAME (the `tag` kwarg is often absent). Any
+# tag handling MUST parse the suffix, not just the kwarg, or a tier tag leaks
+# through the event name. See split_tag_event.
+TAG_EVENT_BASES = ("domain-tag-add", "domain-tag-delete")
 
 NOT_FOUND = {"ok": False, "error": "not found"}
 
@@ -90,6 +98,61 @@ def event_matches(event: str, filters: list[str]) -> bool:
         if event == f or event.startswith(f + ":"):
             return True
     return False
+
+
+def _load_scope_vocab() -> frozenset:
+    """The AI-observable tag vocabulary, from the shared qmcp_scope helper
+    (single source of truth, sibling-loaded the same way the read wrappers
+    load qmcp_scope). Fail-closed: if the helper can't load, return the empty
+    set so NO tag value ever surfaces on the event channel."""
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_scope", os.path.join(here, "qmcp_scope.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return frozenset(mod.QMCP_TAG_VOCABULARY)
+    except Exception:
+        return frozenset()
+
+
+def split_tag_event(event: str) -> tuple[str | None, str | None]:
+    """Parse a tag-change event into (base, tag).
+
+    Real qubesd tag events are colon-suffixed with the tag name, so the tag
+    lives in the event NAME: "domain-tag-add:ai-full" -> ("domain-tag-add",
+    "ai-full"). The bare form (no suffix) -> (base, None) and the tag, if any,
+    is then in the `tag` kwarg. A non-tag event -> (None, None)."""
+    for base in TAG_EVENT_BASES:
+        if event == base:
+            return base, None
+        if event.startswith(base + ":"):
+            return base, event[len(base) + 1:]
+    return None, None
+
+
+def scoped_tag_event(event: str, kwargs: dict, tag_vocab):
+    """Redact a tag-change event to the AI-observable vocabulary.
+
+    Returns (include, base_event, tag). Only a tag in tag_vocab
+    (qmcp_scope.QMCP_TAG_VOCABULARY = {ai-managed}) may surface; a tier tag
+    (ai-exec/ai-net/ai-full) or any operator tag is dropped WHOLE — its value,
+    its kwarg, AND the colon-suffixed event NAME (the real leak vector the
+    hardware proof exposed). For a vocab tag the event name is normalised to
+    the bare base so the name never carries a tag string, and `tag` is surfaced
+    separately. A non-tag event passes through unchanged: (True, event, None).
+    I-1 closed this on the static `tags` read (scoped_tags); the event surface
+    is the sibling that needs the same filter."""
+    base, tag_in_name = split_tag_event(event)
+    if base is None:
+        return True, event, None
+    tag = tag_in_name if tag_in_name is not None else kwargs.get("tag")
+    if tag not in tag_vocab:
+        return False, None, None
+    return True, base, tag
 
 
 def snapshot_ai_managed(app) -> set[str]:
@@ -126,7 +189,9 @@ def should_include(app, subject_name: str, event: str,
     snapshot for still-existing subjects — newly-tagged surfaces in,
     newly-untagged drops out (except the tag-delete event above).
     """
-    if event == "domain-tag-delete" and kwargs.get("tag") == "ai-managed":
+    base, tag_in_name = split_tag_event(event)
+    tag = tag_in_name if tag_in_name is not None else kwargs.get("tag")
+    if base == "domain-tag-delete" and tag == "ai-managed":
         return subject_name in snapshot
     try:
         return "ai-managed" in app.domains[subject_name].tags
@@ -181,6 +246,9 @@ def main() -> int:
     # ----- snapshot the ai-managed set BEFORE subscribing. The window
     # is "ai-managed at t0 OR ai-managed live-now"; t0 is now.
     snapshot = snapshot_ai_managed(app)
+    # AI-observable tag vocabulary (single source of truth: qmcp_scope).
+    # Fail-closed to empty → no tag value surfaces if the helper can't load.
+    tag_vocab = _load_scope_vocab()
 
     collected: list[dict] = []
     warning_box: list[str | None] = [None]
@@ -212,16 +280,21 @@ def main() -> int:
         if events_filter is not None and not event_matches(event, events_filter):
             return
 
+        # Tag events carry the tag in the colon-suffixed event NAME; redact to
+        # the AI-observable vocabulary so a tier/operator tag leaks neither its
+        # value nor its event name. Non-tag events pass through unchanged; the
+        # ai-managed grant/revoke signal still surfaces (name normalised).
+        include, base_event, tag = scoped_tag_event(event, kwargs, tag_vocab)
+        if not include:
+            return
         item = {
-            "event": event,
+            "event": base_event,
             "subject": subject_name,
             "subject_klass": subject_klass,
             "ts": time.time(),
         }
-        # Whitelisted kwarg: `tag` for tag-add / tag-delete events. AI
-        # needs to know WHICH tag changed to act on the event.
-        if event in TAG_KWARG_EVENTS and "tag" in kwargs:
-            item["tag"] = kwargs["tag"]
+        if tag is not None:
+            item["tag"] = tag
         collected.append(item)
 
     dispatcher = qubesadmin.events.EventsDispatcher(app)
