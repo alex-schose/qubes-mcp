@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.LIFECYCLE)
@@ -41,4 +41,4 @@ def qubes_spawn(
         payload["netvm"] = netvm
     if private_size is not None:
         payload["private_size"] = private_size
-    return call_qmcp("qmcp.SpawnAIManagedQube", payload)
+    return call_qmcp("qmcp.SpawnAIManagedQube", payload, timeout=GATED_TIMEOUT)

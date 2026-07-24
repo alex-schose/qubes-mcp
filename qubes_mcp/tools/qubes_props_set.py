@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.LIFECYCLE)
@@ -14,4 +14,5 @@ def qubes_props_set(name: str, property: str, value) -> dict:
     return call_qmcp(
         "qmcp.SetPropertyAIManaged",
         {"name": name, "property": property, "value": value},
+        timeout=GATED_TIMEOUT,
     )

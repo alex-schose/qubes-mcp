@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.DEVICE)
@@ -25,4 +25,4 @@ def qubes_device_detach(
         "backend": backend,
         "device_id": device_id,
         "frontend": frontend,
-    })
+    }, timeout=GATED_TIMEOUT)

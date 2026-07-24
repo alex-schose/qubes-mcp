@@ -1,0 +1,40 @@
+# /etc/qmcp/consent-policy — operator-owned consent gate (Stage I-6: EMPTY).
+#
+# This file selects which (service, action) pairs require live operator consent
+# before the dom0 wrapper performs the privileged operation. One rule per line:
+#
+#     service:action
+#
+# where `action` may be '*' to gate every action of that service. Lines
+# starting with '#' and blank lines are ignored. The file is re-read on every
+# gated call, so edits take effect with NO daemon restart.
+#
+# ── Stage I-6 ships this file EMPTY (all lines below are comments) ────────────
+# An empty gate means consent_required() returns False for every call, the
+# consent daemon is never contacted, and behaviour is byte-identical to the
+# pre-I-6 tree (invariance). The mechanism is installed but INERT. Turning it on
+# is Stage I-7: uncomment the rules you want (or your own), and each matching
+# call will pop the operator consent dialog.
+#
+# FAIL-CLOSED: if this file is MISSING or contains ANY unparseable non-comment
+# line, the helper falls back to gating the destructive-by-default set —
+# LifecycleAIManaged:remove/kill and Attach/DetachDeviceAIManaged — rather than
+# gating nothing. So a corrupt policy denies more, never less.
+#
+# Only the four @adminvm-wrapper surfaces below are gateable here; firewall
+# write and exec/copy are policy-scoped surfaces (not wrappers) and cannot be
+# gated through this file.
+#
+# ── The intended Stage I-7 default (uncomment to enable) ─────────────────────
+# qmcp.LifecycleAIManaged:remove
+# qmcp.LifecycleAIManaged:kill
+# qmcp.AttachDeviceAIManaged:attach
+# qmcp.DetachDeviceAIManaged:detach
+#
+# ── Further examples (uncomment / adapt as you like) ─────────────────────────
+# Gate EVERY lifecycle action (start/shutdown/kill/pause/unpause/remove):
+# qmcp.LifecycleAIManaged:*
+#
+# Gate every property write and every clone:
+# qmcp.SetPropertyAIManaged:set-property
+# qmcp.CloneAIManagedQube:clone

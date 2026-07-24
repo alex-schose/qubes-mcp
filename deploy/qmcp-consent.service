@@ -1,0 +1,36 @@
+# qmcp-consent.service — the operator-consent daemon (Stage I-6).
+#
+# Installed as a systemd --USER unit for the operator (uid 1000, group
+# `qubes`):  ~/.config/systemd/user/qmcp-consent.service, then
+#   systemctl --user enable --now qmcp-consent.service
+#
+# It MUST run inside the operator's graphical session: the daemon pops a zenity
+# dialog, so it needs $DISPLAY (and the session D-Bus). A --user unit inherits
+# the graphical session environment; graphical-session.target ties its lifetime
+# to that session so it stops on logout and restarts on login.
+#
+# At Stage I-6 the shipped /etc/qmcp/consent-policy gates the EMPTY set, so no
+# wrapper ever connects and the daemon is inert — present and startable, but
+# never asked. Enforcement is Stage I-7.
+
+[Unit]
+Description=qmcp operator-consent daemon (Stage I-6, inert)
+Documentation=https://github.com/alex-schose/qubes-mcp
+# Needs the graphical session for the zenity consent dialog ($DISPLAY, D-Bus).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/qmcp/qmcp-consentd
+# Restart on any exit so a crashed daemon does not silently leave gated calls
+# unable to reach consent (which, being fail-closed, would DENY them).
+Restart=always
+RestartSec=2
+# The zenity dialog requires the session $DISPLAY. A --user unit normally
+# inherits it from the session; import it explicitly as a belt-and-suspenders
+# for environments where systemd --user did not import the session env.
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical-session.target

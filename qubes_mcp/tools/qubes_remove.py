@@ -1,9 +1,10 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.LIFECYCLE)
 def qubes_remove(name: str) -> dict:
     """Remove an ai-managed qube. Qube must be shut down first."""
     return call_qmcp("qmcp.LifecycleAIManaged",
-                     {"name": name, "action": "remove"})
+                     {"name": name, "action": "remove"},
+                     timeout=GATED_TIMEOUT)

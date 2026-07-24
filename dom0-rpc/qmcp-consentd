@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""qmcp-consentd — the operator-consent daemon (Stage I-6).
+
+Runs as a systemd --user service in the operator's graphical dom0 session
+(uid 1000, group `qubes`, with $DISPLAY). It serves an AF_UNIX SOCK_STREAM
+socket at `/run/qmcp/consent.sock`; the dom0 qrexec wrappers connect through
+the sibling helper `qmcp_consent.py` when — and only when — the operator's
+`/etc/qmcp/consent-policy` gates the incoming (service, action). At Stage I-6
+that policy is EMPTY, so no wrapper ever connects and this daemon is inert —
+present, startable, but never asked. Enforcement is Stage I-7.
+
+Trust boundary
+--------------
+Only the wrapper user and the operator GUI session (both uid 1000, group
+`qubes`) can reach the socket: the daemon binds inside the tmpfiles-created
+`/run/qmcp` dir (2770 root:qubes) and chmods the socket 0660 after bind. The
+daemon runs as a systemd --user unit in the operator session (uid 1000), so the
+socket it binds is owned `<operator>:qubes 0660` — NOT root:qubes. Reachability
+rests on the `qubes` group + 0660 mode (the setgid parent forces the group), not
+on the owner. AI has no dom0 file access and no `qmcp.*` service exposes the
+socket or the policy, so AI cannot open it, read the policy, or forge an
+approval. The authoritative record of what was gated stays the wrapper's
+`qmcp_audit` hash chain (which logs the verdict); this daemon logs only to
+stderr/journal.
+
+Serialization
+-------------
+SINGLE-THREADED accept loop. Consent is inherently serial — one operator, one
+dialog — so a second gated request simply waits its turn on the accept queue
+rather than popping a competing dialog. This is deliberate, not a limitation.
+
+Wire protocol (newline-delimited JSON), see qmcp_consent.py:
+    request  {"v":1,"nonce":<32-hex>,"service":..,"action":..,
+              "principal":..,"summary":{..}}
+    response {"v":1,"nonce":<same>,"verdict":"approved"|"denied"|"timeout"}
+
+Dialog
+------
+zenity, subprocess LIST form (NEVER shell=True — request data must never reach a
+shell). Two shapes:
+  - non-destructive => a --question dialog (Approve / Deny), --timeout T_gate.
+  - destructive (action in {remove, kill}) => a --entry "typed-confirm" dialog:
+    the operator must TYPE the target qube name; stdout must equal the target
+    exactly, else the verdict is "denied".
+On dialog auto-expiry zenity exits 5 => verdict "timeout". T_gate is read per
+request from `/etc/qmcp/consent-timeout` (default 300), so it is the innermost
+of the three timeouts (T_gate < helper recv < T_mcp).
+
+zenity availability in dom0 is a SLOT-VERIFY assumption — dom0 is minimal; the
+install slot must confirm `zenity` is present in the operator session before
+this is relied on for enforcement (I-7). At I-6 the empty gate means it is never
+invoked, so its absence cannot regress behaviour.
+
+Grant windows (I-8) are NOT implemented here. `_active_grant()` is a no-op stub
+that always reports "no active grant" so the I-8 call site already exists; do not
+mistake it for a grant cache.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+
+SOCKET_PATH = "/run/qmcp/consent.sock"
+TIMEOUT_PATH = "/etc/qmcp/consent-timeout"
+
+#: Fallback dialog auto-expiry (T_gate) when the timeout file is unreadable.
+DEFAULT_TIMEOUT = 300
+
+#: T_gate clamp band. The frozen ordering T_gate < helper_recv(=T_gate+10) <
+#: T_mcp(360) must hold for ANY content of the operator-editable timeout file, so
+#: T_gate is clamped into [MIN_TIMEOUT, MAX_TIMEOUT]. MAX_TIMEOUT=340 keeps
+#: helper_recv = 340+10 = 350 < 360 even at the ceiling; MIN_TIMEOUT=5 stops a
+#: zero/negative typo from turning `zenity --timeout 0` into "no auto-expiry"
+#: (which, on this single-threaded daemon, would wedge every later request behind
+#: a dialog that never expires). The helper's _t_gate() clamps to the same band.
+MIN_TIMEOUT = 5
+MAX_TIMEOUT = 340
+
+#: Per-connection socket-read deadline slack over T_gate. Set on each accepted
+#: connection so a peer that connects but never sends a complete frame is dropped
+#: instead of blocking this single-threaded loop forever. It bounds only the
+#: socket reads/writes (the request-frame recv and the tiny reply sendall); the
+#: operator-dialog wait is bounded separately by zenity --timeout inside decide()
+#: (a subprocess, unaffected by this socket timeout). A stalled peer therefore
+#: falls away at ~T_gate+slack; a legitimate request's frame arrives in one recv.
+_CONN_SLACK = 10
+
+#: Destructive actions get the typed-confirm --entry dialog (type the qube
+#: name), not the one-click --question dialog.
+TYPED_CONFIRM_ACTIONS = frozenset({"remove", "kill"})
+
+#: zenity exit codes. 0 => affirmative (Approve, or entry submitted); 1 =>
+#: negative (Deny / entry cancelled); 5 => --timeout auto-expiry.
+_ZEN_OK = 0
+_ZEN_CANCEL = 1
+_ZEN_TIMEOUT = 5
+
+
+def _log(msg: str) -> None:
+    """Log to stderr (journal under systemd). The authoritative record is the
+    wrapper's qmcp_audit chain, so this is operational logging only — and must
+    never carry secret-bearing values (the wrappers pass whitelisted summaries
+    of structural identifiers only)."""
+    print(f"qmcp-consentd: {msg}", file=sys.stderr, flush=True)
+
+
+def _t_gate() -> int:
+    """Dialog auto-expiry (T_gate), read per request from the timeout file.
+
+    Default DEFAULT_TIMEOUT on any error and CLAMPED to [MIN_TIMEOUT,
+    MAX_TIMEOUT] on any in-band-but-out-of-range value, so the frozen ordering
+    T_gate < helper_recv < T_mcp(360) is preserved regardless of the file's
+    contents (a zero/negative typo can't disable the dialog's auto-expiry and
+    wedge this single-threaded daemon; a huge value can't push past the MCP
+    ceiling and reopen the split-brain). Independent of the helper's read of the
+    same file, so operator edits apply on the next request without a daemon
+    restart."""
+    try:
+        with open(TIMEOUT_PATH, encoding="utf-8") as fh:
+            v = int(fh.read().strip())
+    except Exception:
+        return DEFAULT_TIMEOUT
+    return max(MIN_TIMEOUT, min(v, MAX_TIMEOUT))
+
+
+def _active_grant(service, action, target) -> bool:
+    """I-8 GRANT-WINDOW STUB — always reports "no active grant".
+
+    Stage I-8 will add a bounded "approve N minutes of <class> ops" cache so a
+    single approval can cover a burst. That is out of scope for I-6; this stub
+    only makes the future call site exist. It must ALWAYS return False here, so
+    every gated request pops its own dialog. Do NOT implement a grant here.
+    """
+    return False
+
+
+def _target_of(summary) -> str:
+    """Best-effort human target for the dialog text. The wrappers whitelist a
+    `target` field into the summary; fall back to a generic label if absent so
+    the dialog never crashes on a summary shape the operator's policy allows."""
+    if isinstance(summary, dict):
+        for key in ("target", "name", "vm"):
+            val = summary.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return "(unspecified target)"
+
+
+def _blast_radius(summary) -> str:
+    """A short blast-radius label for the dialog. Whitelisted `class` field if
+    present, else the empty-safe fallback."""
+    if isinstance(summary, dict):
+        val = summary.get("class")
+        if isinstance(val, str) and val:
+            return val
+    return "unspecified"
+
+
+def _run_zenity(argv) -> int:
+    """Run zenity via subprocess LIST form (NEVER shell=True) and return its
+    exit code. A missing zenity or spawn error is mapped to _ZEN_CANCEL so an
+    unavailable dialog DENIES — fail-closed, never a silent approval."""
+    try:
+        proc = subprocess.run(argv, capture_output=True)
+        return proc.returncode
+    except Exception as e:
+        _log(f"zenity spawn failed: {e}")
+        return _ZEN_CANCEL
+
+
+def _run_zenity_entry(argv) -> tuple[int, str]:
+    """Run a zenity --entry (typed-confirm) and return (exit_code, stdout).
+    stdout is stripped of the trailing newline zenity appends. A spawn failure
+    denies (exit _ZEN_CANCEL, empty stdout)."""
+    try:
+        proc = subprocess.run(argv, capture_output=True)
+        out = proc.stdout.decode("utf-8", "replace").rstrip("\n")
+        return proc.returncode, out
+    except Exception as e:
+        _log(f"zenity spawn failed: {e}")
+        return _ZEN_CANCEL, ""
+
+
+def decide(request: dict) -> str:
+    """Map one parsed request to a verdict via the operator dialog.
+
+    Returns "approved" | "denied" | "timeout". A grant window (I-8) would
+    short-circuit to "approved" here — the stub never does. Destructive actions
+    (remove/kill) require the operator to TYPE the target name (typed-confirm);
+    everything else is a one-click Approve/Deny.
+
+    FAIL-CLOSED: any unexpected exception while building the dialog argv,
+    reading T_gate, or interpreting zenity's result is caught and mapped to
+    "denied" — a surprise here must never approve, and (paired with the accept
+    loop's per-connection guard) must never crash the daemon.
+    """
+    try:
+        service = str(request.get("service", ""))
+        action = str(request.get("action", ""))
+        principal = str(request.get("principal", "mcp-control"))
+        summary = request.get("summary", {})
+        target = _target_of(summary)
+        blast = _blast_radius(summary)
+        t_gate = _t_gate()
+
+        # I-8 grant-window hook (stub: always False at I-6).
+        if _active_grant(service, action, target):
+            return "approved"
+
+        typed_confirm = action in TYPED_CONFIRM_ACTIONS
+
+        if typed_confirm:
+            argv = [
+                "zenity", "--entry",
+                "--title", "qmcp consent — DESTRUCTIVE",
+                "--text", (f"{action} will DESTROY {target}. "
+                           "Type the qube name to confirm:"),
+                "--timeout", str(t_gate),
+            ]
+            code, typed = _run_zenity_entry(argv)
+            if code == _ZEN_TIMEOUT:
+                return "timeout"
+            if code == _ZEN_OK and typed == target:
+                return "approved"
+            return "denied"
+
+        argv = [
+            "zenity", "--question",
+            "--title", "qmcp consent",
+            "--ok-label", "Approve",
+            "--cancel-label", "Deny",
+            "--timeout", str(t_gate),
+            "--text", (f"{principal} requests {action} on {target}\n"
+                       f"Blast radius: {blast}\n"
+                       "Approve?"),
+        ]
+        code = _run_zenity(argv)
+        if code == _ZEN_TIMEOUT:
+            return "timeout"
+        if code == _ZEN_OK:
+            return "approved"
+        return "denied"
+    except Exception as e:
+        _log(f"decide() error (fail-closed -> denied): {e}")
+        return "denied"
+
+
+def _recv_line(conn) -> str | None:
+    """Read one newline-delimited request frame. Returns the line WITHOUT the
+    trailing newline, or None if the peer closed before a newline arrived.
+
+    Any OSError — a peer RST mid-read (ConnectionResetError), or the
+    per-connection socket.timeout set in handle() when a client connects but
+    never completes a frame — returns None (a DROPPED request). It must never
+    propagate: a single reset/stalled/partial connection cannot be allowed to
+    crash or wedge the single-threaded accept loop. A dropped request sends no
+    reply, so the helper's recv backstop maps it to "unavailable" => deny
+    (fail-closed)."""
+    chunks = []
+    while True:
+        try:
+            data = conn.recv(4096)
+        except OSError:
+            return None
+        if not data:
+            return None
+        chunks.append(data)
+        if b"\n" in data:
+            break
+    return b"".join(chunks).split(b"\n", 1)[0].decode("utf-8", "replace")
+
+
+def handle(conn) -> None:
+    """Serve one connection: read the request, decide, reply. Any parse error
+    yields a "denied" verdict (never a soft-fail); a request whose nonce we
+    cannot echo is dropped without a reply (the helper's recv backstop then
+    maps it to unavailable)."""
+    try:
+        line = _recv_line(conn)
+        if line is None:
+            return
+        try:
+            request = json.loads(line)
+        except Exception:
+            _log("unparseable request; dropping")
+            return
+
+        if not isinstance(request, dict) or "nonce" not in request:
+            _log("malformed request (no nonce); dropping")
+            return
+
+        nonce = request["nonce"]
+        verdict = decide(request)
+
+        resp = {"v": 1, "nonce": nonce, "verdict": verdict}
+        _log(f"verdict={verdict} service={request.get('service')} "
+             f"action={request.get('action')}")
+        try:
+            conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+        except OSError:
+            # Peer gave up (its recv backstop tripped). The wrapper treats a
+            # missing reply as unavailable => fail-closed. Nothing to do.
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def serve() -> int:
+    """Bind the AF_UNIX socket, chmod 0660, and run the single-threaded accept
+    loop. The 2770 root:qubes parent dir (tmpfiles) plus the 0660 socket mode
+    limit reach to the wrapper user and the operator GUI session; AI cannot
+    reach either. A stale socket file from an unclean exit is unlinked first."""
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        _log(f"could not unlink stale socket: {e}")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o660)
+    srv.listen(8)
+    _log(f"listening on {SOCKET_PATH} (single-threaded; I-6 inert)")
+
+    try:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError as e:
+                _log(f"accept failed: {e}")
+                continue
+            # Bound the pre-dialog read INDEPENDENTLY of the dialog's own
+            # auto-expiry: a client that connects but never completes a frame
+            # (partial write, or a stall) must not block this single-threaded
+            # loop forever. T_gate+slack drops such a peer well before the
+            # dialog would have expired; _recv_line maps the timeout to a
+            # dropped request. The zenity --timeout inside decide() still bounds
+            # the operator-dialog wait separately.
+            try:
+                conn.settimeout(_t_gate() + _CONN_SLACK)
+            except OSError:
+                pass
+            # One malformed/aborted/stalled connection must never take the
+            # daemon down. handle() has its own try/finally to close the conn;
+            # this guard catches anything decide()/_recv_line let escape and
+            # continues the accept loop (Restart=always is a backstop, not the
+            # primary defence).
+            try:
+                handle(conn)
+            except Exception as e:
+                _log(f"handle() error (dropping connection): {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            srv.close()
+        finally:
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(serve())

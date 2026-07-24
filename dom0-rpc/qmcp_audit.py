@@ -181,12 +181,22 @@ def _append(record: dict) -> bool:
         return False
 
 
-def audit(service, args_summary, ok, error=None) -> bool:
+def audit(service, args_summary, ok, error=None, consent=None) -> bool:
     """Record one state-changing `qmcp.*` call. Best-effort; see module
     docstring for the two caller contracts (best-effort + caller-sanitises).
 
     Returns True if a chained line was written, False on any failure.
-    Never raises."""
+    Never raises.
+
+    `consent` (Stage I-6) records the operator-consent verdict WHEN a
+    consent gate actually ran for this call — one of "approved", "denied",
+    "timeout", "unavailable". It is OPTIONAL and defaults to None, in which
+    case the `consent` key is OMITTED from the record entirely. This
+    omission is load-bearing for INVARIANCE: when no gate is consulted (the
+    I-6 empty-gate default, and every read/ungated call), the line is
+    BYTE-IDENTICAL to the pre-I-6 format — the key is absent, never written
+    as null. Only a call that consulted the daemon carries the key, so the
+    chain hash of an ungated call is unchanged by this stage."""
     try:
         record = {
             "v": SCHEMA,
@@ -196,6 +206,9 @@ def audit(service, args_summary, ok, error=None) -> bool:
             "ok": bool(ok),
             "error": None if error is None else str(error),
         }
+        # Byte-neutral omission: the key exists only when a gate ran (I-6).
+        if consent is not None:
+            record["consent"] = str(consent)
         return _append(record)
     except Exception:
         return False

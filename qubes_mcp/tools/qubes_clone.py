@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.CLONE)
@@ -17,4 +17,5 @@ def qubes_clone(source: str, name: str) -> dict:
       {"ok": false, "error": "not found"}        -- source missing or not ai-managed
       {"ok": false, "error": "<reason>"}
     """
-    return call_qmcp("qmcp.CloneAIManagedQube", {"source": source, "name": name})
+    return call_qmcp("qmcp.CloneAIManagedQube", {"source": source, "name": name},
+                     timeout=GATED_TIMEOUT)

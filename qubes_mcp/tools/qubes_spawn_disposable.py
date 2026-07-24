@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp
 
 
 @ring_tool(Ring.LIFECYCLE)
@@ -25,4 +25,5 @@ def qubes_spawn_disposable(template: str) -> dict:
       {"ok": false, "error": "<reason>"}          -- e.g. template lacks
                                                      template_for_dispvms
     """
-    return call_qmcp("qmcp.SpawnDisposableAIManaged", {"template": template})
+    return call_qmcp("qmcp.SpawnDisposableAIManaged", {"template": template},
+                     timeout=GATED_TIMEOUT)

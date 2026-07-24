@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_qmcp, call_service
+from qubes_mcp.tools._qrexec import GATED_TIMEOUT, call_qmcp, call_service
 
 
 _RUNNING_STATES = ("Running", "Transient")
@@ -46,13 +46,15 @@ def qubes_run_disposable(
        "error": "<reason>"}
       {"ok": false, "stage": "spawn", "error": "..."}   -- no name yet
     """
-    spawn_r = call_qmcp("qmcp.SpawnDisposableAIManaged", {"template": template})
+    spawn_r = call_qmcp("qmcp.SpawnDisposableAIManaged", {"template": template},
+                        timeout=GATED_TIMEOUT)
     if not spawn_r.get("ok"):
         return {"ok": False, "stage": "spawn", "error": spawn_r.get("error")}
     name = spawn_r["name"]
 
     start_r = call_qmcp("qmcp.LifecycleAIManaged",
-                        {"name": name, "action": "start"})
+                        {"name": name, "action": "start"},
+                        timeout=GATED_TIMEOUT)
     if not start_r.get("ok"):
         _best_effort_teardown(name)
         return {"ok": False, "name": name, "stage": "start",
@@ -69,7 +71,8 @@ def qubes_run_disposable(
                          timeout=timeout + 30)
 
     shutdown_r = call_qmcp("qmcp.LifecycleAIManaged",
-                           {"name": name, "action": "shutdown"})
+                           {"name": name, "action": "shutdown"},
+                           timeout=GATED_TIMEOUT)
 
     if not run_r.get("ok"):
         # run failed but we still tried to shut down cleanly above. If
@@ -110,4 +113,5 @@ def _wait_running(name: str) -> bool:
 def _best_effort_teardown(name: str) -> None:
     """Kill the disposable so auto_cleanup removes it. Ignore errors —
     this is a best-effort safety net during failure paths."""
-    call_qmcp("qmcp.LifecycleAIManaged", {"name": name, "action": "kill"})
+    call_qmcp("qmcp.LifecycleAIManaged", {"name": name, "action": "kill"},
+              timeout=GATED_TIMEOUT)

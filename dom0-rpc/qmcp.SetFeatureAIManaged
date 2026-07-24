@@ -131,16 +131,78 @@ def _require_full(vm) -> bool:
         return False
 
 
+def _load_consent_lib():
+    """Load the sibling qmcp_consent helper by path (Stage I-6).
+
+    Same sibling-import shim as qmcp_tier / qmcp_audit. Returns None on any
+    failure; the consent gate then FAILS CLOSED at the call site (a None
+    helper is treated as verdict "unavailable" => deny), matching the I-5
+    tier gate's fail-closed posture, NOT the best-effort audit hook.
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_consent", os.path.join(here, "qmcp_consent.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_CONSENT = _load_consent_lib()
+
+#: Stage I-6 consent verdict for THIS call, recorded on the audit line only
+#: when a gate actually ran. Stays None on the empty-gate default (I-6) and
+#: on every ungated path, so emit() OMITS the `consent` key and the audit
+#: line is byte-identical to pre-I-6 (INVARIANCE). Set to "approved"/"denied"/
+#: "timeout"/"unavailable" by _consent_gate only when the daemon was consulted.
+_consent_verdict = None
+
+
+def _consent_gate(action) -> bool:
+    """Stage I-6 operator-consent gate. Returns True to proceed, False to
+    refuse. The sibling qmcp_consent helper decides from
+    /etc/qmcp/consent-policy whether (service, action) is gated at all.
+
+    Under the I-6 empty gate NOTHING is gated: gate() returns (True, "open")
+    without touching the daemon, `_consent_verdict` stays None, and the call
+    is byte-neutral. Only when a gate actually runs does the verdict get
+    recorded for the audit line. FAIL-CLOSED: a missing/broken helper or any
+    exception denies with verdict "unavailable" (same posture as the I-5 tier
+    gate, opposite of the best-effort audit hook)."""
+    global _consent_verdict
+    if _CONSENT is None:
+        _consent_verdict = "unavailable"
+        return False
+    try:
+        ok, verdict = _CONSENT.gate(_AUDIT_SERVICE, action, _audit_summary)
+    except Exception:
+        _consent_verdict = "unavailable"
+        return False
+    # "open" == gate did not run (empty policy). Leave the verdict unset so
+    # the audit line omits the key and stays byte-identical to pre-I-6.
+    if verdict != "open":
+        _consent_verdict = verdict
+    return ok
+
+
 def emit(payload: dict) -> int:
     # Stage I-2: record this state-changing call on the hash-chained dom0
     # audit trail before responding. Best-effort and defensively guarded
     # so an audit failure can never change what AI sees or whether the
     # operation ran (qmcp_audit.audit is itself non-raising; the guard is
     # belt-and-suspenders at the security boundary).
+    # Stage I-6: pass the consent verdict through; it is None (=> key omitted,
+    # byte-identical line) unless a gate actually ran for this call.
     if _AUDIT is not None:
         try:
             _AUDIT.audit(_AUDIT_SERVICE, _audit_summary,
-                         bool(payload.get("ok")), payload.get("error"))
+                         bool(payload.get("ok")), payload.get("error"),
+                         consent=_consent_verdict)
         except Exception:
             pass
     print(json.dumps(payload))
@@ -191,6 +253,15 @@ def main() -> int:
     # collapses to the same opaque NOT_FOUND as an untagged target (no tier
     # oracle), BEFORE the denied-key / cross-ref checks (authority first).
     if not _require_full(vm):
+        return emit(NOT_FOUND)
+
+    # Stage I-6: operator-consent gate — authority, so it fires here (after the
+    # tier check, before the denied-key / cross-ref input-validation, matching
+    # the I-5 ordering). Inert under the empty policy; once gated, a refusal/
+    # timeout/unavailable collapses to the same opaque NOT_FOUND as an
+    # untagged/under-tier target (the tag AND tier denials above both emit
+    # NOT_FOUND), so it is no consent oracle. Fail-closed (in _consent_gate).
+    if not _consent_gate("set-feature"):
         return emit(NOT_FOUND)
 
     # Denied keys — the target IS ai-managed (AI can see it via
