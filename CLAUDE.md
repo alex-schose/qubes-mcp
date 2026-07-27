@@ -37,8 +37,11 @@ this directory.**
     ro-floor) and `admin.vm.firewall.{Set,Reload}` on `@tag:ai-net` +
     `@tag:ai-full` targets (Stage I-4 — graduated to the firewall-write
     tier; plus a `@tag:ai-managed` compat backstop, removed at the flip);
-  - `admin.vm.device.{block,usb,mic}.{List,Available}` on
-    `@tag:ai-managed` targets (Stage E1, read-only enumeration — ro-floor);
+  - device enumeration: `admin.vm.device.*.Available` was a ro-floor read
+    (Stage E1); Stage G0 routes ALL of it (attached + available) through the
+    dom0 redactor `qmcp.ListAttachedDevicesAIManaged` (which hides out-of-scope
+    backend / consuming-frontend qube names) and DENIES the direct
+    `admin.vm.device.*.{Available,Attached,Assigned}` methods to AI;
   - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-dump` (Stage I-4 —
     the write-only sink; copy-IN only).
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
@@ -178,7 +181,7 @@ this directory.**
 | `qmcp.ListAIManagedQubes` | Discovery — returns only qubes carrying `ai-managed`. | A |
 | `qmcp.SpawnAIManagedQube` | Create AppVM (A); DispVMTemplate + DispVM klasses (D). Auto-tags. Validates name + klass + template (incl. `template_for_dispvms` cross-ref for DispVM) + (optional) netvm. Optional `private_size` grows the persistent volume up to the per-qube cap. | A → D |
 | `qmcp.GetPropertyAIManaged` | Wrapped read. `"not found"` is indistinguishable from `"not tagged"`. | A |
-| `qmcp.SetPropertyAIManaged` | Wrapped write with cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
+| `qmcp.SetPropertyAIManaged` | Wrapped write with an explicit settable-property allowlist (`provides_network` operator-only — Stage G0) + cross-ref validation on `template`/`netvm`/`default_dispvm`. | A |
 | `qmcp.LifecycleAIManaged` | start/shutdown/kill/pause/unpause/remove on ai-managed qubes. Replaces direct `admin.vm.*` lifecycle in Stage D — qrexec's `@tag:` matcher doesn't reach klass=DispVM targets, so we do the tag check in dom0. | D |
 | `qmcp.GetPoolStats` | AI-scoped disk-budget visibility — sum of the **persistent footprint** of every ai-managed qube (each `private`, plus `root` for klasses whose root persists; COW root + ephemeral volatile are not counted), plus an operator-set cap from `/etc/qmcp/pool-cap` (re-read per call). Returns `{used, cap, headroom}`; no pool names, no free-space, no operator-side volumes. Cap is an operator → AI contract, not a sensor in the other direction. | F3 |
 | `qmcp.RunInAIManaged` | Execute command inside ai-managed qube as root. Custom qrexec service in ai-managed templates. | B |
@@ -186,6 +189,7 @@ this directory.**
 | `qmcp.CloneAIManagedQube` | Clone an existing ai-managed qube; auto-tags the clone. | D |
 | `qmcp.AttachDeviceAIManaged` | Virtual device attach. Both qubes (backend and frontend) must be ai-managed; dom0 wrapper enforces the tag check on both ends, then shells out to `qvm-device` (absorbs DeviceAssignment-API drift across Qubes 4.1 → 4.2 → 4.3). | E1 |
 | `qmcp.DetachDeviceAIManaged` | Mirror of Attach. | E1 |
+| `qmcp.ListAttachedDevicesAIManaged` | Redacted device enumeration (attached + available modes) — replaces the direct `admin.vm.device.*` reads (now denied to AI); out-of-scope backend / consuming-frontend qube names collapse to `<out-of-scope>` via a fail-closed allowlist. | G0 |
 | `qmcp.SpawnDisposableAIManaged` | Ephemeral DispVM creation via `admin.vm.CreateDisposable`. DVMT must be ai-managed; the auto-named disposable is force-tagged before AI sees it; auto-removed on shutdown. | E2 |
 | `qmcp.SetFeatureAIManaged` | `feature.Set` on ai-managed qubes. `internal` denied (operator-only); cross-VM keys (`audiovm`/`guivm`) must reference an ai-managed qube via an opaque refusal; echoes the post-set value back (no feature-read surface). | F1 |
 | `qmcp.AIManagedEvents` | Filtered event stream — events whose subject is `@tag:ai-managed`. Bounded-window batch: tool blocks for a caller-given duration, wrapper collects ai-managed-filtered events, returns the batch. | F2 |
@@ -376,7 +380,14 @@ I-5. Tiers on the wrapper + exec surfaces — the second enforcement
     RunInAIManaged/CopyToAIManaged) AND writes "ro" to
     /etc/qmcp/tier-default in one coupled change. Behaviour-neutral in
     compat; no new RPC service, no new qube, no new ring.
-G. [DEFERRED until Stage I completes] mcp-control hardening (sudo
+G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
+   Gateway input boundary: SetProperty settable-property allowlist
+   (provides_network operator-only), qrexec target-name validator, device
+   enumeration wrapped through a dom0 backend/attachment redactor (direct
+   admin.vm.device.* enumeration denied), qubes.Filecopy re-tiered to ai-exec
+   on both endpoints + explicit deny, and error-detail masking. Tier-independent;
+   closes four review boundary findings.
+G1/G2. [DEFERRED until Stage I completes] mcp-control host hardening (sudo
    lockdown, dedicated MCP user) + Tor hidden service for sshd →
    mobile CLI reach.
 H. [DEFERRED until Stage I completes] FastMCP HTTP/SSE transport
@@ -572,7 +583,7 @@ completes.
 |---|---|---|---|
 | reads / discovery | `GetProperty`, `List`, `AIManagedEvents` | `ai-ro` (umbrella) | wrapper (dom0 tag-check) |
 | firewall read | `firewall.Get` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
-| device enumerate | `device.*.{List,Available}` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
+| device enumerate | `qmcp.ListAttachedDevicesAIManaged` (attached + available) | `ai-ro` (umbrella) | **wrapper (dom0 redactor)** — direct `device.*` denied (G0) |
 | firewall write | `firewall.{Set,Reload}` | `ai-net` / `ai-full` | **policy (I-4)** `@tag:ai-net` + `@tag:ai-full` (+ compat backstop) |
 | copy-IN sink | `qubes.Filecopy → ai-dump` | `ai-dump` (orthogonal) | **policy (I-4)** `@tag:ai-dump` target |
 | exec / copy | `RunInAIManaged`, `CopyToAIManaged` | `ai-exec` | **policy (I-5)** `@tag:ai-exec`/`ai-net`/`ai-full` (+ compat backstop) |

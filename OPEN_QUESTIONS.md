@@ -22,6 +22,10 @@ GitHub issue.
    adds a policy line bypassing the default `ask` dialog for inter-qube file
    transfer between ai-managed qubes. Are there assumptions in
    `qubes.Filecopy`'s implementation that depend on the dialog being present?
+   *(Stage G0c (finding [6]) re-tiered this line: inter-ai-managed Filecopy now
+   requires `ai-exec` on BOTH endpoints (a 3×3 peer mesh) plus an explicit
+   `@tag:ai-managed → @anyvm` deny, so a single `ai-exec` grant no longer yields
+   fleet-wide file push into every `ai-ro` qube's `~/QubesIncoming`.)*
 3. **`target=@adminvm` documentation gap.** Without that clause on
    tag-scoped admin allows, qrexec attempts to start the target VM during
    read-only operations. This is subtle, easy to miss, and not surfaced in
@@ -36,6 +40,14 @@ GitHub issue.
    through a side door, mutating `provides_network` through a property
    wrapper I haven't blocked, abusing network-stack properties I haven't
    thought of)?
+   *(Property-mutation bypass RESOLVED in Stage G0a (finding [1]):
+   `qmcp.SetPropertyAIManaged` now enforces an explicit settable-property
+   allowlist that hard-denies `provides_network` (operator-only), and
+   `qmcp.SpawnAIManagedQube` never accepts a `provides_network` request key —
+   so AI can neither flip the flag on a qube it holds nor mint a second
+   network-providing qube. The netvm-retarget guard (unchanged) covers the
+   third path, and the allowlist's default-deny blocks novel network-stack
+   properties until a stage deliberately admits one with its own cross-ref.)*
 5. **Single-egress vs. cascade as a Qubes idiom.** The original Stage C
    design was a cascade (`ai-sys-firewall` ← `ai-sys-tor` / `ai-sys-vpn`)
    with multiple ai-managed network qubes. The implemented design is one

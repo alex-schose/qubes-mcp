@@ -160,10 +160,9 @@ COMPAT = {
         "untiered/ro": "allow", "exec": "allow", "net": "allow", "full": "allow",
         "dump": "deny", "untagged": "deny", "dom0": "deny", "ghost": "deny",
     },
-    "admin.vm.device.block.List": {
-        "untiered/ro": "allow", "exec": "allow", "net": "allow", "full": "allow",
-        "dump": "deny", "untagged": "deny", "dom0": "deny", "ghost": "deny",
-    },
+    # (Device enumeration is no longer a direct ro-floor policy read — G0d/G0e
+    # route ALL of it through qmcp.ListAttachedDevicesAIManaged and deny the direct
+    # admin.vm.device.* methods. firewall.Get above is the ro-floor representative.)
     # exec surface — I-4 leaves it at the umbrella floor (tiering is I-5). Guard
     # that I-4 did NOT accidentally move it.
     "qmcp.RunInAIManaged": {
@@ -184,7 +183,6 @@ COMPAT = {
 POSTFLIP = {
     # reads unchanged by the flip
     "admin.vm.firewall.Get": COMPAT["admin.vm.firewall.Get"],
-    "admin.vm.device.block.List": COMPAT["admin.vm.device.block.List"],
     "qmcp.RunInAIManaged": COMPAT["qmcp.RunInAIManaged"],
     # firewall WRITE — flip: ro + exec LOSE write; net + full keep it
     "admin.vm.firewall.Set": {
@@ -219,7 +217,10 @@ def run_filecopy(rules, phase):
     cases = [
         # (label, source, target, expected)
         ("ai-managed  -> ai-dump   (the valve, copy-IN)", WORKER, TARGETS["dump"], "allow"),
-        ("ai-managed  -> ai-managed (inter-copy, unchanged)", WORKER, WORKER, "allow"),
+        # Stage G0c re-tiered inter-ai-managed Filecopy: an ai-ro source (WORKER)
+        # can no longer inter-copy — BOTH ends must be ai-exec+ now. Authoritative
+        # matrix lives in offline-validate-G0c.py; here we confirm the ai-ro floor.
+        ("ai-ro       -> ai-ro      (G0c: inter-copy needs ai-exec+ both ends)", WORKER, WORKER, "deny"),
         ("ai-managed  -> untagged  (no exfil to random qube)", WORKER, TARGETS["untagged"], "deny"),
         ("ai-managed  -> dom0      (no exfil to dom0)", WORKER, TARGETS["dom0"], "deny"),
         ("ai-dump     -> ai-managed (sink is WRITE-ONLY)", DUMP_SRC, WORKER, "deny"),
@@ -257,16 +258,17 @@ def main() -> int:
     a, b = run_filecopy(flipped, "PHASE 2 — POST-FLIP")
     tp += a; tf += b
 
-    # HYBRID CAVEAT — document the known limitation explicitly (red-team finding).
-    # A qube tagged BOTH ai-managed and ai-dump is NOT write-only: the inter-copy
-    # line matches it as a source, so its contents read back out. These checks
-    # assert that (mis)behaviour so it is acknowledged + tested, not silently
-    # green. The fix is operator-side (disjointness): installer warns, I-5 refuses.
+    # HYBRID CAVEAT — a qube tagged BOTH ai-managed and ai-dump. PRE-G0c the
+    # any-to-any inter-copy line matched it as a source, so its contents read back
+    # out (valve defeated). Stage G0c re-tiered inter-copy to ai-exec+ on both
+    # ends, so an ai-RO hybrid can no longer copy out (asserted below). A residual
+    # gap remains only for an ai-EXEC+ hybrid; the operator-side disjointness fix
+    # (installer warns, I-5 refuses to tier a hybrid) is still the real guard.
     print(f"\n{'=' * 70}\n  HYBRID CAVEAT (ai-managed + ai-dump — operator misconfig)\n{'=' * 70}")
     hp = hf = 0
     for label, src, tgt, want, note in [
-        ("hybrid -> ai-managed copies OUT (valve DEFEATED — the known gap)",
-         HYBRID, WORKER, "allow", "documents the read-out"),
+        ("hybrid(ai-ro) -> ai-managed copies OUT (G0c CLOSED this for ai-ro hybrids)",
+         HYBRID, WORKER, "deny", "not ai-exec+, so the peer mesh + @tag:ai-managed deny block it"),
         ("hybrid is itself an ai-managed read target (firewall.Get allowed)",
          None, None, "allow", "hybrid carries the umbrella → readable"),
     ]:
@@ -277,8 +279,8 @@ def main() -> int:
         ok = got == want
         hp += ok; hf += not ok
         print(f"  {'PASS' if ok else 'FAIL'}  {label}: {got}  ({note})")
-    print("  → NOTE: these PASS by asserting the LEAK exists; the guarantee holds")
-    print("         only for a PURE sink. AI cannot create a hybrid (no tag mutation).")
+    print("  → NOTE: G0c closed the read-out for an ai-RO hybrid; a pure sink is")
+    print("         write-only. AI cannot create a hybrid (no tag mutation).")
     tp += hp; tf += hf
 
     # structural guard: the flip must remove exactly the two backstop lines

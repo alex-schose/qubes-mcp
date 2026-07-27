@@ -80,10 +80,26 @@ qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-full     allow  user=root
 # COMPAT backstop (CopyToAIManaged) — DELETE at the I-5 flip, paired with tier-default → "ro":
 qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-managed  allow  user=root
 
-# Allow qubes.Filecopy directly between ai-managed qubes (skip operator popup).
-# Source AND target both tagged ai-managed; nothing crosses out of the sandbox.
-
-qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
+# Stage G0c (finding [6]): inter-ai-managed Filecopy graduates to the tier
+# ladder — BOTH endpoints must be ai-exec+ (the single-elevation ladder means a
+# qube carries exactly one of ai-exec/ai-net/ai-full, so the peer-copy mesh is
+# the 3x3 cross-product below). Before G0c this was one @tag:ai-managed ->
+# @tag:ai-managed line, so one operator ai-exec grant let the agent push files
+# into EVERY ai-ro qube's ~/QubesIncoming (fleet-wide data plane — the flip
+# barely reduced blast radius). Inter-worker copy is now peer-to-peer between
+# working (ai-exec+) qubes only; pushing INTO a low-integrity qube uses the
+# dedicated ai-dump write-only sink below, not this mesh. The explicit
+# @tag:ai-managed -> @anyvm DENY after the ai-dump line closes the fallthrough
+# so an ai-exec -> ai-ro copy is a dialog-free DENY, not a system-default `ask`.
+qubes.Filecopy              *  @tag:ai-exec  @tag:ai-exec  allow
+qubes.Filecopy              *  @tag:ai-exec  @tag:ai-net   allow
+qubes.Filecopy              *  @tag:ai-exec  @tag:ai-full  allow
+qubes.Filecopy              *  @tag:ai-net   @tag:ai-exec  allow
+qubes.Filecopy              *  @tag:ai-net   @tag:ai-net   allow
+qubes.Filecopy              *  @tag:ai-net   @tag:ai-full  allow
+qubes.Filecopy              *  @tag:ai-full  @tag:ai-exec  allow
+qubes.Filecopy              *  @tag:ai-full  @tag:ai-net   allow
+qubes.Filecopy              *  @tag:ai-full  @tag:ai-full  allow
 
 # --- Stage I-4: ai-dump — the write-only sink (Biba integrity valve).
 # An ai-dump qube is ORTHOGONAL to the tier ladder. The write-only guarantee
@@ -110,6 +126,18 @@ qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  allow
 # requirement. A future editor must NOT "graduate" this line to an elevation tag.
 
 qubes.Filecopy              *  @tag:ai-managed  @tag:ai-dump     allow
+
+# Stage G0c (finding [6] + [8]): explicit dialog-free DENY for every OTHER
+# qubes.Filecopy from an ai-managed source — anything that did NOT match the
+# ai-exec+ peer-copy mesh above (an ai-ro source, or an ai-exec+ source copying
+# to an ai-ro/out-of-scope target) and is NOT the ai-dump sink (matched just
+# above, so already allowed). Ordering is load-bearing: it sits AFTER the
+# ai-dump allow so the sink wins, and its source is @tag:ai-managed so it never
+# touches the operator's own `qubes.Filecopy mcp-control @anyvm ask` line below.
+# Without it such a copy falls through to the SYSTEM-DEFAULT qubes.Filecopy `ask`
+# (a dialog governed by a policy file this project does not own — finding [8]'s
+# fallthrough hazard); the explicit deny keeps the boundary self-contained.
+qubes.Filecopy              *  @tag:ai-managed  @anyvm          deny
 
 # --- Stage C + I-4: per-qube firewall rule management on ai-managed qubes.
 # target=@adminvm routes the call to dom0 (firewall rules live in dom0's
@@ -162,15 +190,45 @@ qmcp.CloneAIManagedQube      *  mcp-control  @adminvm         allow
 # explicit-deny block below (which still lists the Attach/Detach
 # methods, denied for any direct caller bypassing the wrapper).
 
-qmcp.AttachDeviceAIManaged       *  mcp-control  @adminvm         allow
-qmcp.DetachDeviceAIManaged       *  mcp-control  @adminvm         allow
+qmcp.AttachDeviceAIManaged            *  mcp-control  @adminvm         allow
+qmcp.DetachDeviceAIManaged            *  mcp-control  @adminvm         allow
+# Stage G0d (finding [4]): attached-device listing is wrapped so out-of-scope
+# backend qube names are redacted. AI reads attached devices via this wrapper;
+# the direct admin.vm.device.<class>.List (which embeds the backend qube name of
+# an operator-attached device) is DENIED below. `.Available` stays direct — it
+# lists devices the ai-managed qube EXPOSES, whose backend is the qube itself.
+qmcp.ListAttachedDevicesAIManaged     *  mcp-control  @adminvm         allow
 
-admin.vm.device.block.List       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.device.block.Available  *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.device.usb.List         *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.device.usb.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.device.mic.List         *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-admin.vm.device.mic.Available    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+# Stage G0d/G0e (findings [4] + [3]): ALL AI-facing device enumeration is now
+# wrapper-mediated — qmcp.ListAttachedDevicesAIManaged redacts out-of-scope
+# BACKEND names (attached mode) AND out-of-scope CONSUMING-FRONTEND names
+# (available mode's `attachment=` field). So EVERY direct admin.vm.device.<class>.
+# {Available,Attached,Assigned} is denied to AI. `.Available` was ro-floor-allow
+# pre-G0e; it leaked the consuming-frontend name, so it joins the deny set.
+# @anyvm structurally EXCLUDES @adminvm, so the operator's own usb.{List,Available}
+# @adminvm `ask` lines (further down, G0b) survive.
+admin.vm.device.block.Available  *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Available    *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Available    *  mcp-control  @anyvm  deny
+admin.vm.device.block.Attached   *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Attached     *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Attached     *  mcp-control  @anyvm  deny
+admin.vm.device.block.Assigned   *  mcp-control  @anyvm  deny
+admin.vm.device.usb.Assigned     *  mcp-control  @anyvm  deny
+admin.vm.device.mic.Assigned     *  mcp-control  @anyvm  deny
+# Finding [5]: PROJECT-OWNED @adminvm denies for the enum methods with NO operator
+# use — so dom0 device-enum is not left to the platform-default policy (which our
+# @anyvm lines + catch-all cannot reach for the @adminvm target). usb.{List,
+# Available} @adminvm intentionally stay operator-`ask` (below); the legacy .List
+# on 4.3 does not exist, so block/mic .List need no line.
+admin.vm.device.block.Available  *  mcp-control  @adminvm  deny
+admin.vm.device.mic.Available    *  mcp-control  @adminvm  deny
+admin.vm.device.block.Attached   *  mcp-control  @adminvm  deny
+admin.vm.device.usb.Attached     *  mcp-control  @adminvm  deny
+admin.vm.device.mic.Attached     *  mcp-control  @adminvm  deny
+admin.vm.device.block.Assigned   *  mcp-control  @adminvm  deny
+admin.vm.device.usb.Assigned     *  mcp-control  @adminvm  deny
+admin.vm.device.mic.Assigned     *  mcp-control  @adminvm  deny
 
 # --- Stage E2: ephemeral disposables via admin.vm.CreateDisposable.
 # The wrapper validates the DVMT is ai-managed AND has
@@ -264,8 +322,18 @@ qubes.ClipboardPaste            *  mcp-control  @anyvm        ask
 # stream between sys-usb and the consuming qube. Both must be allowed.
 admin.vm.device.usb.Attach      *  mcp-control  mcp-control   ask    target=@adminvm
 admin.vm.device.usb.Detach      *  mcp-control  mcp-control   ask    target=@adminvm
-admin.vm.device.usb.Available   *  mcp-control  @adminvm      allow  target=@adminvm
-admin.vm.device.usb.List        *  mcp-control  @adminvm      allow  target=@adminvm
+# Stage G0b (finding [2]): these two were `allow` — but their source token is
+# mcp-control, IDENTICAL to the source an agent's calls carry, so an AI-shaped
+# qubes_device_list(qube="@adminvm") rode this line straight into dom0's USB
+# enumeration (an out-of-scope hardware oracle). qrexec cannot tell "human typed
+# it" from "agent forwarded it" on a shared source. Fix = defense in depth:
+# (a) the mcp-control-side _qrexec target validator rejects @adminvm on the TOOL
+# path before the call is made, and (b) these drop to `ask` (like the Attach/
+# Detach lines above) so a bypass of (a) — or a compromised mcp-control — surfaces
+# a dom0 dialog instead of a SILENT oracle. The human's genuine USB-attach
+# enumeration still works with one confirmation click.
+admin.vm.device.usb.Available   *  mcp-control  @adminvm      ask    target=@adminvm
+admin.vm.device.usb.List        *  mcp-control  @adminvm      ask    target=@adminvm
 qubes.USB                       *  mcp-control  sys-usb       ask
 
 # =========================================================================

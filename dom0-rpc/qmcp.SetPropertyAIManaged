@@ -31,6 +31,41 @@ import sys
 CROSS_REF_PROPS = {"template", "netvm", "default_dispvm"}
 NOT_FOUND = {"ok": False, "error": "not found"}
 
+#: Stage G0a (review finding [1]): explicit allowlist of the properties an
+#: ai-full agent may set. Before G0a this wrapper cross-ref-validated
+#: template/netvm/default_dispvm but let EVERY other property fall through to
+#: setattr(vm, prop, value) below — so an ai-full agent (and, in the shipped
+#: compat default where untiered ai-managed == ai-full, EVERY qube it holds)
+#: could set provides_network=True, turn a qube it owns into an egress router,
+#: then point siblings' netvm at it (the cross-ref only requires the referent be
+#: ai-managed — and it now is). That defeats the Stage-C egress invariant: "the
+#: operator chooses ai-net-router's upstream in dom0; that one prefs flip
+#: reroutes all AI traffic." The parallel router the agent builds was never the
+#: operator's choice. Default-deny closes it: only these properties are settable.
+#: provides_network is operator-only (a new egress means the operator builds the
+#: router). Everything not listed (autostart, virt_mode, kernel,
+#: management_dispvm, default_user, …) is denied until a stage deliberately
+#: admits it with its own cross-ref. Volume sizes (private/volatile) are
+#: intentionally NOT here: a resize is a vm.volumes[...].resize() op, not a
+#: settable VM property, so it could never reach this setattr path — a post-hoc
+#: resize surface, if ever wanted, is its own wrapper. The cross-ref members
+#: (template/netvm/default_dispvm) stay subject to the CROSS_REF_PROPS check.
+SETTABLE_PROPS = {
+    "name", "label", "memory", "maxmem", "vcpus",
+    "template", "netvm", "default_dispvm",
+}
+
+#: Opaque refusal for a property that is not on SETTABLE_PROPS. Deliberately
+#: uniform across operator-only (provides_network), not-yet-admitted
+#: (autostart/kernel/…), and nonexistent/typo'd names — all collapse to this one
+#: message, so the surface is no oracle over WHICH properties the operator
+#: reserves (no "operator-only" tell, per the finding-[1] brief). It fires only
+#: AFTER the tier + consent authority gates, so — like the cross-ref and egress
+#: refusals below, and unlike the pre-authority NOT_FOUND — it is post-authority
+#: input-validation feedback on a qube the caller already holds CAP_FULL on; it
+#: leaks nothing about qube existence or tier.
+PROP_NOT_SETTABLE = {"ok": False, "error": "property not settable"}
+
 
 _AUDIT_SERVICE = "qmcp.SetPropertyAIManaged"
 #: Request-derived, whitelisted call summary (qube names / keys / actions
@@ -203,7 +238,8 @@ def main() -> int:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+        print(f"qmcp.SetPropertyAIManaged: qubesadmin import failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "set failed"})
 
     if name not in app.domains:
         return emit(NOT_FOUND)
@@ -227,6 +263,17 @@ def main() -> int:
     # NOT_FOUND), so it is no consent oracle. Fail-closed (in _consent_gate).
     if not _consent_gate("set-property"):
         return emit(NOT_FOUND)
+
+    # Stage G0a (finding [1]): property allowlist — default-deny. Only
+    # SETTABLE_PROPS may be set; provides_network and every other VM property
+    # are operator-only. This fires AFTER the tier + consent authority gates (so
+    # an under-tiered qube still gets the opaque NOT_FOUND above with no property
+    # feedback) and BEFORE the egress / cross-ref input-validation below —
+    # authority before input-validation, the same ordering the tier gate uses.
+    # The refusal is uniform across operator-only / not-yet-admitted / unknown
+    # property names, so it is no oracle over the operator's property policy.
+    if prop not in SETTABLE_PROPS:
+        return emit(PROP_NOT_SETTABLE)
 
     # Egress invariant: AI may not retarget the upstream of a network-providing
     # qube. The operator owns that pointer (in dom0) so they can route all AI
@@ -264,7 +311,10 @@ def main() -> int:
     except AttributeError:
         return emit({"ok": False, "error": f"property '{prop}' does not exist"})
     except Exception as e:
-        return emit({"ok": False, "error": f"set failed: {e}"})
+        # Stage G0e (finding [9]): opaque to AI (raw {e} can name an out-of-scope
+        # qube); detail to dom0 stderr.
+        print(f"qmcp.SetPropertyAIManaged: set failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "set failed"})
 
     return emit({"ok": True})
 

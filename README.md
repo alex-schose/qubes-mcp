@@ -111,10 +111,13 @@ I-4 (tiers on the policy-scoped surfaces), and I-5 (tiers on the wrapper
 listed below. **Wave 1 (I-0..I-5) is complete**, behaviour-neutral until
 the operator tiers the fleet and runs the flip; Wave 2 (I-6..I-8, the
 action gate) is next.
-**Stages G and H are deferred until
-Stage I completes** — both depend on a non-binary trust model (G's
-mcp-control lockdown is per-tier; H's remote reach needs Stage I's
-dom0 gate-lift) and are re-scoped once Stage I lands.
+**Stage G0 (gateway input boundary) was pulled ahead of Wave 2** — a
+2026-07-24 architecture review found reachable boundary breaks in the
+shipped tree, so the tier-independent hardening that closes them shipped
+now (see the G0 row). **The rest of Stage G (mcp-control host hardening,
+G1/G2) and Stage H remain deferred** until Stage I completes — both depend
+on a non-binary trust model (G1's lockdown is per-tier; H's remote reach
+needs Stage I's dom0 gate-lift).
 
 | Stage | Capability | State |
 |---|---|---|
@@ -133,7 +136,8 @@ dom0 gate-lift) and are re-scoped once Stage I lands.
 | I-3 | Tier taxonomy + dom0 tier-resolution helper — the keystone of the resource axis. Graduates the binary boundary into a cumulative ladder within ai-managed: `ai-managed` (read floor) < `ai-exec` (+commands) < `ai-net` (+firewall write) < `ai-full` (+lifecycle/property/clone/spawn/feature/attach/detach); `ai-dump` is an orthogonal copy-IN-only sink. A shared dom0 helper (`qmcp_tier.py`, sibling-loaded like `qmcp_budget`/`qmcp_scope`/`qmcp_audit`) exposes `effective_capabilities(vm)` → a frozenset of capability tokens, so the wrappers ask `CAP_FULL in caps` and stay decoupled from the taxonomy. Behaviour-neutral: ships inert (no wrapper sources it until I-5) in compat mode (untiered ai-managed = full = today's boundary). AI can neither mutate tags (keystone) nor read the tier tags (a `tags` read stays `["ai-managed"]` — the authority topology is not an oracle). Two-phase migration: enforce in I-4/I-5, then flip `/etc/qmcp/tier-default` to `ro` for least privilege. No new RPC, no policy change. | tested |
 | I-4 | First enforcement step of the resource axis — a single-file policy diff graduating the directly-`@tag:`-scoped surfaces. `firewall.Get` + device-list stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`; `ai-dump` gets a dedicated copy-IN-only `qubes.Filecopy * @tag:ai-managed @tag:ai-dump allow` (the Biba write-only sink — a **pure** `ai-dump` qube is push-only and invisible to reads/list/exec because it lacks the umbrella; the write-only property rests on the operator invariant that an `ai-dump` qube is never also `ai-managed`, which the installer checks and I-5 enforces). The policy layer matches tags literally and cannot call `qmcp_tier`, so firewall-write ships with a `@tag:ai-managed` **compat backstop** (keeps untiered qubes writable through migration → A–F3 stays green and the live egress qube keeps firewall control on deploy; behaviour-neutral on firewall in compat — only the `ai-dump` valve is new live behaviour). The flip (end of I-5) deletes the backstop **and** writes `ro` to `/etc/qmcp/tier-default` in one change. Policy-only; no new RPC, no new qube, no wrapper change. Proven offline (100-check policy simulation, compat + post-flip), a per-tier hardware slot, and an AI-side transparency test. | tested |
 | I-5 | Second enforcement step — tiers on the `@adminvm` **wrapper** surfaces (dom0 code) + the **exec** surfaces (policy), then the least-privilege flip. Lifecycle/SetProperty/SetFeature require `ai-full` on the target, Clone on the source, Spawn on the template, SpawnDisposable on the DVMT, Attach/Detach on **both** endpoints — via the sibling-loaded `qmcp_tier` helper, **fail-closed** (a missing/broken resolver denies, never allows). `RunInAIManaged`/`CopyToAIManaged` graduate in policy to `@tag:ai-exec`/`ai-net`/`ai-full` + a `@tag:ai-managed` compat backstop (mirrors I-4 firewall). Every create path **strips** any tier tag the platform propagates — `clone_vm` copies the source's tags, `CreateDisposable` inherits the DVMT's — so a created qube is always untiered (umbrella only); without the strip, AI could clone an `ai-full` qube into another and self-escalate past the flip. Behaviour-neutral in compat (untiered = full). The flip (separate slot, after the operator tiers the fleet) deletes **four** compat backstops (firewall.Set/Reload + Run/Copy) **and** writes `ro` to `/etc/qmcp/tier-default` in one coupled change. No new RPC, no new qube, no new ring. Proven offline (260 checks: wrapper-gate suite + policy simulator + I-4 regression) and on dom0 hardware (per-tier gate + the create-path strip, read back via `qvm-tags` in dom0 since tier tags are AI-unreachable). | tested |
-| G | mcp-control hardening + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
+| G0 | Gateway input boundary (pulled ahead of Wave 2 after the 2026-07-24 review). Property allowlist — `provides_network` operator-only (no self-minted egress); qrexec target-name validator (`@adminvm`/`dom0`/malformed rejected before any call); device enumeration (attached + available) routed through the dom0 redactor `qmcp.ListAttachedDevicesAIManaged` that hides out-of-scope backend/consuming-frontend qube names, with direct `admin.vm.device.*` enumeration denied; `qubes.Filecopy` re-tiered to `ai-exec` on **both** endpoints + explicit deny (no fleet-wide push into `ai-ro` qubes); `mask_error_details` + opaque error collapse. Closes four review findings; offline + per-fix hardware slots green. | tested |
+| G1/G2 | mcp-control host hardening (sudo lockdown, dedicated MCP user) + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
 See `CLAUDE.md` for the full design document — trust model, anti-goals, file
@@ -833,12 +837,20 @@ MIT — see `LICENSE`.
 
 This is operator-grade infrastructure for a specific use case (sandboxed AI
 agents managing Qubes-isolated workloads). It is not a hardened product. The
-threat model assumes the MCP source qube (`mcp-control`) is itself the trust
-boundary — compromising it does not let AI escape the `ai-managed` tag scope
-at the dom0/policy layer, but the AI in question can do anything inside its
-sandbox. Stage I (graduated authority — current work line) addresses the
-"anything inside its sandbox" half of that by tiering authority below the
-umbrella tag; Stage G (mcp-control hardening — sudo lockdown, dedicated
-MCP user) is deferred until Stage I lands, because the lockdown becomes
-meaningfully per-tier once the tier model exists.
+threat model treats the MCP source qube (`mcp-control`) as itself the trust
+boundary, and the dom0/policy layer is what enforces it: the `qmcp.*` wrappers
+and qrexec policy are built so a compromised `mcp-control` cannot read,
+enumerate, mutate, or act on qubes outside its `ai-managed` tag scope, cannot
+mint its own network egress, and cannot escalate the authority the operator
+granted. The gateway-input boundary breaks a 2026-07-24 architecture review
+surfaced — an unrestricted property write (self-minted egress), device-enumeration
+oracles reaching dom0, out-of-scope qube names leaking through reads and device
+lists, and inter-qube file-copy over-reach — are closed in **Stage G0**. Within
+its granted scope the AI can do anything. Two honest limits remain: a few
+pre-existing failure-path error messages can still surface a referenced qube
+name (being collapsed to opaque refusals), and hardening `mcp-control` itself
+(sudo lockdown, dedicated MCP user) is deferred Stage G1/G2 work. Stage I
+(graduated authority — current work line) tiers authority below the umbrella tag
+so a compromised or hallucinating agent need not hold full authority on every
+qube it can see.
 Run on your own infrastructure; report bugs in issues.

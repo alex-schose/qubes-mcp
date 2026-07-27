@@ -2,9 +2,36 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 QREXEC_CLIENT = "/usr/lib/qubes/qrexec-client-vm"
+
+# Stage G0b (finding [2]): the shape a tool-supplied qube name must have before
+# it may become a qrexec TARGET. A Qubes VM name is a letter followed by up to 30
+# more of [A-Za-z0-9_.-] (Qubes' own 31-char limit). Anything else — a qrexec
+# @-token (@adminvm/@dispvm/@tag:…), the plain-name special target `dom0`,
+# whitespace, shell/argv metacharacters, empty, or overlong — is rejected BEFORE
+# any qrexec call, so a tool forwarding an agent-supplied name (e.g.
+# qubes_device_list's `qube`) cannot ride an operator-UX policy line scoped to
+# @adminvm into dom0's device enumeration (an out-of-scope hardware oracle). This
+# is defense-in-depth in the UNTRUSTED process — a fully compromised mcp-control
+# bypasses it, which is why the dom0 policy is scoped independently (the device
+# @adminvm lines drop to `ask`). It also blocks argv-injection into
+# qrexec-client-vm. `dom0` passes the charset, so it is denied explicitly.
+# \A ... \Z (NOT ^...$): Python's `$` also matches just before a trailing
+# newline, so `^...$` would accept "dom0\n" / "ai-x\n" and forward the newline to
+# qrexec-client-vm — bypassing both the charset guard and the reserved denylist.
+# \A/\Z anchor to the absolute string bounds, so any embedded/trailing \n or \r
+# is rejected.
+_VALID_TARGET_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
+_RESERVED_TARGETS = {"dom0"}
+
+
+def _valid_target(name) -> bool:
+    return (isinstance(name, str)
+            and _VALID_TARGET_RE.match(name) is not None
+            and name.lower() not in _RESERVED_TARGETS)
 
 # Client-side timeout for the qmcp.* services that Stage I-6 gates behind an
 # operator-consent dialog (Lifecycle/SetProperty/SetFeature/Clone/Spawn/
@@ -88,12 +115,21 @@ def call_service(qube: str, service: str, payload: dict | None = None, timeout: 
     (qmcp.RunInAIManaged, qmcp.CopyToAIManaged). The named qube must be
     ai-managed and running; policy gates the source/target pair.
     """
-    proc = subprocess.run(
-        [QREXEC_CLIENT, qube, service],
-        input=json.dumps(payload).encode() if payload is not None else b"",
-        capture_output=True,
-        timeout=timeout,
-    )
+    if not _valid_target(qube):
+        # Opaque refusal, byte-identical to a policy deny / no-such-VM, so a
+        # rejected name is no validation oracle; no subprocess is spawned.
+        return {"ok": False, "error": "not found or refused"}
+    try:
+        proc = subprocess.run(
+            [QREXEC_CLIENT, qube, service],
+            input=json.dumps(payload).encode() if payload is not None else b"",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # Stage G0b (Component D, findings [12]/[9]): collapse transport/timeout
+        # exceptions to the opaque refusal instead of propagating raw text.
+        return {"ok": False, "error": "not found or refused"}
     return _decode_response(proc)
 
 
@@ -111,12 +147,18 @@ def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float =
     failure — followed by the payload. We strip the header so callers see
     clean stdout. In-band failures collapse to "not found or refused" too.
     """
-    proc = subprocess.run(
-        [QREXEC_CLIENT, vm_name, method],
-        input=payload,
-        capture_output=True,
-        timeout=timeout,
-    )
+    if not _valid_target(vm_name):
+        return {"ok": False, "error": "not found or refused"}
+    try:
+        proc = subprocess.run(
+            [QREXEC_CLIENT, vm_name, method],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # Stage G0b (Component D, findings [12]/[9]): opaque on transport/timeout.
+        return {"ok": False, "error": "not found or refused"}
     if proc.returncode != 0:
         return {"ok": False, "error": "not found or refused"}
 

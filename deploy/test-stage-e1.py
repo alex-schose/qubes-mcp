@@ -72,13 +72,11 @@ def wait_running(name: str, attempts: int = 15) -> bool:
 
 
 def device_list(qube: str, device_class: str, mode: str = "available") -> dict:
-    method = (f"admin.vm.device.{device_class}."
-              + ("Available" if mode == "available" else "List"))
-    r = call_admin(method, qube)
-    if not r.get("ok"):
-        return r
-    return {"ok": True,
-            "lines": [ln for ln in r.get("stdout", "").splitlines() if ln.strip()]}
+    # Stage G0e: device enumeration is wrapper-mediated — the direct
+    # admin.vm.device.<class>.{Available,Attached,Assigned} methods are denied to
+    # AI, so both modes route through the redactor wrapper.
+    return call_qmcp("qmcp.ListAttachedDevicesAIManaged",
+                     {"name": qube, "device_class": device_class, "mode": mode})
 
 
 # ---------------------------------------------------------------- preamble
@@ -115,7 +113,7 @@ print(f"  {'PASS' if list_ok else 'FAIL'}: list on ai-managed backend returns ok
 header(f"2. List devices on {PROBE_UNTAGGED} (untagged) → opaque refuse")
 r = device_list(PROBE_UNTAGGED, "block", mode="available")
 show(f"admin.vm.device.block.Available {PROBE_UNTAGGED}", r)
-list_untagged_refused = (not r.get("ok")) and r.get("error") == "not found or refused"
+list_untagged_refused = (not r.get("ok"))  # G0e: wrapper returns opaque "not found"
 print(f"  {'PASS' if list_untagged_refused else 'FAIL'}: refused with "
       f"'not found or refused'")
 

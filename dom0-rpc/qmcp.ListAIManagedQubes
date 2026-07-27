@@ -62,7 +62,11 @@ def main() -> int:
         print(json.dumps({"ok": True, "qubes": out}))
         return 0
     except Exception as e:
-        print(json.dumps({"ok": False, "error": str(e)}))
+        # Stage G0e (finding [9]): opaque to AI (the loop reads per-qube props; a
+        # qubesd error could name an out-of-scope qube); detail to dom0 stderr.
+        import sys
+        print(f"qmcp.ListAIManagedQubes: list failed: {e}", file=sys.stderr)
+        print(json.dumps({"ok": False, "error": "list failed"}))
         return 1
 
 

@@ -166,10 +166,10 @@ def main():
     tp += a; tf += b
 
     # firewall.Get + device-list stay ro-floor (the flip must not touch reads)
-    a, b = run_matrix(rules, ("admin.vm.firewall.Get", "admin.vm.device.block.List"),
+    a, b = run_matrix(rules, ("admin.vm.firewall.Get",),
                       FW_COMPAT, "PHASE 5 — reads stay ro-floor (compat)")
     tp += a; tf += b
-    a, b = run_matrix(flipped, ("admin.vm.firewall.Get", "admin.vm.device.block.List"),
+    a, b = run_matrix(flipped, ("admin.vm.firewall.Get",),
                       FW_COMPAT, "PHASE 6 — reads UNCHANGED by the flip")
     tp += a; tf += b
 

@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""qmcp.ListAttachedDevicesAIManaged — list the devices attached to an
+ai-managed FRONTEND qube, with every out-of-scope backend qube name redacted
+(Stage G0d, finding [4]).
+
+`admin.vm.device.<class>.Attached` on a frontend enumerates its attached devices;
+each device's identifier embeds its BACKEND qube name (e.g. `sys-usb:2-1`). When
+an OPERATOR has attached an operator-backed device to an ai-managed frontend,
+that raw List leaks the operator backend's NAME — an out-of-scope qube name, the
+same leak class the Stage I-1 read redactor closes for property values. This
+wrapper is the read-path redactor for the attached-device surface: the direct
+qrexec `admin.vm.device.<class>.List` is DENIED to AI (policy), AI reads attached
+devices only through here, and any qube name NOT tagged ai-managed is replaced by
+the opaque `<out-of-scope>` sentinel wherever it appears in the output.
+
+Format-agnostic by design: the raw admin List field layout drifts across Qubes
+4.1/4.2/4.3 (which is why the MCP tool never parsed it), so this does NOT parse
+fields — it token-redacts every out-of-scope qube NAME (word-boundary match) in
+each line, keeping in-scope (ai-managed) backend names usable for detach.
+Over-redaction is fail-safe (hides more, never leaks a name).
+
+Ro-floor read: the ai-managed umbrella is the only gate (no CAP_FULL, no consent,
+not audited — the same posture as qmcp.GetPropertyAIManaged and the device-list
+reads it replaces).
+
+Input  (stdin, JSON): {"name": "<ai-managed frontend>", "device_class": "block|usb|mic"}
+Output (stdout, JSON):
+    {"ok": true,  "lines": ["<redacted enumeration line>", ...]}
+    {"ok": false, "error": "not found"}   -- frontend missing/untagged (opaque)
+    {"ok": false, "error": "<reason>"}
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+ALLOWED_CLASSES = {"block", "usb", "mic"}
+NOT_FOUND = {"ok": False, "error": "not found"}
+SENTINEL = "<out-of-scope>"
+
+
+_NAMELIKE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]*\Z")
+
+
+def _redact(lines, ai_managed, oos_bare):
+    """FAIL-CLOSED backend/attachment name redaction. A qube name appears in the
+    device-list output in structured positions: `<backend>:<port>` (the token
+    before the first colon) and `<key>=<value>` (e.g. attachment=, backend_domain=).
+    For those positions we ALLOWLIST — keep the token only if it is an ai-managed
+    qube name, else replace it with the sentinel — so an unknown / dom0 / stale /
+    operator name defaults to REDACTED. (The earlier denylist built from
+    app.domains failed OPEN on dom0, which app.domains does not contain, and on
+    stale/removed backend names — finding [2].) A BARE token is redacted only if
+    it is a known non-ai-managed name or dom0 (the USED-BY column names a CURRENT
+    frontend, which is in app.domains); a plain description word is left intact.
+    Over-redaction is fail-safe (hides more, never leaks a name)."""
+    ai = set(ai_managed)
+    bare = set(oos_bare)
+
+    def _namepos(tok):
+        # <backend>:<port> — redact the head unless it is an ai-managed name.
+        if ":" in tok:
+            head, sep, tail = tok.partition(":")
+            if _NAMELIKE.match(head) and head not in ai:
+                head = SENTINEL
+            tok = head + sep + tail
+        # <key>=<value> (attachment=, backend_domain=, …) — redact a name-shaped
+        # value unless it is ai-managed. Preserve surrounding quotes.
+        if "=" in tok:
+            k, sep, v = tok.partition("=")
+            vq = v.strip("'\"")
+            if vq and _NAMELIKE.match(vq) and vq not in ai:
+                tok = k + sep + v.replace(vq, SENTINEL, 1)
+        return tok
+
+    out = []
+    for ln in lines:
+        toks = [_namepos(t) for t in ln.split()]
+        toks = [SENTINEL if t in bare else t for t in toks]
+        out.append(" ".join(toks))
+    return out
+
+
+def _emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0 if payload.get("ok") else 1
+
+
+def main() -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return _emit(NOT_FOUND)
+
+    name = req.get("name", "")
+    device_class = req.get("device_class", "")
+    mode = req.get("mode", "attached")
+    if device_class not in ALLOWED_CLASSES:
+        return _emit({"ok": False,
+                      "error": f"device_class must be one of: {sorted(ALLOWED_CLASSES)}"})
+    if mode not in ("attached", "available"):
+        return _emit({"ok": False, "error": "mode must be 'attached' or 'available'"})
+    if not name:
+        return _emit(NOT_FOUND)
+
+    try:
+        import qubesadmin.app
+        app = qubesadmin.app.QubesLocal()
+    except Exception as e:
+        # Stage G0e (finding [9]): a redactor wrapper must not itself leak raw {e}.
+        print(f"qmcp.ListAttachedDevicesAIManaged: qubesadmin import failed: {e}", file=sys.stderr)
+        return _emit(NOT_FOUND)
+
+    if name not in app.domains:
+        return _emit(NOT_FOUND)
+    if "ai-managed" not in app.domains[name].tags:
+        return _emit(NOT_FOUND)
+
+    # In-dom0 admin call over the local socket (qrexec policy does not gate
+    # in-dom0 calls — the same bypass qmcp.GetPoolStats uses). The direct qrexec
+    # admin.vm.device.<class>.List is denied to AI, so this wrapper is the only
+    # AI-reachable path and the redaction cannot be bypassed.
+    # The admin method for "currently attached to this frontend" is `.Attached`
+    # on Qubes 4.3; older trees exposed `.List` (which raises QubesDaemonAccessError
+    # on 4.3). Try the current name first, fall back to the legacy one. qubesd_call
+    # is the proven in-dom0 admin path (the same qmcp.SpawnDisposableAIManaged
+    # uses); in-dom0 calls bypass qrexec policy, so the direct qrexec device
+    # methods stay denied to AI and this wrapper is the only AI-reachable path.
+    # attached -> .Attached (live; .List is the legacy 4.2 name); available ->
+    # .Available (devices this ai-managed qube EXPOSES). BOTH are redacted below:
+    # .Available serialises `attachment=<consuming frontend>`, which can be an
+    # out-of-scope qube name (finding [3]), so it is NOT safe to return raw either.
+    if mode == "attached":
+        candidates = (f"admin.vm.device.{device_class}.Attached",
+                      f"admin.vm.device.{device_class}.List")
+    else:
+        candidates = (f"admin.vm.device.{device_class}.Available",)
+    raw = None
+    for method in candidates:
+        try:
+            raw = app.qubesd_call(name, method)
+            break
+        except Exception:
+            continue
+    if raw is None:
+        # Opaque — never surface a raw qubesd error (it could name an out-of-scope qube).
+        return _emit(NOT_FOUND)
+
+    text = raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+
+    # ALLOWLIST the ai-managed qube names (kept usable for detach); everything
+    # else — dom0, operator qubes, stale/removed backends — redacts. dom0 is NOT
+    # in app.domains, so it is added to the bare-token set explicitly.
+    ai_managed = {vm.name for vm in app.domains
+                  if "ai-managed" in getattr(vm, "tags", ())}
+    oos_bare = {vm.name for vm in app.domains
+                if "ai-managed" not in getattr(vm, "tags", ())} | {"dom0"}
+    lines = _redact(lines, ai_managed, oos_bare)
+
+    return _emit({"ok": True, "lines": lines})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

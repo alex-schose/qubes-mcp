@@ -64,7 +64,12 @@ _RING_MIN_TIER: dict[Ring, str] = {
 }
 
 
-mcp = FastMCP("qubes")
+# Stage G0b (Component D, findings [12]/[9]): mask_error_details keeps raw
+# exception text (qubesd messages, transport errors, tracebacks) out of the
+# response the agent sees — the detail is already on the AI-unreachable dom0
+# audit chain. Pairs with the exception collapse in _qrexec.call_service /
+# call_admin so no path leaks server-internal strings past the opaque refusal.
+mcp = FastMCP("qubes", mask_error_details=True)
 
 
 def spend_gate(ring: Ring) -> None:

@@ -193,7 +193,8 @@ def main() -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
     except Exception as e:
-        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+        print(f"qmcp.LifecycleAIManaged: invalid JSON input: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "invalid input"})
 
     name = req.get("name", "")
     action = req.get("action", "")
@@ -209,7 +210,8 @@ def main() -> int:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+        print(f"qmcp.LifecycleAIManaged: qubesadmin import failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "action failed"})
 
     if name not in app.domains:
         return emit(NOT_FOUND)
@@ -251,7 +253,10 @@ def main() -> int:
         elif action == "unpause":
             vm.unpause()
     except Exception as e:
-        return emit({"ok": False, "error": f"{action} failed: {e}"})
+        # Stage G0e (finding [9]): opaque to AI (a raw qubesd error can name an
+        # out-of-scope qube, e.g. a dependency); detail to dom0 stderr.
+        print(f"qmcp.LifecycleAIManaged: {action} failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "action failed"})
 
     return emit({"ok": True})
 

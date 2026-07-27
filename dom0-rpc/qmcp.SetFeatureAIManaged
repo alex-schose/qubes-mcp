@@ -224,7 +224,8 @@ def main() -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
     except Exception as e:
-        return emit({"ok": False, "error": f"invalid JSON input: {e}"})
+        print(f"qmcp.SetFeatureAIManaged: invalid JSON input: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "invalid input"})
 
     name = req.get("name", "")
     feature = req.get("feature", "")
@@ -239,7 +240,8 @@ def main() -> int:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+        print(f"qmcp.SetFeatureAIManaged: qubesadmin import failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "feature.Set failed"})
 
     # Existence-or-tag check — opaque "not found" for missing or untagged,
     # matching qmcp.GetPropertyAIManaged's existence-oracle stance.
@@ -292,7 +294,10 @@ def main() -> int:
     try:
         vm.features[feature] = value_str
     except Exception as e:
-        return emit({"ok": False, "error": f"feature.Set failed: {e}"})
+        # Stage G0e (finding [9]): opaque to AI (raw {e} can name an out-of-scope
+        # qube); detail to dom0 stderr.
+        print(f"qmcp.SetFeatureAIManaged: feature.Set failed: {e}", file=sys.stderr)
+        return emit({"ok": False, "error": "feature.Set failed"})
 
     # Live read-back from qubesd (Features.__getitem__ is not cached) so
     # the caller can confirm the round-trip.

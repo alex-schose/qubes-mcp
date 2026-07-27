@@ -1,5 +1,5 @@
 from qubes_mcp.server import Ring, ring_tool
-from qubes_mcp.tools._qrexec import call_admin
+from qubes_mcp.tools._qrexec import call_qmcp
 
 _ALLOWED_CLASSES = ("block", "usb", "mic")
 
@@ -35,10 +35,10 @@ def qubes_device_list(qube: str, device_class: str, mode: str = "available") -> 
     if mode not in ("available", "attached"):
         return {"ok": False, "error": "mode must be 'available' or 'attached'"}
 
-    method = (f"admin.vm.device.{device_class}."
-              + ("Available" if mode == "available" else "List"))
-    r = call_admin(method, qube)
-    if not r.get("ok"):
-        return r
-    lines = [ln for ln in r.get("stdout", "").splitlines() if ln.strip()]
-    return {"ok": True, "lines": lines}
+    # Stage G0d/G0e (findings [4] and [3]): BOTH modes route through the dom0
+    # redactor wrapper. "attached" can leak an out-of-scope BACKEND name;
+    # "available" can leak an out-of-scope CONSUMING-FRONTEND name (the
+    # `attachment=` field). The wrapper redacts either to <out-of-scope>; the
+    # direct admin device-enum methods are denied to AI, so it can't be bypassed.
+    return call_qmcp("qmcp.ListAttachedDevicesAIManaged",
+                     {"name": qube, "device_class": device_class, "mode": mode})
