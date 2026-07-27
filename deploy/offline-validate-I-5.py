@@ -199,7 +199,7 @@ class BudgetStub:
 class AuditRecorder:
     """Stand-in for the qmcp_audit module: record (ok, error) of every emit()."""
     def __init__(self): self.calls = []
-    def audit(self, service, summary, ok, error): self.calls.append((ok, error))
+    def audit(self, service, summary, ok, error, consent=None): self.calls.append((ok, error))
 
 
 def load_wrapper(filename):
@@ -231,6 +231,14 @@ def prep(mod, *, tier_none=False, stub_budget=False, audit=None):
     if stub_budget and hasattr(mod, "_load_budget_lib"):
         mod._load_budget_lib = lambda: BudgetStub()
     mod._AUDIT = audit  # None disables the best-effort audit hook (clean output)
+    # Stage I-6 added a consent gate to the 8 @adminvm wrappers; offline (no
+    # /etc/qmcp/consent-policy) qmcp_consent.gate() fail-closes to
+    # ('unavailable' -> deny), which would spuriously turn every past-the-tier
+    # case into NOT_FOUND. This file validates the I-5 TIER logic, not the consent
+    # axis (offline-validate-I-6.py covers that), so neutralise the gate to the
+    # I-6 empty-gate default (open), mirroring the _AUDIT=None override above.
+    if hasattr(mod, "_consent_gate"):
+        mod._consent_gate = lambda action: True
     return mod
 
 
