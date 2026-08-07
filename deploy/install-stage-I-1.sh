@@ -99,7 +99,21 @@ s=importlib.util.spec_from_file_location('qmcp_scope','/etc/qubes-rpc/qmcp_scope
 m=importlib.util.module_from_spec(s); s.loader.exec_module(m); \
 print('    scope lib OK:', hasattr(m,'scoped_name') and hasattr(m,'scoped_tags'))"
 echo '    dom0 read (expect {"ok": false, "error": "not found"}):'
-echo '{"name":"dom0","property":"netvm"}' | sudo /etc/qubes-rpc/qmcp.GetPropertyAIManaged | sed 's/^/      /'
+# The wrapper's emit() returns `0 if payload["ok"] else 1`, so a REFUSAL exits 1
+# — and a refusal is exactly the security property this smoke check exists to
+# demonstrate. Piping it directly under `set -euo pipefail` therefore aborts the
+# installer on success-as-designed. Capture the output instead, and assert the
+# refusal explicitly so the check still means something.
+# (Bit the fresh-box rebuild on 2026-08-05: this installer predates the
+# exit-on-refusal behaviour that later stages gave the wrappers.)
+_i1_out="$(echo '{"name":"dom0","property":"netvm"}' | sudo /etc/qubes-rpc/qmcp.GetPropertyAIManaged || true)"
+printf '%s\n' "$_i1_out" | sed 's/^/      /'
+if printf '%s' "$_i1_out" | grep -q '"ok": *false'; then
+    echo '    existence-hiding holds (dom0 read refused).'
+else
+    echo "FATAL: dom0 read was NOT refused — existence-hiding is broken." >&2
+    exit 1
+fi
 echo
 
 # ---------------------------------------------------------------- 5. cleanup
