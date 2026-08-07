@@ -187,7 +187,16 @@ path = sys.argv[1]
 try:
     # Authoritative: the qrexec policy parser, if present in dom0.
     from qrexec.policy.parser import StringPolicy  # type: ignore
-    StringPolicy(policy={'30-mcp-control': open(path, encoding='utf-8').read()})
+    _s = open(path, encoding='utf-8').read()
+    try:
+        # Qubes 4.3+ qrexec requires a '__main__' entry point in the dict.
+        StringPolicy(policy={'__main__': _s})
+    except Exception as _e1:
+        try:
+            # Older qrexec accepted a plain named key.
+            StringPolicy(policy={'30-mcp-control': _s})
+        except Exception:
+            raise _e1  # report the REAL parse error, not the key-shape error
     print("    qrexec parser: policy parses clean.")
     sys.exit(0)
 except ImportError:
