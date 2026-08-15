@@ -29,7 +29,7 @@
 # No policy changes; no daemon restart.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-I-1.sh' > /tmp/uninstall-I-1.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-I-1.sh' > /tmp/uninstall-I-1.sh
 #   bash /tmp/uninstall-I-1.sh
 #   # or:    bash /tmp/uninstall-I-1.sh --force   (skips the wrapper check)
 

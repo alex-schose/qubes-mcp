@@ -15,7 +15,7 @@
 # surface is fully denied again (Stage F2 state).
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-f3.sh' > /tmp/uninstall-f3.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-f3.sh' > /tmp/uninstall-f3.sh
 #   bash /tmp/uninstall-f3.sh
 
 set -euo pipefail

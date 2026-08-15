@@ -38,17 +38,61 @@
 
 set -euo pipefail
 
+# The flip stages its candidate policy as root and must validate and install it
+# as root too. dom0's root umask is 0077, so a root-created temp file is 0600 and
+# an unprivileged validator cannot read it -- the flip then aborts (fail-closed,
+# but it can never complete). Say so up front instead of dying at the last step.
+if [ "$(id -u)" -ne 0 ]; then
+    if ! sudo -n true 2>/dev/null; then
+        echo "FATAL: this script needs root (or passwordless sudo) in dom0." >&2
+        echo "       run:  sudo bash $0" >&2
+        exit 1
+    fi
+fi
+
 POLICY="/etc/qubes/policy.d/30-mcp-control.policy"
 FLAG="/etc/qmcp/tier-default"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 BK_DIR="/var/lib/qmcp-rollback/flip-$TS"     # OUTSIDE policy.d/ (loader hygiene)
 BK_LATEST="/var/lib/qmcp-rollback/flip-latest"
 
+# Reload the policy daemon and PROVE it came back. Returns non-zero if it did
+# not, so callers decide: the main flip path aborts, but rollback() only reports
+# (it is already in a failure path and must finish restoring the policy file).
+#
+# This matters more here than in any other installer: the flip is what switches
+# the fleet to least privilege, so a daemon that fails to return leaves the box
+# in its most security-consequential state with policy evaluation degraded to
+# the per-call fallback. Restarts 1-5 succeed and leave the unit active; the
+# 6th inside systemd's 10s StartLimitIntervalSec fails with rc=1 and leaves it
+# `failed`. Checking $? would catch that one case; asserting is-active also
+# catches the daemon dying for any other reason, so we assert.
 reload_daemon() {
     sudo systemctl reset-failed qubes-qrexec-policy-daemon qubes-policy-daemon 2>/dev/null || true
-    sudo systemctl restart qubes-qrexec-policy-daemon 2>/dev/null \
-        || sudo systemctl restart qubes-policy-daemon 2>/dev/null \
-        || echo "    WARNING: neither policy daemon name worked — reload by hand." >&2
+    local unit=""
+    if sudo systemctl restart qubes-qrexec-policy-daemon 2>/dev/null; then
+        unit=qubes-qrexec-policy-daemon
+    elif sudo systemctl restart qubes-policy-daemon 2>/dev/null; then
+        unit=qubes-policy-daemon
+    fi
+    if [ -z "$unit" ]; then
+        echo "    ERROR: neither policy daemon name could be restarted." >&2
+        return 1
+    fi
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ "$(systemctl is-active "$unit")" = "active" ] && break
+        sleep 1
+    done
+    if [ "$(systemctl is-active "$unit")" != "active" ]; then
+        echo "    ERROR: $unit did not return to active after restart." >&2
+        echo "           qrexec policy evaluation is DEGRADED (per-call fallback)." >&2
+        echo "           Recover:  sudo systemctl reset-failed $unit" >&2
+        echo "                     sudo systemctl start $unit" >&2
+        return 1
+    fi
+    echo "    reloaded $unit (verified active)."
+    return 0
 }
 
 # Restore this run's pre-flip state (policy + flag) and reload. Called on any
@@ -62,7 +106,10 @@ rollback() {
     else
         sudo rm -f "$FLAG"      # flag did not pre-exist → compat is "absent"
     fi
-    reload_daemon
+    # Report but do NOT abort: we are already in the failure path and the policy
+    # file has just been restored. Dying here would leave the caller without the
+    # confirmation line and without the recovery hint reload_daemon just printed.
+    reload_daemon || echo "    (daemon reload FAILED during rollback — see above)" >&2
     echo "    rolled back: backstops restored, tier-default reset." >&2
 }
 
@@ -113,7 +160,7 @@ then
 fi
 
 # ----------------------------------------------------------------- 2. VALIDATE before replacing the live file
-if python3 - "$STAGED" <<'PY'
+if sudo python3 - "$STAGED" <<'PY'
 import sys
 path = sys.argv[1]
 try:
@@ -165,7 +212,15 @@ if ! printf 'ro\n' | sudo tee "$FLAG" >/dev/null; then
     echo "FATAL: tier-default write failed — rolling back the policy half." >&2; rollback; exit 1
 fi
 sudo chmod 0644 "$FLAG"; sudo chown root:root "$FLAG"
-reload_daemon
+# Both halves are now written. If the daemon does not come back, the fleet is
+# at least privilege with policy evaluation degraded to the per-call fallback —
+# the worst moment for that to be true and unnoticed. Roll back rather than
+# report success.
+if ! reload_daemon; then
+    echo "FATAL: policy daemon did not return after the flip — rolling back." >&2
+    rollback
+    exit 1
+fi
 echo "    policy flipped + tier-default=ro written + daemon reloaded."
 
 # ----------------------------------------------------------------- 4. POST-ASSERT both halves (rollback if wrong)

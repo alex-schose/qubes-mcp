@@ -8,9 +8,36 @@
 # Review this script BEFORE executing it. Dom0 is your trust root.
 
 set -euo pipefail
+# ---------------------------------------------------------------- flip coherence guard
+# This installer writes /etc/qubes/policy.d/30-mcp-control.policy from the
+# shipped, PRE-FLIP artifact, which still carries the four @tag:ai-managed
+# compat backstops. Doing that on a FLIPPED fleet restores those backstops while
+# /etc/qmcp/tier-default stays "ro", so the two halves of the coupled flip
+# disagree -- and it fails PERMISSIVE: exec, file-copy and firewall-write reopen
+# to every umbrella qube while the @adminvm wrapper surfaces keep denying. The
+# operator has every reason to think least privilege is still on; nothing
+# announces the regression. This is the split-brain the I-4 design note warns
+# about, reached by routine stage maintenance rather than a partial flip.
+if [ "$(tr -d '[:space:]' < /etc/qmcp/tier-default 2>/dev/null)" = "ro" ]; then
+    if [ "${QMCP_ALLOW_UNFLIP:-0}" = "1" ]; then
+        echo "    WARNING: fleet is FLIPPED; this install restores the compat" >&2
+        echo "             backstops. Proceeding on QMCP_ALLOW_UNFLIP=1 --" >&2
+        echo "             RE-RUN deploy/install-stage-flip.sh when it finishes." >&2
+    else
+        echo "FATAL: this fleet is FLIPPED (/etc/qmcp/tier-default=ro), but this" >&2
+        echo "       installer writes the shipped policy, which still carries the" >&2
+        echo "       four compat backstops. Installing it would un-flip the policy" >&2
+        echo "       half while the flag stays 'ro' -- reopening exec, file-copy" >&2
+        echo "       and firewall-write to every @tag:ai-managed qube, silently." >&2
+        echo "       Re-run with QMCP_ALLOW_UNFLIP=1 and then immediately re-run" >&2
+        echo "       deploy/install-stage-flip.sh to restore coherence." >&2
+        exit 1
+    fi
+fi
+
 
 QUBE="${1:-mcp-control}"
-SOURCE_PATH="${2:-/home/user/qubes_mcp}"
+SOURCE_PATH="${2:-/home/user/qubes_mcp/public}"
 STAGE_DIR="/tmp/qubes-mcp-stage-a"
 
 echo "==> Stage A deploy starting"
@@ -112,5 +139,7 @@ echo "    Template: ai-debian-13 (tagged ai-managed)"
 echo "    Policy:   /etc/qubes/policy.d/30-mcp-control.policy"
 echo "    Services: qmcp.{List,Spawn,GetProperty,SetProperty}AIManaged*"
 echo
-echo "    No daemon restart needed — qrexec re-reads policy on each call."
+echo "    The qrexec policy daemon CACHES policy — it does NOT re-read per call."
+echo "    Later stages restart it; if you stop after Stage A, apply it yourself:"
+echo "      sudo systemctl restart qubes-qrexec-policy-daemon"
 echo "    Tell the MCP session to run the Stage A test plan from mcp-control."

@@ -83,21 +83,21 @@ if not target_ok:
 header("1. feature.Set round-trip + boolean coercion")
 roundtrip_ok = bool_true_ok = bool_false_ok = False
 if target_ok:
-    r = qubes_feature_set(TEST_QUBE, "qmcp-test-marker", "hello")
-    show("set qmcp-test-marker=hello", r)
-    roundtrip_ok = (r.get("ok") and r.get("feature") == "qmcp-test-marker"
+    r = qubes_feature_set(TEST_QUBE, "ai-test-marker", "hello")
+    show("set ai-test-marker=hello", r)
+    roundtrip_ok = (r.get("ok") and r.get("feature") == "ai-test-marker"
                     and r.get("value") == "hello")
 
-    r = qubes_feature_set(TEST_QUBE, "qmcp-test-flag", True)
-    show("set qmcp-test-flag=True", r)
+    r = qubes_feature_set(TEST_QUBE, "ai-test-flag", True)
+    show("set ai-test-flag=True", r)
     bool_true_ok = r.get("ok") and r.get("value") == "1"
 
     # False coerces to "" in the wrapper; what Qubes stores is the
     # interesting bit. The Admin API may keep an empty-string feature
     # (readback "") or treat empty-as-removal (readback None). Both are
     # legitimate falsy states, so we accept either and print what we got.
-    r = qubes_feature_set(TEST_QUBE, "qmcp-test-flag", False)
-    show("set qmcp-test-flag=False", r)
+    r = qubes_feature_set(TEST_QUBE, "ai-test-flag", False)
+    show("set ai-test-flag=False", r)
     bool_false_ok = r.get("ok") and r.get("value") in ("", None)
 print(f"  {'PASS' if roundtrip_ok and bool_true_ok and bool_false_ok else 'FAIL'}: "
       f"set echoes value back + bool coercion (True→\"1\", False→\"\"/None)")
@@ -142,7 +142,7 @@ print(f"  {'PASS' if crossref_opaque_ok else 'FAIL'}: "
 
 # ---------------------------- 5. untagged target → opaque "not found"
 header(f"5. feature.Set on untagged qube ({PROBE_UNTAGGED}) → opaque 'not found'")
-r = qubes_feature_set(PROBE_UNTAGGED, "qmcp-test-marker", "x")
+r = qubes_feature_set(PROBE_UNTAGGED, "ai-test-marker", "x")
 show(f"set on {PROBE_UNTAGGED}", r)
 untagged_target_ok = (not r.get("ok")) and r.get("error") == "not found"
 print(f"  {'PASS' if untagged_target_ok else 'FAIL'}: refused with literal 'not found'")

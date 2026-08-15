@@ -11,7 +11,7 @@
 # so after uninstall feature.Set is fully denied again (Stage E2 state).
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-f1.sh' > /tmp/uninstall-f1.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-f1.sh' > /tmp/uninstall-f1.sh
 #   bash /tmp/uninstall-f1.sh
 
 set -euo pipefail

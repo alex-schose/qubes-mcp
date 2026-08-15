@@ -50,6 +50,20 @@ import sys
 # from the operator's menus / manager, undermining human oversight.
 DENIED_FEATURE_KEYS = {"internal"}
 
+# Operator-only feature-key PREFIXES. The project's own `qmcp*` namespace is
+# reserved so that AI can never seed it.
+#
+# Today nothing in this codebase reads a feature to make an authorization
+# decision — exec is gated by the policy tag (@tag:ai-exec/ai-net/ai-full) plus
+# the service file's presence in the template, never by a feature. A clean-room
+# rig confirmed that on 2026-08-15, which is why this is *reservation*, not a
+# fix for a live escalation. It is here so the general principle holds by
+# construction going forward: anything the authorization layer might one day
+# read must not be writable by the party being authorized. Claiming the
+# namespace now costs nothing; retrofitting it after a future stage starts
+# consulting `qmcp-*` would mean auditing every qube for pre-seeded keys.
+DENIED_FEATURE_PREFIXES = ("qmcp",)
+
 # Feature keys whose value names another qube; the value must be an
 # ai-managed qube. Defensive — see module docstring.
 CROSS_REF_FEATURE_KEYS = {"audiovm", "guivm"}
@@ -271,6 +285,14 @@ def main() -> int:
     # other qubes.
     if feature in DENIED_FEATURE_KEYS:
         return emit({"ok": False, "error": f"feature '{feature}' is operator-only"})
+
+    # Reserved namespace — same informative-refusal reasoning as DENIED_FEATURE_KEYS
+    # above: the target is already known to AI via ListAIManagedQubes, so naming
+    # the rule leaks nothing about other qubes.
+    if feature.startswith(DENIED_FEATURE_PREFIXES):
+        reserved = "/".join(f"{p}*" for p in DENIED_FEATURE_PREFIXES)
+        return emit({"ok": False, "error":
+                     f"feature namespace {reserved} is reserved"})
 
     # Cross-VM keys — value must name an ai-managed qube. Collapse
     # "missing" and "untagged" to one opaque message so AI cannot probe

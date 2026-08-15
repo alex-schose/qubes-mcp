@@ -28,7 +28,7 @@
 # Idempotent — re-runnable. Installs overwrite the lib and the two wrappers.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
 #   bash /tmp/install-I-1.sh mcp-control ~user/qubes_mcp/public
 
 set -euo pipefail

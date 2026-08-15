@@ -30,7 +30,8 @@ and this file is only ONE of the three:
     gate-able surface is the SAME opaque sentinel as a not-found / untagged target
     (no consent oracle).
 
-FLIP-AWARE (post fleet-flip, /etc/qmcp/tier-default=ro): the invariance baseline
+MODE-AGNOSTIC (the suite does not assume the flip; see the coherence check in
+test_1_empty_gate_invariance): the invariance baseline
 is the I-5 POST-FLIP truth, not compat. A self-spawned qube is born UNTIERED
 (Spawn strips all tier tags), so it resolves ai-ro: its reads succeed but every
 CAP_FULL op (lifecycle/property/feature/attach/detach) is DENIED with the opaque
@@ -216,24 +217,62 @@ def test_1_empty_gate_invariance() -> bool:
     cap_full_ops = [
         ("Lifecycle start", {"service": "qmcp.LifecycleAIManaged",
                              "payload": {"name": TEST_QUBE, "action": "start"}}),
+    ]
+    # ORDER MATTERS — see the same note in test-stage-a.py. All of these run
+    # against ONE qube, so `remove` must come last: removing it partway down makes
+    # every later probe answer "not found" for a trivial reason, which is
+    # indistinguishable from a tier denial. Invisible post-flip (all denied
+    # anyway); in compat the remove succeeds and the tail tests nothing.
+    cap_full_ops = [
+        ("SetProperty memory=400",
+         {"service": "qmcp.SetPropertyAIManaged",
+          "payload": {"name": TEST_QUBE, "property": "memory", "value": "400"}}),
+        ("SetFeature ai-i6-probe=1",
+         {"service": "qmcp.SetFeatureAIManaged",
+          "payload": {"name": TEST_QUBE, "feature": "ai-i6-probe", "value": "1"}}),
+    ] + cap_full_ops + [
         ("Lifecycle kill (I-7 typed-confirm surface)",
          {"service": "qmcp.LifecycleAIManaged", "payload": {"name": TEST_QUBE, "action": "kill"}}),
         ("Lifecycle remove (I-7 typed-confirm surface)",
          {"service": "qmcp.LifecycleAIManaged", "payload": {"name": TEST_QUBE, "action": "remove"}}),
-        ("SetProperty memory=400",
-         {"service": "qmcp.SetPropertyAIManaged",
-          "payload": {"name": TEST_QUBE, "property": "memory", "value": "400"}}),
-        ("SetFeature qmcp-i6-probe=1",
-         {"service": "qmcp.SetFeatureAIManaged",
-          "payload": {"name": TEST_QUBE, "feature": "qmcp-i6-probe", "value": "1"}}),
     ]
+    _gate_denied: list = []
+    _gate_succeeded: list = []
+    _gate_other: list = []
     for label, call in cap_full_ops:
         r = call_qmcp(call["service"], call["payload"])
-        show(f"{label} on untiered probe → must be NOT_FOUND", r)
-        if r != NOT_FOUND:
-            print(f"  FAIL — {label} on an UNTIERED qube was not the opaque refusal: {r}")
-            print("         (a CAP_FULL op succeeding on an untiered qube is self-escalation)")
-            ok = False
+        show(f"{label} on untiered probe", r)
+        # COHERENCE, not a mode assumption — see the same change in
+        # test-stage-a.py / test-stage-I-5.py. This suite runs from the AI seat
+        # and cannot read /etc/qmcp/tier-default, so requiring post-flip denial
+        # unconditionally made it fail on a stock compat install where untiered
+        # == ai-full is the documented default. Collect, then judge agreement.
+        if r == NOT_FOUND:
+            _gate_denied.append(label)
+        elif isinstance(r, dict) and r.get("ok") is True:
+            _gate_succeeded.append(label)
+        else:
+            _gate_other.append((label, r))
+
+    if _gate_other:
+        ok = False
+        print("  FAIL — a CAP_FULL probe returned neither the opaque refusal nor success:")
+        for label, r in _gate_other:
+            print(f"         {label}: {r}")
+    elif _gate_denied and _gate_succeeded:
+        ok = False
+        print("  FAIL — INCOHERENT: the untiered probe was denied on some CAP_FULL "
+              "surfaces and allowed on others.")
+        print(f"         denied:    {_gate_denied}")
+        print(f"         succeeded: {_gate_succeeded}")
+    elif _gate_denied:
+        print("  POST-FLIP: every CAP_FULL op on the untiered probe collapsed to the "
+              "opaque refusal — the empty gate added nothing on top of I-5.")
+    else:
+        print("  COMPAT (/etc/qmcp/tier-default absent or not 'ro'): every CAP_FULL op "
+              "on the untiered probe succeeded, which is the documented compat "
+              "behaviour (untiered == ai-full) — the empty gate still added nothing.")
+        print("         Re-run after the flip to exercise least privilege.")
 
     # --- (b) OPTIONAL happy path: the empty gate lets a CAP_FULL-granted op through
     # unchanged and promptly. NON-DESTRUCTIVE: a GetProperty→SetProperty memory

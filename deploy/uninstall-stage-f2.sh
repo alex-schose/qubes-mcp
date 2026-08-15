@@ -18,7 +18,7 @@
 # state).
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-f2.sh' > /tmp/uninstall-f2.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-f2.sh' > /tmp/uninstall-f2.sh
 #   bash /tmp/uninstall-f2.sh
 
 set -euo pipefail

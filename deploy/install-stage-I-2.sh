@@ -32,7 +32,7 @@
 # Idempotent — re-runnable. Installs overwrite the lib and the 8 wrappers.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
 #   bash /tmp/install-I-2.sh mcp-control ~user/qubes_mcp/public
 
 set -euo pipefail
@@ -153,10 +153,26 @@ echo "==> Smoke: REAL qrexec path — call a wrapper from $SOURCE_QUBE, confirm 
 # broken, so we exercise the qrexec path explicitly. Lifecycle on a nonexistent
 # name is refused immediately (no qube touched), but emit() still records the
 # attempt — so the log must grow by one line.
+# This smoke needs the MCP server's venv in the source qube. Nothing earlier in
+# the band builds it, so on a clean-room install it is legitimately absent —
+# and dying here with `.venv/bin/python: No such file or directory` (rc=127)
+# would abort AFTER the audit log is installed, leaving the one check that
+# proves the non-root write path silently unrun. Skip loudly instead, and say
+# exactly how to complete the verification.
+if ! qvm-run --pass-io "$SOURCE_QUBE" "test -x '$SOURCE_PATH/.venv/bin/python'" </dev/null 2>/dev/null; then
+    echo "      SKIPPED — no venv at $SOURCE_QUBE:$SOURCE_PATH/.venv" >&2
+    echo "      The audit log is installed but the NON-ROOT qrexec write path is" >&2
+    echo "      UNVERIFIED. Build the venv and re-run this installer:" >&2
+    echo "        (in $SOURCE_QUBE)  cd $SOURCE_PATH && python3 -m venv .venv \\" >&2
+    echo "                           && .venv/bin/pip install -e ." >&2
+    echo
+    echo "==> Stage I-2 deploy complete (smoke SKIPPED — see above)."
+    exit 0
+fi
 before="$(sudo cat "$LOG" 2>/dev/null | wc -l)"
 qvm-run --pass-io "$SOURCE_QUBE" \
     "cd '$SOURCE_PATH' && .venv/bin/python -c 'from qubes_mcp.tools._qrexec import call_qmcp; print(call_qmcp(\"qmcp.LifecycleAIManaged\", {\"name\": \"qmcp-i2-install-smoke\", \"action\": \"start\"}))'" \
-    | sed 's/^/      /'
+    </dev/null | sed 's/^/      /'
 after="$(sudo cat "$LOG" 2>/dev/null | wc -l)"
 echo "      audit lines: before=$before after=$after   (must grow by 1)"
 # ASSERT, don't just print: a non-root wrapper user that cannot write the log

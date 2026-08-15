@@ -3,8 +3,16 @@
 
 Exercises the four qmcp.* RPCs and the tag-scoped lifecycle methods.
 
-FLIP-AWARE (post-2026-06-21): the fleet flip is LIVE
-(/etc/qmcp/tier-default=ro). A qube spawned via qmcp.SpawnAIManagedQube is born
+MODE-AGNOSTIC. This suite runs from the AI seat and by design CANNOT read
+/etc/qmcp/tier-default, so it does not assume whether the fleet flip has
+happened. The CAP_FULL assertions test COHERENCE: every CAP_FULL surface on an
+untiered qube must agree — all opaque-denied (post-flip least privilege) or all
+successful (compat, where untiered == ai-full is the documented default). A
+MIXED result is the real defect and is what fails the run. An earlier version
+asserted post-flip unconditionally and therefore failed on a correct, freshly
+installed compat box.
+
+A qube spawned via qmcp.SpawnAIManagedQube is born
 UNTIERED (the create path strips every inherited tier tag), so post-flip it
 resolves to ai-ro: READS succeed, but every CAP_FULL op (start/shutdown/kill/
 pause/unpause/remove, SetProperty, SetFeature, Clone, Attach, Detach) is DENIED
@@ -181,25 +189,69 @@ if spawn_ok:
 cap_full_denied = None
 if spawn_ok:
     header("3c. CAP_FULL ops on untiered ai-scratch-1 → opaque NOT_FOUND (no self-escalation)")
+    # ORDER MATTERS: non-destructive probes FIRST, `remove` LAST. These all run
+    # against the same qube, so a `remove` partway down destroys the subject and
+    # every later probe then answers "not found" for a trivial reason — a false
+    # denial indistinguishable from a tier denial. Post-flip that was invisible
+    # (everything is denied anyway); in compat the remove SUCCEEDS and the tail of
+    # the list silently tested nothing. test-stage-I-5.py already orders it this
+    # way, which is why it passed in both modes.
     cap_full_probes = [
+        ("SetProperty memory", {"name": "ai-scratch-1", "property": "memory", "value": "400"},
+         "qmcp.SetPropertyAIManaged"),
+        ("SetFeature probe", {"name": "ai-scratch-1", "feature": "ai-a-probe", "value": "1"},
+         "qmcp.SetFeatureAIManaged"),
         ("Lifecycle start",  {"name": "ai-scratch-1", "action": "start"},   "qmcp.LifecycleAIManaged"),
         ("Lifecycle kill",   {"name": "ai-scratch-1", "action": "kill"},    "qmcp.LifecycleAIManaged"),
         ("Lifecycle remove", {"name": "ai-scratch-1", "action": "remove"},  "qmcp.LifecycleAIManaged"),
-        ("SetProperty memory", {"name": "ai-scratch-1", "property": "memory", "value": "400"},
-         "qmcp.SetPropertyAIManaged"),
-        ("SetFeature probe", {"name": "ai-scratch-1", "feature": "qmcp-a-probe", "value": "1"},
-         "qmcp.SetFeatureAIManaged"),
     ]
-    cap_full_denied = True
+    # COHERENCE, not a fixed expectation. This suite runs from the AI seat and by
+    # design CANNOT read /etc/qmcp/tier-default, so it cannot know which mode the
+    # box is in — and asserting post-flip unconditionally made this suite FAIL on
+    # a correct, freshly-installed (compat) system, where untiered == ai-full is
+    # the documented behaviour. What must hold in BOTH modes is that the surfaces
+    # agree with each other:
+    #     all denied   -> post-flip least privilege
+    #     all succeed  -> compat (untiered == ai-full), the shipped default
+    #     MIXED        -> the real bug: enforcement is incoherent across surfaces,
+    #                     i.e. a split-brain window of the kind the I-4 coupled
+    #                     flip exists to prevent.
+    denied, succeeded, other = [], [], []
     for label, payload, svc in cap_full_probes:
         rr = call_qmcp(svc, payload)
         show(label, rr)
-        if rr != NOT_FOUND:
-            print(f"  FAIL — {label} did NOT return the opaque {json.dumps(NOT_FOUND)}: {rr}")
-            print("         (a CAP_FULL op SUCCEEDING on an untiered qube would be self-escalation)")
-            cap_full_denied = False
-    if cap_full_denied:
-        print(f"  PASS: every CAP_FULL op on the untiered qube collapses to {json.dumps(NOT_FOUND)}")
+        if rr == NOT_FOUND:
+            denied.append(label)
+        elif isinstance(rr, dict) and rr.get("ok") is True:
+            succeeded.append(label)
+        else:
+            other.append((label, rr))
+
+    if other:
+        cap_full_denied = False
+        print("  FAIL — a CAP_FULL probe returned neither the opaque refusal nor success:")
+        for label, rr in other:
+            print(f"         {label}: {rr}")
+    elif denied and succeeded:
+        cap_full_denied = False
+        print("  FAIL — INCOHERENT: some CAP_FULL ops on the untiered qube were denied "
+              "and others succeeded.")
+        print(f"         denied:    {denied}")
+        print(f"         succeeded: {succeeded}")
+        print("         One tier mode must apply to every surface at once; a split "
+              "means a gate is missing on the surfaces that succeeded.")
+    elif denied:
+        cap_full_denied = True
+        print(f"  PASS: POST-FLIP — every CAP_FULL op on the untiered qube collapses "
+              f"to {json.dumps(NOT_FOUND)} (no self-escalation).")
+    else:
+        cap_full_denied = True
+        print("  PASS: COMPAT (/etc/qmcp/tier-default absent or not 'ro') — every "
+              "CAP_FULL op on the untiered qube succeeded, which is the documented "
+              "compat behaviour (untiered == ai-full).")
+        print("        This is NOT self-escalation: the qube is untiered, and in "
+              "compat untiered carries full authority by design.")
+        print("        Re-run after the flip to exercise least privilege.")
 
 # ----------------------------------- 4. SetProperty cross-ref OPAQUE COLLAPSE
 # The wrapper's cross-ref refusal must collapse "missing" and "untagged"

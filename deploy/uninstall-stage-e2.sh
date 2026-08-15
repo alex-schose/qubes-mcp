@@ -12,7 +12,7 @@
 # any straggler in dom0 if needed.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-e2.sh' > /tmp/uninstall-e2.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-e2.sh' > /tmp/uninstall-e2.sh
 #   bash /tmp/uninstall-e2.sh
 
 set -euo pipefail

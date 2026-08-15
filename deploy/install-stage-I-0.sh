@@ -34,13 +34,13 @@
 # wrappers; the cap file is never touched.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
 #   bash /tmp/install-I-0.sh mcp-control ~user/qubes_mcp
 
 set -euo pipefail
 
 SOURCE_QUBE="${1:-mcp-control}"
-SOURCE_PATH="${2:-/home/user/qubes_mcp}"
+SOURCE_PATH="${2:-/home/user/qubes_mcp/public}"
 
 STAGE_DIR="/tmp/qubes-mcp-stage-I-0"
 

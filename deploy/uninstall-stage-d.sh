@@ -28,7 +28,7 @@
 # That's the operator's call — `qvm-remove` whichever ai-* test qubes remain.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-d.sh' > /tmp/uninstall-d.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-d.sh' > /tmp/uninstall-d.sh
 #   bash /tmp/uninstall-d.sh
 
 set -euo pipefail

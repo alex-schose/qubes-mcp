@@ -565,6 +565,21 @@ qubes_mcp/                          # repo root
   before deploy. After deploy, the stage's test plan runs from mcp-control.
   Do not begin the next stage until the current one's tests pass.
 
+## Versioning
+
+**Releases are semantically versioned from 0.9.0 onward** (see `CHANGELOG.md`).
+The lettered *stage* vocabulary below is retained as the as-built design record
+and in `deploy/` filenames; those filenames will be renamed to match in a later
+release, kept as a separate mechanical change so it stays reviewable.
+
+0.9.0 is pre-1.0 on purpose. The resource axis is complete and enforced, but
+least privilege is not yet *operable*: the create path strips every inherited
+tier tag (the keystone, working as designed), so post-flip a created qube is
+untiered and has no capability at all — an operator must tier it before it can
+be started, cloned, retargeted or executed in. 1.0.0 is reserved for the release
+where an agent can work inside least privilege without an operator action
+between every create and its first use.
+
 ## Stage status
 
 All stages **A–F3 + I-0..I-5 are implemented and tested**; the per-stage *state*

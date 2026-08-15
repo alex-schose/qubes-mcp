@@ -34,7 +34,7 @@
 # and policy can be deleted by hand (see the end of this script).
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-I-6.sh' > /tmp/uninstall-I-6.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-I-6.sh' > /tmp/uninstall-I-6.sh
 #   bash /tmp/uninstall-I-6.sh
 
 set -uo pipefail

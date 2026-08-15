@@ -31,7 +31,7 @@
 # restart.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-I-0.sh' > /tmp/uninstall-I-0.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-I-0.sh' > /tmp/uninstall-I-0.sh
 #   bash /tmp/uninstall-I-0.sh
 #   # or:    bash /tmp/uninstall-I-0.sh --force   (skips the wrapper check)
 

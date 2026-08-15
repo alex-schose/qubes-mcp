@@ -19,7 +19,7 @@
 # removes the ai-dump valve. No qube is touched; no tag is changed.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-I-4.sh' > /tmp/uninstall-I-4.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-I-4.sh' > /tmp/uninstall-I-4.sh
 #   bash /tmp/uninstall-I-4.sh
 
 set -euo pipefail

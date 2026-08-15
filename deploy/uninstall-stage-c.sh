@@ -17,7 +17,7 @@
 # version, git checkout the prior tag/commit before re-running the script).
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-c.sh' > /tmp/uninstall-c.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-c.sh' > /tmp/uninstall-c.sh
 #   bash /tmp/uninstall-c.sh
 #
 # Env-var knobs (all optional):

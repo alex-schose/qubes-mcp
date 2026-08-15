@@ -92,6 +92,18 @@ Where this has been discussed:
 
 ## Status
 
+**Current version: 0.9.0** (pre-1.0 — see [CHANGELOG.md](CHANGELOG.md)).
+
+Development up to 0.9.0 was tracked as lettered *stages*; that vocabulary is kept
+in `deploy/` filenames and in the design document as the as-built record, and the
+table below is still organised that way. Releases are versioned from 0.9.0 on.
+
+0.9.0 is deliberately pre-1.0: the resource axis is complete and enforced, but
+least privilege is not yet operable end to end — a newly created qube is born
+untiered and so has no capability until an operator tiers it, which means an
+operator action sits between every create and its first use. 1.0.0 is reserved
+for the release that closes that gap.
+
 Stages A through F3 land the binary trust boundary: a qube tagged
 `ai-managed` is visible and acted on through the `qmcp.*` wrappers;
 an untagged qube is invisible. The F band closes that surface with
@@ -195,7 +207,7 @@ package by name from any working directory.
 ### Step 2 — Deploy Stage A (from dom0)
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-a.sh' > /tmp/install-a.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-a.sh' > /tmp/install-a.sh
 less /tmp/install-a.sh         # review before executing
 bash /tmp/install-a.sh mcp-control ~user/qubes_mcp
 ```
@@ -231,7 +243,7 @@ wrappers with the opaque-collapse versions).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-b.sh' > /tmp/install-b.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-b.sh' > /tmp/install-b.sh
 bash /tmp/install-b.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -258,7 +270,7 @@ and set firewall rules on `ai-net-router` and on its own qubes.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-c.sh' > /tmp/install-c.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-c.sh' > /tmp/install-c.sh
 EGRESS_UPSTREAM=sys-firewall bash /tmp/install-c.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -299,7 +311,7 @@ policy + RPC scripts change.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-d.sh' > /tmp/install-d.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-d.sh' > /tmp/install-d.sh
 bash /tmp/install-d.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -336,7 +348,7 @@ wrappers are ready when the operator chooses to tag those backends.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e1.sh' > /tmp/install-e1.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-e1.sh' > /tmp/install-e1.sh
 bash /tmp/install-e1.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -372,7 +384,7 @@ move on" pattern collapses to a single call.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e2.sh' > /tmp/install-e2.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-e2.sh' > /tmp/install-e2.sh
 bash /tmp/install-e2.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -400,7 +412,7 @@ provisioning — only the policy + RPC script change.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f1.sh' > /tmp/install-f1.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f1.sh' > /tmp/install-f1.sh
 bash /tmp/install-f1.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -437,7 +449,7 @@ SetFeatureAIManaged, finally aligned across all write/spawn surfaces).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f2.sh' > /tmp/install-f2.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f2.sh' > /tmp/install-f2.sh
 bash /tmp/install-f2.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -481,7 +493,7 @@ the wrapper + policy + cap file.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
 bash /tmp/install-f3.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -543,7 +555,7 @@ Stage F3 is a prerequisite (it seeds `/etc/qmcp/pool-cap`).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
 bash /tmp/install-I-0.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -607,7 +619,7 @@ restart the policy daemon.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
 bash /tmp/install-I-1.sh mcp-control ~user/qubes_mcp/public
 ```
 
@@ -652,7 +664,7 @@ policy daemon.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
 bash /tmp/install-I-2.sh mcp-control ~user/qubes_mcp/public
 ```
 
@@ -709,7 +721,7 @@ From dom0 (the installer validates the policy before replacing the live file —
 a malformed policy can break all of qrexec):
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-4.sh' > /tmp/install-I-4.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-4.sh' > /tmp/install-I-4.sh
 bash /tmp/install-I-4.sh mcp-control ~user/qubes_mcp/public
 ```
 
@@ -767,7 +779,7 @@ disjointness), and validates the policy before replacing the live file.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-5.sh' > /tmp/install-I-5.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-5.sh' > /tmp/install-I-5.sh
 bash /tmp/install-I-5.sh mcp-control ~user/qubes_mcp/public
 ```
 

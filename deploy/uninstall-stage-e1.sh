@@ -16,7 +16,7 @@
 # or someone runs `qvm-device <class> detach` in dom0.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-e1.sh' > /tmp/uninstall-e1.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-e1.sh' > /tmp/uninstall-e1.sh
 #   bash /tmp/uninstall-e1.sh
 
 set -euo pipefail

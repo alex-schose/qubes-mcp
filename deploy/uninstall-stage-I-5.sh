@@ -25,7 +25,7 @@
 # the wrapper gates remain until you reinstall the pre-I-5 wrappers from source.
 #
 # Run from dom0:
-#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/uninstall-stage-I-5.sh' > /tmp/uninstall-I-5.sh
+#   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/uninstall-stage-I-5.sh' > /tmp/uninstall-I-5.sh
 #   bash /tmp/uninstall-I-5.sh
 
 set -euo pipefail

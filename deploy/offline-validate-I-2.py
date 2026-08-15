@@ -300,12 +300,12 @@ def section_integration():
 
     # SetFeature with a distinctive value → value MUST NOT appear in the log
     p = tmp_log()
-    r = run_wrapper(setf, {"name": "ai-work", "feature": "qmcp-probe", "value": SECRET}, p)
+    r = run_wrapper(setf, {"name": "ai-work", "feature": "ai-probe", "value": SECRET}, p)
     blob = open(p).read()
     rows = read_lines(p)
     check("setfeature leaves one line", len(rows) == 1)
     check("setfeature args = {name, feature} only (no 'value' key)",
-          rows and rows[0]["args"] == {"name": "ai-work", "feature": "qmcp-probe"})
+          rows and rows[0]["args"] == {"name": "ai-work", "feature": "ai-probe"})
     check("setfeature: secret value appears NOWHERE in the log line", SECRET not in blob)
     os.remove(p)
 
