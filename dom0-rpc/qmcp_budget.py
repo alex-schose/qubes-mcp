@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import sys
 
 CAP_PATH = "/etc/qmcp/pool-cap"
 PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
@@ -239,11 +240,22 @@ def acquire_create_lock() -> int:
     """
     try:
         fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o660)
-    except Exception:
+    except Exception as e:
+        # AUDIT-LOUD (Stage I-7, finding [5]): the lock file is provisioned
+        # root:qubes 0660 at install (install-stage-I-0.sh), so a failure here is
+        # exceptional — surface it to stderr/journal instead of silently degrading
+        # serialization to nothing. Still BEST-EFFORT by design (see the docstring:
+        # a cap overshoot is a bounded, reclaimable transient DoS, not a breakout,
+        # and a broken lock file must never block every create).
+        print(f"qmcp_budget: create-lock open failed ({e}); proceeding UNLOCKED "
+              f"— serialization degraded, concurrent creates may overshoot the cap",
+              file=sys.stderr, flush=True)
         return -1
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-    except Exception:
+    except Exception as e:
+        print(f"qmcp_budget: create-lock flock failed ({e}); proceeding UNLOCKED "
+              f"— serialization degraded", file=sys.stderr, flush=True)
         try:
             os.close(fd)
         except Exception:

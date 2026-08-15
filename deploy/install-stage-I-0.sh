@@ -90,6 +90,26 @@ for w in qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIM
 done
 echo
 
+# ---------------------------------------------------------------- 3b. provision the create-lock
+# The cap-check->create critical section is serialized by an flock on
+# /etc/qmcp/budget.lock (qmcp_budget.acquire_create_lock). The non-root qrexec
+# wrapper user (uid 1000, group qubes) must be able to open+flock it, so it is
+# owned root:qubes 0660 — the same perm pattern as the I-2 audit log. Without
+# this file the wrapper's O_CREAT in a root-owned /etc/qmcp fails and cross-process
+# serialization silently degrades (now audit-loud in qmcp_budget). Idempotent:
+# reasserts perms if the file already exists; never truncates a live lock inode.
+echo "==> Provisioning the create-lock (/etc/qmcp/budget.lock, 0660 root:qubes)..."
+sudo install -d -m 0755 -o root -g root /etc/qmcp
+if [ -e "/etc/qmcp/budget.lock" ]; then
+    sudo chown root:qubes /etc/qmcp/budget.lock
+    sudo chmod 0660 /etc/qmcp/budget.lock
+    echo "    /etc/qmcp/budget.lock (existed; owner/mode reasserted)"
+else
+    sudo install -m 0660 -o root -g qubes /dev/null /etc/qmcp/budget.lock
+    echo "    /etc/qmcp/budget.lock (created)"
+fi
+echo
+
 # ---------------------------------------------------------------- 4. sanity-check cap file
 if [ -e "/etc/qmcp/pool-cap" ]; then
     echo "==> Pool cap file present (operator state):"
