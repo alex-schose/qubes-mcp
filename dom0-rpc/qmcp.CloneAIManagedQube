@@ -183,6 +183,64 @@ def _load_consent_lib():
 
 _CONSENT = _load_consent_lib()
 
+
+def _load_caps_lib():
+    """Load the sibling qmcp_caps decision kernel (Wave 2 Stage 1).
+
+    Same sibling-import shim as qmcp_tier / qmcp_consent / qmcp_audit. Returns
+    None on any failure — and unlike the tier and consent gates, a None here is
+    BENIGN by design: the kernel runs in SHADOW mode, so its absence must change
+    nothing at all. If a later stage makes this a gate, the fail-closed posture
+    has to move with it (see qmcp_caps' own docstring).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_caps", os.path.join(here, "qmcp_caps.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_CAPS = _load_caps_lib()
+
+#: Wave 2 Stage 1 (SHADOW): set ONLY when the decision kernel disagrees with
+#: what this wrapper actually did on capability grounds. Stays None whenever
+#: they agree — and on every path where the kernel is unavailable or errored —
+#: so emit() omits the key and the audit line stays BYTE-IDENTICAL to
+#: pre-Stage-1 (INVARIANCE, the I-6 consent pattern). A populated key IS the
+#: divergence log that Stage 3's flip to decide() is gated on.
+_shadow = None
+
+
+def _shadow_note(action, roles, params, wrapper_allowed) -> None:
+    """Record kernel-vs-wrapper divergence for this call.
+
+    NEVER raises and NEVER changes behaviour: it only sets `_shadow` for the
+    audit line. Guarded here AND inside qmcp_caps.shadow_record, the same
+    belt-and-suspenders the I-2 audit hook uses at this boundary.
+
+    `roles` maps the kernel's role names ("target"/"source"/"template"/"dvmt"/
+    "backend"/"frontend") to qube objects; `wrapper_allowed` is what THIS
+    wrapper decided at this point, so the comparison is like-for-like.
+    """
+    global _shadow
+    if _CAPS is None:
+        return
+    try:
+        import os
+        _shadow = _CAPS.shadow_record(
+            os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown",
+            _AUDIT_SERVICE, action, roles, params,
+            wrapper_allowed=wrapper_allowed)
+    except Exception:
+        _shadow = None
+
 #: Stage I-6 consent verdict for THIS call, recorded on the audit line only
 #: when a gate actually ran. Stays None on the empty-gate default (I-6) and
 #: on every ungated path, so emit() OMITS the `consent` key and the audit
@@ -230,7 +288,17 @@ def emit(payload: dict) -> int:
         try:
             _AUDIT.audit(_AUDIT_SERVICE, _audit_summary,
                          bool(payload.get("ok")), payload.get("error"),
-                         consent=_consent_verdict)
+                         consent=_consent_verdict,
+                         # Byte-neutral AND deploy-tolerant: the kwarg is
+                         # passed only when there IS a divergence. If dom0
+                         # still holds a pre-Stage-1 qmcp_audit.py (a partial
+                         # deploy — F9's split-brain family), passing
+                         # shadow=None unconditionally would raise TypeError
+                         # inside this best-effort guard and silently take the
+                         # ENTIRE audit line with it. Omitting it keeps every
+                         # agreeing call auditable against the old helper.
+                         **({} if _shadow is None
+                            else {"shadow": _shadow}))
         except Exception:
             pass
     print(json.dumps(payload))
@@ -287,7 +355,12 @@ def main() -> int:
     # Stage I-5: clone requires CAP_FULL on the SOURCE qube. Fail-closed;
     # collapses to the same opaque NOT_FOUND as an untagged source (no tier
     # oracle).
-    if not _require_full(src_vm):
+    _full_ok = _require_full(src_vm)
+    # Wave 2 Stage 1 (SHADOW): record kernel disagreement only. The kernel gates
+    # the SOURCE, matching this wrapper; the birth-egress half of the clone path
+    # is Stage 2's and is not asserted here (no `resolved_netvm` to compare to).
+    _shadow_note("clone", {"source": src_vm}, {}, _full_ok)
+    if not _full_ok:
         return emit(NOT_FOUND)
 
     # Stage I-6: operator-consent gate on the clone — authority, so it fires

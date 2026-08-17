@@ -12,6 +12,46 @@ kept separate so it stays independently reviewable.
 
 ## [Unreleased]
 
+### Added
+- **A dom0 capability decision kernel, running in shadow mode**
+  (`dom0-rpc/qmcp_caps.py`, `deploy/install-stage-1.sh`). `decide(actor,
+  service, action, targets)` derives a verdict from a domination lattice rather
+  than a hand-authored matrix, resolving first-match-wins: a target outside the
+  `ai-managed` umbrella denies; an escalation-class operation denies at every
+  tier, forever (tag writes, `provides_network`, `template` retarget, `netvm`,
+  `name`, TemplateVM create); a target in the operator's guarded hard class
+  gates, checked *before* the domination logic so it can never be argued away;
+  an operation that an already-held capability fully dominates is allowed; and
+  anything left falls through to the `CAP_*` ladder. The kernel also exposes
+  `capabilities()`, `explain()` and `resolve_birth_egress()`.
+
+  **It enforces nothing.** Each of the eight state-changing wrappers asks the
+  kernel the same question its `CAP_FULL` gate just answered — on both outcomes
+  — and records only a *disagreement*, through its existing single response
+  funnel, as a new optional `shadow` field on the hash-chained dom0 audit line.
+  The field is **omitted when they agree**, following the same byte-neutral
+  contract the `consent` field already had, so an agreeing call's audit line and
+  chain hash are identical to before and a wrapper still audits correctly
+  against an older `qmcp_audit.py`. A missing or broken kernel changes nothing
+  at all: this is the one component in the codebase that fails **open**, because
+  it is not a gate — the tier and consent helpers fail closed precisely because
+  they are.
+
+  The divergence log is the deliverable. It is dom0-side and unreachable by AI,
+  and the later release that flips enforcement onto `decide()` is gated on it
+  holding nothing unexplained. Until then two divergences are expected and
+  documented: a lifecycle operation on an `ai-exec` target (the kernel allows
+  what exec already dominates; the wrapper still refuses) and a `netvm` /
+  `template` / `name` property write (the kernel refuses as escalation class;
+  the wrapper still allows).
+
+  No policy change, no daemon restart, no new RPC service, no AI-visible
+  surface. Covered by `deploy/offline-validate-1.py` (46 checks over the
+  lattice) and `deploy/offline-validate-1-wiring.py` (26 checks, which prove
+  invariance by running every case twice — kernel loaded and kernel absent —
+  and asserting byte-identical responses, and confirm a *raising* kernel changes
+  nothing either).
+
 ### Fixed
 - **Reads no longer discard a whole call over one class-specific property.**
   `qubes_state` and `qubes_props_get` composed `qmcp.GetPropertyAIManaged` per

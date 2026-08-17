@@ -181,7 +181,8 @@ def _append(record: dict) -> bool:
         return False
 
 
-def audit(service, args_summary, ok, error=None, consent=None) -> bool:
+def audit(service, args_summary, ok, error=None, consent=None,
+          shadow=None) -> bool:
     """Record one state-changing `qmcp.*` call. Best-effort; see module
     docstring for the two caller contracts (best-effort + caller-sanitises).
 
@@ -196,7 +197,17 @@ def audit(service, args_summary, ok, error=None, consent=None) -> bool:
     I-6 empty-gate default, and every read/ungated call), the line is
     BYTE-IDENTICAL to the pre-I-6 format — the key is absent, never written
     as null. Only a call that consulted the daemon carries the key, so the
-    chain hash of an ungated call is unchanged by this stage."""
+    chain hash of an ungated call is unchanged by this stage.
+
+    `shadow` (Wave 2 Stage 1) records a DIVERGENCE between the `qmcp_caps`
+    decision kernel and what the wrapper actually did — and only that. It
+    follows the `consent` contract exactly: None means the key is OMITTED, so a
+    call where the kernel agrees (or where the kernel is unavailable) writes a
+    BYTE-IDENTICAL line and the chain hash is unchanged. The populated key IS
+    the divergence log that Stage 3's flip to `decide()` is gated on. Callers
+    pass a small dict of fixed-vocabulary fields (verdict / rule / the
+    wrapper's own verdict) — never free text and never a raw request, per this
+    module's caller-sanitises contract."""
     try:
         record = {
             "v": SCHEMA,
@@ -209,6 +220,10 @@ def audit(service, args_summary, ok, error=None, consent=None) -> bool:
         # Byte-neutral omission: the key exists only when a gate ran (I-6).
         if consent is not None:
             record["consent"] = str(consent)
+        # Same byte-neutral omission for the Stage 1 shadow kernel: present
+        # only on a real divergence, so agreeing calls hash exactly as before.
+        if shadow is not None:
+            record["shadow"] = shadow if isinstance(shadow, dict) else str(shadow)
         return _append(record)
     except Exception:
         return False

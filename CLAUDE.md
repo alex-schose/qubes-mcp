@@ -380,6 +380,42 @@ I-5. Tiers on the wrapper + exec surfaces — the second enforcement
     RunInAIManaged/CopyToAIManaged) AND writes "ro" to
     /etc/qmcp/tier-default in one coupled change. Behaviour-neutral in
     compat; no new RPC service, no new qube, no new ring.
+W2-1. Wave 2 Stage 1 — the capability decision kernel, in SHADOW mode.
+    A new dom0 lib (qmcp_caps.py, sibling-loaded like qmcp_tier) derives a
+    verdict from a domination lattice instead of a hand-authored matrix:
+    decide(actor, service, action, targets) resolves, first match wins —
+    (1) any target outside the ai-managed umbrella -> DENY; (2) an
+    escalation-class operation -> DENY at every tier, forever (tag writes,
+    provides_network, template retarget, netvm, name, TemplateVM create);
+    (3) a target in the operator's guarded hard class -> GATE, checked
+    BEFORE the domination logic so it cannot be argued away; (4) an
+    operation an already-held capability fully dominates -> ALLOW; (5)
+    otherwise the CAP_* ladder. Steps 1-3 sit above step 4 deliberately:
+    they are exactly the decisions domination must never reach.
+    The anti-theatre rule (step 4) is why gating `remove` while the actor
+    holds exec is refused as a design: exec already reaches `rm -rf` and
+    `shutdown`, so the gate protects nothing and trains the operator to
+    click through. Domination entries must be AIRTIGHT — `pause`/`unpause`
+    are excluded because exec cannot reach a paused qube, and device
+    attach/detach are excluded because crossing to physical hardware is the
+    one thing exec-inside genuinely cannot do.
+    BEHAVIOUR-NEUTRAL: the kernel enforces nothing. Each of the 8
+    state-changing wrappers asks it the same question its Stage I-5 CAP_FULL
+    gate just answered — on BOTH outcomes, since a hook consulted only on
+    the allow path measures half the lattice — and records ONLY a
+    disagreement, through its existing single emit() funnel, as a new
+    optional `shadow` field on the I-2 audit line. The field is OMITTED when
+    they agree (the byte-neutral contract `consent` already follows), so an
+    agreeing call's line and chain hash are identical to pre-Stage-1, and a
+    wrapper still audits correctly against an older qmcp_audit.py.
+    Fail-OPEN by design, the one inversion in the codebase: a missing or
+    broken qmcp_caps.py must change nothing, because it is not a gate. The
+    tier and consent helpers fail closed precisely because they are.
+    That divergence log is the deliverable — it is dom0-side and
+    AI-unreachable, and the later stage that flips enforcement over to
+    decide() is gated on it holding nothing unexplained. No policy change;
+    no daemon restart; no new RPC service (a lib is not a service); no new
+    ring; no AI-visible surface of any kind.
 G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
    Gateway input boundary: SetProperty settable-property allowlist
    (provides_network operator-only), qrexec target-name validator, device
@@ -508,11 +544,16 @@ qubes_mcp/                          # repo root
 │                                      # loaded by GetProperty/List
 │   ├── qmcp_audit.py                 # Stage I-2 — shared hash-chained audit log
 │                                      # loaded by the 8 state-changing wrappers
-│   └── qmcp_tier.py                  # Stage I-3 — shared tier-resolution helper
+│   ├── qmcp_tier.py                  # Stage I-3 — shared tier-resolution helper
 │                                      # (Stage I-5 sources it: the 8 wrappers gate
 │                                      # on CAP_FULL + strip inherited tier tags on
 │                                      # create. I-5 added NO new dom0-rpc file —
 │                                      # it modified the 8 wrappers + the policy.)
+│   └── qmcp_caps.py                  # Wave 2 Stage 1 — the decision kernel, SHADOW
+│                                      # mode: decide() derives a verdict from the
+│                                      # domination lattice, the 8 wrappers compare it
+│                                      # against what they did and log only the
+│                                      # difference. Enforces nothing (see below).
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged
@@ -599,10 +640,19 @@ is the Status table in `README.md`, and the *design* of each is the "Stage
 rollout" block above. **Wave 1 of Stage I (I-0..I-5) is complete** — the resource
 axis is live and behaviour-neutral until the operator tiers the fleet and runs
 the coordinated least-privilege flip (delete the four compat backstops + write
-`ro` to `/etc/qmcp/tier-default`). **Wave 2 (I-6..I-8)** — the action gate +
-consent GUI — and **Wave 3 (I-9..I-11)** — principal axis, secrets vault, persona
-presets — are the remaining work. **Stages G and H** stay deferred until Stage I
-completes.
+`ro` to `/etc/qmcp/tier-default`).
+
+**Wave 2 was redesigned after a clean-room install run.** The original
+I-6..I-8 plan had the operator *author* a per-class `(tag, service, action)`
+gate matrix; that is dropped. The matrix is **derived** by the dom0 kernel
+`qmcp_caps.decide()` from a domination lattice, so a gate that an existing
+capability already dominates cannot be written at all. **Stage 1 of that wave —
+the kernel itself, in shadow mode — is what ships here** (see `W2-1` above):
+it enforces nothing and exists to produce the divergence log that gates the
+later flip. The stages after it, not yet built, are ownership + birth tier +
+birth egress; flipping enforcement to `decide()`; klass handling; the remaining
+egress work; then grants and a sign-only vault. **Stages G and H** stay
+deferred.
 
 ### Per-surface enforcement decision table (where each tier check lives)
 

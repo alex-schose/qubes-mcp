@@ -199,7 +199,14 @@ class BudgetStub:
 class AuditRecorder:
     """Stand-in for the qmcp_audit module: record (ok, error) of every emit()."""
     def __init__(self): self.calls = []
-    def audit(self, service, summary, ok, error, consent=None): self.calls.append((ok, error))
+    # `**kw` on purpose: emit() grew `consent` (I-6) and `shadow` (Wave 2
+    # Stage 1), and a stub with a fixed signature turns every additive kwarg
+    # into a silent audit blackout here — emit()'s best-effort guard swallows
+    # the TypeError, `calls` stays empty, and the failure looks like a wrapper
+    # bug. Permissive is right for a stub; the REAL audit() signature and its
+    # byte-neutral omission are asserted in offline-validate-1-wiring.py §5.
+    def audit(self, service, summary, ok, error, consent=None, **kw):
+        self.calls.append((ok, error))
 
 
 def load_wrapper(filename):
