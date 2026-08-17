@@ -438,6 +438,18 @@ until the current one's tests pass.
   of Tailscale-corp; own VPN; own Tor).
 - **No `admin.Events` direct subscription.** Use `qmcp.AIManagedEvents` (Stage F2)
   for filtered streaming.
+- **Never scope policy, ownership, or any gate on `created-by-*` or
+  `disp-created-by-*`.** Neither tag can carry AI provenance, for two independent
+  reasons. (1) qubesd stamps `created-by-` + the name of the *calling* domain, and
+  every `qmcp.*` create runs inside a dom0 wrapper that calls qubesd over the
+  dom0-local socket — so an AI-spawned qube and an operator-created one are
+  byte-identically `created-by-dom0`. A rule keyed on it would grant AI authority
+  over every qube in dom0. (2) `disp-created-by-*` is not covered by qubesd's
+  guard at all, because `"disp-created-by-x".startswith("created-by-")` is
+  `False` — anything holding `admin.vm.tag.Set` can forge it. Provenance is
+  carried by a wrapper-stamped tag in the project's own reserved namespace
+  instead. (Upstream has not solved this either: `qubes/ext/admin.py` carries a
+  TODO for passing the management VM's name.)
 
 ## File layout
 
