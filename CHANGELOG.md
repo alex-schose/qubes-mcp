@@ -10,6 +10,28 @@ the as-built record; from 0.9.0 onward, releases are versioned. The stage names
 in `deploy/` will be renamed to match in a later release — a mechanical change
 kept separate so it stays independently reviewable.
 
+## [Unreleased]
+
+### Fixed
+- **Reads no longer discard a whole call over one class-specific property.**
+  `qubes_state` and `qubes_props_get` composed `qmcp.GetPropertyAIManaged` per
+  property but returned on the FIRST failure, so a StandaloneVM or a TemplateVM
+  — neither of which has a `template` property — yielded nothing usable even
+  though `power_state`, `netvm` and `provides_network` all read fine. Both tools
+  now report per property: `{"ok": true, "values": {...}}` plus an `"errors"`
+  map naming only what could not be read. The dom0 wrapper already answered per
+  property; the granularity was being thrown away in the MCP layer, so no dom0
+  change was needed and the tools stay class-agnostic (no extra round trip to
+  learn the klass, and it keeps working for properties added later).
+  Opacity is unchanged: when NOTHING reads, the first error is returned
+  verbatim, so an out-of-scope or nonexistent qube still collapses to the same
+  opaque `"not found"` / `"not found or refused"` it always did. The
+  per-property error can only surface alongside a successful read, which itself
+  proves the target is inside the umbrella — the same post-scope-check ordering
+  the cross-ref and egress refusals follow, so it is no existence oracle.
+  Covered by `deploy/offline-validate-0-2.py` (24 checks, including teeth
+  asserting the pre-fix control flow fails the same cases).
+
 ## [0.9.0] — 2026-08-15
 
 First versioned release. Deliberately **pre-1.0**: the resource axis (tiers) is
