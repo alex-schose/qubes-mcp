@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""qmcp-tombstone-reaper — destroy tombstoned qubes once the window has passed.
+
+Wave 2 Stage 3a. Runs as a systemd SYSTEM timer in dom0 (root), not as a qrexec
+service: nothing about it is AI-reachable, no policy line names it, and it takes
+no input from outside dom0. It is the only thing in this project that deletes a
+qube on its own initiative, so every branch below is written to prefer leaving a
+qube alone.
+
+**Inert as shipped.** `qmcp.LifecycleAIManaged` does not create tombstones yet
+(that is Stage 3c), so on a Stage 3a fleet this finds nothing and exits 0. That
+is the point: the reaper exists BEFORE the thing that produces its input, so
+the flip never lands a destructive capability with no window behind it.
+
+**Timer-only, never under pressure.** There is deliberately no "reap early
+because the pool is full" path and no way to ask for one — see
+`qmcp_tombstone`'s docstring for why (the I-2 chain records operations, not
+contents, so early-reaping is an evidence-destruction path an AI could drive by
+flooding small creates). Under pressure the cap refuses the create instead.
+
+**Modes.** `--list` prints what exists and what it would do, `--dry-run` runs
+the full decision path and reports without deleting, and no flag reaps for
+real. The two read-only modes exist because the operator's inspection window is
+worthless if inspecting it is hard.
+
+Exit status: 0 when the pass completed, even if it reaped nothing and even if
+individual qubes failed to remove (those are audited and reported); 2 only when
+the pass could not run at all — no qubesadmin, or the helper missing. A timer
+unit that exits nonzero for "nothing to do" trains the operator to ignore it.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+import time
+
+_SERVICE = "qmcp.TombstoneReaper"
+
+
+#: Where dom0 qmcp libraries are installed on a real host. Every install-stage-
+#: *.sh writes libs to /etc/qubes-rpc/ (see the project's dom0-rpc/ convention),
+#: but this reaper lives at /usr/local/lib/qmcp/ — the qmcp-consentd
+#: convention — because it is a systemd oneshot, not an RPC service. So the
+#: sibling-load pattern the wrappers use (co-located script + libs) does not
+#: apply, and the loader has to look somewhere OTHER than __file__'s directory.
+#:
+#: The install location is queried FIRST, so production behaviour never depends
+#: on the reaper's own directory. The __file__ fallback exists purely so the
+#: offline validator (deploy/offline-validate-3a.py §8) can load the reaper out
+#: of public/dom0-rpc/ with no dom0 present.
+INSTALLED_LIB_DIR = "/etc/qubes-rpc"
+
+
+def _load_sibling(modname: str):
+    """Load a dom0 helper by name. Returns None on any failure.
+
+    Tries INSTALLED_LIB_DIR first (the production layout), then the reaper's
+    own directory (the offline-test layout). Never sys.path — the whole point
+    of the explicit loader is to avoid any dependency on how Python was
+    invoked.
+    """
+    _own_dir = os.path.dirname(os.path.realpath(__file__))
+    for base in (INSTALLED_LIB_DIR, _own_dir):
+        path = os.path.join(base, f"{modname}.py")
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(modname, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            return None
+    return None
+
+
+_TOMB = _load_sibling("qmcp_tombstone")
+_AUDIT = _load_sibling("qmcp_audit")
+
+
+def _audit(summary: dict, ok: bool, error=None) -> None:
+    """Best-effort I-2 chain line. Never raises, never changes the decision.
+
+    The summary is built by the caller from a WHITELIST of named fields (name,
+    age, verdict) — never a raw tag set — per `qmcp_audit`'s caller-sanitises
+    contract. A reap is an irreversible act by an unattended timer; if it is
+    not in the chain, it did not happen as far as any later audit is
+    concerned, which is why this is called on every branch and not only on
+    success.
+    """
+    if _AUDIT is None:
+        return
+    try:
+        _AUDIT.audit(_SERVICE, summary, ok, error=error)
+    except Exception:
+        pass
+
+
+def _tags_of(vm) -> set:
+    try:
+        return set(vm.tags)
+    except Exception:
+        return set()
+
+
+def _running(vm) -> bool:
+    """True unless the qube is demonstrably halted.
+
+    Fail-closed toward NOT reaping: an unreadable power state is treated as
+    running, so a qube we cannot ask about is never deleted.
+    """
+    try:
+        return str(vm.get_power_state()) != "Halted"
+    except Exception:
+        return True
+
+
+def _classify(vm, now, retention, umbrella):
+    """(verdict, age_or_None) for one tombstoned qube. Pure; no side effects.
+
+    Verdicts are a fixed vocabulary so the audit chain can be grouped by cause
+    without parsing prose — the same discipline `qmcp_caps.Decision.rule` uses.
+    """
+    tags = _tags_of(vm)
+    epoch = _TOMB.tombstone_epoch(tags)
+    age = None if epoch is None else int(now) - epoch
+
+    if umbrella in tags:
+        # The strip did not complete: AI can still see and act on this qube, so
+        # it is stuck rather than dead. Never reaped, always reported — this is
+        # the loud half of the tag-before-strip ordering.
+        return "stuck-in-umbrella", age
+    if epoch is None:
+        return "undatable", age
+    if _running(vm):
+        # On a tombstone this means a person started it. The timer does not
+        # delete what someone is looking at.
+        return "running", age
+    if _TOMB.due_for_reap(tags, now, retention, umbrella=umbrella):
+        return "due", age
+    return "within-window", age
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Reap qmcp tombstones whose retention window has passed.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="run the full decision path, delete nothing")
+    ap.add_argument("--list", action="store_true", dest="list_only",
+                    help="list tombstones and the verdict for each; delete nothing")
+    args = ap.parse_args(argv)
+
+    if _TOMB is None:
+        print("qmcp-tombstone-reaper: qmcp_tombstone.py not loadable — refusing "
+              "to run", file=sys.stderr)
+        return 2
+    try:
+        import qubesadmin
+        app = qubesadmin.Qubes()
+    except Exception as exc:
+        print(f"qmcp-tombstone-reaper: qubesadmin unavailable: {exc}",
+              file=sys.stderr)
+        return 2
+
+    retention = _TOMB.read_retention()
+    if retention is None:
+        # Malformed config. Reap nothing and say so loudly — a silent no-op
+        # here would look exactly like "no tombstones were due".
+        print(f"qmcp-tombstone-reaper: {_TOMB.RETENTION_PATH} is malformed — "
+              "reaping nothing this pass", file=sys.stderr)
+        _audit({"verdict": "config-malformed"}, False, error="retention unreadable")
+        return 0
+
+    now = int(time.time())
+    umbrella = "ai-managed"
+    reaped = failed = 0
+    seen = 0
+
+    for vm in list(app.domains):
+        tags = _tags_of(vm)
+        if not _TOMB.is_tombstoned(tags):
+            continue
+        seen += 1
+        name = str(getattr(vm, "name", "?"))
+        verdict, age = _classify(vm, now, retention, umbrella)
+        summary = {"name": name, "verdict": verdict,
+                   "age_s": -1 if age is None else int(age)}
+
+        if args.list_only or args.dry_run:
+            print(f"{name}\t{verdict}\tage={'?' if age is None else age}s"
+                  f"\tretention={retention}s")
+            if args.dry_run:
+                _audit({**summary, "mode": "dry-run"}, True)
+            continue
+
+        if verdict != "due":
+            # Every non-reap is audited too. A tombstone that sits "stuck" for
+            # weeks is a finding, and it is only a finding if it is recorded.
+            _audit(summary, True)
+            if verdict in ("stuck-in-umbrella", "undatable"):
+                print(f"qmcp-tombstone-reaper: {name}: {verdict} — needs an "
+                      "operator", file=sys.stderr)
+            continue
+
+        try:
+            del app.domains[name]
+        except Exception as exc:
+            failed += 1
+            print(f"qmcp-tombstone-reaper: {name}: remove failed: {exc}",
+                  file=sys.stderr)
+            _audit(summary, False, error="remove failed")
+            continue
+        reaped += 1
+        _audit({**summary, "verdict": "reaped"}, True)
+
+    if args.list_only or args.dry_run:
+        print(f"# {seen} tombstone(s); retention {retention}s; nothing deleted")
+    elif seen:
+        print(f"qmcp-tombstone-reaper: {seen} tombstone(s), {reaped} reaped, "
+              f"{failed} failed", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

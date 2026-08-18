@@ -81,6 +81,15 @@ DEFAULT_PRIVATE_BYTES = 2 * 1024 ** 3
 #: create (AppVM, DispVM, DispVMTemplate) has a COW root and is absent here.
 PERSISTENT_ROOT_KLASSES = frozenset({"TemplateVM", "StandaloneVM"})
 
+#: The tombstone marker (Wave 2 Stage 3a). OWNED by `qmcp_tombstone.py`; this
+#: is a deliberate literal copy, not a sibling import. `counts_toward_cap` is a
+#: GATE, and a helper that failed to load would silently stop charging
+#: tombstones — which is precisely the create/remove churn bypass the charge
+#: exists to close, reintroduced with no symptom whatsoever. A literal cannot
+#: fail to load. `deploy/offline-validate-3a.py` asserts the two agree, so the
+#: duplication cannot drift instead.
+TOMBSTONE_PREFIX = "qmcp-tombstone_"
+
 ERR_CAP_MISSING = "pool cap not configured"
 ERR_CAP_EXCEEDED = "pool cap exceeded"
 ERR_STATS_UNAVAILABLE = "pool stats unavailable"
@@ -150,12 +159,46 @@ def persistent_bytes(vm) -> int:
     return total
 
 
-def sum_ai_managed_persistent_bytes(app) -> int:
-    """Σ `persistent_bytes` over every ai-managed qube.
+def counts_toward_cap(tags) -> bool:
+    """True iff this qube's persistent bytes are charged to the AI pool cap.
 
-    `qmcp.GetPoolStats` imports and calls this exact function, so AI's
-    `(used, cap, headroom)` view predicts the gate's behaviour byte-for-byte —
-    a single source of truth, no duplicated klass-aware logic to drift.
+    Two ways to be charged, and the second is a security property rather than
+    bookkeeping:
+
+    - **inside the umbrella** — the original rule, unchanged.
+    - **carrying a tombstone marker** — an AI-initiated remove drops the
+      umbrella so AI can neither see nor touch the qube, but its private (and,
+      for a persistent-root klass, its root) stays allocated until the reaper
+      runs. If the cap ignored tombstones, dropping the umbrella would make
+      one free, and an `ai-exec` actor could create-and-remove in a loop to
+      park an unbounded number of full-size qubes outside the accounting for
+      the whole retention window — churn straight through the one bound on
+      accumulation. See `qmcp_tombstone.py`.
+
+    Fail-closed to NOT charging on an unreadable tag set, matching the loop
+    this replaced: a qube whose tags cannot be read is not demonstrably ours,
+    and inventing a charge against it would refuse AI's creates for a reason
+    nothing can explain.
+    """
+    try:
+        tagset = set(tags)
+    except Exception:
+        return False
+    if "ai-managed" in tagset:
+        return True
+    return any(str(t).startswith(TOMBSTONE_PREFIX) for t in tagset)
+
+
+def sum_ai_managed_persistent_bytes(app) -> int:
+    """Σ `persistent_bytes` over every qube charged to the AI pool.
+
+    That is every ai-managed qube plus every tombstone awaiting the reaper —
+    see `counts_toward_cap` for why the second is not optional. The name is
+    kept because `qmcp.GetPoolStats` imports it by name and the whole point of
+    the shared function is that the read surface and the gate cannot drift:
+    AI's `(used, cap, headroom)` still predicts the gate byte-for-byte, so a
+    remove does not immediately hand back headroom and waiting out the
+    retention window is the honest, visible cost of churning qubes.
     """
     total = 0
     for vm in app.domains:
@@ -163,7 +206,7 @@ def sum_ai_managed_persistent_bytes(app) -> int:
             tags = vm.tags
         except Exception:
             continue
-        if "ai-managed" not in tags:
+        if not counts_toward_cap(tags):
             continue
         total += persistent_bytes(vm)
     return total

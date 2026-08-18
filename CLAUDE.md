@@ -472,6 +472,59 @@ W2-2. Wave 2 Stage 2 — ownership + birth tier + birth egress. The first
     proof of this stage is a `qvm-tags` read in dom0, not an AI-seat test.
     No new RPC service (a lib is not a service); no policy change; no daemon
     restart; no new ring.
+W2-3a. Wave 2 Stage 3a — the tombstone mechanism and its reaper, INERT.
+    Splits off from a Stage 3 that could not ship as one because it wanted to
+    widen destructive authority (drop remove/kill/shutdown/start to CAP_EXEC
+    per the anti-theatre invariant) and land the compensating control in the
+    same change. That ordering leaves a window with the widening armed and
+    the control absent, so 3a lands the control first, inert, before Stage 3c
+    flips enforcement over to decide().
+    THE TRANSITION — a new shared dom0 lib qmcp_tombstone.py owns what a
+    Stage-3c-initiated remove will do. Halted-first (enforced, not assumed —
+    dropping the umbrella from a running qube would leave a live qube that
+    nothing in the model can see); add the qmcp-tombstone_<epoch> marker,
+    strip the umbrella and every privilege tag (tier + qmcp-owner_),
+    unconditionally carry restrictions forward, read back and roll back on any
+    mismatch. Add-before-strip so a crash mid-transition leaves the LOUD half-
+    state (visible, charged, reported stuck) rather than the silent one
+    (invisible, uncharged, unreapable — a permanent pool leak). The same two-
+    sided verify() as qmcp_birth: assert what should be present AND that no
+    controlled tag we didn't intend survived — catches a future platform
+    propagating something new.
+    THE REAPER — a root systemd oneshot (qmcp-tombstone-reaper) on a 1h
+    timer with OnBootSec=15min so the operator has a chance to look before
+    the boot's first reap. Not a qrexec service; no policy line names it. Its
+    veto matrix — umbrella present (stuck, not dead), running (someone is
+    looking), undatable marker (a bug for a person), malformed retention
+    config (fail-closed AWAY from deletion, opposite direction to every other
+    fail-closed here and correct for the same reason), marker dated in the
+    future (clock skew) — is independent per condition, so no single mistake
+    licenses a delete. Reaping is TIMER-ONLY: an under-pressure early-reap
+    path is one AI could drive to destroy evidence before the operator reads
+    it (the I-2 chain records operations, not contents). Under pool pressure
+    the cap refuses the create.
+    THE POOL-CAP CHARGE — the security half of the tombstone.
+    qmcp_budget.sum_ai_managed_persistent_bytes now charges anything carrying
+    the umbrella OR the tombstone marker, not just the umbrella. The pre-fix
+    predicate would have made a tombstone FREE the moment the strip removed
+    the umbrella — an ai-exec actor could then create-and-remove in a loop to
+    park unbounded disk outside the accounting for the whole retention
+    window, straight through the one bound on accumulation. The literal
+    tombstone marker is duplicated between qmcp_tombstone.py and
+    qmcp_budget.py deliberately (a sibling that failed to load would silently
+    stop charging tombstones; a literal cannot fail to load); the offline
+    suite asserts the two agree. qmcp.GetPoolStats and every create gate
+    share the one function, as before, so they cannot drift.
+    Behaviour-neutral: nothing creates a tombstone yet. Proven by INVARIANCE
+    over four fleet shapes offline plus a live pre/post byte-identical read
+    on dom0 hardware (the AI seat's GetPoolStats saw exactly the pre-deploy
+    sum); proven by REGRESSION would be wrong here because there is no
+    behaviour to regress against yet. Full offline coverage — 92 checks
+    including teeth that reproduce the create/remove churn bypass under the
+    pre-fix predicate before asserting the shipped one closes it. No policy
+    change; no qrexec daemon restart; no new RPC service (a lib is not a
+    service, a systemd unit is not a service, and no policy line exposes
+    either); no new ring.
 G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
    Gateway input boundary: SetProperty settable-property allowlist
    (provides_network operator-only), qrexec target-name validator, device
@@ -610,10 +663,23 @@ qubes_mcp/                          # repo root
 │                                      # domination lattice, the 8 wrappers compare it
 │                                      # against what they did and log only the
 │                                      # difference. Enforces nothing (see below).
-│   └── qmcp_birth.py                 # Wave 2 Stage 2 — the reserved qmcp-* namespace
+│   ├── qmcp_birth.py                 # Wave 2 Stage 2 — the reserved qmcp-* namespace
 │                                      # + the atomic birth stamp (owner, birth tier,
 │                                      # restriction inheritance, read-back, rollback),
 │                                      # loaded by the 3 create wrappers
+│   ├── qmcp_tombstone.py             # Wave 2 Stage 3a — the AI-initiated-remove
+│                                      # transition (halted-first, add marker, strip
+│                                      # umbrella + privilege tags, carry restrictions,
+│                                      # read-back, rollback) + the reaper's veto matrix.
+│                                      # INERT until Stage 3c flips the Lifecycle
+│                                      # wrapper's remove path through it.
+│   └── qmcp-tombstone-reaper         # Wave 2 Stage 3a — root systemd oneshot; NOT a
+│                                      # qrexec service and no policy line names it.
+│                                      # Timer-only (never under pressure); the veto
+│                                      # matrix is enforced here. Installed under
+│                                      # /usr/local/lib/qmcp/ (the qmcp-consentd
+│                                      # convention) with sibling loading of
+│                                      # qmcp_tombstone.py from /etc/qubes-rpc/.
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged

@@ -1,0 +1,26 @@
+# qmcp-tombstone-reaper.timer — hourly tick for the tombstone reaper.
+#
+# Hourly against a 24h retention window: the granularity costs at most one extra
+# hour of retention, which errs toward the operator keeping evidence longer.
+# There is deliberately no shorter interval and no on-demand trigger — reaping
+# is timer-only by operator decision (2026-08-16), because an early-reap path
+# is one an AI can drive to destroy evidence before the operator reads it.
+
+[Unit]
+Description=Hourly qmcp tombstone reap
+Documentation=https://github.com/alex-schose/qubes-mcp
+
+[Timer]
+# Not OnCalendar: a wall-clock schedule plus Persistent=true fires immediately
+# at boot to "catch up", which on this unit means deleting qubes seconds after
+# the operator powered the machine on to look at them. OnBootSec gives them a
+# quarter of an hour first.
+OnBootSec=15min
+OnUnitActiveSec=1h
+# Spread the tick so a fleet of dom0s does not all reap on the same second.
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=qmcp-tombstone-reaper.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+# qmcp-tombstone-reaper.service — reap expired tombstones (Wave 2 Stage 3a).
+#
+# Installed as a systemd SYSTEM unit in dom0:
+#   /etc/systemd/system/qmcp-tombstone-reaper.service
+#   /etc/systemd/system/qmcp-tombstone-reaper.timer
+#   systemctl enable --now qmcp-tombstone-reaper.timer
+#
+# SYSTEM, not --user (the qmcp-consent.service pattern does not apply here):
+# removing a qube needs root's Admin API authority, and the reaper must run on a
+# dom0 with no graphical session logged in. It pops no dialog and needs no
+# $DISPLAY.
+#
+# At Stage 3a nothing creates tombstones — qmcp.LifecycleAIManaged still removes
+# outright — so this unit finds nothing and exits 0 on every tick. That is
+# deliberate: the window exists before the capability that needs it.
+
+[Unit]
+Description=qmcp tombstone reaper (Wave 2 Stage 3a)
+Documentation=https://github.com/alex-schose/qubes-mcp
+# qubesd serves the Admin API calls this makes; starting before it is up would
+# fail the whole pass for a reason that has nothing to do with tombstones.
+After=qubesd.service
+Requires=qubesd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/qmcp/qmcp-tombstone-reaper
+# No Restart=: a failed pass must NOT be retried in a tight loop. The next
+# timer tick is the retry, and a tombstone that could not be reaped this hour
+# is not more reapable ten seconds later.
+# A pass that cannot run at all exits 2 and is visible in `systemctl status`;
+# it is not turned into a success here, because a reaper that silently stops
+# reaping is the failure mode that matters.
