@@ -124,6 +124,40 @@ TIER_CAPS = {
 }
 
 
+def _read_operator_word(path: str):
+    """One lowercase token from an operator config file, or a failure sentinel.
+
+    Returns the token, `None` if the file is ABSENT, or `False` if it exists but
+    could not be read or parsed. Callers must treat those two failures
+    differently: absent means "the operator has not opted in", unreadable means
+    "the operator opted in and we cannot see how", which fails closed.
+
+    **Honours `value  # comment`,** the format every other operator file in this
+    project already uses (`qmcp_budget._read_int_file`, and the `pool-cap`
+    shipped by install-stage-I-0 literally contains one). Without the strip, an
+    operator who annotates their file the way the neighbouring files are
+    annotated gets a silently malformed value — and because malformed fails
+    closed, the setting appears to do nothing at all.
+
+    **The permission trap this exists to make survivable.** These wrappers run
+    under qrexec as a NON-ROOT dom0 user, so an operator file created with
+    `sudo bash -c 'echo x > /etc/qmcp/f'` lands `root:root 0600` (root's umask
+    is 077 in that context) and is UNREADABLE here. It then fails closed and the
+    operator sees their setting silently ignored. Every such file must be 0644.
+    `install-stage-2.sh` checks this at deploy for the whole `/etc/qmcp` read
+    set. Same family as the I-2 lesson about the non-root wrapper user, on the
+    read side rather than the write side.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return False
+    return raw.split("#", 1)[0].strip().lower()
+
+
 def _untiered_default_label(tier_default_path: str) -> str:
     """Resolve the untiered-umbrella default tier label from the operator flag.
 
@@ -132,12 +166,10 @@ def _untiered_default_label(tier_default_path: str) -> str:
     (fail-closed — the file exists only by the operator's hand, so an
     unreadable value drops to least authority).
     """
-    try:
-        with open(tier_default_path, encoding="utf-8") as fh:
-            val = fh.read().strip().lower()
-    except FileNotFoundError:
+    val = _read_operator_word(tier_default_path)
+    if val is None:
         return TAG_FULL        # compat: the flag is not yet created
-    except Exception:
+    if val is False:
         return "ai-ro"         # fail-closed: file exists but unreadable
     if val == "full":
         return TAG_FULL

@@ -68,8 +68,21 @@ echo "==> Pulling Stage 1 files from $SOURCE_QUBE:$SOURCE_PATH..."
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
+# Collapse the file list to a single line before it becomes a REMOTE command.
+# `$WRAPPERS` is written multi-line for readability, and an unquoted expansion
+# inside the double-quoted command string keeps those newlines — which the
+# target's shell reads as command separators. `tar` then archives only the
+# files up to the first newline and the remaining lines are EXECUTED: each is a
+# qmcp wrapper, so each reads stdin, hits EOF, prints its `invalid JSON input`
+# refusal INTO the tar stream, and exits 1. The pull returns rc=1 and `set -e`
+# aborts with no message at all. Fail-closed, but silent — and one `set -e`
+# removal away from installing a partial set (F9's split-brain family).
+# `$(echo ...)` collapses every whitespace run to a single space. Do not "tidy"
+# this back into an inline expansion.
+REMOTE_LIST="$(echo $LIBS $WRAPPERS)"
+
 qvm-run --pass-io "$SOURCE_QUBE" \
-    "cd '$SOURCE_PATH' && tar -cf - $LIBS $WRAPPERS" \
+    "cd '$SOURCE_PATH' && tar -cf - $REMOTE_LIST" \
     > "$STAGE_DIR/stage-1.tar" < /dev/null
 (cd "$STAGE_DIR" && tar -xf stage-1.tar)
 
@@ -118,7 +131,12 @@ echo "    ok."
 echo
 
 echo "==> SHA-256 of pulled files (record for your audit):"
-( cd "$STAGE_DIR/dom0-rpc" && sha256sum ./* | sed 's|^|    |' )
+# -type f, not ./*: a stray directory (a __pycache__ left by any
+# python that touched the staging dir) makes sha256sum exit non-zero,
+# and `set -e` then aborts the install with nothing but a one-line
+# sha256sum error to explain it.
+( cd "$STAGE_DIR/dom0-rpc" && find . -maxdepth 1 -type f -print0 \
+    | sort -z | xargs -0 sha256sum | sed 's|^|    |' )
 echo
 
 # ---------------------------------------------------------------- 3. install
