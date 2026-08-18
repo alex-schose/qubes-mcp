@@ -162,6 +162,25 @@ def _load_birth_lib():
 _BIRTH = _load_birth_lib()
 
 
+def _birth_name_refusal(name):
+    """F-1 gate: is `name` inside the reserved AI namespace?
+
+    Returns a refusal string, or None to proceed. **Fail-closed**: if the
+    birth lib is unavailable the create is refused rather than falling through
+    to the unnamespaced behaviour, because the whole point of this check is
+    that the host is never consulted for a name outside the namespace. A guard
+    that quietly disappears when a sibling fails to load is the silent-blackout
+    failure this project has already been bitten by twice.
+    """
+    if _BIRTH is None:
+        return "name namespace unavailable"
+    try:
+        return _BIRTH.name_refusal(name, _BIRTH.read_name_prefix())
+    except Exception:
+        return "name namespace unavailable"
+
+
+
 def _principal() -> str:
     """The calling principal — the qrexec source domain (D1)."""
     import os
@@ -389,12 +408,22 @@ def main() -> int:
     if not NAME_RE.match(name):
         return emit({"ok": False, "error":
             "name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric"})
+    # F-1: same reserved-namespace gate as the spawn path, and for the same
+    # reason — this wrapper's `name in app.domains` check answers
+    # `qube '<name>' already exists` against the WHOLE host. Refusing on shape
+    # first means the host is never consulted for a name outside AI's
+    # namespace. Runs before the qubesadmin import, so it cannot depend on the
+    # fleet even by accident.
+    _name_err = _birth_name_refusal(name)
+    if _name_err:
+        return emit({"ok": False, "error": _name_err})
 
     try:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "qubesadmin unavailable"})
 
     # Source visibility check — collapse "doesn't exist" and "not ai-managed"
     # to the same opaque "not found" so the clone surface cannot be used as
@@ -468,7 +497,8 @@ def main() -> int:
     try:
         budget = _load_budget_lib()
     except Exception as e:
-        return emit({"ok": False, "error": f"budget helper load failed: {e}"})
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "budget helper unavailable"})
     # Serialize the gate->create critical section (see qmcp_budget.acquire_create_lock);
     # held until this one-shot process exits. Best-effort.
     _budget_lock_fd = budget.acquire_create_lock()
@@ -480,7 +510,11 @@ def main() -> int:
     try:
         new_vm = app.clone_vm(src_vm, name)
     except Exception as e:
-        return emit({"ok": False, "error": f"clone failed: {e}"})
+        # F-4: a qubesadmin clone failure carries storage-layer detail (pool
+        # names, LVM paths). Fixed vocabulary out; the class goes to the I-2
+        # chain, which AI cannot read.
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "clone failed"})
 
     # ----- Step 2: birth stamp + birth egress (race window) -----
     # Both are inside one try so a failure in either rolls the clone back. A
@@ -498,7 +532,7 @@ def main() -> int:
         removed = best_effort_remove(app, name)
         if removed:
             return emit({"ok": False,
-                         "error": f"birth stamp failed (rolled back): {e}"})
+                         "error": "birth stamp failed (rolled back)"})
         return emit({"ok": False, "error":
             f"birth stamp failed AND rollback failed: {e}; "
             f"manual cleanup of qube '{name}' required in dom0"})

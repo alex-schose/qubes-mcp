@@ -178,12 +178,30 @@ for prop in ("template", "default_dispvm"):
     check(f"set {prop}=<ai-managed> → ok:true (cross-ref passes)",
           resp.get("ok") is True and _reached_setattr(vm, prop))
 
-# netvm to an ai-managed non-router referent, target is not a router → succeeds
+# netvm retarget on a non-router target → refused (F-2/F-3); null still allowed
 ref = RecordingVM("ai-router-ish", tags=("ai-managed",))
 resp, vm = run("netvm", "ai-router-ish",
                target=RecordingVM("ai-x", provides_network=False), extra=[ref])
-check("set netvm=<ai-managed> on a non-router target → ok:true",
-      resp.get("ok") is True and _reached_setattr(vm, "netvm"))
+# INVERTED 2026-08-18 (F-2/F-3). This used to assert that AI could point a
+# non-router ai-managed qube at another egress, and it passed — which is
+# precisely the hole. Measured on hardware: with birth-egress enforced but
+# retarget open, four routes reached a cross-egress qube, the sharpest being
+# "retarget a source, then clone it", where §3.4's own source-outranks-principal
+# rule inherits the egress the agent just chose and the birth guard has nothing
+# to refuse. The assertion now names the property rather than the behaviour that
+# defeated it.
+check("set netvm=<ai-managed> on a non-router target → REFUSED (retarget is "
+      "escalation-class; birth enforcement is worth what retarget enforcement is)",
+      resp.get("ok") is False
+      and "operator-only" in str(resp.get("error", ""))
+      and not _reached_setattr(vm, "netvm"))
+
+# The de-escalation carve-out, mirroring the birth path's explicit-null rule:
+# taking a qube OFF the network reveals nothing and strands nothing.
+resp_null, vm_null = run("netvm", None,
+                         target=RecordingVM("ai-x", provides_network=False))
+check("set netvm=null → ALLOWED (disconnect is de-escalation, cannot leak)",
+      resp_null.get("ok") is True and _reached_setattr(vm_null, "netvm"))
 
 # -- 2 & 3. DEFAULT-DENY + TEETH: non-allowlisted props refused, never setattr --
 print("\n2/3. Non-allowlisted properties refused opaquely, setattr NEVER reached")

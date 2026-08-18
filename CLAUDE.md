@@ -597,6 +597,54 @@ W2-3b. Wave 2 Stage 3b — the enforcement-mode flag and the production smoke
     two-mode "fail closed to enforce" rule would have armed on a typo. No
     policy change; no qrexec daemon restart; no new RPC service; no new ring;
     no operator file created (absent = shadow = unchanged).
+FIX. Security fixes from the 2026-08-18 adversarial pass. Five findings, all
+    reproduced from the AI seat against a live fleet before being fixed, and all
+    re-attacked afterwards. NOT an inert stage — two behaviours change.
+    F-1, THE RESERVED NAME NAMESPACE. Both create paths validated a requested
+    name against the WHOLE host's domain list and answered `qube '<name>'
+    already exists`, echoing it. Measured: 11 qubes outside the umbrella
+    identified from the AI seat, through the agent-facing tool. Every read
+    surface redacts those to <out-of-scope> or collapses them to `not found`;
+    the create path did not. The fix is a NAMESPACE, not a better message, and
+    the distinction is the whole point: a create has three outcomes (free,
+    taken by an ai-managed qube, taken by something outside), AI can already
+    enumerate the second, so "refused and not in my list" still means "something
+    I cannot see is there" — and the timing separates them anyway, since a free
+    name goes on to do real work. The only way to remove the oracle is to make
+    the third outcome impossible. AI now proposes names ONLY inside a reserved
+    prefix (/etc/qmcp/name-prefix, absent = "ai-"), and a name outside it is
+    refused on SHAPE ALONE, before any host lookup, in constant time, with a
+    message that depends on nothing but the rule. Fail-closed here means falling
+    back to the RESTRICTIVE default, never to "no prefix" — the opposite
+    direction to every other operator file in this tree, because for this one
+    "no prefix" would be most authority. RESIDUAL, documented and installer-
+    reported: a non-ai-managed qube inside the reserved namespace stays
+    detectable — one namespace instead of the whole host.
+    F-2/F-3, THE EGRESS RETARGET. Stage 2 shipped §3.4's birth half; with
+    retarget still open, four routes reached a cross-egress qube and the
+    sharpest needed no netvm argument at all — retarget a source, then CLONE
+    it, and §3.4's own "the creation source's netvm outranks the calling
+    principal's" rule faithfully inherits the egress the agent just chose. The
+    same move through a DispVMTemplate mints disposables on the foreign egress,
+    which is the case §3.4 exists for. So birth-egress enforcement is worth
+    exactly what retarget enforcement is worth, and shipping one without the
+    other was the bug. qmcp.SetPropertyAIManaged now refuses a non-null netvm
+    write; `netvm = null` stays allowed, mirroring the birth path's own
+    de-escalation carve-out. This COMPLETES Stage 2 rather than pre-empting
+    Stage 3c, which still owns the general flip.
+    F-4, NO RAW DOM0 EXCEPTION TEXT. Eleven sites across the three create
+    wrappers forwarded a Python exception string into an AI-visible field; one
+    was measured handing the seat the dom0 storage pool name and the LVM
+    volume path. Fixed vocabulary out, exception CLASS to the I-2 chain. The
+    JSON-parse echo is deliberately kept: it carries AI's own payload.
+    F-5, private_size is an integer. int() coercion truncated 1.5 to 1 and —
+    bool being an int subclass — turned `true` into a byte count. No cap
+    bypass (the estimate clamps to the default floor), but default-deny on
+    input shape, per G0a.
+    Proven by 69 offline checks with teeth reproducing each vulnerable
+    behaviour under the pre-fix predicate, plus a re-run of every original
+    attack against the deployed fix. No policy change; no daemon restart; no
+    new RPC service.
 G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
    Gateway input boundary: SetProperty settable-property allowlist
    (provides_network operator-only), qrexec target-name validator, device
@@ -736,6 +784,11 @@ qubes_mcp/                          # repo root
 │                                      # against what they did and log only the
 │                                      # difference. Enforces nothing (see below).
 │   ├── qmcp_birth.py                 # Wave 2 Stage 2 — the reserved qmcp-* namespace
+│                                      # AND (2026-08-18, F-1) the reserved qube-NAME
+│                                      # namespace: read_name_prefix() /
+│                                      # name_refusal(), called by all three create
+│                                      # paths BEFORE any host lookup, so a name
+│                                      # outside it is refused on shape alone.
 │                                      # + the atomic birth stamp (owner, birth tier,
 │                                      # restriction inheritance, read-back, rollback),
 │                                      # loaded by the 3 create wrappers

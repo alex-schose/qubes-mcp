@@ -400,7 +400,8 @@ def main() -> int:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return emit({"ok": False, "error": f"qubesadmin import failed: {e}"})
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "qubesadmin unavailable"})
 
     # Template visibility check — collapse missing/untagged to opaque "not found"
     # so the disposable-spawn surface cannot be used as an existence oracle.
@@ -456,7 +457,8 @@ def main() -> int:
     try:
         budget = _load_budget_lib()
     except Exception as e:
-        return emit({"ok": False, "error": f"budget helper load failed: {e}"})
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "budget helper unavailable"})
     # Serialize the gate->create critical section (see qmcp_budget.acquire_create_lock);
     # held until this one-shot process exits. Best-effort.
     _budget_lock_fd = budget.acquire_create_lock()
@@ -493,7 +495,9 @@ def main() -> int:
     try:
         disp_name = create_disposable(app, tpl)
     except Exception as e:
-        return emit({"ok": False, "error": f"CreateDisposable failed: {e}"})
+        # F-4: same posture as the clone path.
+        _audit_summary["error_class"] = type(e).__name__
+        return emit({"ok": False, "error": "disposable creation failed"})
 
     # ----- Step 2: apply ai-managed tag (race window starts here) -----
     # Direct admin calls — see module docstring for why we bypass

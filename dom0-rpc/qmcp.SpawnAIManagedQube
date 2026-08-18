@@ -197,6 +197,25 @@ def _load_birth_lib():
 _BIRTH = _load_birth_lib()
 
 
+def _birth_name_refusal(name):
+    """F-1 gate: is `name` inside the reserved AI namespace?
+
+    Returns a refusal string, or None to proceed. **Fail-closed**: if the
+    birth lib is unavailable the create is refused rather than falling through
+    to the unnamespaced behaviour, because the whole point of this check is
+    that the host is never consulted for a name outside the namespace. A guard
+    that quietly disappears when a sibling fails to load is the silent-blackout
+    failure this project has already been bitten by twice.
+    """
+    if _BIRTH is None:
+        return "name namespace unavailable"
+    try:
+        return _BIRTH.name_refusal(name, _BIRTH.read_name_prefix())
+    except Exception:
+        return "name namespace unavailable"
+
+
+
 def _principal() -> str:
     """The calling principal — the qrexec source domain (D1)."""
     import os
@@ -441,14 +460,28 @@ def main() -> int:
 
     if not NAME_RE.match(name):
         return fail("name must be alphanumeric + dashes, 1-31 chars, starting with alphanumeric")
+    # F-1: the requested name must sit inside the reserved AI namespace. This
+    # runs on SHAPE ALONE, before any app.domains lookup, so a name outside the
+    # namespace is refused without the host being consulted at all — which is
+    # what stops the collision check below being an existence oracle over every
+    # qube on the machine. See qmcp_birth's "reserved NAME namespace" note for
+    # why collapsing the collision message is not a substitute.
+    _name_err = _birth_name_refusal(name)
+    if _name_err:
+        return fail(_name_err)
     if klass not in ALLOWED_KLASSES:
         return fail(f"klass must be one of: {sorted(ALLOWED_KLASSES)}")
     if label not in ALLOWED_LABELS:
         return fail(f"label must be one of: {sorted(ALLOWED_LABELS)}")
     if private_size is not None:
-        try:
-            private_size = int(private_size)
-        except Exception:
+        # F-5: the contract says "an integer number of bytes", so accept only
+        # that. int() used to be applied here, which truncated 1.5 to 1 and —
+        # because bool is an int subclass in Python — silently turned `true`
+        # into a byte count. Neither breached the cap (estimate_spawn_bytes
+        # clamps up to the default floor), but a boolean becoming a size is the
+        # kind of laxity that stops being harmless the moment the surrounding
+        # arithmetic changes. Default-deny on input shape, per G0a.
+        if isinstance(private_size, bool) or not isinstance(private_size, int):
             return fail("private_size must be an integer number of bytes")
         if private_size <= 0:
             return fail("private_size must be a positive number of bytes")
@@ -457,7 +490,8 @@ def main() -> int:
         import qubesadmin.app
         app = qubesadmin.app.QubesLocal()
     except Exception as e:
-        return fail(f"qubesadmin import failed: {e}")
+        _audit_summary["error_class"] = type(e).__name__
+        return fail("qubesadmin unavailable")
 
     if name in app.domains:
         return fail(f"qube '{name}' already exists")
@@ -581,7 +615,8 @@ def main() -> int:
     try:
         budget = _load_budget_lib()
     except Exception as e:
-        return fail(f"budget helper load failed: {e}")
+        _audit_summary["error_class"] = type(e).__name__
+        return fail("budget helper unavailable")
     psize_err = budget.check_private_size(private_size)
     if psize_err is not None:
         return fail(psize_err)
@@ -602,7 +637,9 @@ def main() -> int:
     try:
         new_vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
-        return fail(f"create failed: {e}")
+        # F-4: a qvm-create failure carries storage-layer detail.
+        _audit_summary["error_class"] = type(e).__name__
+        return fail("create failed")
 
     # ----- Step 2: apply the birth stamp (race window starts here) -----
     try:
@@ -611,7 +648,8 @@ def main() -> int:
         # Roll back: untagged qube must not persist.
         removed = best_effort_remove(app, name)
         if removed:
-            return fail(f"tag application failed (rolled back): {e}")
+            _audit_summary["error_class"] = type(e).__name__
+        return fail("tag application failed (rolled back)")
         return fail(
             f"tag application failed AND rollback failed: {e}; "
             f"manual cleanup of qube '{name}' required in dom0"
@@ -627,10 +665,17 @@ def main() -> int:
             if not getattr(new_vm, "template_for_dispvms", False):
                 new_vm.template_for_dispvms = True
         except Exception as e:
+            # F-4: fixed vocabulary, never the exception text. A qubesadmin
+            # storage error carries dom0 internals — the pool name and the LVM
+            # volume path were both measured reaching the AI seat this way —
+            # and G0's opaque-collapse posture does not cover payload inside an
+            # ok:true response. The detail goes to the I-2 chain, which the
+            # operator can read and AI cannot.
+            _audit_summary["error_class"] = type(e).__name__
             return emit({
                 "ok": True,
                 "name": name,
-                "warning": f"qube created and tagged but template_for_dispvms set failed: {e}",
+                "warning": "dispvm_template_flag_failed",
             })
 
     # ----- Step 4: netvm assignment (always explicit — qvm-create silently
@@ -658,11 +703,16 @@ def main() -> int:
         if got_name != (None if netvm is None else str(netvm)):
             raise RuntimeError(f"netvm read back as {got_name!r}")
     except Exception as e:
+        # F-4: the exception text stays in dom0. The two outcomes remain
+        # distinguishable to AI because they mean different things — rolled
+        # back means nothing exists, the other means a qube is stranded and
+        # the operator must act — but neither carries platform internals now.
+        _audit_summary["error_class"] = type(e).__name__
         removed = best_effort_remove(app, name)
         if removed:
-            return fail(f"netvm assignment failed (rolled back): {e}")
+            return fail("netvm assignment failed (rolled back)")
         return fail(
-            f"netvm assignment failed AND rollback failed: {e}; "
+            f"netvm assignment failed AND rollback failed; "
             f"manual cleanup of qube '{name}' required in dom0"
         )
 
@@ -675,10 +725,14 @@ def main() -> int:
         try:
             new_vm.volumes["private"].resize(int(private_size))
         except Exception as e:
+            # F-4: see the note on the template_for_dispvms warning above. This
+            # is the site that was measured leaking the dom0 storage pool name
+            # and the `lvresize` remediation path into an AI-visible response.
+            _audit_summary["error_class"] = type(e).__name__
             return emit({
                 "ok": True,
                 "name": name,
-                "warning": f"qube created and tagged but private resize failed: {e}",
+                "warning": "private_resize_failed",
             })
 
     return emit({"ok": True, "name": name})

@@ -117,7 +117,11 @@ _GREEN = {PASS}
 #: completes well inside this cannot have waited on an unanswered dialog.
 CONSENT_MIN_TIMEOUT = 5.0
 
-FIXTURE_PREFIX = "qmcp-smoke-"
+#: Fixtures live inside the reserved AI name namespace (qmcp_birth's F-1
+#: guard), like every other qube AI creates. They were `qmcp-smoke-*` until
+#: 2026-08-18; that namespace belongs to the reserved TAG vocabulary, not to
+#: qube names, and a create outside the name namespace is now refused.
+FIXTURE_PREFIX = "ai-smoke-"
 FIXTURE_PARENT = FIXTURE_PREFIX + "parent"
 FIXTURE_CLONE = FIXTURE_PREFIX + "clone"
 FIXTURE_CROSS = FIXTURE_PREFIX + "cross"

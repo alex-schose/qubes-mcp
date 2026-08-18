@@ -361,6 +361,39 @@ def main() -> int:
             return emit({"ok": False,
                          "error": "netvm of a network-providing qube is operator-only"})
 
+        # F-2/F-3: an egress RETARGET is escalation-class, and refusing it here
+        # is what completes Stage 2 rather than what pre-empts Stage 3c.
+        #
+        # Stage 2 shipped the BIRTH half of §3.4: a create inherits its
+        # creator's netvm and a pinned deviation is refused. Measured on
+        # hardware 2026-08-18, that guard bought nothing against a deliberate
+        # agent while this surface stayed open, by four routes to the same end
+        # state. The sharpest needs no netvm argument at all: retarget a source,
+        # then CLONE it — §3.4's own "the creation source's netvm outranks the
+        # calling principal's" rule then faithfully inherits the egress the
+        # agent just chose, and the birth guard has nothing to refuse. The same
+        # move through a DispVMTemplate mints disposables on the foreign egress,
+        # which is the case §3.4 exists for, because a disposable boots and
+        # resolves DNS on first use.
+        #
+        # So birth-egress enforcement is worth exactly what retarget
+        # enforcement is worth. Shipping one without the other was the bug.
+        #
+        # `netvm = null` stays ALLOWED, mirroring the birth path's carve-out
+        # exactly (qmcp.SpawnAIManagedQube: "explicit null stays allowed with no
+        # approval: de-escalation cannot leak"). Taking a qube OFF the network
+        # reveals nothing and strands nothing; it is the one direction that is
+        # safe by construction.
+        #
+        # Post-authority, like the provides_network refusal above: it fires only
+        # after the tier and consent gates, on a qube the caller already holds
+        # CAP_FULL on, so an informative message leaks nothing about existence
+        # or tier.
+        if value is not None:
+            return emit({"ok": False,
+                         "error": "netvm change is operator-only; "
+                                  "null (disconnect) is permitted"})
+
     # Cross-reference validation: resolve qube-name values to VM objects and
     # refuse if the referenced VM isn't ai-managed. The refusal collapses
     # "missing" and "untagged" to a single opaque message that does not

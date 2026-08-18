@@ -9,7 +9,7 @@ Verifies:
   4. Explicit netvm=null keeps the qube netvm-less (no defaulting).
   5. SetPropertyAIManaged refuses to mutate ai-net-router.netvm
      (egress-qube invariant — operator-only).
-  6. SetPropertyAIManaged can point an AI qube's netvm at ai-net-router.
+  6. SetPropertyAIManaged REFUSES an egress retarget (null still allowed).
   7. admin.vm.firewall.Set + Get round-trip on an ai-managed qube.
   8. Negative: admin.vm.firewall.Set against an untagged operator qube refused.
 
@@ -191,19 +191,22 @@ layer = ("egress invariant" if "network-providing" in err
          else "NOT REFUSED — netvm leak!")
 print(f"  {'PASS' if egress_locked else 'FAIL'}: {EGRESS_QUBE}.netvm refused [{layer}]")
 
-# ---------------------------- 6. retarget of an EXISTING qube — still open
-# Wave 2 Stage 2 closed BIRTH egress; it did not close RETARGET, and the
-# difference is the whole point of §3.4's "birth != retarget". Birth creates an
-# empty qube with nothing to leak. Retargeting an EXISTING qube is the
-# deanonymisation event: it may already hold Tor-derived data, a session, an
-# identity. `qmcp_caps.decide()` already answers escalation-class DENY for a
-# `netvm` write, but Stage 1 runs in shadow, so the wrapper still allows it and
-# the disagreement is recorded on the dom0 audit chain.
+# ---------------------------- 6. retarget of an EXISTING qube — now CLOSED
+# INVERTED 2026-08-18. This block asserted that AI could retarget an existing
+# qube's netvm, deliberately, "so the flip has something concrete to flip". It
+# was flipped early, as a security fix rather than as Stage 3c, because the hole
+# it was holding open turned out to defeat the guard Stage 2 had already
+# shipped: with birth enforced and retarget open, four routes reached a
+# cross-egress qube, and the sharpest needed no netvm argument at all —
+# retarget a source, then CLONE it, and §3.4's own "the creation source's netvm
+# outranks the calling principal's" rule faithfully inherits the egress the
+# agent just chose. The same move through a DispVMTemplate mints disposables on
+# the foreign egress, which is the case §3.4 exists for.
 #
-# So this test asserts the CURRENT, deliberately-still-open behaviour, and it
-# must be INVERTED by Stage 3 when enforcement flips to decide(). It is left
-# passing rather than deleted so the flip has something concrete to flip.
-header(f"6. SetPropertyAIManaged: retarget to {EGRESS_QUBE} — OPEN until Stage 3")
+# So birth-egress enforcement is worth exactly what retarget enforcement is
+# worth. `null` remains allowed: disconnecting is de-escalation and cannot leak,
+# mirroring the birth path's explicit-null carve-out.
+header(f"6. SetPropertyAIManaged: retarget to {EGRESS_QUBE} — now REFUSED")
 redirect_ok = False
 r = call_qmcp("qmcp.SpawnAIManagedQube",
               {"name": "ai-fw-redirect", "template": PROBE_AI_MANAGED_TEMPLATE,
@@ -212,12 +215,18 @@ if r.get("ok"):
     r = call_qmcp("qmcp.SetPropertyAIManaged",
                   {"name": "ai-fw-redirect", "property": "netvm", "value": EGRESS_QUBE})
     show(f"set ai-fw-redirect.netvm = {EGRESS_QUBE}", r)
-    redirect_ok = bool(r.get("ok"))
-    if redirect_ok:
-        r = call_qmcp("qmcp.GetPropertyAIManaged",
-                      {"name": "ai-fw-redirect", "property": "netvm"})
-        redirect_ok = r.get("ok") and r.get("value") == EGRESS_QUBE
-print(f"  {'PASS' if redirect_ok else 'FAIL'}: ai-fw-redirect netvm now {EGRESS_QUBE}")
+    refused = (not r.get("ok")) and "operator-only" in str(r.get("error", ""))
+    # And it must be refused BEFORE the write, not reported after it.
+    v = call_qmcp("qmcp.GetPropertyAIManaged",
+                  {"name": "ai-fw-redirect", "property": "netvm"})
+    unchanged = v.get("ok") and v.get("value") is None
+    show("netvm after the refused retarget", v)
+    # The de-escalation carve-out must still work.
+    n = call_qmcp("qmcp.SetPropertyAIManaged",
+                  {"name": "ai-fw-redirect", "property": "netvm", "value": None})
+    show("set ai-fw-redirect.netvm = null (de-escalation)", n)
+    redirect_ok = refused and unchanged and bool(n.get("ok"))
+print(f"  {'PASS' if redirect_ok else 'FAIL'}: retarget refused, value unchanged, null still allowed")
 
 # ---------------------------- 7. firewall Set + Get round-trip
 header("7. admin.vm.firewall.Set + Get on an ai-managed qube")
@@ -259,7 +268,7 @@ results = {
     "birth netvm inherited (see note)":                      netvm_applied,
     "explicit netvm=null preserved":              nonet_kept,
     "egress-qube netvm locked":                   egress_locked,
-    "AI qube retarget still open (Stage 3 inverts)": redirect_ok,
+    "AI qube retarget REFUSED, null still allowed": redirect_ok,
     "firewall set+get round-trip":                set_ok and read_ok and roundtrip_ok,
     "untagged target refused":                    refused,
 }

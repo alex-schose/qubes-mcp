@@ -332,57 +332,57 @@ SPAWN = "qmcp.SpawnAIManagedQube"
 CLONE = "qmcp.CloneAIManagedQube"
 DISP = "qmcp.SpawnDisposableAIManaged"
 
-r, app = run(CLONE, {"source": "tor-work", "name": "kid"}, wired())
+r, app = run(CLONE, {"source": "tor-work", "name": "ai-kid"}, wired())
 check("clone of a Tor-side source is born on Tor, gateway on clearnet",
-      r.get("ok") is True and netvm_of(app, "kid") == TOR,
+      r.get("ok") is True and netvm_of(app, "ai-kid") == TOR,
       f"{r} netvm={netvm_of(app, 'kid')}")
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13"},
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13"},
              wired(gateway_netvm=TOR))
 check("template spawn inherits the PRINCIPAL's egress (row 2), not a constant",
-      r.get("ok") is True and netvm_of(app, "kid") == TOR,
+      r.get("ok") is True and netvm_of(app, "ai-kid") == TOR,
       f"{r} netvm={netvm_of(app, 'kid')}")
 check("the deleted DEFAULT_NETVM constant is really gone",
       not hasattr(load_wrapper(SPAWN), "DEFAULT_NETVM"),
       "a Tor-side gateway must not produce an ai-net-router child")
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13",
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13",
                      "netvm": TOR}, wired(gateway_netvm=CLEAR))
 check("explicit netvm DIFFERING from the inherited one is refused",
-      r.get("ok") is not True and "kid" not in app.domains,
+      r.get("ok") is not True and "ai-kid" not in app.domains,
       str(r))
 check("...and the refusal names no out-of-scope qube",
       "sys-firewall" not in json.dumps(r))
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13",
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13",
                      "netvm": CLEAR}, wired(gateway_netvm=CLEAR))
 check("explicit netvm MATCHING the inherited one is allowed",
-      r.get("ok") is True and netvm_of(app, "kid") == CLEAR, str(r))
+      r.get("ok") is True and netvm_of(app, "ai-kid") == CLEAR, str(r))
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13",
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13",
                      "netvm": None}, wired(gateway_netvm=CLEAR))
 check("explicit null is de-escalation and stays allowed",
-      r.get("ok") is True and netvm_of(app, "kid") is None, str(r))
+      r.get("ok") is True and netvm_of(app, "ai-kid") is None, str(r))
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13",
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13",
                      "netvm": "sys-firewall"}, wired())
 check("an out-of-scope netvm still collapses to the opaque cross-ref message",
       r.get("error") == "netvm must reference an ai-managed qube", str(r))
 
 # Row 4: the gateway sits outside the umbrella and no operator file exists.
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13"},
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13"},
              wired(gateway_netvm="sys-firewall"))
 check("unresolvable chain REFUSES rather than birthing a network-less qube",
-      r.get("ok") is not True and "kid" not in app.domains, str(r))
+      r.get("ok") is not True and "ai-kid" not in app.domains, str(r))
 check("...but an explicit null still succeeds — it never needed the chain",
-      run(SPAWN, {"name": "kid", "template": "ai-debian-13", "netvm": None},
+      run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13", "netvm": None},
           wired(gateway_netvm="sys-firewall"))[0].get("ok") is True)
 
 # F-J: a workload source that is deliberately offline.
-r, app = run(CLONE, {"source": "offline-vault", "name": "kid"},
+r, app = run(CLONE, {"source": "offline-vault", "name": "ai-kid"},
              wired(gateway_netvm=CLEAR))
 check("F-J: clone of an OFFLINE source stays offline, not on the gateway path",
-      r.get("ok") is True and netvm_of(app, "kid") is None,
+      r.get("ok") is True and netvm_of(app, "ai-kid") is None,
       f"{r} netvm={netvm_of(app, 'kid')}")
 
 r, app = run(DISP, {"template": "ai-dvmt"}, wired(gateway_netvm=TOR))
@@ -400,9 +400,9 @@ check("F-J: disposable off an OFFLINE DVMT is born offline",
 # --------------------------------------------------------------------------
 print("\n=== 2. Birth tier and ownership ===")
 
-for svc, req, who in ((CLONE, {"source": "clear-work", "name": "kid"}, "kid"),
-                      (SPAWN, {"name": "kid", "template": "ai-debian-13"},
-                       "kid")):
+for svc, req, who in ((CLONE, {"source": "clear-work", "name": "ai-kid"}, "ai-kid"),
+                      (SPAWN, {"name": "ai-kid", "template": "ai-debian-13"},
+                       "ai-kid")):
     r, app = run(svc, req, wired())
     tags = set(app.domains[who].tags) if who in app.domains else set()
     check(f"{svc.split('.')[1]}: child born at the source's tier (no ceiling)",
@@ -419,16 +419,16 @@ check("disposable: born at the DVMT's tier and owned",
       str(sorted(dtags)))
 
 # Restriction inheritance — the F-E laundering hole.
-r, app = run(CLONE, {"source": "guarded-work", "name": "kid"}, wired())
-ktags = set(app.domains["kid"].tags) if "kid" in app.domains else set()
+r, app = run(CLONE, {"source": "guarded-work", "name": "ai-kid"}, wired())
+ktags = set(app.domains["ai-kid"].tags) if "ai-kid" in app.domains else set()
 check("a guarded source produces a guarded child (F-E: no laundering)",
       "qmcp-guarded" in ktags, str(sorted(ktags)))
 
 # A foreign owner tag on the source must not survive onto the child.
 vms = wired()
 {v.name: v for v in vms}["clear-work"].tags.add(birth.owner_tag("someone-else"))
-r, app = run(CLONE, {"source": "clear-work", "name": "kid"}, vms)
-ktags = set(app.domains["kid"].tags) if "kid" in app.domains else set()
+r, app = run(CLONE, {"source": "clear-work", "name": "ai-kid"}, vms)
+ktags = set(app.domains["ai-kid"].tags) if "ai-kid" in app.domains else set()
 check("the source's owner tag is replaced, never accumulated",
       birth.owner_tag("someone-else") not in ktags
       and sum(t.startswith("qmcp-owner") for t in ktags) == 1,
@@ -454,24 +454,24 @@ def break_egress_readback(mod):
         mod.netvm_name_direct = lambda app, n: "sys-firewall"
 
 
-for svc, req, who in ((SPAWN, {"name": "kid", "template": "ai-debian-13"}, "kid"),
-                      (CLONE, {"source": "clear-work", "name": "kid"}, "kid")):
+for svc, req, who in ((SPAWN, {"name": "ai-kid", "template": "ai-debian-13"}, "ai-kid"),
+                      (CLONE, {"source": "clear-work", "name": "ai-kid"}, "ai-kid")):
     r, app = run(svc, req, wired(), patch=break_stamp)
     check(f"{svc.split('.')[1]}: a failed birth stamp rolls the qube back",
           r.get("ok") is not True and who not in app.domains, str(r))
 
-for svc, req in ((CLONE, {"source": "clear-work", "name": "kid"}),
+for svc, req in ((CLONE, {"source": "clear-work", "name": "ai-kid"}),
                  (DISP, {"template": "ai-dvmt"})):
     r, app = run(svc, req, wired(), patch=break_egress_readback)
     check(f"{svc.split('.')[1]}: an egress read-back mismatch rolls it back",
           r.get("ok") is not True
-          and not [n for n in app.domains if n.startswith(("kid", "disp"))],
+          and not [n for n in app.domains if n.startswith(("ai-kid", "disp"))],
           str(r))
 
-r, app = run(SPAWN, {"name": "kid", "template": "ai-debian-13"}, wired(),
+r, app = run(SPAWN, {"name": "ai-kid", "template": "ai-debian-13"}, wired(),
              patch=lambda m: setattr(m, "_CAPS", None))
 check("a missing decision kernel REFUSES the create (fail-closed, unlike shadow)",
-      r.get("ok") is not True and "kid" not in app.domains, str(r))
+      r.get("ok") is not True and "ai-kid" not in app.domains, str(r))
 
 # --------------------------------------------------------------------------
 print(f"\n{'='*68}\nStage 2 wiring validation: {PASSED} passed, {FAILED} failed")

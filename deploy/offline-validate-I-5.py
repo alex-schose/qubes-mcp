@@ -327,7 +327,7 @@ for src, expect_pass, lbl in [
 ]:
     app_with_fleet()
     m = prep(load_wrapper(fname), stub_budget=True)
-    r = run(m, {"source": src, "name": "clone-x"})
+    r = run(m, {"source": src, "name": "ai-clone-x"})
     if expect_pass:
         check(f"Clone: {lbl}", r.get("ok") is True)
     else:
@@ -335,11 +335,11 @@ for src, expect_pass, lbl in [
 # fail-closed
 app_with_fleet()
 m = prep(load_wrapper(fname), stub_budget=True, tier_none=True)
-r = run(m, {"source": "ai-full-vm", "name": "clone-y"})
+r = run(m, {"source": "ai-full-vm", "name": "ai-clone-y"})
 check("Clone: _TIER=None → FAIL-CLOSED", r == NOT_FOUND)
 # opacity
-app_with_fleet(); r1 = run(prep(load_wrapper(fname), stub_budget=True), {"source": "ai-exec-vm", "name": "c1"})
-app_with_fleet(); r2 = run(prep(load_wrapper(fname), stub_budget=True), {"source": "untagged", "name": "c2"})
+app_with_fleet(); r1 = run(prep(load_wrapper(fname), stub_budget=True), {"source": "ai-exec-vm", "name": "ai-c1"})
+app_with_fleet(); r2 = run(prep(load_wrapper(fname), stub_budget=True), {"source": "untagged", "name": "ai-c2"})
 check("Clone: under-tier == untagged refusal (no oracle)", r1 == r2 == NOT_FOUND)
 
 # --------------------------------------------------------------------------
@@ -352,7 +352,7 @@ for tpl, expect_pass, lbl in [
 ]:
     app_with_fleet()
     m = prep(load_wrapper(fname), stub_budget=True)
-    r = run(m, {"name": "spawn-x", "template": tpl, "netvm": None})
+    r = run(m, {"name": "ai-spawn-x", "template": tpl, "netvm": None})
     if expect_pass:
         check(f"Spawn: {lbl}", r.get("ok") is True)
     else:
@@ -360,13 +360,13 @@ for tpl, expect_pass, lbl in [
 # fail-closed
 app_with_fleet()
 m = prep(load_wrapper(fname), stub_budget=True, tier_none=True)
-r = run(m, {"name": "spawn-y", "template": "ai-full-tpl", "netvm": None})
+r = run(m, {"name": "ai-spawn-y", "template": "ai-full-tpl", "netvm": None})
 check("Spawn: _TIER=None → FAIL-CLOSED (cross-ref msg)", r.get("error") == SPAWN_OPAQUE)
 # opacity: ai-exec template refusal byte-identical to untagged template refusal
 app_with_fleet(); r1 = run(prep(load_wrapper(fname), stub_budget=True),
-                           {"name": "s1", "template": "ai-exec-tpl", "netvm": None})
+                           {"name": "ai-s1", "template": "ai-exec-tpl", "netvm": None})
 app_with_fleet(); r2 = run(prep(load_wrapper(fname), stub_budget=True),
-                           {"name": "s2", "template": "untagged", "netvm": None})
+                           {"name": "ai-s2", "template": "untagged", "netvm": None})
 check("Spawn: under-tier template == untagged template refusal (no oracle)",
       r1 == r2 and r1.get("error") == SPAWN_OPAQUE)
 
@@ -500,8 +500,8 @@ check("(teeth) raw CreateDisposable INHERITS ai-full — mock models the real bu
 # `offline-validate-2.py`.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.CloneAIManagedQube"), stub_budget=True)
-r = run(m, {"source": "ai-full-vm", "name": "clone-esc"})
-ctags = set(app.domains["clone-esc"].tags) if "clone-esc" in app.domains else set()
+r = run(m, {"source": "ai-full-vm", "name": "ai-clone-esc"})
+ctags = set(app.domains["ai-clone-esc"].tags) if "ai-clone-esc" in app.domains else set()
 check("Clone(ai-full source) \u2192 ok", r.get("ok") is True)
 check("Clone(ai-full source) \u2192 clone keeps ai-managed", "ai-managed" in ctags)
 check("Clone(ai-full source) \u2192 born ai-full (D2 clamp, no ceiling set)",
@@ -523,9 +523,9 @@ check("Clone \u2192 stamped with the calling principal's ownership",
 # ladder in `offline-validate-2.py` \u00a71.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.CloneAIManagedQube"), stub_budget=True)
-r = run(m, {"source": "ai-exec-vm", "name": "clone-exec"})
+r = run(m, {"source": "ai-exec-vm", "name": "ai-clone-exec"})
 check("Clone(ai-exec source) \u2192 REFUSED by the CAP_FULL gate, no child at all",
-      r.get("ok") is not True and "clone-exec" not in app.domains)
+      r.get("ok") is not True and "ai-clone-exec" not in app.domains)
 
 # SpawnDisposable from an ai-full DVMT \u2014 same clamp, ephemeral target.
 app = app_with_fleet()
@@ -544,8 +544,8 @@ check("SpawnDisposable(ai-full DVMT) \u2192 born ai-full (D2 clamp)",
 # answer by a different route, which is why it is worth asserting separately.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.SpawnAIManagedQube"), stub_budget=True)
-r = run(m, {"name": "spawn-esc", "template": "ai-full-tpl", "netvm": None})
-stags = set(app.domains["spawn-esc"].tags) if "spawn-esc" in app.domains else set()
+r = run(m, {"name": "ai-spawn-esc", "template": "ai-full-tpl", "netvm": None})
+stags = set(app.domains["ai-spawn-esc"].tags) if "ai-spawn-esc" in app.domains else set()
 check("Spawn(ai-full template) \u2192 ok", r.get("ok") is True)
 check("Spawn(ai-full template) \u2192 born ai-full, nothing above it",
       "ai-managed" in stags and (stags & ELEV) == {"ai-full"})

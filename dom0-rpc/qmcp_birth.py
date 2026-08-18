@@ -91,6 +91,97 @@ RESTRICTION_TAGS = frozenset({TAG_GUARDED, "anon-vm"})
 RESTRICTION_PREFIXES = (EGRESS_LOCK_PREFIX,)
 
 
+# --- the reserved NAME namespace (F-1) ------------------------------------
+#
+# This module already owns the reserved *tag* namespace, and a reserved *qube
+# name* namespace is the same idea enforced one layer out, so it lives here
+# rather than in a fourth file — and here it is loaded by exactly the three
+# wrappers that create qubes, which are exactly the three that must enforce it.
+#
+# WHY A NAMESPACE AND NOT A BETTER ERROR MESSAGE. The create paths used to
+# check a requested name against `app.domains` — the whole host — and answer
+# `qube '<name>' already exists`, which let AI confirm any qube name it could
+# guess: `vault`, `personal`, `sys-usb`, the operator's own qubes. Measured on
+# hardware 2026-08-18: 11 out-of-scope qubes identified from the AI seat.
+#
+# Collapsing the message is not sufficient, and it is worth being precise about
+# why, because the cheap fix looks convincing. A create has three outcomes: the
+# name is free (a qube appears), the name is taken by an ai-managed qube, or the
+# name is taken by something outside the umbrella. AI can already enumerate the
+# second group. So even with one uniform refusal, "refused and not in my list"
+# still means "something I cannot see is there" — and the *timing* separates
+# them anyway, since a free name goes on to do real work while a taken one
+# returns immediately.
+#
+# The oracle is therefore inherent to an unnamespaced create, and the only way
+# to remove it is to make the third outcome impossible: AI proposes names ONLY
+# inside a namespace reserved for it, and a name outside that namespace is
+# refused on SHAPE ALONE — no host lookup, constant time, an error that depends
+# on nothing but the rule. Then a collision can only ever concern a name inside
+# AI's own namespace.
+#
+# RESIDUAL, stated rather than glossed: a qube inside the reserved namespace
+# that is NOT ai-managed remains detectable, because AI can list the ai-managed
+# ones and subtract. That is a deliberate, bounded trade — one namespace the
+# project documents as reserved, instead of the whole host — and the installer
+# warns when such a qube exists. Do not "fix" it by making collisions silent:
+# a create that fails without saying the name is taken is worse to operate and
+# closes nothing, since the timing tell survives.
+
+#: Operator-owned override, read per call like every other operator file.
+NAME_PREFIX_PATH = "/etc/qmcp/name-prefix"
+
+#: The shipped default. Matches the project's own public vocabulary — every
+#: default qube name in this repo is already `ai-*`.
+DEFAULT_NAME_PREFIX = "ai-"
+
+#: A prefix must itself be a legal start-of-name, or it could never be
+#: satisfied and every create would fail closed forever.
+_PREFIX_RE = r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,15}$"
+
+
+def read_name_prefix(path: str = NAME_PREFIX_PATH) -> str:
+    """The reserved prefix AI-created names must carry.
+
+    Absent      -> `DEFAULT_NAME_PREFIX` (the shipped behaviour).
+    A legal prefix -> that prefix.
+    Malformed, unreadable, or empty -> `DEFAULT_NAME_PREFIX`.
+
+    **Fail-closed here means falling back to the RESTRICTIVE default, not to
+    "no prefix".** Every other operator file in this tree drops to least
+    authority on a malformed value; for this one, "no prefix" would be MOST
+    authority — it reopens the whole-host oracle — so the safe landing is the
+    default rather than the empty string. An operator cannot switch the guard
+    off by corrupting the file, only by editing the code.
+    """
+    import re
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except Exception:
+        return DEFAULT_NAME_PREFIX
+    word = raw.split("#", 1)[0].strip()
+    if not word or not re.match(_PREFIX_RE, word):
+        return DEFAULT_NAME_PREFIX
+    return word
+
+
+def name_refusal(name: str, prefix: str) -> str | None:
+    """`None` if `name` may be created by AI, else the refusal message.
+
+    Depends on `name` and `prefix` ONLY — never on what exists on the host —
+    so it cannot become an oracle and runs in constant time with respect to
+    the fleet. Callers must run this BEFORE any `app.domains` lookup; running
+    it after would leak exactly what it exists to prevent.
+    """
+    if not isinstance(name, str) or not name.startswith(prefix):
+        return (f"name must start with '{prefix}' — that namespace is reserved "
+                f"for AI-created qubes")
+    if len(name) <= len(prefix):
+        return f"name must have something after the reserved '{prefix}' prefix"
+    return None
+
+
 class TagIO:
     """Read/add/remove for one qube's tags, injected by the caller.
 
