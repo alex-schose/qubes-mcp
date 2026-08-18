@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -108,8 +109,13 @@ def _install_fake_qubesadmin(app):
 
 
 def _load_wrapper():
+    # `SourceFileLoader.load_module()` is deprecated and removed in Python 3.15
+    # (see deploy/offline-validate-2-wiring.py:193-199 for the idiom used
+    # elsewhere in this repo).
     loader = importlib.machinery.SourceFileLoader("w_setp_g0a", WRAPPER)
-    mod = loader.load_module()
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
     # Isolate the allowlist: bypass the tier + consent authority gates (proven
     # elsewhere) and silence the best-effort audit hook (its dom0 log path does
     # not exist here). These are the ONLY monkeypatches — the allowlist logic

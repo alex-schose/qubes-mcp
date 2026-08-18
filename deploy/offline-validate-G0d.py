@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.machinery
+import importlib.util
 import io
 import json
 import sys
@@ -46,7 +47,13 @@ def check(label, cond):
         print(f"  FAIL  {label}")
 
 
-W = importlib.machinery.SourceFileLoader("w_listdev", str(WRAPPER)).load_module()
+# `SourceFileLoader.load_module()` is deprecated and removed in Python 3.15
+# (see deploy/offline-validate-2-wiring.py:193-199 for the idiom used elsewhere
+# in this repo).
+_wloader = importlib.machinery.SourceFileLoader("w_listdev", str(WRAPPER))
+_wspec = importlib.util.spec_from_loader(_wloader.name, _wloader)
+W = importlib.util.module_from_spec(_wspec)
+_wloader.exec_module(W)
 SENT = "<out-of-scope>"
 
 # ==========================================================================

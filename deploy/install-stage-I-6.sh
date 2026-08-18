@@ -302,9 +302,15 @@ echo
 # ---------------------------------------------------------------- 7. validate the daemon imports cleanly BEFORE enabling
 echo "==> Validating the installed daemon imports + the socket serve() path..."
 if ! sudo python3 - <<PY
-import importlib.machinery, sys
+import importlib.machinery, importlib.util, sys
 path = "$DAEMON_DST"
-mod = importlib.machinery.SourceFileLoader("qmcp_consentd_check", path).load_module()
+# `SourceFileLoader.load_module()` is deprecated and removed in Python 3.15.
+# Use the spec_from_loader / exec_module idiom the rest of this repo already
+# uses (deploy/offline-validate-2-wiring.py:193-199).
+_loader = importlib.machinery.SourceFileLoader("qmcp_consentd_check", path)
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+mod = importlib.util.module_from_spec(_spec)
+_loader.exec_module(mod)
 # The daemon must expose serve()/decide()/handle() and the frozen socket path.
 for name in ("serve", "decide", "handle", "_recv_line"):
     assert hasattr(mod, name), f"daemon missing {name}"
