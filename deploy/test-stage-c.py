@@ -95,8 +95,21 @@ for q in FORMER_AI_SYS:
     if seen:
         former_invisible = False
 
-# ---------------------------- 3. default netvm applied when omitted
-header(f"3. SpawnAIManagedQube: netvm omitted → defaults to {EGRESS_QUBE}")
+# ---------------------------- 3. birth netvm is INHERITED, not defaulted
+# Rewritten for Wave 2 Stage 2. This used to assert "netvm omitted -> the
+# constant ai-net-router", which was the behaviour §3.4 deliberately removed:
+# the constant was fleet-specific (an adopter whose egress qube is named
+# otherwise got network-less qubes) and, on a fleet with two egress classes,
+# it let a Tor-side agent spawn a clearnet qube.
+#
+# The assertion below still expects EGRESS_QUBE, and on a single-egress fleet
+# that is the same string as before — which is exactly why the OLD wording had
+# to go. It would have kept passing while testing nothing: `ai-net-router`
+# would be right whether the wrapper inherited it or hardcoded it. What makes
+# this a real test is the second check, which asserts the child matches THE
+# GATEWAY'S OWN netvm. Move the gateway to another egress qube and this test
+# must follow it; the old one could not.
+header(f"3. SpawnAIManagedQube: netvm omitted → INHERITED from the creator")
 r = call_qmcp("qmcp.SpawnAIManagedQube",
               {"name": "ai-fw-default", "template": PROBE_AI_MANAGED_TEMPLATE, "label": "gray"})
 show("spawn ai-fw-default (no netvm key)", r)
@@ -106,8 +119,35 @@ if spawn_default_ok:
     r = call_qmcp("qmcp.GetPropertyAIManaged",
                   {"name": "ai-fw-default", "property": "netvm"})
     show("read netvm on ai-fw-default", r)
-    netvm_applied = r.get("ok") and r.get("value") == EGRESS_QUBE
-    print(f"  {'PASS' if netvm_applied else 'FAIL'}: default netvm == {EGRESS_QUBE}")
+    born_on = r.get("value") if r.get("ok") else None
+    netvm_applied = born_on == EGRESS_QUBE
+    print(f"  {'PASS' if netvm_applied else 'FAIL'}: birth netvm == {EGRESS_QUBE}")
+    # Inheritance itself is NOT assertable from this seat, and that is a
+    # property of the design rather than a gap in the test. The gateway is
+    # deliberately not tagged `ai-managed` (tagging it would make its own named
+    # policy rules shadowed by the umbrella rules, and would make it an
+    # OBJECT of every wrapper), so a wrapped read of `mcp-control` returns the
+    # opaque "not found" — as it does below. The seat therefore has nothing to
+    # compare the birth value against.
+    #
+    # Do not "fix" this by tagging the gateway. The comparison belongs in dom0,
+    # where `qvm-prefs mcp-control netvm` and `qvm-prefs <child> netvm` are both
+    # readable; `deploy/install-stage-2.sh` prints exactly that check, and the
+    # decisive version is to move the gateway to a second egress qube and
+    # confirm the child follows it. On a single-egress fleet the assertion above
+    # cannot fail for the right reason — it would read `ai-net-router` whether
+    # the value was inherited or hardcoded (Stage 0.5's vacuous-pass problem).
+    g = call_qmcp("qmcp.GetPropertyAIManaged",
+                  {"name": "mcp-control", "property": "netvm"})
+    if g.get("ok"):
+        same = born_on == g.get("value")
+        print(f"  {'PASS' if same else 'FAIL'}: birth netvm tracks the GATEWAY's "
+              f"netvm ({g.get('value')}) — inheritance, not a constant")
+        netvm_applied = netvm_applied and same
+    else:
+        print("  INFO: the gateway is not ai-managed (by design), so this seat "
+              "cannot read its netvm. Inheritance is a dom0-side assertion — "
+              "see install-stage-2.sh. This is not a failure.")
 else:
     print("  FAIL: spawn failed; skipping netvm check")
     netvm_applied = False
@@ -151,8 +191,19 @@ layer = ("egress invariant" if "network-providing" in err
          else "NOT REFUSED — netvm leak!")
 print(f"  {'PASS' if egress_locked else 'FAIL'}: {EGRESS_QUBE}.netvm refused [{layer}]")
 
-# ---------------------------- 6. AI qube netvm → ai-net-router works
-header(f"6. SetPropertyAIManaged: AI qube netvm → {EGRESS_QUBE} works")
+# ---------------------------- 6. retarget of an EXISTING qube — still open
+# Wave 2 Stage 2 closed BIRTH egress; it did not close RETARGET, and the
+# difference is the whole point of §3.4's "birth != retarget". Birth creates an
+# empty qube with nothing to leak. Retargeting an EXISTING qube is the
+# deanonymisation event: it may already hold Tor-derived data, a session, an
+# identity. `qmcp_caps.decide()` already answers escalation-class DENY for a
+# `netvm` write, but Stage 1 runs in shadow, so the wrapper still allows it and
+# the disagreement is recorded on the dom0 audit chain.
+#
+# So this test asserts the CURRENT, deliberately-still-open behaviour, and it
+# must be INVERTED by Stage 3 when enforcement flips to decide(). It is left
+# passing rather than deleted so the flip has something concrete to flip.
+header(f"6. SetPropertyAIManaged: retarget to {EGRESS_QUBE} — OPEN until Stage 3")
 redirect_ok = False
 r = call_qmcp("qmcp.SpawnAIManagedQube",
               {"name": "ai-fw-redirect", "template": PROBE_AI_MANAGED_TEMPLATE,
@@ -205,10 +256,10 @@ header("Stage C test plan — summary")
 results = {
     f"{EGRESS_QUBE} visible + provides_network":  egress_visible and provides_net,
     "former ai-sys-* invisible":                  former_invisible,
-    "default netvm applied":                      netvm_applied,
+    "birth netvm inherited (see note)":                      netvm_applied,
     "explicit netvm=null preserved":              nonet_kept,
     "egress-qube netvm locked":                   egress_locked,
-    "AI qube can be retargeted at egress":        redirect_ok,
+    "AI qube retarget still open (Stage 3 inverts)": redirect_ok,
     "firewall set+get round-trip":                set_ok and read_ok and roundtrip_ok,
     "untagged target refused":                    refused,
 }

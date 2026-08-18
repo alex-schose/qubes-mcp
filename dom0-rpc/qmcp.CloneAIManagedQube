@@ -18,11 +18,16 @@ The source's existence-or-tag is hidden behind the literal "not found"
 to match qmcp.GetPropertyAIManaged's existence-oracle stance: AI cannot
 use the clone surface to probe whether a named qube exists untagged.
 
-Inheritance: clone copies the source's prefs (template, netvm, memory, …).
-Since the source is ai-managed, its netvm is either None or itself
-ai-managed (the SetPropertyAIManaged wrapper enforces that on every set),
-so the clone's inherited netvm is already inside the sandbox without
-needing a separate retarget step.
+Inheritance: clone copies the source's prefs (template, netvm, memory, …)
+AND its tags. Wave 2 Stage 2 makes both explicit rather than assumed:
+  - tags — the clone is born carrying the umbrella, `qmcp-owner_<principal>`,
+    the source's tier clamped by `/etc/qmcp/birth-ceiling`, and every
+    RESTRICTION the source carried (`qmcp-guarded`, `qmcp-egress-locked_*`,
+    `anon-vm`). Anything else in the reserved vocabulary is stripped, and the
+    result is read back and verified — mismatch rolls the clone back.
+  - netvm — resolved from the §3.4 inheritance chain and verified after the
+    copy, so a source on an egress outside the umbrella REFUSES rather than
+    silently re-homing its child onto a different path.
 
 Atomicity: there is a brief window between qube creation and tag application
 during which the new qube exists untagged. If tag application fails for any
@@ -134,29 +139,66 @@ def _require_full(vm) -> bool:
         return False
 
 
-def _tier_tags_to_strip() -> set:
-    """The qmcp tier tags a freshly-created qube must NOT carry — every tag in
-    the tier vocabulary except the umbrella. Read off qmcp_tier so it tracks
-    the taxonomy. _TIER is guaranteed loaded here: we only reach the create
-    path after _require_full passed, which denies when _TIER is None."""
-    return set(_TIER.QMCP_TIER_TAGS) - {_TIER.UMBRELLA}
+def _load_birth_lib():
+    """Load the sibling qmcp_birth helper by path (Wave 2 Stage 2).
+
+    Same sibling-import shim as the helpers above. Returns None on any failure;
+    the create path then FAILS CLOSED (see `_birth_stamp`).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_birth", os.path.join(here, "qmcp_birth.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
 
 
-def strip_inherited_tier_tags(vm) -> None:
-    """Stage I-5 keystone enforcement. `app.clone_vm` copies the SOURCE's tags
-    verbatim (qubesadmin copies all but `created-by-*`), so a clone of an
-    `ai-full` source INHERITS `ai-full` — which would let AI mint a CAP_FULL
-    qube and, post-flip, fan out unbounded full-authority qubes, defeating the
-    un-self-escalatability keystone. Remove every elevation/orthogonal tier tag
-    so the clone is UNTIERED (= ai-full in compat, ai-ro post-flip — exactly a
-    fresh spawn). Raises if any tier tag survives, so the caller rolls the clone
-    back rather than ship an escalated qube."""
-    for tag in _tier_tags_to_strip():
-        if tag in vm.tags:
-            vm.tags.discard(tag)
-    leftover = _tier_tags_to_strip() & set(vm.tags)
-    if leftover:
-        raise RuntimeError(f"failed to strip inherited tier tags: {sorted(leftover)}")
+_BIRTH = _load_birth_lib()
+
+
+def _principal() -> str:
+    """The calling principal — the qrexec source domain (D1)."""
+    import os
+    return os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown"
+
+
+def _birth_stamp(vm, source_tags) -> None:
+    """Wave 2 Stage 2 birth stamp — supersedes I-5's `strip_inherited_tier_tags`.
+
+    `app.clone_vm` copies the SOURCE's tags verbatim (qubesadmin copies all but
+    `created-by-*`), which before I-5 let a clone of an `ai-full` source emerge
+    `ai-full` — AI minting unbounded full-authority qubes and defeating the
+    un-self-escalatability keystone. I-5 answered that by stripping to
+    UNTIERED; Stage 2 replaces the blanket strip with the D2 clamp, so the
+    clone is born at the source's LITERAL tier bounded by the operator's
+    `/etc/qmcp/birth-ceiling`. That is still not escalation — nothing can
+    exceed the source, and the source's tier is operator-assigned because AI
+    cannot write tags — and it is what makes the clone usable by its creator
+    with no operator action in between (the F6 unblock).
+
+    Restrictions on the source (`qmcp-guarded`, `qmcp-egress-locked_*`,
+    `anon-vm`) ride along unconditionally: per F-E, a restriction the strip can
+    remove is a laundering hole — clone the guarded qube, lose the guard.
+
+    Raises on any mismatch so the caller rolls the clone back rather than ship
+    a qube whose authority it could not prove.
+    """
+    if _BIRTH is None or _TIER is None:
+        raise RuntimeError("birth helper unavailable")
+    _BIRTH.stamp(
+        _BIRTH.TagIO.for_vm(vm),
+        source_tags,
+        _principal(),
+        _TIER.resolve_birth_tier(tags=source_tags),
+        _TIER.UMBRELLA,
+        _TIER.QMCP_TIER_TAGS,
+    )
 
 
 def _load_consent_lib():
@@ -305,6 +347,17 @@ def emit(payload: dict) -> int:
     return 0 if payload.get("ok") else 1
 
 
+def netvm_name(vm):
+    """A qube's netvm as a plain name, or None. Used for the birth-egress
+    read-back: the property yields a VM object, and comparing objects to the
+    name the chain resolved would silently never match."""
+    try:
+        got = getattr(vm, "netvm", None)
+    except Exception:
+        return None
+    return None if got is None else str(getattr(got, "name", got))
+
+
 def best_effort_remove(app, name: str) -> bool:
     """Try to remove a qube created by this script. Returns True on success."""
     try:
@@ -349,6 +402,10 @@ def main() -> int:
     if source not in app.domains:
         return emit(NOT_FOUND)
     src_vm = app.domains[source]
+    # Snapshot the source's tags BEFORE anything is created: the birth stamp
+    # clamps privilege off this set and inherits restrictions from it, and
+    # reading it back off the clone instead would be reading our own output.
+    source_tags = set(src_vm.tags)
     if "ai-managed" not in src_vm.tags:
         return emit(NOT_FOUND)
 
@@ -376,6 +433,31 @@ def main() -> int:
     if name in app.domains:
         return emit({"ok": False, "error": f"qube '{name}' already exists"})
 
+    # ----- Wave 2 Stage 2: birth egress (§3.4) -----
+    # `clone_vm` copies the source's netvm, so the clone is ALREADY born on the
+    # inherited path in the common case. This resolves the same answer up front
+    # anyway and verifies it after, for two reasons: the copy is qubesadmin's
+    # behaviour rather than our guarantee (the I-5 lesson — the mock agreed
+    # with us instead of with Qubes), and a source sitting on an egress outside
+    # the umbrella must REFUSE rather than silently re-home its child.
+    # A TemplateVM source is not authoritative: a template's netvm is an update
+    # path, not a workload egress, so a cloned template lands on the calling
+    # principal's egress instead of the operator's upstream.
+    if _CAPS is None:
+        return emit({"ok": False, "error": "birth egress could not be resolved"})
+    try:
+        actor_vm = app.domains[_principal()]
+    except Exception:
+        actor_vm = None
+    resolved, egress_rule = _CAPS.resolve_birth_egress(
+        actor_vm, src_vm,
+        is_ai_managed=lambda n: (n in app.domains
+                                 and "ai-managed" in app.domains[n].tags),
+        **({} if getattr(src_vm, "klass", None) == "TemplateVM"
+           else {"source_authoritative": True}))
+    if egress_rule == "birth-egress:unresolved":
+        return emit({"ok": False, "error": "birth egress could not be resolved"})
+
     # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
     # Refuse if the projected persistent sum would exceed `/etc/qmcp/pool-cap`.
     # A clone COPIES the source's volumes, so its estimate is the source's full
@@ -400,22 +482,25 @@ def main() -> int:
     except Exception as e:
         return emit({"ok": False, "error": f"clone failed: {e}"})
 
-    # ----- Step 2: apply ai-managed tag + strip inherited tiers (race window) -----
+    # ----- Step 2: birth stamp + birth egress (race window) -----
+    # Both are inside one try so a failure in either rolls the clone back. A
+    # clone whose authority OR whose egress we could not prove is exactly the
+    # qube that must not survive to be started ("burn, don't repair" — nothing
+    # has booted yet, so nothing has leaked).
     try:
-        new_vm.tags.add("ai-managed")
-        if "ai-managed" not in new_vm.tags:
-            raise RuntimeError("tag.add returned but tag not visible on refresh")
-        # Stage I-5: clone_vm copied the source's tags, so the clone may carry
-        # an inherited ai-full/ai-net/ai-exec/ai-dump. Strip them — a created
-        # qube is UNTIERED (umbrella only), never elevated. (See helper.)
-        strip_inherited_tier_tags(new_vm)
+        _birth_stamp(new_vm, source_tags)
+        if netvm_name(new_vm) != resolved:
+            new_vm.netvm = None if resolved is None else app.domains[resolved]
+        got = netvm_name(new_vm)
+        if got != resolved:
+            raise RuntimeError(f"netvm read back as {got!r}, expected {resolved!r}")
     except Exception as e:
         removed = best_effort_remove(app, name)
         if removed:
             return emit({"ok": False,
-                         "error": f"tag application failed (rolled back): {e}"})
+                         "error": f"birth stamp failed (rolled back): {e}"})
         return emit({"ok": False, "error":
-            f"tag application failed AND rollback failed: {e}; "
+            f"birth stamp failed AND rollback failed: {e}; "
             f"manual cleanup of qube '{name}' required in dom0"})
 
     return emit({"ok": True, "name": name})

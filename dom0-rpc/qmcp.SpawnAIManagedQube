@@ -28,16 +28,22 @@ Input  (stdin, JSON): {
                       whether the klass is AppVM-with-flag or the distinct
                       DispVMTemplate klass).
 
-Netvm defaulting (Stage C):
-  - "netvm" key omitted → defaults to "ai-net-router" if it exists AND
-    is ai-managed; otherwise no netvm (qube has no network).
-  - "netvm" key present and null → explicit "no network"; never defaulted.
-  - "netvm" key present and a string → used as-is; must be ai-managed.
+Birth egress (Wave 2 Stage 2 — supersedes Stage C's netvm defaulting):
+  - "netvm" key omitted → INHERITED, via qmcp_caps.resolve_birth_egress:
+    the creation source's netvm, else the calling principal's, else
+    /etc/qmcp/birth-egress, else the create is REFUSED.
+  - "netvm" key present and null → explicit "no network". De-escalation
+    cannot leak, so it needs no approval.
+  - "netvm" key present and a string → must be ai-managed AND must equal
+    the inherited value. Any other value is escalation-class and refused;
+    no tier grants it.
 
-  ai-net-router is the single egress qube the operator configures; AI's
-  qubes inherit it by default. AI cannot retarget ai-net-router itself
-  (the SetPropertyAIManaged wrapper refuses netvm changes on any qube
-  whose provides_network is true).
+  The Stage C constant `DEFAULT_NETVM = "ai-net-router"` is gone. It was
+  fleet-specific (an adopter whose egress qube is named otherwise got
+  qubes with no network at all) and, on a fleet with more than one egress
+  class, it was the leak §3.4 exists to prevent: an agent working behind
+  Tor spawning a clearnet qube that resolves DNS on first boot. AI still
+  cannot retarget an existing qube's netvm at any tier.
 
 Output (stdout, JSON):
     {"ok": true,  "name": "<new-vm-name>"}
@@ -72,7 +78,6 @@ import sys
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$")
 ALLOWED_LABELS = {"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"}
 ALLOWED_KLASSES = {"AppVM", "DispVMTemplate", "DispVM"}
-DEFAULT_NETVM = "ai-net-router"
 
 
 def _load_budget_lib():
@@ -167,27 +172,60 @@ def _require_full(vm) -> bool:
         return False
 
 
-def _tier_tags_to_strip() -> set:
-    """The qmcp tier tags a freshly-created qube must NOT carry — every tag in
-    the tier vocabulary except the umbrella. _TIER is guaranteed loaded here
-    (we passed _require_full on the template, which denies when _TIER is None)."""
-    return set(_TIER.QMCP_TIER_TAGS) - {_TIER.UMBRELLA}
+def _load_birth_lib():
+    """Load the sibling qmcp_birth helper by path (Wave 2 Stage 2).
+
+    Same sibling-import shim as the helpers above. Returns None on any failure;
+    the create path then FAILS CLOSED (see `_birth_stamp`). It owns the
+    authority a created qube is born with, so a missing helper must refuse the
+    create — the tier/consent posture, never the best-effort audit one.
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_birth", os.path.join(here, "qmcp_birth.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
 
 
-def strip_inherited_tier_tags(vm) -> None:
-    """Stage I-5 keystone enforcement (defense-in-depth). `app.add_new_vm`
-    creates a FRESH qube and — on current qubesadmin — copies no tags, so a
-    spawn does not inherit the template's tier (unlike clone_vm / Create-
-    Disposable, which do and are stripped likewise). This strip is the
-    version-robust guarantee that a created qube is UNTIERED regardless of any
-    future qubesadmin change: remove every elevation/orthogonal tier tag,
-    raise if any survives (caller rolls the qube back)."""
-    for tag in _tier_tags_to_strip():
-        if tag in vm.tags:
-            vm.tags.discard(tag)
-    leftover = _tier_tags_to_strip() & set(vm.tags)
-    if leftover:
-        raise RuntimeError(f"failed to strip inherited tier tags: {sorted(leftover)}")
+_BIRTH = _load_birth_lib()
+
+
+def _principal() -> str:
+    """The calling principal — the qrexec source domain (D1)."""
+    import os
+    return os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown"
+
+
+def _birth_stamp(vm, source_tags) -> None:
+    """Wave 2 Stage 2: stamp umbrella + owner + birth tier, inherit
+    restrictions, strip inherited privilege, verify, or raise so the caller
+    rolls the qube back.
+
+    Supersedes the I-5 `strip_inherited_tier_tags` on this path. The strip is
+    still here — it is the `have - want` half of `qmcp_birth.stamp` — but it is
+    now one side of a two-sided assertion rather than a lone removal, and the
+    birth tier it clamps to comes from `qmcp_tier.resolve_birth_tier` instead
+    of being unconditionally "untiered". `app.add_new_vm` creates a FRESH qube
+    that copies no tags today; keeping the strip is the version-robust
+    guarantee that stays correct if a future qubesadmin starts propagating.
+    """
+    if _BIRTH is None or _TIER is None:
+        raise RuntimeError("birth helper unavailable")
+    _BIRTH.stamp(
+        _BIRTH.TagIO.for_vm(vm),
+        source_tags,
+        _principal(),
+        _TIER.resolve_birth_tier(tags=source_tags),
+        _TIER.UMBRELLA,
+        _TIER.QMCP_TIER_TAGS,
+    )
 
 
 def _load_consent_lib():
@@ -439,10 +477,12 @@ def main() -> int:
     # non-ai-managed one). Fail-closed.
     _full_ok = _require_full(tpl)
     # Wave 2 Stage 1 (SHADOW): record kernel disagreement only. `klass` feeds the
-    # escalation check (TemplateVM), `netvm` is the birth-egress half — inert
-    # until Stage 2 supplies `resolved_netvm` from qmcp_caps.resolve_birth_egress
-    # and the two can be compared. Passing it now means the wiring does not
-    # change when the comparison arms.
+    # escalation check (TemplateVM). `netvm` is passed but the kernel's
+    # birth-egress comparison stays inert here, and deliberately so: Stage 2
+    # enforces §3.4 in THIS wrapper (below), before any create, so there is no
+    # divergence left for the shadow to record. Handing the kernel a
+    # `resolved_netvm` at this point would only re-derive an answer the wrapper
+    # is about to act on — a second opinion is not a second enforcement.
     _shadow_note("spawn", {"template": tpl},
                  {"klass": klass, "netvm": netvm}, _full_ok)
     if not _full_ok:
@@ -466,17 +506,66 @@ def main() -> int:
     if tpl_err is not None:
         return fail(tpl_err)
 
-    # Stage C default: when the caller omitted netvm, try ai-net-router.
-    # We only apply this when it exists AND is ai-managed; otherwise we leave
-    # netvm unset (the qube comes up with no network — caller can fix later).
-    if not netvm_specified:
-        if DEFAULT_NETVM in app.domains and "ai-managed" in app.domains[DEFAULT_NETVM].tags:
-            netvm = DEFAULT_NETVM
+    # ----- Wave 2 Stage 2: birth egress (§3.4) -----
+    # Stage C's `DEFAULT_NETVM = "ai-net-router"` constant is GONE. It was
+    # fleet-specific and already public: on an adopter whose egress qube has any
+    # other name the lookup missed and every spawned qube came up silently with
+    # no network. Worse, on a fleet with two egress classes it produced the leak
+    # this invariant exists to prevent — an agent working behind Tor spawning a
+    # clearnet qube that resolves DNS on first boot (demonstrated on the rig,
+    # Stage 0.5). The netvm now comes from the inheritance chain instead.
+    #
+    # The source's klass decides whether its netvm is authoritative: a
+    # TemplateVM's netvm is an update path, not a workload egress, so a
+    # template-based spawn falls through to the calling principal's egress. A
+    # DVMT source (klass=DispVM spawns) is a workload and answers for itself,
+    # including when the answer is "no network" (F-J).
+    if _CAPS is None:
+        return fail("birth egress could not be resolved")
+    try:
+        actor_vm = app.domains[_principal()]
+    except Exception:
+        actor_vm = None
+    resolved, egress_rule = _CAPS.resolve_birth_egress(
+        actor_vm, tpl,
+        is_ai_managed=lambda n: (n in app.domains
+                                 and "ai-managed" in app.domains[n].tags),
+        **({} if getattr(tpl, "klass", None) == "TemplateVM"
+           else {"source_authoritative": True}))
+    # Row 4 is checked per branch, NOT up front, and the difference is not
+    # cosmetic: an explicit `netvm: null` is de-escalation and cannot leak, so
+    # refusing it because the INHERITANCE chain failed to resolve would deny a
+    # request that never needed an inherited value. Refuse only where the
+    # resolved value is actually load-bearing.
+    unresolved = (egress_rule == "birth-egress:unresolved")
 
-    # Same opaque-cross-ref pattern as template above.
-    if netvm is not None:
-        if netvm not in app.domains or "ai-managed" not in app.domains[netvm].tags:
-            return fail("netvm must reference an ai-managed qube")
+    if netvm_specified:
+        # Explicit null stays allowed with no approval: de-escalation cannot
+        # leak (brief §3.4's carve-out). The provides_network exception there
+        # cannot apply to a create — a qube is never born providing network.
+        if netvm is not None:
+            # Opaque cross-ref FIRST, exactly as before, so an out-of-scope
+            # name still collapses to the same message and the egress check
+            # below can never be read as an existence oracle.
+            if netvm not in app.domains or "ai-managed" not in app.domains[netvm].tags:
+                return fail("netvm must reference an ai-managed qube")
+            if unresolved or str(netvm) != str(resolved):
+                # Escalation-class: a birth egress differing from the creator's
+                # is exactly §3.4's deanonymisation event. Informative on
+                # purpose — it fires only after the referenced qube has been
+                # confirmed ai-managed, so AI already knows it exists. An
+                # unresolved chain lands here too: with nothing to match
+                # against, a pinned value cannot be shown to be the inherited
+                # one, and unverifiable is refused.
+                return fail("netvm must match the inherited birth egress")
+    elif unresolved:
+        # Row 4 — the honest failure, and only here does it belong. Refusing
+        # beats birthing a qube on a silently wrong (or absent) egress, which
+        # is what the deleted DEFAULT_NETVM fallback did. Nothing in this
+        # message names a qube, so it is no existence oracle.
+        return fail("birth egress could not be resolved")
+    else:
+        netvm = resolved
 
     # ----- I-0 budget gate (persistent-footprint basis, 2026-06-12) -----
     # Two checks, both opaque-on-refuse:
@@ -515,16 +604,9 @@ def main() -> int:
     except Exception as e:
         return fail(f"create failed: {e}")
 
-    # ----- Step 2: apply ai-managed tag (race window starts here) -----
+    # ----- Step 2: apply the birth stamp (race window starts here) -----
     try:
-        new_vm.tags.add("ai-managed")
-        # Post-condition: the tag must be visible after add.
-        if "ai-managed" not in new_vm.tags:
-            raise RuntimeError("tag.add returned but tag not visible on refresh")
-        # Stage I-5 (defense-in-depth): a created qube is UNTIERED — strip any
-        # tier tag, so spawn cannot mint an elevated qube even if a future
-        # qubesadmin add_new_vm started inheriting template tags. (See helper.)
-        strip_inherited_tier_tags(new_vm)
+        _birth_stamp(new_vm, set(tpl.tags))
     except Exception as e:
         # Roll back: untagged qube must not persist.
         removed = best_effort_remove(app, name)
@@ -556,19 +638,33 @@ def main() -> int:
     # the operator's chosen upstream. We override unconditionally so the
     # request shape determines the netvm: ai-net-router (default), a
     # specified ai-managed qube, or None.) -----
+    #
+    # Wave 2 Stage 2: this is now FATAL, where it used to return ok=true with a
+    # warning. A qube created and tagged but sitting on the system-default
+    # netvm is on an egress nobody chose — the operator's own upstream, quite
+    # possibly outside the umbrella entirely. "Burn, don't repair": a create
+    # whose egress cannot be proven is rolled back, never handed to AI with a
+    # note attached. Nothing has started at this point, so nothing has leaked;
+    # that is only true because this runs before the qube's first boot.
     try:
         if netvm is None:
             new_vm.netvm = None
         else:
             new_vm.netvm = app.domains[netvm]
+        # Read back. Setting a property and trusting the setter is how the
+        # disposable path (F-F) went wrong; the platform is not ours to assume.
+        got = getattr(new_vm, "netvm", None)
+        got_name = None if got is None else str(getattr(got, "name", got))
+        if got_name != (None if netvm is None else str(netvm)):
+            raise RuntimeError(f"netvm read back as {got_name!r}")
     except Exception as e:
-        # Tag is already applied — qube IS in ai-managed scope. Leave it.
-        # AI can fix netvm later via qmcp.SetPropertyAIManaged.
-        return emit({
-            "ok": True,
-            "name": name,
-            "warning": f"qube created and tagged but netvm assignment failed: {e}",
-        })
+        removed = best_effort_remove(app, name)
+        if removed:
+            return fail(f"netvm assignment failed (rolled back): {e}")
+        return fail(
+            f"netvm assignment failed AND rollback failed: {e}; "
+            f"manual cleanup of qube '{name}' required in dom0"
+        )
 
     # ----- Step 5: grow the private volume if a (cap-checked) size was requested.
     # Non-fatal: the qube is created, tagged, and in scope; a resize failure just

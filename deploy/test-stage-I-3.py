@@ -29,8 +29,9 @@ Tests (all HARD):
      I-3 added no read regression and no new oracle.
   3. No AI-facing tier surface. The MCP tool layer (qubes_mcp/tools/) does not
      reach the tier helper, the tier-default flag, or the capability resolver:
-     enforcement is dom0-only (the server.py _RING_MIN_TIER annotation is
-     declarative ring vocabulary, not a tool and not a boundary — design §4.1).
+     enforcement is dom0-only. (server.py carried a declarative
+     `_RING_MIN_TIER` annotation here until Wave 2 Stage 2 deleted it: a tier
+     table above the dom0 boundary reads as a control and is not one.)
 
 Pure read probes — does NOT create or modify any qube.
 """
@@ -138,9 +139,9 @@ def test_3_no_aifacing_tier_surface() -> bool:
     # Silent static scan (no fake-service probes — those trip the qrexec
     # catch-all deny and pop denial dialogs on the operator's screen). The
     # AI-facing surface is the MCP tool layer; scan it for any reach into the
-    # tier helper / flag / resolver. server.py's _RING_MIN_TIER is declarative
-    # ring vocabulary (not a tool, not a boundary — design §4.1) and is out of
-    # scope by construction.
+    # tier helper / flag / resolver. server.py's declarative `_RING_MIN_TIER`
+    # annotation was deleted in Wave 2 Stage 2 (no-illusion invariant), so the
+    # server holds no tier vocabulary at all now.
     tools = Path(__file__).resolve().parents[1] / "qubes_mcp" / "tools"
     needles = ("qmcp_tier", "tier-default", "tier_default", "effective_capabilities")
     offenders = []

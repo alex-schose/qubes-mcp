@@ -416,6 +416,62 @@ W2-1. Wave 2 Stage 1 — the capability decision kernel, in SHADOW mode.
     decide() is gated on it holding nothing unexplained. No policy change;
     no daemon restart; no new RPC service (a lib is not a service); no new
     ring; no AI-visible surface of any kind.
+W2-2. Wave 2 Stage 2 — ownership + birth tier + birth egress. The first
+    stage that deliberately CHANGES create-path behaviour, because it is the
+    one that makes least privilege operable (the 1.0.0 gate). Three things
+    become properties of a created qube rather than accidents of what the
+    platform propagated:
+    OWNERSHIP — a new shared dom0 lib (qmcp_birth.py) owns a reserved `qmcp-*`
+    namespace and stamps `qmcp-owner_<principal>` from the qrexec source
+    domain. Provenance is carried here and NEVER on `created-by-*`: qubesd
+    stamps that with the CALLING domain, which is dom0 for every qmcp create,
+    so it cannot distinguish an AI-spawned qube from an operator-created one
+    (and `disp-created-by-*` escapes qubesd's guard entirely, so it is
+    forgeable by anything holding tag.Set). The namespace has two classes and
+    the asymmetry is the design: PRIVILEGE tags (the tier ladder, the owner
+    tag) are CLAMPED to the actor's authority on the source; RESTRICTION tags
+    (`qmcp-egress-locked_*`, `qmcp-guarded`, the platform's `anon-vm`) are
+    INHERITED UNCONDITIONALLY, because a restriction the clamp can remove is a
+    laundering hole — clone the guarded qube, lose the guard.
+    BIRTH TIER — replaces I-5's blanket strip-to-untiered with the D2 clamp:
+    a child is born at its source's tier, bounded by the operator-owned
+    `/etc/qmcp/birth-ceiling` (absent = no clamp; malformed = fail closed to
+    untiered). Read off the source's LITERAL tag, never its effective
+    capability: in compat an untiered qube resolves to ai-full, so clamping on
+    the effective value would mint permanently-ai-full children throughout the
+    migration — qubes keeping full authority through the flip when everything
+    else drops to the read floor. Reading the literal tag makes the stage
+    behaviour-neutral in compat by construction and correct after the flip.
+    Self-escalation stays impossible: nothing is born ABOVE its source, and a
+    source's tier is operator-assigned because AI cannot write tags.
+    BIRTH EGRESS — §3.4's inheritance chain, first match wins: the creation
+    SOURCE's netvm (a clone source or DVMT answers for itself, including when
+    the answer is "no network"), else the calling PRINCIPAL's netvm, else
+    `/etc/qmcp/birth-egress` (operator-owned, installer-written), else REFUSE
+    the create. A TemplateVM source is not authoritative — a template's netvm
+    is an update path, not a workload egress — so template-based spawns take
+    the gateway's egress. Source outranks principal deliberately: a clone of a
+    Tor-side qube must stay on Tor even when the gateway sits on clearnet.
+    This DELETES the hardcoded `DEFAULT_NETVM = "ai-net-router"`, which was
+    fleet-specific and already public: on an adopter whose egress qube is
+    named otherwise, every spawned qube came up with no network — and on a
+    fleet with two egress classes it produced the leak the invariant exists to
+    prevent, a Tor-side agent spawning a clearnet qube that resolves DNS on
+    first boot. A caller-supplied netvm is accepted only if it equals the
+    inherited value; explicit null stays allowed with no approval (de-
+    escalation cannot leak). Every create reads its tag state and its netvm
+    BACK and ROLLS THE QUBE BACK on any mismatch — including where a netvm
+    failure previously returned ok=true with a warning ("burn, don't repair";
+    nothing has started yet, so nothing has leaked).
+    Also lands the no-illusion rider: `server.py`'s declarative `_RING_MIN_TIER`
+    is DELETED. It was accurate and enforced nothing, and a tier table above
+    the dom0 boundary reads as a control to anyone skimming.
+    Not AI-observable: the owner and tier tags stay outside
+    `qmcp_scope.QMCP_TAG_VOCABULARY`, so a `tags` read is unchanged and the
+    authority topology is still not an oracle — which also means the hardware
+    proof of this stage is a `qvm-tags` read in dom0, not an AI-seat test.
+    No new RPC service (a lib is not a service); no policy change; no daemon
+    restart; no new ring.
 G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
    Gateway input boundary: SetProperty settable-property allowlist
    (provides_network operator-only), qrexec target-name validator, device
@@ -549,11 +605,15 @@ qubes_mcp/                          # repo root
 │                                      # on CAP_FULL + strip inherited tier tags on
 │                                      # create. I-5 added NO new dom0-rpc file —
 │                                      # it modified the 8 wrappers + the policy.)
-│   └── qmcp_caps.py                  # Wave 2 Stage 1 — the decision kernel, SHADOW
+│   ├── qmcp_caps.py                  # Wave 2 Stage 1 — the decision kernel, SHADOW
 │                                      # mode: decide() derives a verdict from the
 │                                      # domination lattice, the 8 wrappers compare it
 │                                      # against what they did and log only the
 │                                      # difference. Enforces nothing (see below).
+│   └── qmcp_birth.py                 # Wave 2 Stage 2 — the reserved qmcp-* namespace
+│                                      # + the atomic birth stamp (owner, birth tier,
+│                                      # restriction inheritance, read-back, rollback),
+│                                      # loaded by the 3 create wrappers
 ├── template-rpc/                   # drafts → /etc/qubes-rpc/ inside ai-managed templates
 │   ├── qmcp.RunInAIManaged
 │   └── qmcp.CopyToAIManaged

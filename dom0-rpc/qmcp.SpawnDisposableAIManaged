@@ -301,52 +301,82 @@ def create_disposable(app, tpl) -> str:
     return name
 
 
-def apply_tag_direct(app, vm_name: str, tag: str) -> None:
-    """Set a tag via direct admin call — bypasses the domains cache."""
-    app.qubesd_call(vm_name, "admin.vm.tag.Set", tag)
+def _load_birth_lib():
+    """Load the sibling qmcp_birth helper by path (Wave 2 Stage 2).
+
+    Same sibling-import shim as the helpers above. Returns None on any failure;
+    the create path then FAILS CLOSED (see `_birth_stamp_direct`).
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_birth", os.path.join(here, "qmcp_birth.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
 
 
-def has_tag_direct(app, vm_name: str, tag: str) -> bool:
-    """Read tags via direct admin call. Returns True iff `tag` is set."""
-    raw = app.qubesd_call(vm_name, "admin.vm.tag.List")
-    tags = set(raw.decode(errors="replace").split())
-    return tag in tags
+_BIRTH = _load_birth_lib()
 
 
-def list_tags_direct(app, vm_name: str) -> set:
-    """All tags on `vm_name` via direct admin call (cache-lag-safe)."""
-    raw = app.qubesd_call(vm_name, "admin.vm.tag.List")
-    return set(raw.decode(errors="replace").split())
+def _principal() -> str:
+    """The calling principal — the qrexec source domain (D1)."""
+    import os
+    return os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown"
 
 
-def remove_tag_direct(app, vm_name: str, tag: str) -> None:
-    """Remove a tag via direct admin call — bypasses the domains cache."""
-    app.qubesd_call(vm_name, "admin.vm.tag.Remove", tag)
+def _birth_stamp_direct(app, vm_name: str, source_tags) -> None:
+    """Wave 2 Stage 2 birth stamp — supersedes I-5's strip on this path.
+
+    `admin.vm.CreateDisposable` INHERITS the DVMT's tags (slot-16 confirmed the
+    umbrella is inherited), so a disposable off an `ai-full` DVMT emerged
+    `ai-full` — an ephemeral CAP_FULL grant the gate was meant to withhold.
+    I-5 answered with a blanket strip to UNTIERED; Stage 2 replaces it with the
+    D2 clamp (source tier, bounded by `/etc/qmcp/birth-ceiling`) so the
+    disposable is usable by its creator without an operator action, while
+    still never exceeding its DVMT.
+
+    Uses the direct-qubesd TagIO for the same VMCollection-cache-lag reason the
+    rest of this wrapper does: `app.domains[disp_name]` raises KeyError for
+    several seconds after CreateDisposable (reviewer ask #7).
+
+    Raises on any mismatch so the caller kills the disposable.
+    """
+    if _BIRTH is None or _TIER is None:
+        raise RuntimeError("birth helper unavailable")
+    _BIRTH.stamp(
+        _BIRTH.TagIO.for_qubesd(app, vm_name),
+        source_tags,
+        _principal(),
+        _TIER.resolve_birth_tier(tags=source_tags),
+        _TIER.UMBRELLA,
+        _TIER.QMCP_TIER_TAGS,
+    )
 
 
-def _tier_tags_to_strip() -> set:
-    """The qmcp tier tags a freshly-created qube must NOT carry — every tag in
-    the tier vocabulary except the umbrella. _TIER is guaranteed loaded here
-    (we passed _require_full, which denies when _TIER is None)."""
-    return set(_TIER.QMCP_TIER_TAGS) - {_TIER.UMBRELLA}
+def netvm_name_direct(app, vm_name: str):
+    """A disposable's netvm as a plain name, or None — via direct admin call.
+
+    `admin.vm.property.Get` answers `default=False type=vm <name>`; an unset
+    netvm answers with an empty value. Parsed here rather than through
+    `app.domains[...]` for the cache-lag reason above.
+    """
+    raw = app.qubesd_call(vm_name, "admin.vm.property.Get", "netvm")
+    text = raw.decode(errors="replace")
+    value = text.split(" ", 2)[-1] if " " in text else text
+    value = value.strip()
+    return value or None
 
 
-def strip_inherited_tier_tags_direct(app, vm_name: str) -> None:
-    """Stage I-5 keystone enforcement. admin.vm.CreateDisposable INHERITS the
-    DVMT's tags (slot-16 confirmed `ai-managed` is inherited), so a disposable
-    from an `ai-full` DVMT also inherits `ai-full` — an ephemeral CAP_FULL grant
-    the gate is meant to withhold. Remove every elevation/orthogonal tier tag so
-    the disposable is UNTIERED. Uses direct qubesd calls for the same
-    VMCollection-cache-lag reason the rest of this wrapper does. Raises if any
-    tier tag survives, so the caller rolls the disposable back."""
-    # Read-first: only remove tags actually present, so this is robust whether
-    # admin.vm.tag.Remove is idempotent or errors on an absent tag.
-    present = list_tags_direct(app, vm_name)
-    for tag in (_tier_tags_to_strip() & present):
-        remove_tag_direct(app, vm_name, tag)
-    leftover = _tier_tags_to_strip() & list_tags_direct(app, vm_name)
-    if leftover:
-        raise RuntimeError(f"failed to strip inherited tier tags: {sorted(leftover)}")
+def set_netvm_direct(app, vm_name: str, netvm) -> None:
+    """Set a disposable's netvm via direct admin call ("" clears it)."""
+    app.qubesd_call(vm_name, "admin.vm.property.Set", "netvm",
+                    ("" if netvm is None else str(netvm)).encode())
 
 
 def kill_direct(app, vm_name: str) -> None:
@@ -435,6 +465,30 @@ def main() -> int:
     if cap_err is not None:
         return emit({"ok": False, "error": cap_err})
 
+    # ----- Wave 2 Stage 2: birth egress (§3.4) -----
+    # Per F-F the platform gives the disposable the DVMT's netvm. That is row 1
+    # of the inheritance chain by construction, but it is the platform's
+    # behaviour rather than our guarantee, so the chain is resolved here and
+    # verified after create — BEFORE the disposable is ever started. A DVMT is
+    # an AppVM carrying template_for_dispvms, never a TemplateVM, so it is
+    # always an authoritative source: an offline DVMT yields an offline
+    # disposable rather than one handed the gateway's egress (F-J).
+    source_tags = set(tpl.tags)
+    if _CAPS is None:
+        return emit({"ok": False, "error": "birth egress could not be resolved"})
+    try:
+        actor_vm = app.domains[_principal()]
+    except Exception:
+        actor_vm = None
+    resolved, egress_rule = _CAPS.resolve_birth_egress(
+        actor_vm, tpl,
+        is_ai_managed=lambda n: (n in app.domains
+                                 and "ai-managed" in app.domains[n].tags),
+        **({} if getattr(tpl, "klass", None) == "TemplateVM"
+           else {"source_authoritative": True}))
+    if egress_rule == "birth-egress:unresolved":
+        return emit({"ok": False, "error": "birth egress could not be resolved"})
+
     # ----- Step 1: create the disposable -----
     try:
         disp_name = create_disposable(app, tpl)
@@ -446,21 +500,24 @@ def main() -> int:
     # `app.domains[disp_name]` here (the VMCollection cache lags
     # CreateDisposable and raises KeyError for several seconds).
     try:
-        apply_tag_direct(app, disp_name, "ai-managed")
-        if not has_tag_direct(app, disp_name, "ai-managed"):
-            raise RuntimeError("tag.Set returned but tag not visible on refresh")
-        # Stage I-5: CreateDisposable inherited the DVMT's tags, so the
-        # disposable may carry an inherited ai-full/ai-net/ai-exec/ai-dump.
-        # Strip them — a created qube is UNTIERED (umbrella only). (See helper.)
-        strip_inherited_tier_tags_direct(app, disp_name)
+        _birth_stamp_direct(app, disp_name, source_tags)
+        # Pin the egress EXPLICITLY even when the inherited default already
+        # matches, then read it back. An explicit value cannot drift if the
+        # DVMT is retargeted mid-life, and the read-back is what §3.4 requires
+        # before a disposable is allowed to start. Nothing has started yet, so
+        # a mismatch here costs a kill and no leak.
+        set_netvm_direct(app, disp_name, resolved)
+        got = netvm_name_direct(app, disp_name)
+        if got != resolved:
+            raise RuntimeError(f"netvm read back as {got!r}, expected {resolved!r}")
     except Exception as tag_err:
         try:
             kill_direct(app, disp_name)
             return emit({"ok": False,
-                         "error": f"tag application failed (rolled back): {tag_err}"})
+                         "error": f"birth stamp failed (rolled back): {tag_err}"})
         except Exception as kill_err:
             return emit({"ok": False, "error":
-                f"tag application failed AND kill failed: "
+                f"birth stamp failed AND kill failed: "
                 f"tag-err={tag_err}, kill-err={kill_err}; "
                 f"manual cleanup of qube '{disp_name}' required in dom0"})
 

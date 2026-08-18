@@ -80,6 +80,15 @@ import os
 #: privilege once the fleet is tiered.
 TIER_DEFAULT_PATH = "/etc/qmcp/tier-default"
 
+#: Operator-owned ceiling on the tier a CREATED qube may be born with (Wave 2
+#: Stage 2 / decision D2). Re-read per call, same posture as the flag above.
+#: Absent = no clamp (the shipped default): a child is born at its source's
+#: literal tier. A label (`ai-ro` / `ai-exec` / `ai-net` / `ai-full`) clamps to
+#: that rung; anything else is malformed and fails closed to `ai-ro`, i.e. an
+#: untiered child. AI can neither read nor write it — no `qmcp.*` service
+#: exposes it and no policy line reaches it.
+BIRTH_CEILING_PATH = "/etc/qmcp/birth-ceiling"
+
 # --- the tag taxonomy (design §3.1) --------------------------------------
 UMBRELLA = "ai-managed"   #: existence boundary AND read floor
 TAG_EXEC = "ai-exec"
@@ -260,3 +269,76 @@ def has_capability(vm=None, cap: str = "", *, tags=None,
     """True iff the qube grants `cap`. Thin wrapper the I-5 wrappers call as
     `has_capability(vm, qmcp_tier.CAP_FULL)` before a state-changing op."""
     return cap in effective_capabilities(vm, tags=tags, tier_default_path=tier_default_path)
+
+
+# --- birth tier (Wave 2 Stage 2 / D2) -------------------------------------
+#
+# This lives HERE rather than in `qmcp_caps` on purpose. Clamping one rung
+# against another needs the ladder's ORDER, and the I-3 lesson is that the
+# order stays behind this module: the kernel is rank-free and set-returning,
+# so it must not learn that `ai-net` sits above `ai-exec`. Callers ask for a
+# TAG to stamp and never see an index.
+
+#: Ceiling labels the operator file may name, plus the synthetic floor. Maps a
+#: label to its rung index on `ELEVATION_LADDER`; `-1` is "untiered" (umbrella
+#: only), which is what `ai-ro` means as a ceiling.
+_RUNG = {"ai-ro": -1, TAG_EXEC: 0, TAG_NET: 1, TAG_FULL: 2}
+
+
+def _ceiling_rung(birth_ceiling_path: str) -> int:
+    """The operator's birth ceiling as a rung index.
+
+    Absent  -> `len(ELEVATION_LADDER) - 1`, i.e. no clamp (shipped default).
+    A label -> that rung.
+    Anything else (malformed, unreadable-but-present) -> `-1`, fail-closed to
+    an untiered child. Same reasoning as `_untiered_default_label`: the file
+    exists only because the operator created it, so we are in the managed
+    regime and an unreadable value must drop to LEAST authority.
+    """
+    val = _read_operator_word(birth_ceiling_path)
+    if val is None:
+        return len(ELEVATION_LADDER) - 1      # absent: no clamp
+    if val is False:
+        return -1                             # unreadable: fail-closed
+    return _RUNG.get(val, -1)                 # fail-closed on a bad label
+
+
+def resolve_birth_tier(source_vm=None, *, tags=None,
+                       birth_ceiling_path: str = BIRTH_CEILING_PATH):
+    """The elevation tag a qube created from `source_vm` must be born with.
+
+    Returns a tag string (`ai-exec` / `ai-net` / `ai-full`) or **None** for
+    "untiered" — umbrella only, exactly what every create path produced before
+    this stage.
+
+    **Birth tier reads the source's LITERAL tag, never its effective
+    capability, and that distinction is load-bearing.** In compat an untiered
+    umbrella qube resolves to `ai-full`, so stamping the *effective* tier would
+    mint permanently-`ai-full` children throughout the migration — qubes that
+    keep full authority through the flip, when everything else drops to the
+    read floor. That is a silent escalation armed at flip time, the exact shape
+    of bug the I-5 create-path strip exists to prevent. Reading the literal tag
+    instead makes this stage behaviour-neutral in compat by construction (an
+    untiered source still yields an untiered child) and correct after the flip
+    (an operator-tiered `ai-full` source yields an `ai-full` child, which is
+    the F6 unblock and the 1.0.0 bar).
+
+    **Self-escalation stays impossible.** The child's rung is `min(source rung,
+    ceiling)`; nothing in the chain can exceed the source, and the source's
+    rung is operator-assigned because AI cannot write tags. Note that under a
+    single gateway principal "the actor's tier on the source" IS the source's
+    tier — the two only diverge once I-9's principal axis lands, which is why
+    the clamp that actually does work today is the operator's ceiling file.
+
+    Fail-closed: any error resolving the tag set yields None (untiered).
+    """
+    try:
+        tagset = _tags_of(source_vm, tags)
+    except Exception:
+        return None
+    if UMBRELLA not in tagset:
+        return None
+    rung = _highest_elevation(tagset)
+    src = _RUNG.get(rung, -1) if rung is not None else -1
+    idx = min(src, _ceiling_rung(birth_ceiling_path))
+    return ELEVATION_LADDER[idx] if idx >= 0 else None

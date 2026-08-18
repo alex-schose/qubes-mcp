@@ -13,6 +13,86 @@ kept separate so it stays independently reviewable.
 ## [Unreleased]
 
 ### Added
+- **Ownership, birth tier and birth egress on every create path**
+  (`dom0-rpc/qmcp_birth.py`, `deploy/install-stage-2.sh`). A qube created by
+  `qmcp.SpawnAIManagedQube` / `qmcp.CloneAIManagedQube` /
+  `qmcp.SpawnDisposableAIManaged` is now stamped atomically with the
+  `ai-managed` umbrella, `qmcp-owner_<principal>`, the source's tier clamped by
+  the operator-owned `/etc/qmcp/birth-ceiling`, and every restriction its source
+  carried — then the tag state is **read back** and any mismatch rolls the
+  create back.
+
+  A new reserved `qmcp-*` namespace splits tags into two classes with a
+  deliberate asymmetry. *Privilege* tags (the tier ladder, the owner tag) are
+  **clamped** to the authority held on the source. *Restriction* tags
+  (`qmcp-egress-locked_*`, `qmcp-guarded`, and the platform's `anon-vm`) are
+  **inherited unconditionally**, because a restriction the clamp can remove is a
+  laundering hole: clone the guarded qube, lose the guard. Tags the project does
+  not own — an operator's own labels, the platform's `created-by-*` — are left
+  untouched.
+
+  Ownership is carried by that stamped tag and **never** by `created-by-*`.
+  qubesd stamps `created-by-` with the *calling* domain, which is dom0 for every
+  qmcp create, so an AI-spawned qube and an operator-created one are
+  byte-identical under it; `disp-created-by-*` is worse, escaping qubesd's guard
+  entirely and so forgeable by anything holding `tag.Set`.
+
+  Birth tier reads the source's **literal** tag, not its effective capability,
+  and the distinction is load-bearing: while the fleet is in compat an untiered
+  qube resolves to `ai-full`, so clamping on the effective value would mint
+  permanently-`ai-full` children throughout the migration — qubes that keep full
+  authority through the least-privilege flip when everything else drops to the
+  read floor. Reading the literal tag keeps this change invisible in compat and
+  correct after the flip. Nothing is ever born above its source, and a source's
+  tier is operator-assigned because AI cannot write tags.
+
+  This is what makes least privilege *operable*: a created qube is usable by its
+  creator with no operator action in between, which is the gap 0.9.0 documented
+  as a known limitation.
+
+### Changed
+- **BREAKING — a created qube's `netvm` is inherited, not defaulted.** The
+  hardcoded `DEFAULT_NETVM = "ai-net-router"` in `qmcp.SpawnAIManagedQube` is
+  gone. Birth egress now resolves first-match-wins: the creation source's netvm
+  (a clone source or DVMT answers for itself, including when the answer is *no
+  network*), else the calling principal's netvm, else the name in
+  `/etc/qmcp/birth-egress` (written by `install-stage-c.sh`, which already knows
+  it), else the create is **refused**. A `TemplateVM` source is not
+  authoritative — a template's netvm is an update path, not a workload egress —
+  so template-based spawns inherit the gateway's egress.
+
+  Two real bugs close with it. The constant was fleet-specific and already
+  public: on an install whose egress qube is named anything else, every spawned
+  qube silently came up with **no network**. And on a fleet with more than one
+  egress class it produced the leak the invariant exists to prevent — an agent
+  working behind Tor spawning a clearnet qube, which then resolves DNS or checks
+  for updates on first boot.
+
+  A caller-supplied `netvm` is accepted only when it equals the inherited value;
+  any other value is escalation-class and refused at every tier. Explicit `null`
+  remains allowed with no approval, since de-escalation cannot leak.
+  **What this does NOT close, stated plainly.** Stage 2 governs **birth** egress
+  only. Moving an **existing** qube across egress classes is still permitted at
+  `ai-full` — and that is the more dangerous of the two: a newly born qube is
+  empty and has nothing to leak, while an existing one may already hold
+  Tor-derived data, a session, or an identity. The decision kernel already
+  answers `escalation-class` DENY for a `netvm` write, but it runs in shadow, so
+  the wrapper still allows it and only the disagreement is recorded. Retarget
+  closes when enforcement flips to `decide()`. Until then, "egress is enforced"
+  is true of creation and false of mutation.
+- **A create whose egress cannot be proven is rolled back.** A failed `netvm`
+  assignment used to return `ok: true` with a warning, leaving a tagged qube on
+  whatever the system default was — possibly the operator's own upstream. It now
+  rolls the qube back. Disposables have their netvm pinned explicitly and read
+  back *before* they are ever started, so a mismatch costs a kill and no leak.
+- **Removed `_RING_MIN_TIER` from `qubes_mcp/server.py`.** It mapped each ring
+  to the tier its write surface needs — accurate, and enforced nowhere. This
+  layer runs inside `mcp-control`, the untrusted side; the real check is the
+  dom0 helper read across the trust boundary. Nothing above that boundary should
+  resemble a control, because a reader who finds a tier table in the server
+  reasons about the system's authority from a table that has never denied
+  anything, and a comment saying "declarative only" does not survive a skim.
+
 - **A dom0 capability decision kernel, running in shadow mode**
   (`dom0-rpc/qmcp_caps.py`, `deploy/install-stage-1.sh`). `decide(actor,
   service, action, targets)` derives a verdict from a domination lattice rather

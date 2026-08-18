@@ -314,9 +314,10 @@ def test_4_no_aifacing_tier_surface() -> bool:
     # AI-facing surface is the MCP tool layer; scan it for any reach into the
     # tier helper / flag / resolver. I-5 enforces in the dom0 wrappers, so the
     # tool layer must STILL hold no tier surface (it inherits enforcement, it
-    # does not gain a tier read/set). server.py's _RING_MIN_TIER is declarative
-    # ring vocabulary (not a tool, not a boundary — design §4.1) and is out of
-    # scope by construction.
+    # does not gain a tier read/set). server.py held a declarative
+    # `_RING_MIN_TIER` annotation until Wave 2 Stage 2 deleted it under the
+    # no-illusion invariant — nothing above the dom0 boundary may resemble a
+    # tier control, not even accurately.
     tools = Path(__file__).resolve().parents[1] / "qubes_mcp" / "tools"
     needles = ("qmcp_tier", "tier-default", "tier_default",
                "effective_capabilities", "has_capability")

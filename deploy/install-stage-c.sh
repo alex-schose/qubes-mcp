@@ -24,10 +24,17 @@
 #   EGRESS_MEMORY    = 500                    # RAM in MiB
 #   EGRESS_UPSTREAM  = sys-firewall           # netvm; "" means offline
 #
-# Note: the default-netvm constant in dom0-rpc/qmcp.SpawnAIManagedQube is
-# hard-coded to "ai-net-router". If you set EGRESS_QUBE to something else,
-# also sed-replace DEFAULT_NETVM in that script before installing, or
-# AI-spawned qubes will inherit no netvm by default.
+# Note (was a footgun until Wave 2 Stage 2, now handled): the spawn wrapper used
+# to carry a hardcoded `DEFAULT_NETVM = "ai-net-router"`, so setting EGRESS_QUBE
+# to anything else meant every AI-spawned qube silently came up with NO network
+# unless you also sed-replaced that constant. The constant is gone. This script
+# now writes the name to /etc/qmcp/birth-egress and the create paths inherit
+# their netvm from the §3.4 chain, so EGRESS_QUBE works whatever you set it to.
+#
+# Gateway placement matters for that chain: mcp-control should itself sit behind
+# an ai-managed egress qube (`qvm-prefs mcp-control netvm <EGRESS_QUBE>`), so a
+# template-based create inherits the gateway's real egress rather than falling
+# back to the configured constant. This script says so if it is not the case.
 
 set -euo pipefail
 # ---------------------------------------------------------------- flip coherence guard
@@ -145,6 +152,39 @@ if qvm-tags "$EGRESS_QUBE" 2>/dev/null | grep -q '^ai-managed$'; then
 else
     qvm-tags "$EGRESS_QUBE" add ai-managed
     echo "==> Tagged $EGRESS_QUBE ai-managed."
+fi
+
+# Wave 2 Stage 2: record the egress qube's NAME where the create paths can read
+# it (row 3 of the §3.4 birth-egress chain). This is the file that replaced the
+# hardcoded `DEFAULT_NETVM = "ai-net-router"` in qmcp.SpawnAIManagedQube — a
+# constant that was fleet-specific and already public, so on an adopter's
+# install whose egress qube is named anything else, every spawned qube came up
+# with no network at all. This script is the one place that already knows the
+# right name, so it writes it and the constant is gone. Rows 1-2 (the source's
+# and the principal's own egress) normally answer first; this is the backstop
+# for a gateway sitting outside the umbrella.
+sudo install -d -m 0755 -o root -g root /etc/qmcp
+if [ -e /etc/qmcp/birth-egress ]; then
+    echo "==> /etc/qmcp/birth-egress exists -> $(cat /etc/qmcp/birth-egress) (left alone)."
+else
+    printf '%s\n' "$EGRESS_QUBE" | sudo tee /etc/qmcp/birth-egress >/dev/null
+    sudo chmod 0644 /etc/qmcp/birth-egress
+    echo "==> Wrote /etc/qmcp/birth-egress -> $EGRESS_QUBE."
+fi
+
+# The gateway's own placement is load-bearing and easy to get wrong: rows 1-2
+# of the chain only resolve when mcp-control itself sits behind an ai-managed
+# egress qube. Say so at install time rather than leaving it to the README.
+_gw_netvm="$(qvm-prefs "$SOURCE_QUBE" netvm 2>/dev/null || true)"
+if [ -n "$_gw_netvm" ] && qvm-tags "$_gw_netvm" 2>/dev/null | grep -q '^ai-managed$'; then
+    echo "==> Gateway $SOURCE_QUBE sits behind $_gw_netvm (ai-managed) — birth egress inherits normally."
+else
+    echo "==> NOTE: gateway $SOURCE_QUBE is not behind an ai-managed egress qube."
+    echo "    Consider:  qvm-prefs $SOURCE_QUBE netvm $EGRESS_QUBE"
+    echo "    Until then, template-based creates fall back to /etc/qmcp/birth-egress."
+    echo "    Trade-off to know: a gateway behind an AI-controllable netvm means an"
+    echo "    ai-net/ai-full agent can firewall or shut down its own transport."
+    echo "    That is self-DoS, recoverable only from dom0 — not an escalation."
 fi
 echo
 

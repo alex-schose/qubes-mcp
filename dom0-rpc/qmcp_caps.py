@@ -342,13 +342,29 @@ def explain(vm=None, *, tags=None, tier_default_path=None) -> dict:
 
 def resolve_birth_egress(actor_vm=None, source_vm=None, *,
                          birth_egress_path: str = BIRTH_EGRESS_PATH,
-                         is_ai_managed=None):
+                         is_ai_managed=None, source_authoritative=None):
     """Which netvm a qube created right now must be born on, and why.
 
-    Returns `(name_or_None, rule)`. A `None` name means **refuse the create** —
-    never "leave it unset", which is what `qmcp.SpawnAIManagedQube` does today
-    and how a qube silently comes up with no network on any fleet whose egress
-    qube is not named `ai-net-router`.
+    Returns `(name_or_None, rule)`. A `None` name with the rule
+    `"birth-egress:unresolved"` means **refuse the create** — never "leave it
+    unset", which is what `qmcp.SpawnAIManagedQube` does today and how a qube
+    silently comes up with no network on any fleet whose egress qube is not
+    named `ai-net-router`. A `None` name with `"birth-egress:source-offline"`
+    is the opposite: a *resolved* answer of "no network", inherited from a
+    source that deliberately has none. Callers must branch on the RULE, not on
+    the name being None.
+
+    **`source_authoritative` — Stage 2, finding F-J.** Row 1 as originally
+    worded ("the source's netvm, when it has one of its own") silently falls
+    through to row 2 when the source's netvm is `None`, which is right for a
+    TemplateVM — a template's netvm is an update path, not a workload egress —
+    and wrong for every other source. A clone of a deliberately-offline qube,
+    or a disposable off an offline DVMT, would be *granted* network the source
+    never had; today's `clone_vm` copies `netvm=None` and keeps it, so applying
+    row 2 there is a regression, not a fix. Pass `True` when the source is a
+    workload qube (clone source, DVMT) so its netvm — **including `None`** — is
+    the answer; pass `False`/omit for a TemplateVM base. Omitted preserves the
+    Stage 1 behaviour exactly.
 
     **The precedence chain (operator decision, 2026-08-17), first match wins:**
 
@@ -397,6 +413,20 @@ def resolve_birth_egress(actor_vm=None, source_vm=None, *,
         src_netvm = None
     if _ok(src_netvm):
         return str(src_netvm), "birth-egress:source"
+    # Row 1b (F-J) — an AUTHORITATIVE source is final, whatever it says. Two
+    # cases reach here, and falling through would be wrong for both:
+    #   netvm is None            the source is deliberately offline; row 2
+    #                            would hand its child network it never had
+    #   netvm set, out of scope  the source sits on an egress we cannot
+    #                            inherit; row 2 would silently re-home the
+    #                            child onto a DIFFERENT path, which is the
+    #                            cross-egress birth §3.4 exists to prevent
+    # Only a non-authoritative source (a TemplateVM base, whose netvm is an
+    # update path rather than a workload egress) may fall through to row 2.
+    if source_authoritative and source_vm is not None:
+        if src_netvm is None:
+            return None, "birth-egress:source-offline"
+        return None, "birth-egress:unresolved"
 
     # Row 2 — the calling principal's egress, when the gateway is in-umbrella.
     actor_netvm = None
@@ -466,7 +496,7 @@ def decide(actor, service, action, targets=None, params=None, *,
     `actor` is the calling principal's NAME (the wrappers pass
     `os.environ["QREXEC_REMOTE_DOMAIN"]`). It is recorded rather than gated on
     today; when the fleet grows past one gateway it becomes D1's
-    `qmcp-owner:<principal>` and I-9's delegation `principal` without a schema
+    `qmcp-owner_<principal>` and I-9's delegation `principal` without a schema
     change. Reserving it now is free; retrofitting it is not.
 
     SHADOW MODE: nothing calls this to gate. Wrappers compare it against what

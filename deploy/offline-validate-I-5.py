@@ -486,38 +486,71 @@ raw_disp = app_t2.qubesd_call("ai-full-dvmt", "admin.vm.CreateDisposable").decod
 check("(teeth) raw CreateDisposable INHERITS ai-full — mock models the real bug",
       "ai-full" in set(app_t2.domains[raw_disp].tags))
 
-# Clone of an ai-full source → fix must strip the inherited ai-full.
+# Clone of an ai-full source. **Wave 2 Stage 2 changed the expected answer
+# here, and the change is deliberate.** I-5 stripped every create to UNTIERED,
+# which held the no-self-escalation keystone but left a created qube with no
+# capability at all post-flip (F6) — an operator had to tier it before its
+# creator could even start it. D2 replaces the blanket strip with a CLAMP: the
+# child is born at the source's literal tier, bounded by the operator's
+# `/etc/qmcp/birth-ceiling`. What is preserved is the property that actually
+# mattered: nothing is ever born ABOVE its source, and the source's tier is
+# operator-assigned because AI cannot write tags. What is given up is the
+# blanket strip, on purpose. `birth-ceiling` is absent in this harness, so
+# these assert the no-clamp default; the clamp matrix itself lives in
+# `offline-validate-2.py`.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.CloneAIManagedQube"), stub_budget=True)
 r = run(m, {"source": "ai-full-vm", "name": "clone-esc"})
 ctags = set(app.domains["clone-esc"].tags) if "clone-esc" in app.domains else set()
-check("Clone(ai-full source) → ok", r.get("ok") is True)
-check("Clone(ai-full source) → clone keeps ai-managed", "ai-managed" in ctags)
-check("Clone(ai-full source) → ai-full STRIPPED (no self-escalation)", "ai-full" not in ctags)
-check("Clone(ai-full source) → clone carries ONLY umbrella from tier vocab",
-      (ctags & ELEV) == set())
+check("Clone(ai-full source) \u2192 ok", r.get("ok") is True)
+check("Clone(ai-full source) \u2192 clone keeps ai-managed", "ai-managed" in ctags)
+check("Clone(ai-full source) \u2192 born ai-full (D2 clamp, no ceiling set)",
+      "ai-full" in ctags)
+check("Clone(ai-full source) \u2192 never ABOVE the source: no other elevation tag",
+      (ctags & ELEV) == {"ai-full"})
+check("Clone \u2192 stamped with the calling principal's ownership",
+      any(t.startswith("qmcp-owner") for t in ctags))
 
-# SpawnDisposable from an ai-full DVMT → fix must strip the inherited ai-full.
+# The brief's worked escalation example \u2014 "an ai-exec actor cloning an ai-full
+# source gets an ai-exec child" \u2014 is NOT reachable in the shipped model, and
+# saying so is more useful than asserting a scenario that cannot occur. There
+# is one principal (the gateway) and capability is a property of the TARGET
+# qube, so "the actor's tier on the source" IS the source's tier; the two only
+# diverge when I-9's principal axis lands. Below ai-full the clone is refused
+# outright by the I-5 CAP_FULL gate, so no child exists to be escalated \u2014 a
+# stronger property than the clamp, and the one that actually holds. The clamp
+# that does real work today is the operator ceiling, exercised across the whole
+# ladder in `offline-validate-2.py` \u00a71.
+app = app_with_fleet()
+m = prep(load_wrapper("qmcp.CloneAIManagedQube"), stub_budget=True)
+r = run(m, {"source": "ai-exec-vm", "name": "clone-exec"})
+check("Clone(ai-exec source) \u2192 REFUSED by the CAP_FULL gate, no child at all",
+      r.get("ok") is not True and "clone-exec" not in app.domains)
+
+# SpawnDisposable from an ai-full DVMT \u2014 same clamp, ephemeral target.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.SpawnDisposableAIManaged"), stub_budget=True)
 r = run(m, {"template": "ai-full-dvmt"})
 dn = r.get("name")
 dtags = set(app.domains[dn].tags) if dn and dn in app.domains else set()
-check("SpawnDisposable(ai-full DVMT) → ok", r.get("ok") is True)
-check("SpawnDisposable(ai-full DVMT) → disposable keeps ai-managed", "ai-managed" in dtags)
-check("SpawnDisposable(ai-full DVMT) → ai-full STRIPPED (no ephemeral escalation)",
-      "ai-full" not in dtags)
-check("SpawnDisposable(ai-full DVMT) → disposable carries ONLY umbrella from tier vocab",
-      (dtags & ELEV) == set())
+check("SpawnDisposable(ai-full DVMT) \u2192 ok", r.get("ok") is True)
+check("SpawnDisposable(ai-full DVMT) \u2192 disposable keeps ai-managed",
+      "ai-managed" in dtags)
+check("SpawnDisposable(ai-full DVMT) \u2192 born ai-full (D2 clamp)",
+      (dtags & ELEV) == {"ai-full"})
 
-# Spawn (defense-in-depth): fresh VM, never inherits, ai-managed-only.
+# Spawn: `add_new_vm` creates a FRESH qube that inherits nothing, so the tier
+# it is born with comes from the clamp rather than from propagation \u2014 the same
+# answer by a different route, which is why it is worth asserting separately.
 app = app_with_fleet()
 m = prep(load_wrapper("qmcp.SpawnAIManagedQube"), stub_budget=True)
 r = run(m, {"name": "spawn-esc", "template": "ai-full-tpl", "netvm": None})
 stags = set(app.domains["spawn-esc"].tags) if "spawn-esc" in app.domains else set()
-check("Spawn(ai-full template) → ok", r.get("ok") is True)
-check("Spawn → new qube carries ONLY umbrella from tier vocab",
-      "ai-managed" in stags and (stags & ELEV) == set())
+check("Spawn(ai-full template) \u2192 ok", r.get("ok") is True)
+check("Spawn(ai-full template) \u2192 born ai-full, nothing above it",
+      "ai-managed" in stags and (stags & ELEV) == {"ai-full"})
+check("Spawn \u2192 stamped with the calling principal's ownership",
+      any(t.startswith("qmcp-owner") for t in stags))
 
 # ==========================================================================
 print(f"\n=== I-5 offline: {_passed} passed, {_failed} failed ===")

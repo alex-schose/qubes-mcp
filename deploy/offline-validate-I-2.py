@@ -88,6 +88,13 @@ class FakeVM:
     def is_running(self):
         return self._power == "Running"
 
+    def __str__(self):
+        # A real qubesadmin VM stringifies to its name, which is how the
+        # birth-egress chain turns a `netvm` property into a name to check
+        # against the umbrella. A fake without this reads as an out-of-scope
+        # netvm and every create fails closed — correct behaviour, wrong cause.
+        return self.name
+
     def __getattr__(self, item):
         props = self.__dict__.get("_props", {})
         if item in props:
@@ -121,7 +128,21 @@ ai_a = FakeVM("ai-work", "AppVM", {"ai-managed"})
 ai_b = FakeVM("ai-net-router", "AppVM", {"ai-managed"}, provides_network=False)
 ai_tpl = FakeVM("ai-debian-13", "TemplateVM", {"ai-managed"})
 operator = FakeVM("operator-vm", "AppVM", set())
-THE_APP = FakeApp(FakeDomains([ai_a, ai_b, ai_tpl, operator]))
+# Wave 2 Stage 2: the create paths now resolve a birth egress and REFUSE when
+# the chain cannot. The gateway is therefore part of the fleet, sitting behind
+# an ai-managed egress qube exactly as production does, so a spawn here reaches
+# the budget gate this section is actually about rather than failing earlier on
+# an unresolvable chain. (`QREXEC_REMOTE_DOMAIN` is set below so the wrapper
+# looks the gateway up by the name qrexec would give it.)
+gateway = FakeVM("mcp-control", "AppVM", set())
+gateway.netvm = ai_b
+# Assigned, never setdefault: this variable is often already present in a
+# session's ambient environment (it reads `dom0` in an operator shell), and a
+# setdefault silently keeps that value — the fleet then has no gateway under
+# that name and every create fails closed for a reason that has nothing to do
+# with the test.
+os.environ["QREXEC_REMOTE_DOMAIN"] = "mcp-control"
+THE_APP = FakeApp(FakeDomains([ai_a, ai_b, ai_tpl, operator, gateway]))
 
 _qa = types.ModuleType("qubesadmin")
 _qa_app = types.ModuleType("qubesadmin.app")

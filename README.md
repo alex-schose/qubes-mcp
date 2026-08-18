@@ -121,8 +121,12 @@ I-3 (the tier taxonomy + resolution helper, landed behaviour-neutral),
 I-4 (tiers on the policy-scoped surfaces), and I-5 (tiers on the wrapper
 + exec surfaces, with the least-privilege flip available) are done — all
 listed below. **Wave 1 (I-0..I-5) is complete**, behaviour-neutral until
-the operator tiers the fleet and runs the flip; Wave 2 (I-6..I-8, the
-action gate) is next.
+the operator tiers the fleet and runs the flip. **Wave 2 was redesigned
+after a clean-room install run**: instead of an operator-authored
+per-class gate matrix, a dom0 kernel *derives* each verdict from a
+domination lattice, so a gate that an existing capability already
+dominates cannot be written at all. Its Stage 1 (the kernel, in shadow
+mode) and Stage 2 (ownership, birth tier, birth egress) are below.
 **Stage G0 (gateway input boundary) was pulled ahead of Wave 2** — a
 2026-07-24 architecture review found reachable boundary breaks in the
 shipped tree, so the tier-independent hardening that closes them shipped
@@ -149,6 +153,8 @@ needs Stage I's dom0 gate-lift).
 | I-4 | First enforcement step of the resource axis — a single-file policy diff graduating the directly-`@tag:`-scoped surfaces. `firewall.Get` + device-list stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`; `ai-dump` gets a dedicated copy-IN-only `qubes.Filecopy * @tag:ai-managed @tag:ai-dump allow` (the Biba write-only sink — a **pure** `ai-dump` qube is push-only and invisible to reads/list/exec because it lacks the umbrella; the write-only property rests on the operator invariant that an `ai-dump` qube is never also `ai-managed`, which the installer checks and I-5 enforces). The policy layer matches tags literally and cannot call `qmcp_tier`, so firewall-write ships with a `@tag:ai-managed` **compat backstop** (keeps untiered qubes writable through migration → A–F3 stays green and the live egress qube keeps firewall control on deploy; behaviour-neutral on firewall in compat — only the `ai-dump` valve is new live behaviour). The flip (end of I-5) deletes the backstop **and** writes `ro` to `/etc/qmcp/tier-default` in one change. Policy-only; no new RPC, no new qube, no wrapper change. Proven offline (100-check policy simulation, compat + post-flip), a per-tier hardware slot, and an AI-side transparency test. | tested |
 | I-5 | Second enforcement step — tiers on the `@adminvm` **wrapper** surfaces (dom0 code) + the **exec** surfaces (policy), then the least-privilege flip. Lifecycle/SetProperty/SetFeature require `ai-full` on the target, Clone on the source, Spawn on the template, SpawnDisposable on the DVMT, Attach/Detach on **both** endpoints — via the sibling-loaded `qmcp_tier` helper, **fail-closed** (a missing/broken resolver denies, never allows). `RunInAIManaged`/`CopyToAIManaged` graduate in policy to `@tag:ai-exec`/`ai-net`/`ai-full` + a `@tag:ai-managed` compat backstop (mirrors I-4 firewall). Every create path **strips** any tier tag the platform propagates — `clone_vm` copies the source's tags, `CreateDisposable` inherits the DVMT's — so a created qube is always untiered (umbrella only); without the strip, AI could clone an `ai-full` qube into another and self-escalate past the flip. Behaviour-neutral in compat (untiered = full). The flip (separate slot, after the operator tiers the fleet) deletes **four** compat backstops (firewall.Set/Reload + Run/Copy) **and** writes `ro` to `/etc/qmcp/tier-default` in one coupled change. No new RPC, no new qube, no new ring. Proven offline (260 checks: wrapper-gate suite + policy simulator + I-4 regression) and on dom0 hardware (per-tier gate + the create-path strip, read back via `qvm-tags` in dom0 since tier tags are AI-unreachable). | tested |
 | G0 | Gateway input boundary (pulled ahead of Wave 2 after the 2026-07-24 review). Property allowlist — `provides_network` operator-only (no self-minted egress); qrexec target-name validator (`@adminvm`/`dom0`/malformed rejected before any call); device enumeration (attached + available) routed through the dom0 redactor `qmcp.ListAttachedDevicesAIManaged` that hides out-of-scope backend/consuming-frontend qube names, with direct `admin.vm.device.*` enumeration denied; `qubes.Filecopy` re-tiered to `ai-exec` on **both** endpoints + explicit deny (no fleet-wide push into `ai-ro` qubes); `mask_error_details` + opaque error collapse. Closes four review findings; offline + per-fix hardware slots green. | tested |
+| W2-1 | Wave 2 Stage 1 — the capability decision kernel (`qmcp_caps.py`), in **shadow mode**. `decide(actor, service, action, targets)` resolves first-match-wins: a target outside the umbrella → DENY; an escalation-class op (tag writes, `provides_network`, `template`, `netvm`, `name`, TemplateVM create) → DENY at every tier forever; a target in the operator's guarded class → GATE, checked *before* the domination logic so it cannot be argued away; an op an already-held capability fully dominates → ALLOW; else the `CAP_*` ladder. The anti-theatre rule is why gating `remove` while the actor holds exec is refused as a design — exec already reaches `rm -rf`, so the dialog protects nothing and trains the operator to click through. Enforces nothing: each of the 8 state-changing wrappers asks the kernel the question its I-5 gate just answered and records only a *disagreement*, as an optional `shadow` field omitted when they agree, so an agreeing call's audit line and chain hash are byte-identical to pre-Stage-1. Fail-**open** by design — the one inversion in the codebase, because it is not a gate. That divergence log is the deliverable and gates the later flip. | tested |
+| W2-2 | Wave 2 Stage 2 — **ownership + birth tier + birth egress**; the first stage that deliberately changes create-path behaviour, because it is what makes least privilege *operable*. A created qube is stamped atomically with the umbrella, `qmcp-owner_<principal>` (provenance in the project's reserved namespace — never `created-by-*`, which qubesd stamps with the calling domain and so cannot distinguish AI-created from operator-created), the source's **literal** tier clamped by the operator-owned `/etc/qmcp/birth-ceiling`, and every **restriction** the source carried (`qmcp-guarded`, `qmcp-egress-locked_*`, `anon-vm`) — restrictions inherit unconditionally, since a restriction the privilege clamp can remove is a laundering hole. The stamp is read back and any mismatch **rolls the create back**. Netvm is likewise **inherited** rather than defaulted: the source's egress, else the calling gateway's, else `/etc/qmcp/birth-egress`, else refuse — replacing a hardcoded `ai-net-router` that gave adopters network-less qubes and, on a multi-egress fleet, let a Tor-side agent spawn a clearnet qube. Reading the source's *literal* tag rather than its effective capability keeps the stage neutral in compat (an untiered source still yields an untiered child) and correct after the flip. **Scope, stated plainly: this governs BIRTH egress only** — retargeting an *existing* qube across egress classes is still permitted at `ai-full`, and that is the more dangerous half (a new qube is empty; an existing one may hold Tor-derived data). The kernel already answers escalation-class DENY for a `netvm` write but runs in shadow, so retarget closes when enforcement flips to `decide()`. Self-escalation stays impossible — nothing is born above its source, and tiers are operator-assigned because AI cannot write tags. Also deletes `server.py`'s declarative `_RING_MIN_TIER`: nothing above the dom0 boundary may resemble a control. Proven offline (96 checks across a logic suite and a wiring suite whose mocks reproduce qubesadmin's real tag/netvm propagation and carry teeth asserting they still do); the tier and owner tags are AI-unreachable by design, so hardware proof is a `qvm-tags` read in dom0. | built — pending hardware |
 | G1/G2 | mcp-control host hardening (sudo lockdown, dedicated MCP user) + Tor hidden service for sshd → mobile CLI reach | designed — deferred until Stage I completes |
 | H | FastMCP HTTP/SSE bound to a second .onion → mobile-app reach | designed — deferred until Stage I completes |
 
@@ -286,6 +292,31 @@ Switch the upstream any time:
 ```
 qvm-prefs ai-net-router netvm <new-upstream>
 ```
+
+**Gateway placement (load-bearing — put `mcp-control` behind the egress qube).**
+
+```
+qvm-prefs mcp-control netvm ai-net-router
+```
+
+From Wave 2 Stage 2 on, a qube the AI creates inherits its network path rather
+than getting a hardcoded default: the creation source's netvm if it has one,
+else the calling gateway's, else the name recorded in `/etc/qmcp/birth-egress`,
+else the create is refused. A spawn from a *template* has no source egress to
+inherit — a template's netvm is an update path, not a workload egress — so the
+gateway's own placement is what answers, and a gateway parked outside the
+sandbox falls back to the configured constant for every such create. Stage C's
+installer writes that constant and warns when the gateway is not behind an
+ai-managed egress qube, so nothing silently breaks either way; placing the
+gateway correctly is what makes inheritance mean the fleet's real topology.
+
+**The trade-off, stated rather than buried.** A gateway behind an
+AI-controllable netvm means an agent holding `ai-net` or `ai-full` on that
+egress qube can rewrite its firewall or shut it down — and take out its own
+transport. That is self-denial-of-service, recoverable only from dom0. It is
+not an escalation (the agent gains nothing it did not already have on that
+qube), and the alternative — parking the gateway outside the sandbox — trades
+it for birth egress that no longer tracks the real topology. Pick knowingly.
 
 Then from mcp-control:
 
