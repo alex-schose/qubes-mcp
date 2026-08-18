@@ -525,6 +525,78 @@ W2-3a. Wave 2 Stage 3a — the tombstone mechanism and its reaper, INERT.
     change; no qrexec daemon restart; no new RPC service (a lib is not a
     service, a systemd unit is not a service, and no policy line exposes
     either); no new ring.
+W2-3b. Wave 2 Stage 3b — the enforcement-mode flag and the production smoke
+    suite, INERT. The other half of what Stage 3 could not ship as one: 3a
+    landed the compensating control, 3b lands the switch and the gate, and
+    3c does the flip. Nothing sources the flag until 3c, so the diff over
+    dom0-rpc/qmcp.*, policy/ and template-rpc/ is EMPTY and behaviour-
+    neutrality holds by construction rather than by measurement.
+    THE FLAG — a new shared dom0 lib qmcp_enforce.py, re-read per call, over
+    the operator file /etc/qmcp/enforce-mode. Three modes, not two, and the
+    third is forced rather than chosen. Every previous flip in this project
+    was MONOTONE: tier-default only ever removed authority, so a corrupt file
+    could fail closed to least privilege. The enforcement flip is
+    BIDIRECTIONAL — it narrows the escalation class (netvm/template/name/
+    provides_network stop being writable) and simultaneously WIDENS lifecycle,
+    because the anti-theatre invariant grants remove/kill/shutdown/start at
+    CAP_EXEC. So "enforce" is not uniformly safer than "shadow" and a
+    malformed flag must not land there; it would arm irreversible qube
+    destruction for every ai-exec actor on the strength of a typo. `strict` is
+    the mode that is safer than both — allow only what the wrapper AND the
+    kernel allow, taking every narrowing and no widening — so it is the only
+    correct fail-closed target. Having been forced into existence it is also
+    the right intermediate rollout step, which is why the ladder reads
+    shadow -> strict -> enforce: 3a's tombstone is what makes the widening
+    survivable, so strict lets the narrowing half arm ahead of 3c.
+    NO POLICY BACKSTOP, deliberately, though every prior flip had one, and
+    the reason has to be drawn service by service rather than over the whole
+    lattice. tier-default needed paired COMPAT lines because the surfaces it
+    governed were @tag:-scoped and the qrexec engine matches tags literally, so
+    a helper flag could not move them (the I-4 lesson). Of qmcp_caps'
+    SERVICE_TABLE, 13 are dom0 WRAPPER surfaces scoped
+    `* mcp-control @adminvm allow` with no tag matching — the decision is inside
+    our own wrapper, which can read the flag, so a backstop would back up
+    nothing while reading as a control (invariant 2, the _RING_MIN_TIER defect
+    again). Those 13 are what Stage 3c flips. The other 6 — the two template
+    exec/copy services, the three firewall methods, qubes.Filecopy — are
+    @tag:-scoped and decided by the qrexec engine before any code of ours runs;
+    this flag cannot govern them, and does not need to, because Stages I-4, I-5
+    and G0c graduated each of them with its own COMPAT backstop and those flips
+    are done. admin.vm.tag.{Set,Remove} are already deny at @anyvm. So every
+    tag-scoped surface in the lattice already had its backstop, at the stage
+    that graduated it. Revert is one write to the operator file: no policy
+    reload, no daemon restart, no slot-revert.
+    A NOTE 3c MUST NOT SKIP: the kernel keeps SERVICE_TABLE entries for those 6
+    policy-decided surfaces so it can model the whole lattice, and
+    shadow_record legitimately compares against them — but flipping the flag
+    does not enforce them, so 3c must not read "the flag is enforce" as "the
+    lattice is enforced everywhere". Same shape as the unreachable
+    resolved_netvm branch 3c already has to resolve.
+    THE GATE — deploy/smoke-production.py implements the brief's seven-item
+    production smoke suite and reports FOUR outcomes, because two is a lie
+    here. PASS / FAIL / VACUOUS (ran, but the fleet's shape means it could not
+    have failed — item 7 on a single-egress fleet) / NOT-RUN (needs a tool
+    outside this repo). Exit 0 GREEN, 2 FAILED, 3 INCOMPLETE — and INCOMPLETE
+    is NOT green: a suite that counted an unrunnable check as a pass would
+    report green while 3/7 of the gate never executed, which is the failure
+    the anti-grep audit had for four months.
+    Items 2 and 3 assert properties of a deployment's own file-transfer and
+    context-sync tooling, which is not part of qubes-mcp and must not be
+    vendored into it — a suite shipping its own
+    copy of the thing it smoke-tests tests the copy. They are declared instead
+    in an operator-local conf naming one command per item; undeclared is
+    NOT-RUN, never a pass. Item 1 is an INVARIANCE check against a recorded
+    baseline rather than the brief's absolute: an ai-managed AppVM built from
+    an operator template has no qmcp.RunInAIManaged service to answer, and
+    from the AI seat that is byte-identical to a tier refusal by design, so
+    "exec works in every ai-managed qube" is false on a normal fleet and
+    unfalsifiable-for-the-right-reason. What the flip gate actually needs is
+    "nothing that could exec before can't now".
+    Full offline coverage — 91 checks, with teeth that reproduce, against the
+    real decision kernel, both directions of divergence and the destruction a
+    two-mode "fail closed to enforce" rule would have armed on a typo. No
+    policy change; no qrexec daemon restart; no new RPC service; no new ring;
+    no operator file created (absent = shadow = unchanged).
 G0. [SHIPPED — pulled ahead of Wave 2 after the 2026-07-24 review]
    Gateway input boundary: SetProperty settable-property allowlist
    (provides_network operator-only), qrexec target-name validator, device
@@ -673,6 +745,14 @@ qubes_mcp/                          # repo root
 │                                      # read-back, rollback) + the reaper's veto matrix.
 │                                      # INERT until Stage 3c flips the Lifecycle
 │                                      # wrapper's remove path through it.
+│   ├── qmcp_enforce.py               # Wave 2 Stage 3b — the operator's flip switch:
+│                                      # read_mode() over /etc/qmcp/enforce-mode and
+│                                      # effective_verdict() composing a wrapper's own
+│                                      # decision with the kernel's. THREE modes
+│                                      # (shadow -> strict -> enforce) because the flip
+│                                      # is bidirectional, so no two-valued flag has a
+│                                      # safe malformed-value target. INERT: nothing
+│                                      # sources it until Stage 3c.
 │   └── qmcp-tombstone-reaper         # Wave 2 Stage 3a — root systemd oneshot; NOT a
 │                                      # qrexec service and no policy line names it.
 │                                      # Timer-only (never under pressure); the veto
@@ -728,7 +808,27 @@ qubes_mcp/                          # repo root
     ├── test-stage-I-4.py
     ├── install-stage-I-5.sh
     ├── uninstall-stage-I-5.sh
-    └── test-stage-I-5.py
+    ├── test-stage-I-5.py
+    ├── install-stage-I-6.sh          # I-6 consent mechanism (inert)
+    ├── uninstall-stage-I-6.sh
+    ├── test-stage-I-6.py
+    ├── install-stage-flip.sh         # the I-5 tier flip (policy backstops + tier-default)
+    ├── uninstall-stage-flip.sh
+    ├── install-stage-1.sh            # Wave 2 Stage 1 — the decision kernel (shadow)
+    ├── uninstall-stage-1.sh
+    ├── install-stage-2.sh            # Wave 2 Stage 2 — ownership, birth tier, birth egress
+    ├── install-stage-3a.sh           # Wave 2 Stage 3a — tombstone + reaper (inert)
+    ├── uninstall-stage-3a.sh
+    ├── qmcp-tombstone-reaper.service # Stage 3a systemd units
+    ├── qmcp-tombstone-reaper.timer
+    ├── install-stage-3b.sh           # Wave 2 Stage 3b — the enforcement-mode flag (inert)
+    ├── uninstall-stage-3b.sh
+    ├── smoke-production.py           # Wave 2 Stage 3b — the seven-item §6 flip gate.
+    │                                 # Run from mcp-control. Exit 0 GREEN / 2 FAILED /
+    │                                 # 3 INCOMPLETE, and INCOMPLETE is NOT green.
+    └── offline-validate-*.py         # per-stage offline suites (no dom0, no qubesadmin)
+                                      # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b,
+                                      # G0a..G0d, I-2..I-6
 ```
 
 ## Operating protocol
