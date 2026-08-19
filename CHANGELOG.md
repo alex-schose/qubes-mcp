@@ -27,6 +27,51 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.11] — 2026-08-19
+
+Wave 2 Stage 3c — the enforcement flip, shipped inert.
+
+### Added
+
+- `deploy/install-stage-3c.sh`, `deploy/uninstall-stage-3c.sh`,
+  `deploy/offline-validate-3c.py` (82 checks).
+- `_gate()` in all 8 mutation wrappers, replacing Stage 1's `_shadow_note`. It
+  composes the wrapper's own capability verdict with the kernel's through
+  `qmcp_enforce.effective_verdict`, treats `GATE` as a refusal until Stage 7
+  arms that channel, and keeps the I-2 divergence record — carrying `mode` and
+  `effective` as well, once a mode is armed.
+- `qmcp.LifecycleAIManaged:remove` routes through `qmcp_tombstone.entomb` **when
+  enforcing**. The tombstone arms with enforcement rather than with the install,
+  in the same predicate, so no ordering of writes can separate the `CAP_EXEC`
+  widening from the control that makes it survivable.
+- The installer gates behaviourally rather than structurally: it *runs* the
+  staged kernel against the decisions this stage changes, *runs* each staged
+  wrapper's gate through the mode ladder including both partial-deploy
+  directions, and *runs* a real tombstone transition from the installed layout.
+  It refuses to install if `/etc/qmcp/enforce-mode` already exists, so the code
+  and its arming cannot land in one step.
+
+### Changed
+
+- **BREAKING (behind the flag): `qmcp_caps` now permits `netvm = null`.** Every
+  `netvm` write was modelled as escalation-class, which was right while the
+  kernel only logged and wrong the moment it decides — both halves of §3.4
+  deliberately permit the disconnect as de-escalation. The carve-out is a
+  *direction*, not a value, and is opt-in by the caller: a call site that does
+  not state the value still gets the refusal. Under `shadow` nothing changes.
+- `qmcp.SetPropertyAIManaged` passes the property `value` to the kernel, which
+  is what makes the carve-out decidable.
+- `deploy/install-stage-1.sh` and `deploy/offline-validate-1-wiring.py` follow
+  the hook's rename from `_shadow_note` to `_gate`.
+
+### Removed
+
+- The unreachable `resolved_netvm` branch in `qmcp_caps._decide_inner`. §3.4's
+  birth half is enforced in the create wrappers and no caller ever populated the
+  key; a branch that reads as an enforcement path and is not one is the
+  no-illusion defect. `offline-validate-1.py` pins the cut structurally, and the
+  property itself is asserted where it is enforced.
+
 ## [0.9.10] — 2026-08-19
 
 `pending` — changelog backfill, retroactive per-commit versions, and the first GitHub release

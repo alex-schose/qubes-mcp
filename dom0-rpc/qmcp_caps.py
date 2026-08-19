@@ -173,6 +173,12 @@ def _guarded_names(path: str = GUARDED_LIST_PATH):
 #: reason the taxonomy does not make obvious: renaming the gateway severs every
 #: policy line that names it literally, executed from AI's own seat and
 #: unrecoverable without dom0 (see NEXT.md's named-principal open question).
+#:
+#: **`netvm` has exactly one carve-out and it is a direction, not a value** —
+#: see `_is_disconnect`. Setting it to null is de-escalation and is permitted
+#: at CAP_FULL; setting it to any qube is refused at every tier. Nothing else
+#: here has a carve-out, and the check is written so that a caller who does not
+#: say which it is gets the refusal.
 ESCALATION_PROPS = frozenset({"provides_network", "template", "netvm", "name"})
 
 #: Klasses AI may never create. TemplateVM is the root of every qube's
@@ -513,6 +519,34 @@ def decide(actor, service, action, targets=None, params=None, *,
         return Decision(DENY, "kernel-error", type(exc).__name__)
 
 
+def _is_disconnect(prop, params) -> bool:
+    """True iff this is the one escalation-class write that is de-escalation.
+
+    `netvm = null` takes a qube OFF the network. Both halves of §3.4 carve it
+    out deliberately and in the same words — `qmcp.SpawnAIManagedQube` ("explicit
+    null stays allowed with no approval: de-escalation cannot leak") and, since
+    F-2, `qmcp.SetPropertyAIManaged` ("netvm change is operator-only; null
+    (disconnect) is permitted"). Disconnecting reveals nothing and strands
+    nothing; it is the one direction that is safe by construction.
+
+    Stage 1 modelled `netvm` as flatly escalation-class, which was right while
+    the kernel only logged. It is wrong the moment the kernel decides: measured
+    on the rig 2026-08-19, the shadow log carries `netvm` writes with `ok: true`
+    AFTER the F-2 fix landed — the null carve-out being exercised — so arming
+    **either** `strict` or `enforce` against the Stage 1 model would have
+    refused an operation both wrappers deliberately permit. Not a security
+    regression, but a capability silently deleted by a stage whose changes are
+    supposed to be enumerated.
+
+    **The key must be PRESENT to earn the carve-out.** `params.get("value")` is
+    `None` both for a null value and for a caller that never passed one, and
+    those must not be the same answer: a call site that omits `value` gets the
+    conservative reading (escalation, denied), so the carve-out is opt-in by the
+    wrapper that actually parsed the request. Fail-closed by omission.
+    """
+    return prop == "netvm" and "value" in params and params["value"] is None
+
+
 def _decide_inner(actor, service, action, targets, params,
                   tier_default_path, guarded_list_path):
     roles = SERVICE_TABLE.get(service)
@@ -539,20 +573,28 @@ def _decide_inner(actor, service, action, targets, params,
         return Decision(DENY, "escalation-class", f"{service} is operator-only")
     prop = params.get("property")
     if service == "qmcp.SetPropertyAIManaged" and prop in ESCALATION_PROPS:
-        return Decision(DENY, "escalation-class",
-                        f"property '{prop}' is operator-only at every tier")
+        if not _is_disconnect(prop, params):
+            return Decision(DENY, "escalation-class",
+                            f"property '{prop}' is operator-only at every tier")
     klass = params.get("klass")
     if klass in ESCALATION_KLASSES:
         return Decision(DENY, "escalation-class",
                         f"klass '{klass}' is operator-only")
-    # A create proposing an egress the chain did not resolve to is the birth
-    # half of §3.4. Stage 2 supplies `resolved_netvm`; until then the key is
-    # absent and this is inert.
-    proposed = params.get("netvm")
-    resolved = params.get("resolved_netvm")
-    if proposed is not None and resolved is not None and str(proposed) != str(resolved):
-        return Decision(DENY, "escalation-class",
-                        "birth egress differs from the resolved inheritance")
+    # There is deliberately no birth-egress branch here. §3.4's birth half is
+    # enforced in the create wrappers themselves (`qmcp.SpawnAIManagedQube`,
+    # `.CloneAIManagedQube`, `.SpawnDisposableAIManaged`), which resolve the
+    # inherited netvm, refuse a pinned deviation, and read the value back after
+    # the create. Stage 1 shipped a `resolved_netvm` comparison here that no
+    # caller ever populated; Stage 3c CUT it rather than wiring it, on invariant
+    # 2 (no-illusion): a branch that reads as an enforcement path and is not one
+    # is the `_RING_MIN_TIER` defect, and a second opinion computed from an
+    # answer the wrapper is about to act on is not a second enforcement.
+    #
+    # **So `enforce` does not mean "the whole lattice is enforced here."** Three
+    # kinds of rule live outside this kernel and stay outside it: the birth
+    # egress (wrapper), the six `@tag:`-scoped policy surfaces (qrexec engine),
+    # and every shape/cross-ref check the wrappers run after this gate. 3b's
+    # docstring names the second; this comment names the first.
 
     # --- step 3: the guarded hard class (checked BEFORE domination) --------
     guarded = _guarded_names(guarded_list_path)

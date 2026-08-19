@@ -110,10 +110,13 @@ for f in $LIBS $WRAPPERS; do
 done
 echo "    all 10 compile."
 
-echo "==> Confirming every wrapper actually carries the shadow hook..."
+# Stage 3c renamed this hook from `_shadow_note` (which computed the kernel's
+# verdict and discarded it) to `_gate` (which acts on it). The marker moved with
+# it, so this guard keeps checking the tree it is actually installing.
+echo "==> Confirming every wrapper actually carries the decision hook..."
 for f in $WRAPPERS; do
-    if ! grep -q '_shadow_note(' "$STAGE_DIR/$f"; then
-        echo "FATAL: $f has no _shadow_note call — wrong or stale source tree." >&2
+    if ! grep -q '_gate(' "$STAGE_DIR/$f"; then
+        echo "FATAL: $f has no _gate call — wrong or stale source tree." >&2
         rm -rf "$STAGE_DIR"
         exit 1
     fi

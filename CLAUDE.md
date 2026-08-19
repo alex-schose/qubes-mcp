@@ -143,6 +143,22 @@ this directory.**
     deletes FOUR compat backstops** (firewall.Set/Reload from I-4, RunInAIManaged/
     CopyToAIManaged from I-5) **and** writes `ro` to `/etc/qmcp/tier-default` in
     one coupled change. Behaviour-neutral in compat; no new RPC/qube/ring.
+- **Enforcement mode (Wave 2 Stage 3c).** The dom0 kernel `qmcp_caps.decide()`
+  binds to the wrappers through an operator file, `/etc/qmcp/enforce-mode`, read
+  per call: **absent = `shadow`** (the shipped default — each wrapper's own
+  verdict, unchanged, kernel logs only), `strict` (allow only what the wrapper
+  **and** the kernel allow — every narrowing, no widening), `enforce` (the
+  kernel's verdict is the verdict, including the anti-theatre widening of
+  `remove`/`kill`/`shutdown`/`start` to `ai-exec`). Malformed or unreadable
+  resolves to `strict`, because the flip is bidirectional and neither endpoint
+  dominates the other. **Once any mode is armed, an AI-initiated `remove`
+  becomes a Stage 3a tombstone rather than a deletion** — the qube leaves the
+  umbrella, is invisible and unresurrectable to AI immediately, stays charged to
+  the pool cap, and is destroyed only by the dom0 timer after the operator's
+  retention window. The flag governs the 13 dom0 wrapper surfaces only; the 6
+  `@tag:`-scoped surfaces are settled by the qrexec engine, and §3.4's birth
+  egress is enforced in the create wrappers. AI can neither read nor write the
+  flag: no `qmcp.*` service exposes it and no policy line reaches it.
 - **Disk budget = persistent footprint, hard-capped (I-0/F3, corrected
   2026-06-12).** AI cannot exhaust the host pool. The I-0 create-gate and
   `qmcp.GetPoolStats` meter the **persistent** provisioned footprint of
@@ -597,6 +613,68 @@ W2-3b. Wave 2 Stage 3b — the enforcement-mode flag and the production smoke
     two-mode "fail closed to enforce" rule would have armed on a typo. No
     policy change; no qrexec daemon restart; no new RPC service; no new ring;
     no operator file created (absent = shadow = unchanged).
+W2-3c. Wave 2 Stage 3c — the enforcement flip, SHIPPED INERT. Stage 1 landed
+    the decision kernel in shadow; 3b landed the three-mode flag; 3c joins them.
+    Each of the 8 mutation wrappers' capability gate now runs through
+    qmcp_enforce.effective_verdict(mode, the wrapper's own verdict, the
+    kernel's), and qmcp.LifecycleAIManaged:remove routes through the Stage 3a
+    tombstone — but ONLY while a mode is armed.
+    INERT ON INSTALL, and the installer checks it rather than claiming it: with
+    /etc/qmcp/enforce-mode absent every wrapper resolves to shadow, shadow is
+    defined as "return the wrapper's own verdict unchanged", and under shadow
+    the tombstone path is unreachable. The tombstone arms WITH ENFORCEMENT
+    rather than with the install, in the SAME predicate, so no ordering of
+    writes can separate the CAP_EXEC widening from the control that makes it
+    survivable. `strict` is included in that predicate deliberately even though
+    it never grants the dominated remove: a rollout step where the stricter mode
+    destroys irreversibly and the looser one does not would be backwards.
+    WHAT THE FLAG DECIDES, AND WHAT IT DOES NOT. It decides the capability
+    question at one gate. Every other check a wrapper runs is unconditional and
+    still runs where it did: argument shape, SETTABLE_PROPS, the cross-reference
+    guards, §3.4's birth-egress inheritance, the I-0 pool cap, the I-6 consent
+    gate. Nor does it reach the 6 @tag:-scoped surfaces the qrexec engine
+    settles before any of this code runs — 3b's docstring names those, and 3c
+    does not pretend otherwise.
+    THE ONE DECISION THAT CHANGED WITH IT. qmcp_caps modelled every `netvm`
+    write as escalation-class. That was right while the kernel only logged and
+    wrong the moment it decides: both halves of §3.4 deliberately permit
+    `netvm = null` (de-escalation cannot leak), and the rig's own shadow log
+    carries such writes succeeding AFTER the F-2 retarget guard landed. Arming
+    either strict or enforce against the old model would have deleted a live
+    capability silently — not a security regression, but a change nobody
+    enumerated, which is the same defect. The carve-out is a DIRECTION, not a
+    value, and it is OPT-IN BY THE CALLER: `params.get("value")` is None both
+    for a null value and for a caller that never passed one, so the check
+    requires the key to be PRESENT and a call site that omits it still gets the
+    refusal. Fail-closed by omission.
+    AND ONE BRANCH REMOVED. Stage 1's `resolved_netvm` comparison in
+    _decide_inner was unreachable — Stage 2 chose to enforce §3.4's birth half
+    in the create wrappers, and no caller ever populated the key. 3c CUT it
+    rather than wiring it, on invariant 2 (no-illusion): a second opinion
+    computed from the answer the wrapper is about to act on is not a second
+    enforcement, and a branch that reads as a gate and is not one is the
+    _RING_MIN_TIER defect. The property is asserted where it IS enforced
+    (offline-validate-2-wiring.py §1); offline-validate-1.py pins the cut
+    structurally, by AST rather than by grep, because a grep matches the comment
+    explaining the cut.
+    THE DIVERGENCE RECORD ANSWERS TWO DIFFERENT QUESTIONS. Under shadow it is
+    "would the kernel have decided otherwise?" — Stage 1's comparison, preserved
+    exactly, so a shadow audit line is byte-identical to the one this stage
+    replaced. Under an enforcing mode it is "did enforcement CHANGE the
+    outcome?", and carries `mode` + `effective` as well. Both are GATE-LOCAL:
+    `wrapper` has always meant the wrapper's verdict AT THAT GATE, so a call the
+    kernel refuses there and the wrapper would have refused thirty lines later
+    still records. Reading the log as end-to-end over-counts.
+    Proven offline (82 checks, with teeth reconstructing the pre-fix predicate
+    for each fix and pinning `_gate` byte-identical across all 8 wrappers) and
+    on dom0 hardware IN ALL THREE MODES: shadow invariance measured from the AI
+    seat as 33/33 responses byte-identical across the deploy; strict refusing
+    the escalation class while the null carve-out still works; enforce allowing
+    a CAP_EXEC remove that produced a tombstone — present in dom0, umbrella and
+    every privilege tag stripped, marker datable, invisible and unrestartable
+    from the AI seat, still charged to the pool cap, seen by the reaper, refused
+    inside the retention window and reaped when due. No policy change; no qrexec
+    daemon restart; no new RPC service; no new ring; no operator file created.
 FIX. Security fixes from the 2026-08-18 adversarial pass. Five findings, all
     reproduced from the AI seat against a live fleet before being fixed, and all
     re-attacked afterwards. NOT an inert stage — two behaviours change.
@@ -804,8 +882,10 @@ qubes_mcp/                          # repo root
 │                                      # decision with the kernel's. THREE modes
 │                                      # (shadow -> strict -> enforce) because the flip
 │                                      # is bidirectional, so no two-valued flag has a
-│                                      # safe malformed-value target. INERT: nothing
-│                                      # sources it until Stage 3c.
+│                                      # safe malformed-value target. Stage 3c wires
+│                                      # it into all 8 mutation wrappers; the flag
+│                                      # file stays ABSENT (= shadow) until an
+│                                      # operator writes it.
 │   └── qmcp-tombstone-reaper         # Wave 2 Stage 3a — root systemd oneshot; NOT a
 │                                      # qrexec service and no policy line names it.
 │                                      # Timer-only (never under pressure); the veto
@@ -876,11 +956,20 @@ qubes_mcp/                          # repo root
     ├── qmcp-tombstone-reaper.timer
     ├── install-stage-3b.sh           # Wave 2 Stage 3b — the enforcement-mode flag (inert)
     ├── uninstall-stage-3b.sh
+    ├── install-stage-3c.sh           # Wave 2 Stage 3c — the wrappers wired to obey the
+    │                                 # kernel. Gates BEHAVIOURALLY: runs the staged
+    │                                 # kernel and each staged wrapper before installing
+    │                                 # either, and refuses if the operator flag already
+    │                                 # exists (landing the code and arming it in one
+    │                                 # step is what the inert ship exists to prevent).
+    ├── uninstall-stage-3c.sh         # disarms (removes the flag) and VERIFIES every
+    │                                 # installed wrapper is back to shadow. It does not
+    │                                 # claim to restore the pre-3c wrapper code.
     ├── smoke-production.py           # Wave 2 Stage 3b — the seven-item §6 flip gate.
     │                                 # Run from mcp-control. Exit 0 GREEN / 2 FAILED /
     │                                 # 3 INCOMPLETE, and INCOMPLETE is NOT green.
     └── offline-validate-*.py         # per-stage offline suites (no dom0, no qubesadmin)
-                                      # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b,
+                                      # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b, 3c,
                                       # G0a..G0d, I-2..I-6
 ```
 
@@ -925,13 +1014,15 @@ the coordinated least-privilege flip (delete the four compat backstops + write
 I-6..I-8 plan had the operator *author* a per-class `(tag, service, action)`
 gate matrix; that is dropped. The matrix is **derived** by the dom0 kernel
 `qmcp_caps.decide()` from a domination lattice, so a gate that an existing
-capability already dominates cannot be written at all. **Stage 1 of that wave —
-the kernel itself, in shadow mode — is what ships here** (see `W2-1` above):
-it enforces nothing and exists to produce the divergence log that gates the
-later flip. The stages after it, not yet built, are ownership + birth tier +
-birth egress; flipping enforcement to `decide()`; klass handling; the remaining
-egress work; then grants and a sign-only vault. **Stages G and H** stay
-deferred.
+capability already dominates cannot be written at all. **Stages 1, 2, 3a, 3b and
+3c of that wave ship here**: the kernel (shadow), ownership + birth tier + birth
+egress, the tombstone and its reaper, the three-mode enforcement flag and the
+production smoke suite, and the wrappers wired to obey the kernel. **Every one
+of them is inert or in shadow on install** — 3c ships with
+`/etc/qmcp/enforce-mode` absent, and the installer refuses to run if that file
+already exists, so the code and its arming cannot land together. The stages
+after them, not yet built, are klass handling; the remaining egress work; then
+grants and a sign-only vault. **Stages G and H** stay deferred.
 
 ### Per-surface enforcement decision table (where each tier check lives)
 

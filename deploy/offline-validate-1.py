@@ -28,6 +28,7 @@ Split of proof, per the project's trust-boundary rule:
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import sys
@@ -47,6 +48,9 @@ def _load(modname, filename):
 
 caps = _load("qmcp_caps", "qmcp_caps.py")
 tier = _load("qmcp_tier", "qmcp_tier.py")
+
+#: Read for the §8 structural check that Stage 3c's cut branch stayed cut.
+CAPS_SRC = os.path.join(DOM0_RPC, "qmcp_caps.py")
 
 PASSED = 0
 FAILED = 0
@@ -377,20 +381,31 @@ check("a source whose egress is out-of-umbrella is skipped, not proposed",
 # --------------------------------------------------------------------------
 print("\n-- 8. teeth --")
 
-# The live 0.5 finding: a fixture on ai-net-alt spawns a child that comes up on
-# the hardcoded ai-net-router. Model it as a create PROPOSING the constant while
-# the chain RESOLVES to the creator's path.
-resolved, _ = caps.resolve_birth_egress(
-    FakeVM("mcp-control", netvm="ai-net-alt"), TEMPLATE,
-    birth_egress_path=CFG, is_ai_managed=managed)
-check("teeth: the kernel DENIES the demonstrated cross-egress birth",
+# The live 0.5 finding — a create landing on an egress its creator did not
+# choose — is enforced in the CREATE WRAPPERS, not here. Stage 1 shipped a
+# `resolved_netvm` comparison in `_decide_inner` that no caller ever populated,
+# and Stage 3c cut it on invariant 2 (no-illusion) rather than wiring it: a
+# second opinion computed from the answer the wrapper is about to act on is not
+# a second enforcement. The property itself is asserted where it is enforced,
+# against the real wrappers, in `offline-validate-2-wiring.py` §1 ("explicit
+# netvm DIFFERING from the inherited one is refused" and its five neighbours).
+#
+# These two checks pin the CUT so a later stage cannot quietly restore a branch
+# that reads as a gate and is not one.
+# Keyed on STRUCTURE, not vocabulary: a grep for the word matches the comment
+# above the cut explaining why it is cut, which is the "read a refusal as a
+# result" family this project has already been bitten by twice. Parse instead
+# and look for the string as a LITERAL in the code — the only form that can
+# reach `params`.
+_caps_ast = ast.parse(open(CAPS_SRC, encoding="utf-8").read())
+check("teeth: the kernel does NOT decide birth egress (the branch stayed cut)",
+      not any(isinstance(n, ast.Constant) and n.value == "resolved_netvm"
+              for n in ast.walk(_caps_ast)),
+      "re-adding it needs a caller that populates it AND a test at that caller")
+check("teeth: a create proposing any netvm is decided on the ladder, not egress",
       d("qmcp.SpawnAIManagedQube", "spawn", {"template": vm("ai-full")},
-        {"netvm": "ai-net-router", "resolved_netvm": resolved}).rule
-      == "escalation-class",
-      "0.5 proved this create happens silently today")
-check("teeth: the same create with the inherited egress is NOT denied by it",
-      d("qmcp.SpawnAIManagedQube", "spawn", {"template": vm("ai-full")},
-        {"netvm": resolved, "resolved_netvm": resolved}).verdict == caps.ALLOW)
+        {"netvm": "ai-net-alt"}).rule == "ladder",
+      "the kernel has no opinion on which egress a create lands on")
 
 # A domination table that grew a merely-plausible entry would delete a real
 # gate. Assert the two we argued are NOT airtight stay out.
@@ -414,10 +429,31 @@ check("divergence: shipped Lifecycle needs CAP_FULL; the kernel allows at exec",
       d("qmcp.LifecycleAIManaged", "remove", {"target": vm("ai-exec")}).verdict
       == caps.ALLOW,
       "Stage 3 deletes the dominated gate — WITH D3 tombstoning in the same change")
-check("divergence: shipped SetProperty allows netvm retarget; the kernel denies",
+# CONVERGED 2026-08-19. This read "shipped SetProperty allows netvm retarget;
+# the kernel denies" until F-2 closed the retarget in the wrapper (761bae1), so
+# the two now AGREE on a pinned retarget. The assertion is kept — with an honest
+# label — because it is the load-bearing half of Stage 3c's carve-out pair
+# below: `netvm` denies by default, and only a caller that says the value is
+# null earns the exemption.
+check("kernel: a netvm write with no stated value is escalation-class",
       d("qmcp.SetPropertyAIManaged", "set", {"target": vm("ai-full")},
         {"property": "netvm"}).verdict == caps.DENY,
-      "Stage 2 flips the wrapper to match")
+      "omitting `value` must get the conservative reading, not the carve-out")
+check("kernel: a netvm write to a NAMED qube is escalation-class",
+      d("qmcp.SetPropertyAIManaged", "set", {"target": vm("ai-full")},
+        {"property": "netvm", "value": "ai-net-alt"}).verdict == caps.DENY)
+check("kernel: `netvm = null` is de-escalation and falls through to the ladder",
+      d("qmcp.SetPropertyAIManaged", "set", {"target": vm("ai-full")},
+        {"property": "netvm", "value": None}).rule == "ladder",
+      "both wrappers permit the disconnect; arming a mode against the Stage 1 "
+      "model would have deleted it silently")
+check("kernel: the carve-out is netvm-only — a null `template` is still denied",
+      d("qmcp.SetPropertyAIManaged", "set", {"target": vm("ai-full")},
+        {"property": "template", "value": None}).verdict == caps.DENY)
+check("kernel: `netvm = null` below CAP_FULL is still refused, on the ladder",
+      d("qmcp.SetPropertyAIManaged", "set", {"target": vm("ai-exec")},
+        {"property": "netvm", "value": None}).rule == "insufficient:full",
+      "de-escalation is exempt from the escalation class, not from authority")
 
 # --------------------------------------------------------------------------
 print(f"\n{PASSED}/{PASSED + FAILED} checks passed")

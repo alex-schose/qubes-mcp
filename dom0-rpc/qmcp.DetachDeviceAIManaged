@@ -156,37 +156,200 @@ def _load_caps_lib():
 
 _CAPS = _load_caps_lib()
 
-#: Wave 2 Stage 1 (SHADOW): set ONLY when the decision kernel disagrees with
-#: what this wrapper actually did on capability grounds. Stays None whenever
-#: they agree — and on every path where the kernel is unavailable or errored —
-#: so emit() omits the key and the audit line stays BYTE-IDENTICAL to
-#: pre-Stage-1 (INVARIANCE, the I-6 consent pattern). A populated key IS the
-#: divergence log that Stage 3's flip to decide() is gated on.
+def _load_enforce_lib():
+    """Load the sibling qmcp_enforce mode flag (Wave 2 Stage 3b).
+
+    Same sibling-import shim as qmcp_caps / qmcp_tier / qmcp_consent. Unlike
+    Stage 1's `_CAPS`, a None here is NOT benign — this module is what decides
+    whether the kernel binds — so `_enforce_mode` resolves the ambiguity from
+    the operator's own file rather than picking a constant default.
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_enforce", os.path.join(here, "qmcp_enforce.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_ENFORCE = _load_enforce_lib()
+
+#: `/etc/qmcp/enforce-mode`, duplicated as a literal for the partial-deploy
+#: branch below — which runs precisely when importing the module that owns the
+#: constant has already failed. A literal cannot fail to load (the same reason
+#: `qmcp_budget` carries its own copy of `TOMBSTONE_PREFIX`).
+_MODE_PATH = "/etc/qmcp/enforce-mode"
+
+#: Resolved once per call. These wrappers are one-shot processes, so caching
+#: costs nothing and guarantees that a mode file edited mid-call cannot make
+#: one gate in this process disagree with the next.
+_MODE = None
+
+
+def _enforce_mode() -> str:
+    """This call's enforcement mode. Never raises; always returns a mode word.
+
+    The case worth writing down is a PARTIAL DEPLOY — Stage 3c's wrappers
+    installed while `qmcp_enforce.py` is not. That is the F9 split-brain family
+    and the same shape as the additive-kwarg blackout that silently killed the
+    I-2 audit line, so it gets an explicit branch rather than a default:
+
+      module missing, flag file ABSENT   -> "shadow". The shipped default is
+        shadow, so an operator who never asked for enforcement gets exactly the
+        Stage 1 behaviour. This direction cannot arm a widening.
+      module missing, flag file PRESENT  -> "strict". The operator DID ask for
+        enforcement and we cannot resolve which kind. Strict is the only mode
+        more restrictive than both of its neighbours — the same reason
+        `qmcp_enforce.read_mode` falls there on a malformed value.
+
+    Neither constant default is safe alone: "shadow" would silently discard an
+    enforcement the operator configured, and "strict"/"enforce" would arm one
+    they never asked for, on nothing but a failed import.
+    """
+    global _MODE
+    if _MODE is not None:
+        return _MODE
+    if _ENFORCE is not None:
+        try:
+            _MODE = _ENFORCE.read_mode()
+        except Exception:
+            _MODE = "strict"
+        return _MODE
+    try:
+        import os.path
+        _MODE = "strict" if os.path.exists(_MODE_PATH) else "shadow"
+    except Exception:
+        _MODE = "strict"
+    return _MODE
+
+
+def _enforcing() -> bool:
+    """True iff the kernel's verdict can change what this wrapper does.
+
+    Read by the side effects that arm WITH enforcement rather than with the
+    install — today that is the Stage 3a tombstone in `qmcp.LifecycleAIManaged`.
+    Under shadow every one of them must stay dormant, which is what keeps this
+    stage byte-neutral at install and revertible in one write.
+    """
+    return _enforce_mode() != "shadow"
+
+
+#: Wave 2 Stage 1/3c: set ONLY when the decision kernel and this wrapper reach
+#: different answers. Stays None whenever they agree — and on every path where
+#: the kernel is unavailable or errored — so emit() omits the key and the audit
+#: line stays BYTE-IDENTICAL to pre-Stage-1 (INVARIANCE, the I-6 consent
+#: pattern).
+#:
+#: The key's MEANING depends on the mode, and the two readings are different
+#: questions. Under shadow it is "the kernel would have decided otherwise" —
+#: the divergence log Stage 3c's flip is gated on. Under strict/enforce it is
+#: "enforcement CHANGED the outcome", and carries `mode` + `effective` as well,
+#: because by then the interesting fact is not that the two disagreed but which
+#: one won. Both are fixed vocabulary; neither forwards the kernel's `reason`
+#: prose, per the I-2 caller-sanitises contract.
 _shadow = None
 
 
-def _shadow_note(action, roles, params, wrapper_allowed) -> None:
-    """Record kernel-vs-wrapper divergence for this call.
+def _gate(action, roles, params, wrapper_allowed) -> bool:
+    """The capability decision for this call. Wave 2 Stage 3c.
 
-    NEVER raises and NEVER changes behaviour: it only sets `_shadow` for the
-    audit line. Guarded here AND inside qmcp_caps.shadow_record, the same
-    belt-and-suspenders the I-2 audit hook uses at this boundary.
+    Replaces Stage 1's `_shadow_note`, which computed the kernel's verdict and
+    threw it away. Returns whether the call may proceed. NEVER raises: a gate
+    that can throw into a wrapper's mutation path is worse than no gate.
+
+    **What this decides, and what it does not.** `wrapper_allowed` is this
+    wrapper's own CAPABILITY verdict at this point — the I-5 tier gate — and the
+    kernel answers that question plus the escalation class and the guarded hard
+    class. Everything else the wrapper checks is unconditional and still runs
+    exactly where it did: argument shape, `SETTABLE_PROPS`, the cross-reference
+    guards, the birth-egress inheritance (§3.4, enforced in the create wrappers
+    and deliberately NOT in the kernel), the I-0 pool cap, and the I-6 consent
+    gate. So `enforce` means "the kernel decides THIS", never "the kernel
+    decides everything" — the same caution `qmcp_enforce`'s docstring gives for
+    the six policy-decided surfaces it also cannot reach.
+
+    **GATE is not an allow.** `qmcp_caps` returns it for the guarded hard class
+    and for a guarded list it could not read; Stage 7 arms that channel. Until
+    then a wrapper that reaches it must refuse — the same fail-closed posture
+    `_consent_gate` already takes on an unavailable daemon.
 
     `roles` maps the kernel's role names ("target"/"source"/"template"/"dvmt"/
-    "backend"/"frontend") to qube objects; `wrapper_allowed` is what THIS
-    wrapper decided at this point, so the comparison is like-for-like.
+    "backend"/"frontend") to qube objects; `params` carries the operation's
+    scalar arguments.
     """
     global _shadow
-    if _CAPS is None:
-        return
+    mode = _enforce_mode()
+
+    if _ENFORCE is None:
+        # Partial deploy. `_enforce_mode` has already chosen between the two
+        # honest readings; refusing outright is at least as strict as either,
+        # and re-implementing the mode semantics here is what this module
+        # exists to prevent.
+        return bool(wrapper_allowed) if mode == "shadow" else False
+
+    verdict, rule = None, "kernel-unavailable"
+    if _CAPS is not None:
+        try:
+            import os
+            dec = _CAPS.decide(
+                os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown",
+                _AUDIT_SERVICE, action, roles, params)
+            verdict, rule = dec.verdict, dec.rule
+        except Exception:
+            verdict, rule = None, "kernel-call-failed"
+
+    if verdict is None:
+        # The kernel gave NO opinion — the module is absent, or calling it threw
+        # before it could apply its own fail-closed posture. (An internal error
+        # the kernel caught itself arrives as a real DENY with rule
+        # "kernel-error" and is treated as an opinion, because it is one.)
+        #
+        # Under SHADOW this must change NOTHING and log NOTHING: Stage 1's
+        # promise is that a wrapper whose kernel failed to load behaves exactly
+        # as it did before Stage 1, and a divergence line here would invent a
+        # disagreement out of an absence — poisoning the very log the flip is
+        # gated on. Under any enforcing mode the opposite holds: an opinion we
+        # cannot read is not an allow.
+        if mode == _ENFORCE.SHADOW:
+            return bool(wrapper_allowed)
+        verdict = _ENFORCE.DENY
+
+    effective = _ENFORCE.effective_verdict(mode, bool(wrapper_allowed), verdict)
+    allowed = effective == _ENFORCE.ALLOW
+
     try:
-        import os
-        _shadow = _CAPS.shadow_record(
-            os.environ.get("QREXEC_REMOTE_DOMAIN") or "unknown",
-            _AUDIT_SERVICE, action, roles, params,
-            wrapper_allowed=wrapper_allowed)
+        if mode == _ENFORCE.SHADOW:
+            # Stage 1's comparison, preserved EXACTLY — including that GATE
+            # counts as "not allowed" — so a shadow-mode audit line is
+            # byte-identical to the one this stage replaced. Anything else
+            # would silently rewrite the divergence history the flip is
+            # measured against.
+            diverged = (verdict == _ENFORCE.ALLOW) != bool(wrapper_allowed)
+        else:
+            # Once enforcing, the question is whether enforcement CHANGED what
+            # happened — not whether the two opinions differed. A kernel GATE
+            # over a wrapper DENY is a different opinion and the same outcome,
+            # and logging it would bury the lines that matter.
+            diverged = allowed != bool(wrapper_allowed)
+        if diverged:
+            _shadow = {
+                "kernel": verdict,
+                "rule": rule,
+                "wrapper": _ENFORCE.ALLOW if wrapper_allowed else _ENFORCE.DENY,
+            }
+            if mode != _ENFORCE.SHADOW:
+                _shadow["mode"] = mode
+                _shadow["effective"] = effective
     except Exception:
         _shadow = None
+
+    return allowed
 
 #: Stage I-6 consent verdict for THIS call, recorded on the audit line only
 #: when a gate actually ran. Stays None on the empty-gate default (I-6) and
@@ -295,14 +458,17 @@ def main() -> int:
         # Stage I-5: detach is a CAP_FULL op on BOTH endpoints. Fail-closed;
         # collapses to the same opaque NOT_FOUND (no tier oracle).
         if not _require_full(app.domains[name]):
-            # Wave 2 Stage 1 (SHADOW): see the Attach wrapper — the role map is
-            # guarded by `in app.domains` because on the first iteration the
-            # other endpoint is not yet existence-checked, and an unguarded
-            # lookup would raise outside _shadow_note's try.
-            _shadow_note("detach",
-                         {r: app.domains[n] for r, n in
-                          (("backend", backend), ("frontend", frontend))
-                          if n in app.domains}, {}, False)
+            # Wave 2 Stage 3c: see the Attach wrapper — this endpoint failed
+            # the tier check so the call is refused whatever the kernel says and
+            # `_gate`'s return value is deliberately DISCARDED; the call is made
+            # only so the divergence record still fires under shadow. The role
+            # map is guarded by `in app.domains` because on the first iteration
+            # the other endpoint is not yet existence-checked, and an unguarded
+            # lookup would raise outside _gate's try.
+            _gate("detach",
+                  {r: app.domains[n] for r, n in
+                   (("backend", backend), ("frontend", frontend))
+                   if n in app.domains}, {}, False)
             return emit(NOT_FOUND)
 
     # Stage I-6: operator-consent gate — ONE per-call gate (one operator dialog
@@ -313,10 +479,11 @@ def main() -> int:
     # NOT_FOUND), so it is no consent oracle. Fail-closed (in _consent_gate).
     # Wave 2 Stage 1 (SHADOW): both endpoints passed — record the kernel's
     # verdict on the pair. Expected to agree and log nothing.
-    _shadow_note("detach",
+    if not _gate("detach",
                  {r: app.domains[n] for r, n in
                   (("backend", backend), ("frontend", frontend))
-                  if n in app.domains}, {}, True)
+                  if n in app.domains}, {}, True):
+        return emit(NOT_FOUND)
 
     if not _consent_gate("detach"):
         return emit(NOT_FOUND)

@@ -176,10 +176,14 @@ print("\n-- 1. every wrapper loads with the kernel attached --")
 for w in ALL_WRAPPERS:
     install_fake_qubesadmin(fleet())
     m = load_wrapper(w)
-    check(f"{w}: kernel + shadow hook present",
-          m._CAPS is not None and hasattr(m, "_shadow_note")
+    check(f"{w}: kernel + decision hook present",
+          m._CAPS is not None and hasattr(m, "_gate")
           and m._shadow is None,
           "a wrapper whose _CAPS failed to load would silently log nothing")
+    check(f"{w}: enforcement flag reachable, and SHADOW with no operator file",
+          m._ENFORCE is not None and m._enforce_mode() == "shadow",
+          "Stage 3c's shipped default — a wrapper resolving anything else here "
+          "would arm enforcement that the operator never configured")
 
 # --------------------------------------------------------------------------
 print("\n-- 2. INVARIANCE: the kernel cannot change what AI sees --")
