@@ -896,11 +896,31 @@ A malformed or unreadable file falls back to `ai-` rather than to "no prefix" �
 for this one file, "no prefix" would be *more* authority, so the safe landing is
 the restrictive default.
 
-**One residual, worth knowing:** a qube inside the reserved prefix that is *not*
-`ai-managed` can still be inferred, because the agent can list the ai-managed
-ones and subtract. That is one namespace instead of the whole machine.
-`install-stage-fixes-F1-F5.sh` reports any such qube on your fleet so you can
-rename it or accept it.
+#### Known and accepted: one residual disclosure
+
+A qube whose name is inside the reserved prefix but which is **not** tagged
+`ai-managed` can still be inferred by an agent, because the agent can list the
+ai-managed qubes and subtract. `install-stage-fixes-F1-F5.sh` reports any such
+qube on your fleet at install time.
+
+**This is accepted, not outstanding.** It is the deliberate cost of the design
+rather than a gap awaiting a patch, and the reasoning is short enough to check:
+
+- The alternative to a reserved namespace is a uniform error message, and that
+  does not work here. A create has three outcomes — the name is free, it is
+  taken by a qube the agent can already enumerate, or it is taken by one it
+  cannot. Collapsing the messages still leaves the third resolvable by
+  subtraction, and response time separates them regardless, because a free name
+  goes on to do real work while a taken one returns immediately.
+- So the choice is not "leak one namespace" versus "leak nothing". It is "leak
+  one namespace" versus "leak the whole machine", and the namespace bounds the
+  disclosure to a set the operator controls and can inspect.
+- The residual is empty on a fleet where every qube under the prefix is
+  ai-managed, which is the intended arrangement. If it is not empty on yours,
+  rename those qubes out of the prefix — or change the prefix — and it closes.
+
+If that trade is wrong for your threat model, the prefix is operator-owned:
+point it at a namespace nothing else occupies.
 
 ### Egress: birth is inherited, retarget is operator-only
 

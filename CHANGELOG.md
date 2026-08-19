@@ -10,7 +10,163 @@ the as-built record; from 0.9.0 onward, releases are versioned. The stage names
 in `deploy/` will be renamed to match in a later release — a mechanical change
 kept separate so it stays independently reviewable.
 
+**Every commit ships a version.** One commit, one patch bump, one entry here, one
+tag. There is no accumulating "unreleased" pile: if a change is worth committing
+it is worth saying what it changed, and a reader who has `0.9.7` installed can
+tell exactly what `0.9.9` adds. Versions **0.9.1 … 0.9.9 were assigned
+retroactively** on 2026-08-19 to commits that were already public — the history
+itself is unchanged, because this project does not rewrite published history, so
+those versions are a record laid over it rather than a rebase.
+
+While the major version is `0`, a breaking change takes a patch bump and is
+labelled **BREAKING** in its entry. That is SemVer's own rule for `0.y.z`, not a
+shortcut: nothing here is stable until 1.0.0, and pretending otherwise by
+burning minor versions would misrepresent it.
+
 ## [Unreleased]
+
+Nothing — the working tree is the last released version.
+
+## [0.9.10] — 2026-08-19
+
+`pending` — changelog backfill, retroactive per-commit versions, and the first GitHub release
+
+### Changed
+- **Every commit now ships its own version.** Versions 0.9.1 … 0.9.9 are
+  assigned retroactively below to commits that were already public, and tagged
+  to match. Nothing was rewritten: the history is unchanged and the versions are
+  a record laid over it, which is the only honest way to backfill a repo that
+  forbids force-pushing.
+- **A disclaimer for the reserved-namespace residual** in `README.md`, under
+  *Qube naming*. The bounded disclosure it describes is accepted, not
+  outstanding, and the README now says so plainly rather than leaving a reader
+  to infer it from an installer warning.
+
+## [0.9.9] — 2026-08-18
+
+`761bae1` — close an existence oracle and an egress-retarget bypass found by attack
+
+Found by an adversarial pass against the shipped tree: five findings,
+each reproduced against a live fleet before being fixed and re-attacked after.
+
+### Changed
+- **BREAKING — qubes created by an agent must be named inside a reserved
+  prefix.** `qmcp.SpawnAIManagedQube` and `qmcp.CloneAIManagedQube` now refuse a
+  requested name that does not start with the prefix in
+  `/etc/qmcp/name-prefix` (absent = `ai-`). The refusal happens on the name's
+  *shape*, before dom0's qube list is consulted at all. A create that previously
+  succeeded under another naming convention now returns `name must start with
+  '<prefix>' …`; set the operator file, or rename the convention.
+
+  This is a security boundary, not tidiness — see the existence-oracle entry
+  under **Fixed**. It constrains only what an agent may *ask to create*: a qube
+  the operator names anything and tags `ai-managed` is fully usable, and
+  disposables keep the platform-generated `disp<N>` names.
+
+- **BREAKING — an agent can no longer retarget a qube's network.**
+  `qmcp.SetPropertyAIManaged` refuses a non-null `netvm` write on an ai-managed
+  qube. Setting `netvm = null` (disconnecting) remains allowed, mirroring the
+  create path's carve-out: de-escalation cannot leak.
+
+  Birth-egress inheritance shipped without this and was worth very little
+  without it. With birth enforced and retarget open, an agent could retarget a
+  source qube and then *clone* it — and the clone was born on the new path with
+  no `netvm` argument for the birth guard to inspect, because inheriting from
+  the creation source is precisely what the birth rule is supposed to do. The
+  same move through a DispVMTemplate minted disposables on the foreign egress,
+  which is the case the rule exists for. The two halves are one guarantee.
+
+### Fixed
+- **The create paths were an existence oracle over every qube on the host.**
+  Both validated a requested name against dom0's full qube list — not the
+  ai-managed subset — and answered `qube '<name>' already exists`, echoing it
+  back. An agent could confirm any qube name it could guess, including qubes
+  every *read* surface deliberately redacts.
+
+  Fixed by reserving a namespace rather than by rewording the error, and the
+  distinction is the substance of the fix. A create has three outcomes: the name
+  is free, it is taken by a qube the agent can already enumerate, or it is taken
+  by one it cannot. Collapsing the messages leaves the third resolvable by
+  subtraction, and the timing separates them regardless — a free name goes on to
+  do real work while a taken one returns at once. Restricting *what an agent may
+  ask for* is what makes a collision only ever concern a name it could already
+  see. One residual, documented and reported by the installer: a qube inside the
+  reserved prefix that is not `ai-managed` stays inferable. One namespace
+  instead of the whole machine.
+
+- **Raw dom0 exception text no longer reaches the caller.** Eleven sites across
+  the three create wrappers forwarded a Python exception string into a
+  caller-visible field; one returned dom0's storage pool name, the LVM volume
+  path and `lvresize` remediation advice inside an `ok: true` response. Those
+  fields now carry fixed vocabulary (`private_resize_failed`, `clone failed`, …)
+  and the exception class goes to the dom0 audit chain. The JSON-parse error is
+  deliberately unchanged: it echoes the caller's own payload.
+
+- **`private_size` rejects a float and a boolean.** It was validated with
+  `int()`, which truncated `1.5` to `1` and — `bool` being an `int` subclass in
+  Python — accepted `true` as a byte count. Neither breached the pool cap, since
+  the estimate clamps to the default floor, but the documented contract is an
+  integer and the surrounding posture is default-deny on input shape.
+
+## [0.9.8] — 2026-08-18
+
+`1239065` — Wave 2 Stage 3b — enforcement-mode flag and production smoke suite, INERT
+
+### Added
+- **An operator-owned enforcement-mode flag, shipped inert**
+  (`dom0-rpc/qmcp_enforce.py`, `/etc/qmcp/enforce-mode`, absent = `shadow`).
+  The switch the enforcement flip is made and unmade with, and the way back: one
+  write, no policy reload, no daemon restart. **Three modes rather than two,**
+  because this flip is not monotone the way earlier ones were — it narrows the
+  escalation class and simultaneously *widens* lifecycle, since an actor that
+  can already `rm -rf` inside a qube gains nothing from a separate gate on
+  removing it. So `enforce` is not uniformly safer than `shadow`, and a
+  malformed flag must not land there. `strict` — allow only what the wrapper
+  **and** the kernel allow — is safer than both, which makes it the only correct
+  fail-closed target and, in practice, the right first value to arm.
+
+- **A production smoke suite** (`deploy/smoke-production.py`), the gate the
+  enforcement flip is required to pass. It reports **four** outcomes, not two:
+  `PASS`, `FAIL`, `VACUOUS` (ran, but the fleet's shape means it could not have
+  failed) and `NOT-RUN` (needs tooling outside this repository, declared in an
+  operator-local conf). Exit `0` GREEN, `2` FAILED, `3` INCOMPLETE — and
+  INCOMPLETE is **not** green, because a suite that counts an unrunnable check
+  as a pass reports success while part of the gate never ran.
+
+## [0.9.7] — 2026-08-18
+
+`6e6dfaf` — Wave 2 Stage 3a — tombstone mechanism and reaper, INERT
+
+### Added
+- **A tombstone and its reaper, shipped inert** (`dom0-rpc/qmcp_tombstone.py`,
+  `dom0-rpc/qmcp-tombstone-reaper`, `deploy/install-stage-3a.sh`). The
+  compensating control the coming enforcement flip needs, landed ahead of it so
+  the window exists before the capability that needs it. An AI-initiated remove
+  will, once enforcement flips, halt the qube, add a `qmcp-tombstone_<epoch>`
+  marker, strip the umbrella and every privilege tag while carrying restrictions
+  forward, then read back and roll back on mismatch. A root systemd oneshot
+  reaps on a timer only — never under pool pressure, because an early-reap path
+  is one an agent could drive to destroy evidence before the operator reads it.
+  `qmcp_budget` now charges tombstones as well as ai-managed qubes: dropping the
+  umbrella would otherwise make a tombstone free, and create/remove churn would
+  park unbounded disk outside the accounting. Nothing creates a tombstone yet,
+  so the summation is byte-identical on a fleet without one.
+
+## [0.9.6] — 2026-08-18
+
+`a4f9ebf` — replace deprecated `load_module()` calls (removed in Python 3.15)
+
+### Fixed
+- **Three `SourceFileLoader.load_module()` calls replaced** with the
+  `spec_from_loader` + `exec_module` idiom the rest of the tree uses (the I-6
+  installer heredoc, and the G0a and G0d validators). The call is removed in
+  Python 3.15, so a stage re-install would have aborted on a future interpreter.
+  Invisible under a plain `python3`; surfaced by running every validator under
+  `-W error::DeprecationWarning`, which is now a standing pre-commit step.
+
+## [0.9.5] — 2026-08-18
+
+`6744bf9` — Wave 2 Stage 2 — ownership, birth tier, birth egress
 
 ### Added
 - **Ownership, birth tier and birth egress on every create path**
@@ -80,11 +236,13 @@ kept separate so it stays independently reviewable.
   the wrapper still allows it and only the disagreement is recorded. Retarget
   closes when enforcement flips to `decide()`. Until then, "egress is enforced"
   is true of creation and false of mutation.
+
 - **A create whose egress cannot be proven is rolled back.** A failed `netvm`
   assignment used to return `ok: true` with a warning, leaving a tagged qube on
   whatever the system default was — possibly the operator's own upstream. It now
   rolls the qube back. Disposables have their netvm pinned explicitly and read
   back *before* they are ever started, so a mismatch costs a kill and no leak.
+
 - **Removed `_RING_MIN_TIER` from `qubes_mcp/server.py`.** It mapped each ring
   to the tier its write surface needs — accurate, and enforced nowhere. This
   layer runs inside `mcp-control`, the untrusted side; the real check is the
@@ -93,6 +251,25 @@ kept separate so it stays independently reviewable.
   reasons about the system's authority from a table that has never denied
   anything, and a comment saying "declarative only" does not survive a skim.
 
+## [0.9.4] — 2026-08-18
+
+`226b3cb` — installer pulls only the first wrapper; operator files ignore comments
+
+### Fixed
+- **An installer's multi-file pull archived only the first file** and executed
+  the rest. The file list reached the remote shell containing newlines, which it
+  read as command separators. Collapsed to one line before it becomes a remote
+  command.
+- **`/etc/qmcp/tier-default` ignored the `value  # comment` form**, so an
+  operator annotating the file the way neighbouring files are annotated got a
+  silently malformed value — and malformed fails closed, so the setting appeared
+  to do nothing at all.
+
+## [0.9.3] — 2026-08-17
+
+`5732e4e` — Wave 2 Stage 1 — capability decision kernel, shipped SHADOW
+
+### Added
 - **A dom0 capability decision kernel, running in shadow mode**
   (`dom0-rpc/qmcp_caps.py`, `deploy/install-stage-1.sh`). `decide(actor,
   service, action, targets)` derives a verdict from a domination lattice rather
@@ -131,6 +308,23 @@ kept separate so it stays independently reviewable.
   invariance by running every case twice — kernel loaded and kernel absent —
   and asserting byte-identical responses, and confirm a *raising* kernel changes
   nothing either).
+
+## [0.9.2] — 2026-08-17
+
+`01d1f26` — forbid scoping any gate on `created-by-*` / `disp-created-by-*`
+
+### Changed
+- **Documented an anti-goal:** no policy, ownership or gate may ever be scoped
+  on `created-by-*` or `disp-created-by-*`. qubesd stamps `created-by-` plus the
+  *calling* domain — dom0 for every create this project makes — so the tag
+  cannot distinguish an AI-created qube from an operator-created one; and
+  `disp-created-by-*` escapes qubesd's own `created-by-` write guard, so anything
+  holding `tag.Set` can forge it. Ownership is a wrapper-stamped tag in the
+  reserved namespace instead.
+
+## [0.9.1] — 2026-08-17
+
+`d8839b8` — report property reads per property instead of aborting on the first failure
 
 ### Fixed
 - **Reads no longer discard a whole call over one class-specific property.**
