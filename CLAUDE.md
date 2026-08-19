@@ -31,8 +31,17 @@ this directory.**
     to any `@tag:ai-managed` qube (Stage B — exec and file-copy land in
     the target's qubes-rpc service, which only ai-managed templates
     install);
-  - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-managed` (Stage B
-    — inter-ai-managed transfer without the operator dialog);
+  - `qubes.Filecopy` between `@tag:ai-managed` qubes: **dialog-free between two
+    `ai-exec`+ endpoints** (the G0c 3×3 mesh), and **by operator dialog (`ask`)
+    for every other intra-umbrella pair** (2026-08-19). The `ask` is scoped
+    `@tag:ai-managed → @tag:ai-managed` and never `@anyvm`: AI can already
+    enumerate that target set via `qmcp.ListAIManagedQubes`, so naming one
+    discloses nothing, whereas an `@anyvm` ask would let AI name any qube on the
+    host and learn from whether a dialog appeared — an existence oracle of the
+    class F-1 closed on the create paths. **Leaving the umbrella stays a
+    dialog-free deny**; the handoff-to-a-vault case uses the `ai-dump` sink as a
+    one-way buffer. An `ai-dump` source into the umbrella is explicitly denied,
+    so a misconfigured hybrid cannot be dialogued back through the valve;
   - `admin.vm.firewall.Get` on `@tag:ai-managed` targets (Stage C; the
     ro-floor) and `admin.vm.firewall.{Set,Reload}` on `@tag:ai-net` +
     `@tag:ai-full` targets (Stage I-4 — graduated to the firewall-write
@@ -43,7 +52,12 @@ this directory.**
     backend / consuming-frontend qube names) and DENIES the direct
     `admin.vm.device.*.{Available,Attached,Assigned}` methods to AI;
   - `qubes.Filecopy` from `@tag:ai-managed` to `@tag:ai-dump` (Stage I-4 —
-    the write-only sink; copy-IN only).
+    the write-only sink; copy-IN only). **This is also the operator's handoff
+    buffer**: an `ai-dump` qube carries no umbrella, so it has no read surface,
+    no exec service and no enumeration into it — AI can push files in and cannot
+    read them back, and the operator drains the buffer onward by hand. That is
+    why the project needs no separate "handoff" tag: the airlock already exists,
+    in the direction that matters.
 - AI has **root inside its sandbox qubes** (via `qmcp.RunInAIManaged`, Stage B)
   but no privilege inside `mcp-control` itself. mcp-control is an RPC gateway,
   not a workhorse. Hardening `mcp-control` (sudo lockdown, dedicated MCP
@@ -1032,7 +1046,9 @@ grants and a sign-only vault. **Stages G and H** stay deferred.
 | firewall read | `firewall.Get` | `ai-ro` (umbrella) | **policy** `@tag:ai-managed` |
 | device enumerate | `qmcp.ListAttachedDevicesAIManaged` (attached + available) | `ai-ro` (umbrella) | **wrapper (dom0 redactor)** — direct `device.*` denied (G0) |
 | firewall write | `firewall.{Set,Reload}` | `ai-net` / `ai-full` | **policy (I-4)** `@tag:ai-net` + `@tag:ai-full` (+ compat backstop) |
-| copy-IN sink | `qubes.Filecopy → ai-dump` | `ai-dump` (orthogonal) | **policy (I-4)** `@tag:ai-dump` target |
+| copy-IN sink / operator handoff buffer | `qubes.Filecopy → ai-dump` | `ai-dump` (orthogonal) | **policy (I-4)** `@tag:ai-dump` target |
+| peer copy inside the umbrella | `qubes.Filecopy` ai-managed ↔ ai-managed | `ai-exec`+ both ends → dialog-free; any other pair → **operator dialog** | **policy (G0c + 2026-08-19)** 3×3 mesh, then `@tag:ai-managed → @tag:ai-managed ask` |
+| copy OUT of the umbrella | `qubes.Filecopy` ai-managed → `@anyvm` | none — operator-only | **policy** dialog-free `deny`; use an `ai-dump` buffer |
 | exec / copy | `RunInAIManaged`, `CopyToAIManaged` | `ai-exec` | **policy (I-5)** `@tag:ai-exec`/`ai-net`/`ai-full` (+ compat backstop) |
 | lifecycle / property / clone / spawn / feature / attach / detach | the `qmcp.*` `@adminvm` wrappers | `ai-full` | **wrapper (dom0 CAP_FULL gate)** |
 

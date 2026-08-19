@@ -27,6 +27,63 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.12] — 2026-08-19
+
+Intra-umbrella `qubes.Filecopy` by operator dialog. Policy-only.
+
+### Fixed
+
+- **An operator could not hand-copy a file between two qubes they own, and got
+  no dialog explaining why.** G0c replaced the single
+  `@tag:ai-managed -> @tag:ai-managed` peer-copy line with the 3×3 tiered mesh
+  and left **no compat backstop** — the only tag-scoped surface graduated
+  without one (`install-stage-flip.sh` deletes exactly four, and this is not
+  among them). Because the qrexec engine matches tags *literally* and cannot
+  read `/etc/qmcp/tier-default`, an **untiered** umbrella qube has matched none
+  of those lines since G0c, in compat as much as post-flip, and fell to the
+  dialog-free deny.
+
+### Changed
+
+- `qubes.Filecopy * @tag:ai-managed @tag:ai-managed ask` — intra-umbrella peer
+  copy returns as an **ask**, which is tighter than the pre-G0c `allow` and
+  tighter than the backstop G0c should have left. It changes exactly the five
+  pairs the mesh missed (elevated→untiered, untiered→elevated,
+  untiered→untiered); every pair the mesh already covers keeps its dialog-free
+  `allow`, so nothing that works today starts prompting.
+  **The target selector is `@tag:ai-managed`, never `@anyvm`, and that is the
+  safety argument.** qrexec cannot tell the operator from the agent, so an ask
+  is a control only because AI cannot click zenity — a human-attention control.
+  What a rule *can* bound is what the agent learns by asking: with `@anyvm` the
+  agent names any qube on the host and observes whether a dialog appeared, an
+  existence oracle over every out-of-scope qube (the class F-1 closed on the
+  create paths). With `@tag:ai-managed` the target set is exactly what
+  `qmcp.ListAIManagedQubes` already returns.
+- **Leaving the umbrella is unchanged** and still a dialog-free deny. The
+  handoff-to-a-vault case uses the `ai-dump` sink that already exists as a
+  one-way buffer — no new tag and no second mechanism.
+
+### Added
+
+- `qubes.Filecopy * @tag:ai-dump @tag:ai-managed deny` — the price of
+  introducing an ask at all. A misconfigured hybrid (`ai-managed` **and**
+  `ai-dump`, the invariant the I-4 installer warns about) would otherwise match
+  the new ask as a *source* and be dialogued back into the fleet, defeating the
+  Biba valve. This also closes a pre-existing hole: a **pure** sink copying back
+  in previously matched no rule here and landed on the Qubes system-default
+  `ask` — finding [8]'s fallthrough hazard, in the one direction G0c did not
+  cover. `ai-dump` → out-of-umbrella is deliberately untouched, so an operator
+  can still drain a buffer by hand.
+- `deploy/install-stage-peercopy.sh` — validates the staged policy with the real
+  qrexec parser, resolves the whole Filecopy matrix off the staged file and
+  aborts before touching `/etc/qubes/policy.d/` if anything drifted, backs up
+  the live policy, reloads the daemon, then re-resolves off the **installed**
+  file.
+- `offline-validate-G0c.py` grows from 23 to 42 checks, including teeth that
+  remove each new rule from the parsed set and re-resolve — proving the ask
+  restores a capability that was genuinely absent and the deny closes a hole
+  that would genuinely open.
+
 ## [0.9.11] — 2026-08-19
 
 Wave 2 Stage 3c — the enforcement flip, shipped inert.

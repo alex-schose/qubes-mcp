@@ -839,6 +839,37 @@ because tier tags are deliberately invisible to AI. `deploy/uninstall-stage-I-5.
 reverts (or `/tmp/run.sh revert` restores the pre-I-5 wrappers + policy
 byte-exact).
 
+### Moving files by hand, inside and out of the AI fleet
+
+Two rules govern this, and the second surprises people:
+
+**Inside the umbrella** — copying between two `ai-managed` qubes works. Between
+two `ai-exec`+ endpoints it is dialog-free; any other pair raises the normal
+Qubes copy dialog and proceeds when you approve it. The dialog is the control,
+and it works because an agent cannot answer one.
+
+**Out of the umbrella** — copying from an `ai-managed` qube to a qube outside it
+is refused, with no dialog, whoever asks. That is deliberate: qrexec cannot tell
+an operator apart from an agent, so a rule permitting you to copy out would
+permit the agent to copy out.
+
+To get files out, use an **`ai-dump` buffer**, which is the airlock this design
+already provides:
+
+```
+your AI qube  ──allow──▶  buffer tagged ai-dump  ──your own dialog──▶  vault
+```
+
+```bash
+qvm-tags <buffer> add ai-dump
+```
+
+The buffer must **never** also be `ai-managed`. Carrying no umbrella is what
+makes it one-way: there is no read surface into it, no exec service, no
+enumeration — an agent can put things in and cannot take them back out, and only
+you drain it. (`install-stage-I-4.sh` warns if it finds a hybrid, and a hybrid
+source is explicitly denied back into the fleet.)
+
 ### Wave 2 (pre-1.0) — the enforcement chain and its gate
 
 The Wave 2 stages are **not part of the adopter path yet**: each ships inert or

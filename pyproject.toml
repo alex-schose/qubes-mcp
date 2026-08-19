@@ -1,6 +1,6 @@
 [project]
 name = "qubes-mcp"
-version = "0.9.11"
+version = "0.9.12"
 description = "Tag-scoped Qubes Admin API sandbox for AI assistants"
 authors = [{name = "Alex Schose", email = "alexschose@atomicmail.io"}]
 license = {text = "MIT"}

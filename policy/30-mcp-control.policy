@@ -127,6 +127,60 @@ qubes.Filecopy              *  @tag:ai-full  @tag:ai-full  allow
 
 qubes.Filecopy              *  @tag:ai-managed  @tag:ai-dump     allow
 
+# --- Peer copy inside the umbrella, by operator dialog (2026-08-19).
+#
+# G0c replaced the old single `@tag:ai-managed -> @tag:ai-managed` peer line
+# with the 3x3 tiered mesh above and left NO COMPAT BACKSTOP — the only
+# tag-scoped surface graduated without one. (install-stage-flip.sh deletes
+# exactly four: firewall.Set, firewall.Reload, RunInAIManaged, CopyToAIManaged.)
+# Because the qrexec engine matches tags LITERALLY and cannot read
+# /etc/qmcp/tier-default, an UNTIERED umbrella qube has matched none of those
+# lines since G0c — in compat exactly as much as post-flip — and fell to the
+# dialog-free DENY below. The operator, working by hand inside an AI-owned
+# qube, got no prompt and no copy. That is how this was found.
+#
+# This line restores intra-umbrella peer copy as an ASK rather than the old
+# ALLOW, so it is TIGHTER than both the pre-G0c state and the backstop G0c
+# should have left. Placement is load-bearing, and it is why nothing that
+# works today starts asking:
+#   - AFTER the 3x3 mesh, so a tiered pair keeps its dialog-free allow;
+#   - AFTER the ai-dump line, so the Biba valve keeps its allow;
+#   - BEFORE the @anyvm deny, which still governs everything LEAVING the
+#     umbrella (the vault-handoff case — use an ai-dump buffer for that; see
+#     the sink block above, which already carries data out one-way).
+# What it actually changes is the five pairs the mesh missed: elevated->
+# untiered, untiered->elevated, untiered->untiered.
+#
+# WHY THE TARGET SELECTOR IS `@tag:ai-managed` AND NOT `@anyvm`, and this is
+# the whole safety argument. qrexec cannot tell the operator apart from the
+# agent — a qubes.Filecopy out of ai-work-1 is byte-identical either way — so an
+# ask is a control only because AI cannot click zenity, which is a human-
+# attention control, not a mechanical one. What a mechanical rule CAN do is bound
+# what an agent learns by asking. With `@anyvm` the agent chooses any name on the
+# host and observes whether a dialog appeared: an existence oracle over every
+# out-of-scope qube, exactly the class F-1 closed on the create paths. With
+# `@tag:ai-managed` the target set is precisely the set qmcp.ListAIManagedQubes
+# already returns, so naming one discloses nothing the agent did not have.
+#
+# Residual, stated rather than hidden: an agent holding exec on an elevated qube
+# can now SUMMON this dialog toward a qube it can already see. It cannot answer
+# it. G0c's rule that one exec grant must not become a silent fleet-wide data
+# plane still holds — every push into an untiered qube now costs an operator
+# click, where before it was refused and before G0c it was free.
+#
+# The DENY above it is the price of introducing an ask at all: with a
+# @tag:ai-managed -> @tag:ai-managed ask in the file, a MISCONFIGURED hybrid
+# (ai-managed AND ai-dump — the operator invariant the I-4 installer warns on)
+# would match that ask as a SOURCE and could be dialogued back into the fleet,
+# defeating the valve. Denying an ai-dump SOURCE into the umbrella closes that,
+# and closes more besides: a pure sink copying back in previously fell through
+# to the Qubes SYSTEM-DEFAULT ask, a dialog governed by a policy file this
+# project does not own (finding [8]'s fallthrough hazard). It leaves
+# ai-dump -> OUT-of-umbrella alone, which is how the operator drains a buffer
+# to a vault by hand.
+qubes.Filecopy              *  @tag:ai-dump     @tag:ai-managed  deny
+qubes.Filecopy              *  @tag:ai-managed  @tag:ai-managed  ask
+
 # Stage G0c (finding [6] + [8]): explicit dialog-free DENY for every OTHER
 # qubes.Filecopy from an ai-managed source — anything that did NOT match the
 # ai-exec+ peer-copy mesh above (an ai-ro source, or an ai-exec+ source copying

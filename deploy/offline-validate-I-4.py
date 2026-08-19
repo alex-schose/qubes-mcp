@@ -217,10 +217,14 @@ def run_filecopy(rules, phase):
     cases = [
         # (label, source, target, expected)
         ("ai-managed  -> ai-dump   (the valve, copy-IN)", WORKER, TARGETS["dump"], "allow"),
-        # Stage G0c re-tiered inter-ai-managed Filecopy: an ai-ro source (WORKER)
-        # can no longer inter-copy — BOTH ends must be ai-exec+ now. Authoritative
-        # matrix lives in offline-validate-G0c.py; here we confirm the ai-ro floor.
-        ("ai-ro       -> ai-ro      (G0c: inter-copy needs ai-exec+ both ends)", WORKER, WORKER, "deny"),
+        # Stage G0c re-tiered inter-ai-managed Filecopy: BOTH ends must be
+        # ai-exec+ for a dialog-free allow. An ai-ro pair therefore misses the
+        # mesh — and since 2026-08-19 it routes to an operator ASK rather than a
+        # dialog-free deny, so an operator can hand-copy inside a fleet of qubes
+        # they own. The security property is unchanged and is "never allow":
+        # AI cannot answer a zenity prompt. Authoritative matrix lives in
+        # offline-validate-G0c.py; here we confirm the ai-ro floor.
+        ("ai-ro       -> ai-ro      (misses the mesh: operator dialog, never allow)", WORKER, WORKER, "ask"),
         ("ai-managed  -> untagged  (no exfil to random qube)", WORKER, TARGETS["untagged"], "deny"),
         ("ai-managed  -> dom0      (no exfil to dom0)", WORKER, TARGETS["dom0"], "deny"),
         ("ai-dump     -> ai-managed (sink is WRITE-ONLY)", DUMP_SRC, WORKER, "deny"),
