@@ -968,6 +968,13 @@ qubes_mcp/                          # repo root
     ├── uninstall-stage-3a.sh
     ├── qmcp-tombstone-reaper.service # Stage 3a systemd units
     ├── qmcp-tombstone-reaper.timer
+    ├── install-stage-peercopy.sh     # 2026-08-19 — intra-umbrella qubes.Filecopy by
+    │                                 # operator dialog. Policy-only: validates with the
+    │                                 # REAL qrexec parser, resolves the whole Filecopy
+    │                                 # matrix off the STAGED file and aborts before
+    │                                 # touching /etc/qubes/policy.d/, backs the live
+    │                                 # policy up, reloads the daemon, then re-resolves
+    │                                 # off the INSTALLED file.
     ├── install-stage-3b.sh           # Wave 2 Stage 3b — the enforcement-mode flag (inert)
     ├── uninstall-stage-3b.sh
     ├── install-stage-3c.sh           # Wave 2 Stage 3c — the wrappers wired to obey the
@@ -984,7 +991,12 @@ qubes_mcp/                          # repo root
     │                                 # 3 INCOMPLETE, and INCOMPLETE is NOT green.
     └── offline-validate-*.py         # per-stage offline suites (no dom0, no qubesadmin)
                                       # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b, 3c,
-                                      # G0a..G0d, I-2..I-6
+                                      # fixes-F1-F5, G0a..G0d, I-2, I-3, I-4,
+                                      # I-5, I-5-policy, I-6
+
+    (This listing names the files a reader is most likely to go looking for; it
+    is not exhaustive. `deploy/` also holds the G0a..G0e installers, the I-6
+    consent defaults and its systemd unit. `ls deploy/` is authoritative.)
 ```
 
 ## Operating protocol

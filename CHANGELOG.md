@@ -27,6 +27,24 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.13] — 2026-08-19
+
+Documentation only. No code, no policy, no behaviour change.
+
+### Fixed
+
+- The `deploy/` file-layout listing in `CLAUDE.md` omitted
+  `install-stage-peercopy.sh`, added in 0.9.12 — docs-vs-code drift of exactly
+  the kind the workflow forbids, caught at session close rather than by a
+  reader.
+- The offline-suite inventory line in the same listing was missing
+  `fixes-F1-F5`, `I-3`, `I-5` and `I-5-policy`.
+- The listing now says plainly that it is **not exhaustive** and that
+  `ls deploy/` is authoritative. It has never listed the G0a..G0e installers,
+  the I-6 consent defaults or its systemd unit, and reading it as a complete
+  inventory was the mistake — better to state the contract than to keep a list
+  that silently rots.
+
 ## [0.9.12] — 2026-08-19
 
 Intra-umbrella `qubes.Filecopy` by operator dialog. Policy-only.
