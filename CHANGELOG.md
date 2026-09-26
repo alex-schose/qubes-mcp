@@ -27,6 +27,200 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.14] — 2026-09-26
+
+Wave 2 Stage 3d — the calling principal is never a legitimate object.
+
+### Added
+
+- `dom0-rpc/qmcp_principal.py` — an unconditional pre-gate refusing any
+  mutation whose object is the calling principal (the qrexec source domain),
+  decided on shape before any host lookup. Wired into
+  `qmcp.{SetProperty,SetFeature,Lifecycle,AttachDevice,DetachDevice}AIManaged`
+  ahead of the existence check, the umbrella check, the tier gate, the consent
+  gate and `/etc/qmcp/enforce-mode`.
+- Two self-target `deny` lines in `policy/30-mcp-control.policy`, for the
+  `@tag:`-scoped write methods a dom0 helper cannot reach:
+  `admin.vm.firewall.Set` and `admin.vm.firewall.Reload`.
+  `admin.vm.firewall.Get` gets none — it is a read.
+- An un-flip guard in `install-stage-3d.sh`: a policy-carrying installer now
+  refuses to write the shipped policy (which contains the four `@tag:ai-managed`
+  COMPAT backstops) over a fleet whose `/etc/qmcp/tier-default` reads `ro`,
+  unless `QMCP_ALLOW_UNFLIP=1`. `install-stage-I-4.sh` and `-I-5.sh` already
+  refused this; nothing else did.
+- Optional `/etc/qmcp/principals` for a fleet with more than one gateway. It
+  only ever *adds* to the caller-derived principal, so an absent or malformed
+  file cannot unprotect the caller.
+- `deploy/{install,uninstall}-stage-3d.sh` and
+  `deploy/offline-validate-3d.py` (127 checks).
+
+### Fixed
+
+- **BREAKING** — the mutate-path half of an invariant that was only ever
+  enforced on create. I-5 strips tier tags from every created qube so an agent
+  cannot mint authority for itself; nothing performed the equivalent check on
+  the mutate path, so no wrapper compared its target against the caller. With
+  `/etc/qmcp/tier-default` absent — which resolves to compat, and which the base
+  install never writes (only the separate flip step, `install-stage-flip.sh`,
+  does), so it is the state a fresh install is in — a gateway
+  carrying the `ai-managed` umbrella was fully mutable from the AI seat.
+  Measured offline: **7 of the 8 settable properties were open on the
+  principal**, `name` among them, and renaming the gateway severs every policy
+  line that names it literally, unrecoverable without dom0. `netvm` was the
+  only one already shut, by the F-2 retarget guard.
+  Breaks an adopter who tagged their gateway *and* relies on mutating it
+  through qmcp; the breakage is the fix.
+- The `README.md` Status heading advertised "Current version: 0.9.0" while the
+  changelog stood at 0.9.13 — a false public claim about what the repo is,
+  carried since the version scheme was introduced.
+
+### Unchanged, deliberately
+
+- `kill`, `shutdown` and `start` on the principal, and `Clone` with the
+  principal as source. The agent runs *as* the principal and already holds code
+  execution there, so gating what it can already do from inside deletes nothing
+  and reads as a control. The guarded/dominated partition is pinned by the
+  offline suite and executed by the installer, so a later stage moving a row
+  fails a check rather than quietly inverting the invariant.
+- Every read surface. AI can read its own qube from inside it.
+
+### Regression measured on hardware, before release
+
+- **No regression.** The four suites with the most call sites into the five
+  changed wrappers, run from the AI seat against the current code: `test-stage-e1`
+  6/6 (twice — it exercises the Attach/Detach endpoint loop this stage
+  restructured), `test-stage-I-6` 4/4, `test-stage-I-5` 9/0, `test-stage-a` 11/0.
+  I-6's `test_2_opaque_refusal_parity` — every refusal byte-identical to
+  `{"ok": false, "error": "not found"}` — is the check a new refusal path was
+  most likely to break, and it passes. Suites chosen by grepping for call sites
+  rather than by judgement; 13 of 16 touch the changed wrappers.
+- Pool usage before and after the run is byte-identical (36 507 222 016), so the
+  measurement left no fixtures behind to poison the next one.
+
+### Found by exercising the uninstaller on hardware, before release
+
+- **The uninstaller did a PARTIAL REVERT on its error path, and reported that it
+  had refused.** Its ordering guard — which correctly refuses to remove the
+  fail-closed helper while the 3d wrappers are installed, because that turns
+  every guarded call into a refusal fleet-wide — sat *below* the policy half. So
+  a plain run stripped the two self-target `deny` lines, then hit the refusal,
+  printed "That is an outage, not a revert" and exited 1, leaving the fleet
+  code-guarded and policy-unguarded. Measured on hardware: `denies=2` before,
+  `denies=0` after a run that reported failure. The preconditions are now
+  checked above every mutation, the refusal message says "nothing has been
+  changed", and the offline suite pins the ordering against the actual mutating
+  commands. Re-tested: the policy file's SHA-256 is byte-identical across a
+  refused run.
+- **The revert is now drilled end to end**, which for a stage that ships armed is
+  the thing that makes it shippable: pre-3d wrappers restored, uninstaller run
+  for real (lib removed, denies stripped, daemon healthy), the pre-3d gap
+  confirmed *back* from the AI seat — gateway `SetProperty` and `SetFeature`
+  returning `ok:true` again — then 3d reinstalled and the gap confirmed closed.
+  `QMCP_POLICY_ONLY=1` was exercised separately and its own claim checked: with
+  the policy half reverted the wrapper surfaces still refuse, so the two halves
+  are genuinely independent rather than merely documented as such.
+
+### Found by two-sided attack audit (dom0 + seat), before release
+
+- **The operator-file read was unbounded — a fail-HANG.** `_read_extra` called
+  `fh.read()` with no argument on a path an operator can point anywhere.
+  Symlinked to `/dev/zero` on hardware it never returned, so every guarded call
+  would hang: a gate that fails neither open nor closed but simply stops
+  answering, which for a qrexec service blocks the caller too. Now reads
+  `MAX_PRINCIPALS_BYTES + 1` (64 KiB) and treats anything larger as malformed
+  rather than truncating, which would silently drop the names past the cap. The
+  same bound collapsed the per-call cost of a 200k-line file from **61.4 ms to
+  0.2 ms**. Not agent-reachable — the file is dom0-owned — but a guard that can
+  hang on operator input is a defect regardless.
+- **The `/etc/qmcp/principals` path had never run on hardware**, only in mocks.
+  Exercised end-to-end for the first time by the two-sided probe: dom0 plants a
+  name, the seat's write to that qube flips from `ok:true` to the opaque
+  refusal, and a control confirms it is writable again once the file is
+  removed. Sibling latency `-1.7%` against the other refusal classes, so the
+  per-call file read introduces no tell of its own.
+
+### Found by adversarial audit ON HARDWARE, before release
+
+- **A latency oracle over `/etc/qmcp/principals`.** The guard originally ran
+  before the qubesadmin import, on the argument that deciding "on shape before
+  any host lookup" made it constant-time and oracle-free. That was measured
+  in-process (0.9% spread) — the wrong boundary. Measured end-to-end from the AI
+  seat, a principal-target call returned in **68 ms against ~118 ms for every
+  other refusal class**, because it skipped the qubesd round trip the others
+  paid: byte-identical messages, a 44% timing tell. On a single-gateway fleet
+  that leaks nothing (the agent *is* the principal); with the operator file
+  populated it identifies which names the operator listed — dom0-only config, the
+  same class the tier tags are deliberately kept unreadable to protect.
+  The call site now runs **after** the existence and umbrella checks and still
+  before the tier, consent and enforce-mode gates. Every path returns the same
+  opaque `not found` as before, so no answer changed; only the cost converged.
+  Re-measured on hardware: **−0.7%**. Pinned by the offline suite (which now
+  asserts the *later* placement, inverting a check that had pinned the earlier
+  one), by the installer's ordering gate, and by
+  the end-to-end latency probe run from the AI seat, which is what found it.
+
+### Found by re-audit, before release
+
+- **The guard failed OPEN on an undeterminable caller.** `calling_principal()`
+  returns the empty string when `QREXEC_REMOTE_DOMAIN` is absent, empty or
+  whitespace-only; `protected_principals()` then returned the empty set and the
+  guard refused nothing — in a stage whose every other failure path refuses.
+  Worse, the offline suite asserted that behaviour as expected, so the hole had
+  a test defending it. A guarded position now refuses when the caller cannot be
+  established, while dominated positions stay open so the anti-theatre partition
+  survives the fail-closed path. Teeth reconstruct the pre-fix predicate.
+- **The optional `/etc/qmcp/principals` file needs mode `0644` and nothing said
+  so.** The wrappers run as a non-root dom0 user (uid 1000, group `qubes`), so a
+  `root:0600` file is unreadable to them and contributes nothing while looking
+  installed. This fails *quiet*, not open — the calling principal stays
+  protected and only named siblings are silently lost — but that is exactly the
+  class the I-2 permission lesson exists for. Documented in the module, asserted
+  in the suite, and reported by the installer, which now warns when the wrapper
+  user cannot read the file.
+- **A sixth mutating wrapper would have arrived silently unguarded.** The three
+  create services were excluded from the guard by a paragraph in a docstring,
+  not by an assertion, so nothing checked that the guarded set covered the
+  lattice. New `PRINCIPAL_EXCLUDED` names each deliberate exclusion with its
+  reason, and both the offline suite and the installer now require every
+  `CAP_FULL`-gated service in `qmcp_caps.SERVICE_TABLE` to appear in exactly one
+  of guarded-or-excluded — so a new mutation wrapper fails a check until someone
+  decides which side it is on. Teeth prove the check notices a hypothetical one.
+- **`QMCP_SKIP_POLICY=1` printed "the @tag:-scoped services stay UNGUARDED"
+  unconditionally**, which is false on a fleet where an earlier run already
+  installed the deny lines. It now reads the live policy and reports the actual
+  count. A gate that misreports the state it describes is the defect this stage
+  is about.
+
+### Withdrawn before release
+
+An earlier draft of this stage also carried self-target `deny` lines for
+`qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged`, justified on the grounds that
+they would matter once Stage G1 drops the gateway user's sudo. **Hardware
+measurement withdrew them.** dom0's own policy daemon, on a self-call:
+
+```
+qmcp.RunInAIManaged+: mcp-control -> mcp-control: allowed to mcp-control
+qmcp.RunInAIManaged:  mcp-control -> mcp-control: denied:
+                      loopback qrexec connection not supported
+```
+
+Policy allowed it and the qrexec transport refused it, because a qube cannot
+open a qrexec connection to itself. There is therefore no capability to remove,
+and a rule that can never match while reading as a control is exactly the
+no-illusion defect this stage is built around. The firewall methods were checked
+the same way and are different: `admin.vm.firewall.Get` on the gateway itself
+returns bytes identical to the same call on any ai-managed qube, because
+`target=@adminvm` sends it to dom0 and that is not a loopback. Those two stayed.
+
+### Note
+
+This stage ships **armed**, unlike every stage since I-6, and the reason is
+structural rather than a change of policy: a guard behind
+`/etc/qmcp/enforce-mode` is inert under `shadow`, which is the shipped posture
+and precisely the state the gap is live in. Reverting it is therefore not one
+write — see `deploy/uninstall-stage-3d.sh`, which refuses the ordering that
+would black out every guarded call.
+
 ## [0.9.13] — 2026-08-19
 
 Documentation only. No code, no policy, no behaviour change.

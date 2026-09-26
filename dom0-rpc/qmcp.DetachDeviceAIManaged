@@ -179,6 +179,54 @@ def _load_enforce_lib():
 
 
 _ENFORCE = _load_enforce_lib()
+def _load_principal_lib():
+    """Load the sibling qmcp_principal helper by path (Wave 2 Stage 3d).
+
+    Same sibling-import shim as qmcp_caps / qmcp_tier / qmcp_enforce. A None
+    here is NOT benign and must never be treated as "no guard applies" — see
+    `_principal_refuses`, which refuses on it.
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_principal", os.path.join(here, "qmcp_principal.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_PRINCIPAL = _load_principal_lib()
+
+
+def _principal_refuses(role, name, action=None) -> bool:
+    """Stage 3d pre-gate: True => refuse this call. Never raises.
+
+    **FAIL-CLOSED, and the direction is INVERTED from the I-2 audit hook.**
+    I-2 is best-effort instrumentation, so it degrades silently and a stale
+    helper costs only the new field. This is a GATE. A dom0 still holding a
+    pre-3d deploy has no `qmcp_principal.py` at all (`_PRINCIPAL is None`),
+    and a partially-updated one raises `AttributeError` at the call below —
+    both must REFUSE, never fall through to the mutation. A session
+    pattern-matching on the I-2 lesson will get this backwards and silently
+    re-open the gap this stage closes.
+    """
+    if _PRINCIPAL is None:
+        print("%s: qmcp_principal unavailable — refusing (Stage 3d "
+              "fail-closed)" % _AUDIT_SERVICE, file=sys.stderr)
+        return True
+    try:
+        return bool(_PRINCIPAL.refuses_as_principal(
+            _AUDIT_SERVICE, role, name, action))
+    except Exception as e:
+        print("%s: qmcp_principal guard failed (%s) — refusing (Stage 3d "
+              "fail-closed)" % (_AUDIT_SERVICE, e.__class__.__name__),
+              file=sys.stderr)
+        return True
 
 #: `/etc/qmcp/enforce-mode`, duplicated as a literal for the partial-deploy
 #: branch below — which runs precisely when importing the module that owns the
@@ -454,6 +502,21 @@ def main() -> int:
         if name not in app.domains:
             return emit(NOT_FOUND)
         if "ai-managed" not in app.domains[name].tags:
+            return emit(NOT_FOUND)
+
+        # Wave 2 Stage 3d: the calling principal is never a legitimate OBJECT.
+        # INSIDE the loop, between the umbrella check and the I-5 tier gate,
+        # because this wrapper interleaves the two per endpoint — a guard after
+        # the loop would sit behind the tier gate it must precede.
+        #
+        # After the umbrella check, deliberately: measured 2026-09-02, an early
+        # call site skipped the qubesd round trip and returned 44% faster than
+        # every other refusal class, which is a latency oracle over
+        # /etc/qmcp/principals even though the messages are byte-identical.
+        # Crossing to physical hardware is the one action exec-inside cannot
+        # reach, so BOTH endpoints are guarded and nothing here is dominated.
+        if _principal_refuses("backend" if name == backend else "frontend",
+                              name):
             return emit(NOT_FOUND)
         # Stage I-5: detach is a CAP_FULL op on BOTH endpoints. Fail-closed;
         # collapses to the same opaque NOT_FOUND (no tier oracle).

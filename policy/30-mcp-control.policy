@@ -68,6 +68,38 @@ qmcp.LifecycleAIManaged      *  mcp-control  @adminvm         allow
 # property/clone/spawn/feature/attach/detach — are tiered in dom0 CODE via
 # qmcp_tier, not here; only the directly-@tag:-scoped exec surfaces are policy.)
 
+# --- Wave 2 Stage 3d: the calling principal is never a legitimate OBJECT.
+# The dom0 WRAPPER surfaces are `* mcp-control @adminvm allow`, so the qube
+# being acted on is PAYLOAD and this engine cannot see it — those are guarded
+# in code by qmcp_principal.py. These four services are the other half: they
+# are @tag:-scoped, matched literally by qrexec, and a helper cannot reach them
+# (the I-4 lesson). Both halves move in the same change or the fleet gets an
+# F9 split-brain window.
+# Placement is load-bearing: first-match-wins, so each deny MUST stay above the
+# @tag: lines for its own service.
+# firewall.Get is deliberately absent — it is a read, and AI can already read
+# its own qube from inside it, so a line there would be invariant-2 theatre.
+#
+# ONLY the two firewall WRITE methods are here, and the reason the exec and
+# copy services are NOT is a measurement rather than an argument. A first draft
+# carried `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged` self-denies too, on
+# the theory that they mattered once G1 drops the gateway user's sudo. Measured
+# on the development box 2026-09-02, dom0's own policy daemon says otherwise:
+#
+#   qmcp.RunInAIManaged+: mcp-control -> mcp-control: allowed to mcp-control
+#   qmcp.RunInAIManaged:  mcp-control -> mcp-control: denied:
+#                         loopback qrexec connection not supported
+#
+# Policy ALLOWED it; the qrexec transport refused it, because a qube cannot
+# open a qrexec connection to itself. So there is no capability there to
+# remove, and a deny line would be a rule that can never match while reading
+# as a control — invariant 2's no-illusion defect, in the stage whose whole
+# discipline is not shipping it. The firewall methods are different and were
+# checked the same way: `admin.vm.firewall.Get` on the gateway ITSELF returns
+# `0action=accept`, byte-identical to the same call on an ordinary ai-managed
+# qube, because `target=@adminvm` redirects delivery to dom0 and that is not a
+# loopback. Those two are real gates and they stay.
+
 qmcp.RunInAIManaged          *  mcp-control  @tag:ai-exec     allow  user=root
 qmcp.RunInAIManaged          *  mcp-control  @tag:ai-net      allow  user=root
 qmcp.RunInAIManaged          *  mcp-control  @tag:ai-full     allow  user=root
@@ -213,10 +245,16 @@ qubes.Filecopy              *  @tag:ai-managed  @anyvm          deny
 
 admin.vm.firewall.Get       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 
+# Stage 3d principal guard — must stay above this service's @tag: lines.
+admin.vm.firewall.Set       *  mcp-control  mcp-control      deny
+
 admin.vm.firewall.Set       *  mcp-control  @tag:ai-net      allow  target=@adminvm
 admin.vm.firewall.Set       *  mcp-control  @tag:ai-full     allow  target=@adminvm
 # COMPAT backstop (firewall.Set) — DELETE at the I-5 flip, paired with tier-default → "ro":
 admin.vm.firewall.Set       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+
+# Stage 3d principal guard — must stay above this service's @tag: lines.
+admin.vm.firewall.Reload    *  mcp-control  mcp-control      deny
 
 admin.vm.firewall.Reload    *  mcp-control  @tag:ai-net      allow  target=@adminvm
 admin.vm.firewall.Reload    *  mcp-control  @tag:ai-full     allow  target=@adminvm

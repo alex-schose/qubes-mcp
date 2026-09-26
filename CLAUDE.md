@@ -795,6 +795,48 @@ until the current one's tests pass.
   of Tailscale-corp; own VPN; own Tor).
 - **No `admin.Events` direct subscription.** Use `qmcp.AIManagedEvents` (Stage F2)
   for filtered streaming.
+- **The calling principal is never a legitimate OBJECT** (Stage 3d). Every
+  mutation wrapper refuses a call whose target is the qrexec source domain,
+  before the existence check, the umbrella check, the tier gate, the consent
+  gate and `/etc/qmcp/enforce-mode`. This is the mutate-path twin of I-5's
+  create-path tag strip: I-5 stops an agent minting authority for itself, and
+  this stops it acting on the seat it speaks from. Three properties are
+  load-bearing and none of them is stylistic.
+  (0) **The call site sits after the existence and umbrella checks and before
+  the tier, consent and enforce-mode gates, and the ordering is load-bearing in
+  BOTH directions.** Later than the umbrella check because an earlier guard
+  skips the qubesd round trip every other refusal pays, and returns 44% faster
+  — a latency oracle over `/etc/qmcp/principals` behind byte-identical messages
+  (measured from the AI seat 2026-09-02; −0.7% after the move). Earlier than the
+  tier gate because that is where the security property lives.
+  (1) **It is not a capability decision, so it is not in `qmcp_caps`.** The
+  kernel is bound by `/etc/qmcp/enforce-mode`, which is absent — meaning
+  `shadow` — on a fresh install; a guard placed there would be inert in exactly
+  the posture the gap is live in.
+  (2) **It guards only what exec-inside cannot reach.** The agent runs *as* the
+  principal and already holds code execution there, so `kill`/`shutdown`/`start`
+  and cloning it as a source stay ungated — the anti-theatre invariant, and
+  refusing them would delete nothing while reading as a control. The partition
+  lives in `qmcp_principal.PRINCIPAL_GUARDED_ROLES` / `LIFECYCLE_DOMINATED`,
+  is pinned whole by `deploy/offline-validate-3d.py`, and is executed by
+  `install-stage-3d.sh` — so moving a row fails a check rather than silently
+  inverting the invariant.
+  (3) **The helper fails CLOSED, which is the OPPOSITE direction to the I-2
+  audit hook.** I-2 is best-effort instrumentation and must degrade silently so
+  a stale helper costs only the new field. This is a gate: a missing, stale or
+  raising `qmcp_principal` must refuse. Do not "harmonise" the two.
+  (4) **Which `@tag:`-scoped services get a paired policy `deny` is a
+  measurement, not a list.** A dom0 helper cannot reach what the qrexec engine
+  settles literally, so the write methods `admin.vm.firewall.Set`/`.Reload`
+  carry self-target denies above their own `@tag:` lines. The exec and copy
+  services deliberately do NOT: dom0's policy daemon *allows* the self-call and
+  the qrexec transport then refuses it, because a qube cannot open a qrexec
+  connection to itself — so there is no capability to remove and the rule could
+  never match. `firewall.Get` gets none either, being a read. Before adding a
+  policy line here, check that the thing it forbids can actually happen; the
+  firewall path is reachable only because `target=@adminvm` sends it to dom0
+  rather than back to the source. Both halves of the stage move together or the
+  fleet gets an F9 split-brain window.
 - **Never scope policy, ownership, or any gate on `created-by-*` or
   `disp-created-by-*`.** Neither tag can carry AI provenance, for two independent
   reasons. (1) qubesd stamps `created-by-` + the name of the *calling* domain, and
@@ -890,6 +932,18 @@ qubes_mcp/                          # repo root
 │                                      # read-back, rollback) + the reaper's veto matrix.
 │                                      # INERT until Stage 3c flips the Lifecycle
 │                                      # wrapper's remove path through it.
+│   ├── qmcp_principal.py             # Wave 2 Stage 3d — the calling principal is never
+│   │                                  # a legitimate OBJECT. An UNCONDITIONAL pre-gate,
+│   │                                  # ahead of the umbrella check, the tier gate and
+│   │                                  # /etc/qmcp/enforce-mode: this is object identity,
+│   │                                  # not capability, and the kernel is inert under
+│   │                                  # `shadow`. Guards only what exec-inside cannot
+│   │                                  # reach — PRINCIPAL_GUARDED_ROLES and
+│   │                                  # LIFECYCLE_DOMINATED are that partition, pinned
+│   │                                  # by the offline suite and EXECUTED by the
+│   │                                  # installer. Fails CLOSED (the opposite direction
+│   │                                  # to the I-2 audit hook: that is instrumentation,
+│   │                                  # this is a gate).
 │   ├── qmcp_enforce.py               # Wave 2 Stage 3b — the operator's flip switch:
 │                                      # read_mode() over /etc/qmcp/enforce-mode and
 │                                      # effective_verdict() composing a wrapper's own
@@ -986,11 +1040,24 @@ qubes_mcp/                          # repo root
     ├── uninstall-stage-3c.sh         # disarms (removes the flag) and VERIFIES every
     │                                 # installed wrapper is back to shadow. It does not
     │                                 # claim to restore the pre-3c wrapper code.
+    ├── install-stage-3d.sh           # Wave 2 Stage 3d — the principal guard. FOUR
+    │                                 # behavioural gates that RUN the staged artifacts:
+    │                                 # the guarded/dominated partition, the fail-closed
+    │                                 # direction on a missing/stale/raising helper, and
+    │                                 # mode-independence. Plus GATE 0, which refuses to
+    │                                 # write a backstop-carrying policy over a fleet
+    │                                 # reading tier-default=ro (an F9 un-flip) unless
+    │                                 # QMCP_ALLOW_UNFLIP=1. QMCP_SKIP_POLICY=1 installs
+    │                                 # the code half only, which is always a narrowing.
+    ├── uninstall-stage-3d.sh         # reverts the policy half on its own; REFUSES to
+    │                                 # remove the fail-closed helper while the 3d
+    │                                 # wrappers are installed, because that is a
+    │                                 # fleet-wide outage rather than a revert.
     ├── smoke-production.py           # Wave 2 Stage 3b — the seven-item §6 flip gate.
     │                                 # Run from mcp-control. Exit 0 GREEN / 2 FAILED /
     │                                 # 3 INCOMPLETE, and INCOMPLETE is NOT green.
     └── offline-validate-*.py         # per-stage offline suites (no dom0, no qubesadmin)
-                                      # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b, 3c,
+                                      # 0-2, 1, 1-wiring, 2, 2-wiring, 3a, 3b, 3c, 3d,
                                       # fixes-F1-F5, G0a..G0d, I-2, I-3, I-4,
                                       # I-5, I-5-policy, I-6
 

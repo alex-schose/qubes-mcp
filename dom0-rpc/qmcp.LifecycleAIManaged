@@ -184,6 +184,54 @@ def _load_enforce_lib():
 
 
 _ENFORCE = _load_enforce_lib()
+def _load_principal_lib():
+    """Load the sibling qmcp_principal helper by path (Wave 2 Stage 3d).
+
+    Same sibling-import shim as qmcp_caps / qmcp_tier / qmcp_enforce. A None
+    here is NOT benign and must never be treated as "no guard applies" — see
+    `_principal_refuses`, which refuses on it.
+    """
+    try:
+        import importlib.util
+        import os.path
+        here = os.path.dirname(os.path.realpath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "qmcp_principal", os.path.join(here, "qmcp_principal.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+_PRINCIPAL = _load_principal_lib()
+
+
+def _principal_refuses(role, name, action=None) -> bool:
+    """Stage 3d pre-gate: True => refuse this call. Never raises.
+
+    **FAIL-CLOSED, and the direction is INVERTED from the I-2 audit hook.**
+    I-2 is best-effort instrumentation, so it degrades silently and a stale
+    helper costs only the new field. This is a GATE. A dom0 still holding a
+    pre-3d deploy has no `qmcp_principal.py` at all (`_PRINCIPAL is None`),
+    and a partially-updated one raises `AttributeError` at the call below —
+    both must REFUSE, never fall through to the mutation. A session
+    pattern-matching on the I-2 lesson will get this backwards and silently
+    re-open the gap this stage closes.
+    """
+    if _PRINCIPAL is None:
+        print("%s: qmcp_principal unavailable — refusing (Stage 3d "
+              "fail-closed)" % _AUDIT_SERVICE, file=sys.stderr)
+        return True
+    try:
+        return bool(_PRINCIPAL.refuses_as_principal(
+            _AUDIT_SERVICE, role, name, action))
+    except Exception as e:
+        print("%s: qmcp_principal guard failed (%s) — refusing (Stage 3d "
+              "fail-closed)" % (_AUDIT_SERVICE, e.__class__.__name__),
+              file=sys.stderr)
+        return True
 
 
 def _load_tombstone_libs():
@@ -514,6 +562,32 @@ def main() -> int:
         return emit(NOT_FOUND)
     vm = app.domains[name]
     if "ai-managed" not in vm.tags:
+        return emit(NOT_FOUND)
+
+    # Wave 2 Stage 3d: the calling principal is never a legitimate OBJECT.
+    # UNCONDITIONAL, and ahead of the tier gate, the consent gate and
+    # /etc/qmcp/enforce-mode — this is an object-identity question, not a
+    # capability one, and the kernel is inert under `shadow`, the shipped
+    # posture and exactly the state the gap is live in.
+    #
+    # PLACED AFTER THE EXISTENCE + UMBRELLA CHECKS, DELIBERATELY, and the
+    # reason is a hardware measurement rather than taste. It sat before the
+    # qubesadmin import until 2026-09-02, on an argument about deciding "on
+    # shape before any host lookup". The answers were identical either way —
+    # every path here returns the same opaque NOT_FOUND — but the LATENCY was
+    # not: measured from the AI seat, a principal-target call returned in 68 ms
+    # against 115 ms for every refusal that had to consult qubesd, i.e. exactly
+    # the cost of the round trip it skipped. Byte-identical messages, a 44%
+    # timing tell. On a single-gateway fleet that leaks nothing (the agent IS
+    # the principal), but with /etc/qmcp/principals populated it is an oracle
+    # over the operator's principal list — dom0-only config the agent is not
+    # meant to read, the same class as the tier tags. Paying the round trip
+    # first collapses the tell; the guard still runs before anything that could
+    # act on the target.
+    # `action` is passed so the DOMINATED actions stay UNGUARDED: the seat
+    # can already kill/shutdown/start itself from inside, so refusing them
+    # here would delete nothing and read as a control (invariant 2).
+    if _principal_refuses("target", name, action):
         return emit(NOT_FOUND)
 
     # Stage I-5: lifecycle requires CAP_FULL on the target. Fail-closed; the
