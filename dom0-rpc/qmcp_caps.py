@@ -172,7 +172,8 @@ def _guarded_names(path: str = GUARDED_LIST_PATH):
 #: a separate, weaker thing — see `resolve_birth_egress`). `name` is here for a
 #: reason the taxonomy does not make obvious: renaming the gateway severs every
 #: policy line that names it literally, executed from AI's own seat and
-#: unrecoverable without dom0 (see NEXT.md's named-principal open question).
+#: unrecoverable without dom0. (Stage 3d's `qmcp_principal` now also refuses
+#: any property write whose object is the calling principal.)
 #:
 #: **`netvm` has exactly one carve-out and it is a direction, not a value** —
 #: see `_is_disconnect`. Setting it to null is de-escalation and is permitted

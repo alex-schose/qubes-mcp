@@ -100,8 +100,12 @@ if grep -qE '^\s*qubes\.Filecopy\s+\*\s+@tag:ai-managed\s+@tag:ai-managed\s+allo
     echo "FATAL: staged policy still has the pre-G0c any-to-any Filecopy line. ABORTING." >&2
     rm -rf "$STAGE_DIR"; exit 1
 fi
-if ! grep -qE '^\s*qubes\.Filecopy\s+\*\s+@tag:ai-managed\s+@anyvm\s+deny' "$STAGED"; then
-    echo "FATAL: staged policy missing the G0c explicit @tag:ai-managed @anyvm deny. ABORTING." >&2
+# The explicit rule for everything else an AI qube copies must be OURS (finding
+# [8] is about ownership). Since v0.9.15 it is an `ask` rather than a `deny` — the
+# operator's dialog for leaving the umbrella and for `qvm-copy` (@default) — and
+# either action closes the system-default fallthrough G0c exists to prevent.
+if ! grep -qE '^\s*qubes\.Filecopy\s+\*\s+@tag:ai-managed\s+@anyvm\s+(deny|ask)(\s|$)' "$STAGED"; then
+    echo "FATAL: staged policy missing the explicit @tag:ai-managed @anyvm Filecopy rule. ABORTING." >&2
     rm -rf "$STAGE_DIR"; exit 1
 fi
 echo

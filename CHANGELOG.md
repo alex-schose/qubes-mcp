@@ -27,6 +27,62 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.15] — 2026-09-27
+
+Hand copying out of an AI qube: `qvm-copy` shows the operator dialog again.
+
+### Fixed
+
+- **`qvm-copy` from any `ai-managed` qube was refused with no dialog.** It
+  sends no target — the request is `@default` — and qrexec's `@anyvm` matches
+  `@default`, so the last Filecopy rule for AI sources,
+  `@tag:ai-managed -> @anyvm deny`, refused it before any `ask` could fire.
+  0.9.12 set out to restore hand copying and fixed only the form that names
+  its target (`qvm-copy-to-vm`); the operator reported the same failure again.
+  The offline suite passed throughout because its simulator modelled only
+  named targets.
+
+### Changed
+
+- `policy/30-mcp-control.policy`: that final rule is now
+  `@tag:ai-managed -> @anyvm ask`. Copies leaving the umbrella go through the
+  normal operator dialog instead of being refused, and `qvm-copy` gets the
+  dialog with its usual target list. The 3×3 `ai-exec`+ mesh stays
+  dialog-free, the `ai-dump` valve and the `ai-dump -> ai-managed` deny are
+  unchanged, and the `@tag:ai-managed -> @tag:ai-managed ask` line is removed
+  because the new rule covers it.
+- **Corrected reasoning, not only behaviour.** 0.9.12 kept the dialog-free deny
+  because an `@anyvm` ask was believed to let an agent learn which qube names
+  exist. It does not: qrexec rewrites a target that does not exist to
+  `@default`, so a made-up name and a real one produce the same dialog. What
+  stays probeable is which names are disposable templates (`@dispvm:<name>`
+  fails at once for anything else). The policy comments, `CLAUDE.md` and
+  `README.md` now say so.
+- `deploy/install-stage-peercopy.sh` rewritten. It checks the Filecopy
+  contract with qrexec's own parser — named, made-up and `@default` targets —
+  against the box's policy directory with the staged file substituted in,
+  before writing anything and again against the installed set. It also keeps
+  the tier phase: on a fleet whose `/etc/qmcp/tier-default` reads `ro` it
+  installs the shipped file minus exactly the four COMPAT backstops, where the
+  old version restored them (the F9 split-brain it caused on a flipped fleet
+  on 2026-08-19). `QMCP_ALLOW_UNFLIP=1` keeps the old behaviour on purpose.
+- `deploy/offline-validate-G0c.py` (68 checks, was 42): assertions inverted
+  with the policy, plus a section that puts the questions to qrexec's real
+  parser, with teeth that fail against the 0.9.14 policy. It exits 3
+  (INCOMPLETE, not green) when the parser is not importable.
+  `deploy/offline-validate-I-4.py` inverted its copy-out assertion the same
+  way.
+- `deploy/install-stage-G0c.sh` accepts the explicit `@anyvm` rule as `deny`
+  or `ask` — the finding it guards is about the rule being ours, not its
+  action — and a warning in `install-stage-3d.sh` no longer describes the old
+  refusal.
+- Three public comments no longer point at an operator-local planning file
+  (`dom0-rpc/qmcp_caps.py` — comment only, the module's AST is unchanged —
+  `deploy/offline-validate-3a.py`, `deploy/offline-validate-I-4.py`).
+- `README.md`: the copy section, the version, a status row for the copy
+  dialog, the Stage 2 row's state (its birth egress was verified on hardware;
+  the tag stamp offline), and a stale "current work line".
+
 ## [0.9.14] — 2026-09-26
 
 Wave 2 Stage 3d — the calling principal is never a legitimate object.

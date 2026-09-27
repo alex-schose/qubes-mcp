@@ -20,7 +20,9 @@ policy. The opaqueness of a refusal (every deny looks identical to AI) is a
 property of the MCP `_qrexec.py` normaliser + the single catch-all funnel, and
 is asserted on hardware; here we assert the allow/deny DECISION per tier.
 
-qrexec matching modelled (per the R4.3 findings in NEXT.md, slot-16/18):
+qrexec matching modelled (R4.3 behaviour measured on hardware, slot-16/18). NAMED
+targets only: `@default` (what `qvm-copy` sends) and names that do not exist are
+checked against qrexec's real parser in offline-validate-G0c.py section 8:
   *            — wildcard, matches anything
   @anyvm       — any VM, but EXCLUDES @adminvm/dom0
   @adminvm     — the dom0 target only (alias: dom0)
@@ -225,7 +227,13 @@ def run_filecopy(rules, phase):
         # AI cannot answer a zenity prompt. Authoritative matrix lives in
         # offline-validate-G0c.py; here we confirm the ai-ro floor.
         ("ai-ro       -> ai-ro      (misses the mesh: operator dialog, never allow)", WORKER, WORKER, "ask"),
-        ("ai-managed  -> untagged  (no exfil to random qube)", WORKER, TARGETS["untagged"], "deny"),
+        # INVERTED 2026-09-27 with the policy (operator decision): leaving the
+        # umbrella is the ordinary operator dialog, no longer a dialog-free
+        # deny. The property that must hold is still "never ALLOW" -- no AI
+        # copy reaches a qube outside the umbrella without an operator click.
+        # The real-engine matrix (incl. @default and made-up names) lives in
+        # offline-validate-G0c.py.
+        ("ai-managed  -> untagged  (leaves the umbrella: operator dialog, never allow)", WORKER, TARGETS["untagged"], "ask"),
         ("ai-managed  -> dom0      (no exfil to dom0)", WORKER, TARGETS["dom0"], "deny"),
         ("ai-dump     -> ai-managed (sink is WRITE-ONLY)", DUMP_SRC, WORKER, "deny"),
         ("ai-dump     -> ai-dump    (cannot read its own sink)", DUMP_SRC, TARGETS["dump"], "deny"),

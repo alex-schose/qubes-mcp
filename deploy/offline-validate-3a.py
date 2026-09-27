@@ -26,7 +26,7 @@ present the new summation is byte-identical to the pre-change one, so
 `qmcp.GetPoolStats` and every create gate answer exactly as before.
 
 **§6 carries teeth, and they are the point of the stage.** The tombstone spec as
-written in the brief and NEXT.md is self-contradictory: it drops the umbrella so
+first written in the design notes was self-contradictory: it drops the umbrella so
 AI cannot see the qube, *and* requires the qube to keep counting against the
 pool cap — but the cap summed over `"ai-managed" in tags`, so dropping the
 umbrella made a tombstone free. §6.3 reimplements that pre-fix predicate and

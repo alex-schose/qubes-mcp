@@ -1,64 +1,47 @@
 #!/bin/bash
-# install-stage-peercopy.sh — run in dom0.
+# install-stage-peercopy.sh — run in dom0. POLICY-ONLY.
 #
-# Intra-umbrella qubes.Filecopy by operator dialog (2026-08-19). POLICY-ONLY.
+# Installs public/policy/30-mcp-control.policy, whose qubes.Filecopy section is
+# the subject of this installer, and keeps the fleet in whichever tier phase it
+# is already in (see GATE 0).
 #
-# Surface delta — two rule lines in /etc/qubes/policy.d/30-mcp-control.policy,
-# both placed between the ai-dump valve and the @tag:ai-managed @anyvm deny:
+# THE FILECOPY CONTRACT. Checked with qrexec's OWN parser, against this box's
+# own policy directory with the staged file substituted in, BEFORE anything is
+# written — and again against the installed set afterwards:
+#   - between two AI qubes tagged ai-exec / ai-net / ai-full: allowed, no dialog;
+#   - AI qube -> an ai-dump sink (not ai-managed): allowed, no dialog;
+#   - ai-dump source -> any AI qube: denied (the sink stays write-only);
+#   - every OTHER copy from an AI qube — into a read-only or untiered AI qube,
+#     out of the umbrella, or `qvm-copy` with no target at all (@default) —
+#     the ordinary dialog, decided by THIS file rather than the system default;
+#   - a name that does not exist gets the same dialog as a real qube (qrexec
+#     rewrites it to @default), so the dialog is no existence oracle;
+#   - ai-dump -> out of the umbrella: the stock dialog, which is how the
+#     operator drains a buffer by hand.
 #
-#   qubes.Filecopy  *  @tag:ai-dump     @tag:ai-managed  deny
-#   qubes.Filecopy  *  @tag:ai-managed  @tag:ai-managed  ask
+# HISTORY — two defects of this installer's first version (v0.9.12), both fixed
+# here rather than left behind a new filename:
+#   1. It checked the matrix with a RE-IMPLEMENTED resolver that knew only NAMED
+#      targets. `qvm-copy` sends no target — the request is `@default` — and
+#      `@anyvm` matches `@default`, so every `qvm-copy` from an AI qube hit the
+#      dialog-free `@tag:ai-managed -> @anyvm deny` the old file ended with. The
+#      resolver could not see it, and the operator reported the same failure a
+#      second time (2026-09-27). The contract is now evaluated by the engine
+#      that will enforce it.
+#   2. It wrote the shipped file over a FLIPPED fleet, restoring the four compat
+#      backstops while /etc/qmcp/tier-default stayed "ro": the F9 split-brain
+#      the development box sat in for two weeks. GATE 0 now keeps the phase.
 #
-# WHAT THIS FIXES. G0c replaced the single `@tag:ai-managed -> @tag:ai-managed`
-# peer-copy line with the 3x3 tiered mesh and left NO COMPAT BACKSTOP — the only
-# tag-scoped surface graduated without one (install-stage-flip.sh deletes exactly
-# four, and Filecopy is not among them). The qrexec engine matches tags LITERALLY
-# and cannot read /etc/qmcp/tier-default, so an UNTIERED umbrella qube has matched
-# none of those lines since G0c, in compat as much as post-flip, and fell to the
-# dialog-free deny. An operator working by hand inside a qube they own could not
-# move a file out of it and got no prompt explaining why.
-#
-# The fix restores intra-umbrella peer copy as an ASK, which is tighter than the
-# pre-G0c ALLOW and tighter than the backstop G0c should have left. It changes
-# exactly the five pairs the mesh missed (elevated->untiered, untiered->elevated,
-# untiered->untiered). Everything the mesh already covers keeps its dialog-free
-# allow, so nothing that works today starts prompting.
-#
-# WHY THE TARGET IS @tag:ai-managed AND NOT @anyvm. qrexec cannot tell the
-# operator apart from the agent, so an ask is a control only because AI cannot
-# click zenity — a human-attention control, not a mechanical one. What a rule CAN
-# bound is what the agent learns by asking. With @anyvm the agent names any qube
-# on the host and observes whether a dialog appeared: an existence oracle over
-# every out-of-scope qube, the class F-1 closed on the create paths. With
-# @tag:ai-managed the target set is exactly what qmcp.ListAIManagedQubes already
-# returns, so naming one discloses nothing.
-#
-# WHY THE ACCOMPANYING DENY. Introducing an ask at all creates a way back through
-# the Biba valve: a MISCONFIGURED hybrid (ai-managed AND ai-dump — the operator
-# invariant the I-4 installer warns about) would match the new ask as a SOURCE and
-# could be dialogued into the fleet. Denying an ai-dump SOURCE into the umbrella
-# closes that, and closes more besides — a PURE sink copying back in previously
-# matched no rule here and landed on the Qubes system-default ask, finding [8]'s
-# fallthrough hazard in the one direction G0c did not cover. It deliberately does
-# NOT touch ai-dump -> out-of-umbrella, which is how an operator DRAINS a buffer.
-#
-# LEAVING THE UMBRELLA IS UNCHANGED and still a dialog-free deny. For the
-# vault-handoff case use the ai-dump sink that already exists as the buffer:
-#
-#     ai-owned qube  --allow-->  buffer tagged {ai-dump}  --system ask-->  vault
-#
-# AI can push into the buffer and cannot read it back (no umbrella => no read, no
-# exec, no enumeration), and the operator drains it by hand. No new tag, no new
-# mechanism.
-#
-# A malformed policy breaks ALL of qrexec, so the staged file is VALIDATED before
-# it touches /etc/qubes/policy.d/ and the live file is backed up first.
-#
-# Idempotent — re-runnable. Re-running replaces the policy with the same content.
+# Idempotent. A malformed policy can break ALL of qrexec, so nothing touches
+# /etc/qubes/policy.d/ until the staged file has parsed AND resolved correctly.
 #
 # Run from dom0:
 #   qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-peercopy.sh' > /tmp/install-peercopy.sh
-#   bash /tmp/install-peercopy.sh mcp-control ~user/qubes_mcp/public
+#   bash /tmp/install-peercopy.sh mcp-control /home/user/qubes_mcp/public
+#
+# Environment:
+#   QMCP_ALLOW_UNFLIP=1   install the shipped backstops even on a flipped fleet
+#                         (an explicit, deliberate widening — never a default).
 
 set -euo pipefail
 
@@ -68,9 +51,10 @@ SOURCE_PATH="${2:-/home/user/qubes_mcp/public}"
 STAGE_DIR="/tmp/qubes-mcp-stage-peercopy"
 POLICY_REL="policy/30-mcp-control.policy"
 POLICY_DST="/etc/qubes/policy.d/30-mcp-control.policy"
+FLAG="/etc/qmcp/tier-default"
 BACKUP_DIR="/var/lib/qmcp-rollback"
 
-echo "==> Intra-umbrella Filecopy deploy starting (policy-only)"
+echo "==> Filecopy policy deploy starting (policy-only)"
 echo "    source qube:    $SOURCE_QUBE"
 echo "    source path:    $SOURCE_PATH"
 echo
@@ -84,145 +68,244 @@ qvm-run --pass-io "$SOURCE_QUBE" \
     > "$STAGE_DIR/stage.tar" < /dev/null
 (cd "$STAGE_DIR" && tar -xf stage.tar)
 STAGED="$STAGE_DIR/$POLICY_REL"
-if [ ! -s "$STAGED" ]; then
-    echo "FATAL: pulled an empty policy file." >&2
+# An empty or wrong file must not get as far as the gates: "parses clean" is
+# true of an empty policy too (the 2026-08-19 empty-pull lesson).
+if [ ! -s "$STAGED" ] || ! grep -qE '^qubes\.Filecopy[[:space:]]+\*[[:space:]]+@tag:ai-managed[[:space:]]+@anyvm[[:space:]]+ask' "$STAGED"; then
+    echo "FATAL: the pulled policy is empty or is not the v0.9.15 Filecopy shape." >&2
     rm -rf "$STAGE_DIR"; exit 1
 fi
 echo "==> SHA-256 of the pulled policy (record for your audit):"
 ( cd "$STAGE_DIR" && sha256sum "$POLICY_REL" | sed 's|^|    |' )
 echo
 
-# ---------------------------------------------------------------- 2. validate BEFORE replacing
-echo "==> Validating staged policy syntax (before it touches the live file)..."
-if python3 - "$STAGED" <<'PY'
-import sys
-path = sys.argv[1]
-try:
-    from qrexec.policy.parser import StringPolicy  # type: ignore
-    _s = open(path, encoding='utf-8').read()
-    try:
-        StringPolicy(policy={'__main__': _s})
-    except Exception as _e1:
-        try:
-            StringPolicy(policy={'30-mcp-control': _s})
-        except Exception:
-            raise _e1
-    print("    qrexec parser: policy parses clean.")
-    sys.exit(0)
-except ImportError:
-    pass
-except Exception as e:
-    print(f"FATAL: qrexec parser rejected the policy: {e}", file=sys.stderr)
-    sys.exit(1)
-bad = []
-for i, line in enumerate(open(path, encoding='utf-8'), 1):
-    s = line.strip()
-    if not s or s.startswith('#'):
+# ---------------------------------------------------------------- 2. GATE 0 — keep the fleet's phase
+# The shipped file is the COMPAT phase: it carries the four @tag:ai-managed
+# backstops (firewall.Set, firewall.Reload, RunInAIManaged, CopyToAIManaged)
+# that install-stage-flip.sh deletes. On a flipped fleet this installer installs
+# the shipped file MINUS exactly those four, so a policy-only change never moves
+# the fleet between phases. Anything other than exactly four found is a file
+# this installer does not understand, and it stops.
+EFFECTIVE="$STAGE_DIR/30-mcp-control.policy.effective"
+PHASE="$(sudo awk '{sub(/#.*/, ""); for (i = 1; i <= NF; i++) {print $i; exit}}' "$FLAG" 2>/dev/null || true)"
+if [ "$PHASE" = "ro" ] && [ "${QMCP_ALLOW_UNFLIP:-0}" != "1" ]; then
+    echo "==> GATE 0: the fleet is FLIPPED (tier-default=ro). Stripping the four"
+    echo "    compat backstops from the staged copy so this install keeps it flipped..."
+    if ! python3 - "$STAGED" "$EFFECTIVE" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+RULE = re.compile(r'^(qmcp\.(RunIn|CopyTo)AIManaged|admin\.vm\.firewall\.(Set|Reload))'
+                  r'\s+\*\s+\S+\s+@tag:ai-managed\s+allow(\s|$)')
+NOTE = re.compile(r'^# COMPAT backstop \((firewall\.Set|firewall\.Reload|RunInAIManaged|CopyToAIManaged)\)')
+out, rules, notes = [], 0, 0
+for line in open(src, encoding="utf-8"):
+    if RULE.match(line):
+        rules += 1
         continue
-    toks = s.split()
-    if len(toks) < 5 or toks[4] not in ('allow', 'deny', 'ask'):
-        bad.append((i, s))
-if bad:
-    for i, s in bad:
-        print(f"FATAL: malformed rule line {i}: {s!r}", file=sys.stderr)
+    if NOTE.match(line):
+        notes += 1
+        continue
+    out.append(line)
+if rules != 4:
+    print(f"FATAL: expected exactly 4 backstop rule lines, found {rules}", file=sys.stderr)
     sys.exit(1)
-print("    structural lint: all rule lines well-formed.")
+open(dst, "w", encoding="utf-8").writelines(out)
+print(f"    removed {rules} backstop rule lines + {notes} backstop comment lines")
+PY
+    then
+        echo "FATAL: GATE 0 could not produce the flipped variant — NOT installing." >&2
+        rm -rf "$STAGE_DIR"; exit 1
+    fi
+    EXPECT_BACKSTOPS=0
+else
+    if [ "$PHASE" = "ro" ]; then
+        echo "    WARNING: flipped fleet + QMCP_ALLOW_UNFLIP=1 — installing the shipped"
+        echo "    backstops. The fleet will be split-brained until install-stage-flip.sh"
+        echo "    runs again."
+    else
+        echo "==> GATE 0: the fleet is in COMPAT (tier-default is not 'ro'); installing"
+        echo "    the shipped file as-is."
+    fi
+    cp "$STAGED" "$EFFECTIVE"
+    EXPECT_BACKSTOPS=4
+fi
+echo
+
+# ---------------------------------------------------------------- 3. the contract checker (used twice)
+cat > "$STAGE_DIR/filecopy_contract.py" <<'PY'
+"""Evaluate the Filecopy contract with qrexec's own parser.
+
+    filecopy_contract.py staged <effective-file> <gateway>
+        this box's policy directories, with 30-mcp-control.policy replaced by
+        <effective-file> in a scratch copy — what the daemon WILL see.
+    filecopy_contract.py live <gateway>
+        the installed directories — what the daemon DOES see.
+
+Synthetic qubes (qmcp-gate-*) so the verdict does not depend on the fleet.
+"""
+import logging, pathlib, shutil, sys, tempfile, uuid
+
+try:
+    from qrexec.policy.parser import FilePolicy, Request
+    from qrexec.exc import AccessDenied, RequestError
+except ImportError:
+    print("FATAL: qrexec's policy parser is not importable; refusing to install a "
+          "policy this installer cannot evaluate.", file=sys.stderr)
+    sys.exit(2)
+logging.disable(logging.WARNING)      # the engine logs every @default rewrite
+
+ETC = pathlib.Path("/etc/qubes/policy.d")
+RUN = pathlib.Path("/run/qubes/policy.d")
+OURS = "30-mcp-control.policy"
+mode = sys.argv[1]
+gateway = sys.argv[-1]
+
+scratch = None
+if mode == "staged":
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="qmcp-policy-"))
+    shutil.copytree(ETC, scratch / "policy.d", symlinks=True)
+    shutil.copyfile(sys.argv[2], scratch / "policy.d" / OURS)
+    dirs = [d for d in (RUN, scratch / "policy.d") if d.is_dir()]
+else:
+    dirs = [d for d in (RUN, ETC) if d.is_dir()]
+policy = FilePolicy(policy_path=dirs)
+
+
+def dom(tags, klass="AppVM", dvmt=False):
+    return {"tags": list(tags), "type": klass, "default_dispvm": None,
+            "template_for_dispvms": dvmt, "power_state": "Running",
+            "uuid": str(uuid.uuid4())}
+
+
+SI = {"domains": {
+    "dom0": dom([], "AdminVM"),
+    gateway: dom([]),
+    "qmcp-gate-ro": dom(["ai-managed"]),
+    "qmcp-gate-ro2": dom(["ai-managed"]),
+    "qmcp-gate-exec": dom(["ai-managed", "ai-exec"]),
+    "qmcp-gate-full": dom(["ai-managed", "ai-full"]),
+    "qmcp-gate-dump": dom(["ai-dump"]),
+    "qmcp-gate-hybrid": dom(["ai-managed", "ai-dump"]),
+    "qmcp-gate-out": dom([]),
+}}
+
+
+def ev(src, tgt):
+    """-> (ACTION, decided-in-our-file, targets offered by the dialog)"""
+    try:
+        r = policy.evaluate(Request("qubes.Filecopy", "+", src, tgt, system_info=SI))
+    except (AccessDenied, RequestError) as e:
+        return "DENY", OURS in str(e), frozenset()
+    kind = type(r).__name__.replace("Resolution", "").upper()
+    return (kind, str(r.rule.filepath).endswith(OURS),
+            frozenset(getattr(r, "targets_for_ask", None) or ()))
+
+
+fails = 0
+
+
+def check(label, ok):
+    global fails
+    print(f"    {'PASS' if ok else 'FAIL'}  {label}")
+    fails += not ok
+
+
+check("exec -> full : ALLOW (no dialog)", ev("qmcp-gate-exec", "qmcp-gate-full")[0] == "ALLOW")
+check("full -> exec : ALLOW", ev("qmcp-gate-full", "qmcp-gate-exec")[0] == "ALLOW")
+check("ro   -> dump : ALLOW (the valve)", ev("qmcp-gate-ro", "qmcp-gate-dump")[0] == "ALLOW")
+check("exec -> dump : ALLOW", ev("qmcp-gate-exec", "qmcp-gate-dump")[0] == "ALLOW")
+check("dump   -> exec : DENY (sink stays write-only)", ev("qmcp-gate-dump", "qmcp-gate-exec")[0] == "DENY")
+check("hybrid -> exec : DENY", ev("qmcp-gate-hybrid", "qmcp-gate-exec")[0] == "DENY")
+for label, s, t in (("exec -> ro ", "qmcp-gate-exec", "qmcp-gate-ro"),
+                    ("ro   -> exec", "qmcp-gate-ro", "qmcp-gate-exec"),
+                    ("ro   -> ro2 ", "qmcp-gate-ro", "qmcp-gate-ro2"),
+                    ("exec -> out ", "qmcp-gate-exec", "qmcp-gate-out")):
+    k, ours, _ = ev(s, t)
+    check(f"{label} : ASK decided in {OURS}", k == "ASK" and ours)
+for s in ("qmcp-gate-ro", "qmcp-gate-exec", "qmcp-gate-full"):
+    k, ours, offered = ev(s, "@default")
+    check(f"{s} -> @default (qvm-copy) : ASK decided in {OURS}", k == "ASK" and ours)
+    check(f"{s} -> @default : dialog offers a qube outside the umbrella and the sink",
+          "qmcp-gate-out" in offered and "qmcp-gate-dump" in offered)
+k1 = ev("qmcp-gate-exec", "qmcp-gate-out")[0]
+k2, ours2, _ = ev("qmcp-gate-exec", "qmcp-gate-no-such-qube")
+check("exec -> a name that does not exist : the same ASK as a real qube (no oracle)",
+      k2 == "ASK" and ours2 and k1 == k2)
+k, ours, _ = ev("qmcp-gate-dump", "qmcp-gate-out")
+check("dump -> out : ASK from the stock default (operator drains the buffer)",
+      k == "ASK" and not ours)
+check(f"{gateway} -> @default : ASK (the operator's own line)", ev(gateway, "@default")[0] == "ASK")
+
+if scratch is not None:
+    shutil.rmtree(scratch, ignore_errors=True)
+print(f"    {'contract holds' if not fails else f'{fails} contract check(s) FAILED'}")
+sys.exit(1 if fails else 0)
+PY
+
+# ---------------------------------------------------------------- 4. validate + resolve BEFORE replacing
+echo "==> Validating the staged policy with qrexec's parser..."
+if ! python3 - "$EFFECTIVE" <<'PY'
+import sys
+try:
+    from qrexec.policy.parser import StringPolicy
+except ImportError:
+    print("FATAL: qrexec's policy parser is not importable.", file=sys.stderr)
+    sys.exit(1)
+try:
+    StringPolicy(policy={"__main__": open(sys.argv[1], encoding="utf-8").read()})
+except Exception as e:
+    print(f"FATAL: the parser rejected the staged policy: {e}", file=sys.stderr)
+    sys.exit(1)
+print("    parses clean.")
 PY
 then
-    echo "    policy validation OK."
-else
     echo "FATAL: staged policy failed validation — NOT installing." >&2
     rm -rf "$STAGE_DIR"; exit 1
 fi
 
-# The behavioural gate: resolve the matrix off the STAGED file and refuse if the
-# two rules are absent, mis-ordered, or have drifted in scope. Structure over
-# vocabulary (the 3a lesson) and behaviour over structure where a decision exists
-# (the 3b lesson) — here the artifact is a rule table, so resolve it.
-echo "==> Resolving the Filecopy matrix off the staged policy..."
-if ! python3 - "$STAGED" <<'PY'
-import sys
+# Counted with awk on whole fields, not a grep backreference: `\2` in grep -E
+# is a GNU extension, and a grep that errors prints nothing — the 3d
+# uninstaller's silent no-op (the round-trip lesson).
+count_backstops() {
+    awk '$1 !~ /^#/ && $1 ~ /^(qmcp\.(RunIn|CopyTo)AIManaged|admin\.vm\.firewall\.(Set|Reload))$/ \
+         && $2 == "*" && $4 == "@tag:ai-managed" && $5 == "allow" {n++} END {print n + 0}' "$1"
+}
+count_selfdenies() {
+    awk '$1 ~ /^admin\.vm\.firewall\.(Set|Reload)$/ && $2 == "*" && $3 == $4 \
+         && $5 == "deny" {n++} END {print n + 0}' "$1"
+}
+EB="$(count_backstops "$EFFECTIVE")"
+ES="$(count_selfdenies "$EFFECTIVE")"
+echo "    staged: $EB backstop line(s) (expected $EXPECT_BACKSTOPS), $ES firewall self-deny line(s) (expected 2)"
+if [ "$EB" != "$EXPECT_BACKSTOPS" ] || [ "$ES" != "2" ]; then
+    echo "FATAL: the staged file's backstop / self-deny counts are wrong — NOT installing." >&2
+    rm -rf "$STAGE_DIR"; exit 1
+fi
 
-rules = []
-for n, raw in enumerate(open(sys.argv[1], encoding="utf-8"), 1):
-    s = raw.strip()
-    if not s or s.startswith("#"):
-        continue
-    f = s.split()
-    if len(f) >= 5 and f[0] == "qubes.Filecopy":
-        rules.append((n, f[2], f[3], f[4]))
-
-
-def m(sel, tags):
-    if sel == "@anyvm":
-        return True
-    if sel.startswith("@tag:"):
-        return sel[5:] in tags
-    return False
-
-
-def act(stags, ttags):
-    for n, s_, t_, a in rules:
-        if m(s_, stags) and m(t_, ttags):
-            return a, n
-    return "SYSTEM-DEFAULT", None
-
-
-U = {"ai-managed"}
-FULL, EXEC, RO = U | {"ai-full"}, U | {"ai-exec"}, U
-DUMP, HYBRID, OUT = {"ai-dump"}, U | {"ai-dump"}, set()
-
-fail = []
-# What must NOT change.
-for label, s_, t_ in (("full->full", FULL, FULL), ("exec->exec", EXEC, EXEC),
-                      ("full->exec", FULL, EXEC)):
-    if act(s_, t_)[0] != "allow":
-        fail.append(f"the tiered mesh no longer allows {label} — this change must "
-                    f"not make working copies start prompting")
-for label, s_ in (("full", FULL), ("exec", EXEC), ("ro", RO)):
-    if act(s_, DUMP)[0] != "allow":
-        fail.append(f"the ai-dump valve is closed for a {label} source")
-for label, s_ in (("full", FULL), ("exec", EXEC), ("ro", RO)):
-    if act(s_, OUT)[0] != "deny":
-        fail.append(f"{label} -> OUT-of-umbrella is no longer a dialog-free deny — "
-                    f"leaving the umbrella is not what this change touches")
-# What must change.
-for label, s_, t_ in (("exec->ro", EXEC, RO), ("full->ro", FULL, RO),
-                      ("ro->ro", RO, RO), ("ro->exec", RO, EXEC)):
-    a, _ = act(s_, t_)
-    if a != "ask":
-        fail.append(f"{label} resolves {a!r}, expected 'ask' — the operator "
-                    f"dialog this change exists for is not there")
-# The valve must survive the ask.
-for label, s_ in (("hybrid", HYBRID), ("pure sink", DUMP)):
-    for tl, t_ in (("exec", EXEC), ("ro", RO)):
-        a, _ = act(s_, t_)
-        if a != "deny":
-            fail.append(f"{label} -> {tl} resolves {a!r}, expected 'deny' — an "
-                        f"ai-dump source must never be dialogued back into the fleet")
-# ...but a buffer must still be drainable by hand.
-if act(DUMP, OUT)[0] == "deny":
-    fail.append("sink -> OUT-of-umbrella is denied; the operator cannot drain the "
-                "buffer to a vault, which is the whole handoff pattern")
-
-for line in fail:
-    print("    " + line, file=sys.stderr)
-sys.exit(1 if fail else 0)
-PY
-then
-    echo "FATAL: the staged policy does not resolve as this change requires." >&2
+echo "==> Resolving the Filecopy contract: this box's policy directory + the staged file..."
+# As root: the scratch copy must be able to read every file in the policy
+# directory, exactly as the daemon does.
+if ! sudo python3 "$STAGE_DIR/filecopy_contract.py" staged "$EFFECTIVE" "$SOURCE_QUBE"; then
+    echo "FATAL: the staged policy does not resolve as the contract requires." >&2
     echo "       The live policy has NOT been touched." >&2
     rm -rf "$STAGE_DIR"; exit 1
 fi
-echo "    mesh + valve + umbrella boundary unchanged; the five missed pairs now ask."
 echo
 
-# ---------------------------------------------------------------- 3. back up, then install
+echo "==> Rule-line changes live -> staged (comments ignored):"
+if [ -f "$POLICY_DST" ]; then
+    diff <(grep -vE '^[[:space:]]*(#|$)' "$POLICY_DST") \
+         <(grep -vE '^[[:space:]]*(#|$)' "$EFFECTIVE") | sed 's/^/    /' || true
+else
+    echo "    (no live policy)"
+fi
+echo
+
+# ---------------------------------------------------------------- 5. back up, then install
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 sudo mkdir -p "$BACKUP_DIR/$TS"
 if [ -f "$POLICY_DST" ]; then
     sudo cp -a "$POLICY_DST" "$BACKUP_DIR/$TS/30-mcp-control.policy"
-    echo "==> Backed up the live policy to $BACKUP_DIR/$TS/"
+    echo "==> Backed up the live policy to $BACKUP_DIR/$TS/ (root-only; inspect with sudo)"
     echo "    revert: sudo install -m 0644 -o root -g root \\"
     echo "            $BACKUP_DIR/$TS/30-mcp-control.policy $POLICY_DST"
 else
@@ -231,11 +314,11 @@ fi
 echo
 
 echo "==> Installing dom0 policy (REPLACE)..."
-sudo install -m 0644 -o root -g root "$STAGED" "$POLICY_DST"
+sudo install -m 0644 -o root -g root "$EFFECTIVE" "$POLICY_DST"
 echo "    $POLICY_DST"
 echo
 
-# ---------------------------------------------------------------- 4. reload the daemon
+# ---------------------------------------------------------------- 6. reload the daemon
 echo "==> Reloading the qrexec policy daemon..."
 sudo systemctl reset-failed qubes-qrexec-policy-daemon qubes-policy-daemon 2>/dev/null || true
 if sudo systemctl restart qubes-qrexec-policy-daemon 2>/dev/null; then
@@ -259,44 +342,18 @@ fi
 echo "    $_unit active."
 echo
 
-# ---------------------------------------------------------------- 5. post-assert on the LIVE file
-echo "==> Re-resolving the matrix off the INSTALLED policy..."
-if ! sudo python3 - "$POLICY_DST" <<'PY'
-import sys
-rules = []
-for n, raw in enumerate(open(sys.argv[1], encoding="utf-8"), 1):
-    s = raw.strip()
-    if s and not s.startswith("#"):
-        f = s.split()
-        if len(f) >= 5 and f[0] == "qubes.Filecopy":
-            rules.append((n, f[2], f[3], f[4]))
-
-
-def m(sel, tags):
-    return True if sel == "@anyvm" else (sel[5:] in tags if sel.startswith("@tag:") else False)
-
-
-def act(s_, t_):
-    for n, a, b, ac in rules:
-        if m(a, s_) and m(b, t_):
-            return ac
-    return "SYSTEM-DEFAULT"
-
-
-U = {"ai-managed"}
-ok = (act(U, U) == "ask"
-      and act(U | {"ai-full"}, U | {"ai-full"}) == "allow"
-      and act(U | {"ai-full"}, set()) == "deny"
-      and act({"ai-dump"}, U | {"ai-exec"}) == "deny"
-      and act(U | {"ai-full"}, {"ai-dump"}) == "allow")
-print("    live policy: ro->ro=%s  mesh=%s  out=%s  sink-back=%s  valve=%s"
-      % (act(U, U), act(U | {"ai-full"}, U | {"ai-full"}),
-         act(U | {"ai-full"}, set()), act({"ai-dump"}, U | {"ai-exec"}),
-         act(U | {"ai-full"}, {"ai-dump"})))
-sys.exit(0 if ok else 1)
-PY
-then
-    echo "FATAL: the INSTALLED policy does not resolve as expected." >&2
+# ---------------------------------------------------------------- 7. post-assert on what the daemon sees
+echo "==> Re-resolving the contract off the INSTALLED policy directory..."
+LB="$(count_backstops "$POLICY_DST")"
+PHASE_AFTER="$(sudo awk '{sub(/#.*/, ""); for (i = 1; i <= NF; i++) {print $i; exit}}' "$FLAG" 2>/dev/null || true)"
+echo "    installed: $LB backstop line(s); tier-default before='${PHASE:-<absent>}' after='${PHASE_AFTER:-<absent>}'"
+if [ "$LB" != "$EXPECT_BACKSTOPS" ] || [ "$PHASE" != "$PHASE_AFTER" ]; then
+    echo "FATAL: the installed phase is not the phase this install was meant to keep." >&2
+    echo "       Restore the backup printed above before continuing." >&2
+    exit 1
+fi
+if ! sudo python3 "$STAGE_DIR/filecopy_contract.py" live "$SOURCE_QUBE"; then
+    echo "FATAL: the INSTALLED policy does not resolve as the contract requires." >&2
     echo "       Restore the backup printed above before continuing." >&2
     exit 1
 fi
@@ -307,21 +364,11 @@ rm -rf "$STAGE_DIR"
 cat <<'EOF'
 ==> Installed.
 
-    You can now hand-copy between your ai-managed qubes: a normal Qubes copy
-    dialog appears, you approve it, the file moves. Pairs already covered by the
-    tiered mesh keep copying with no dialog at all.
-
-    Leaving the umbrella is UNCHANGED and still refused. For that, use an
-    ai-dump buffer, which already exists and needs no new rule:
-
-        1. make a buffer qube and tag it   qvm-tags <buffer> add ai-dump
-           (NEVER also ai-managed — that hybrid is what the new deny guards)
-        2. copy into it from any ai-managed qube            (allowed, no dialog)
-        3. drain it to the vault by hand from the buffer    (system dialog)
-
-    The buffer is write-only from AI's side by construction: it carries no
-    umbrella, so there is no read surface, no exec service and no enumeration
-    into it. AI can put things in; only you take them out.
+    From an AI qube, `qvm-copy` now shows the normal Qubes dialog, and copies
+    out to any of your qubes go through that dialog as well. Copies between
+    qubes tagged ai-exec / ai-net / ai-full still need no dialog; copies into
+    read-only or untiered AI qubes still ask. The ai-dump drop box is
+    unchanged.
 
     Revert: restore the backup printed above and restart the policy daemon.
 EOF
