@@ -286,8 +286,11 @@ def acquire_create_lock() -> int:
     except Exception as e:
         # AUDIT-LOUD (Stage I-7, finding [5]): the lock file is provisioned
         # root:qubes 0660 at install (install-stage-I-0.sh), so a failure here is
-        # exceptional — surface it to stderr/journal instead of silently degrading
-        # serialization to nothing. Still BEST-EFFORT by design (see the docstring:
+        # exceptional — surface it on stderr instead of silently degrading
+        # serialization to nothing. A qrexec-invoked dom0 service's stderr lands
+        # in /var/log/qubes/qrexec.<calling qube>.log: not in the journal, and
+        # never at the caller (measured 2026-09-30, qrexec 4.3.14), so that log
+        # is where to look. Still BEST-EFFORT by design (see the docstring:
         # a cap overshoot is a bounded, reclaimable transient DoS, not a breakout,
         # and a broken lock file must never block every create).
         print(f"qmcp_budget: create-lock open failed ({e}); proceeding UNLOCKED "

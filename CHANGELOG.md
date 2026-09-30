@@ -27,6 +27,44 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.16] — 2026-09-30
+
+Two guard/comment fixes carried over from the mcp-control inbox, and a README
+refresh to the shipped state of the repo.
+
+### Fixed
+
+- **`install-stage-1.sh`'s stale-tree guard did not guard.** It aborted unless
+  every staged wrapper matched `grep -q '_gate('` — but every wrapper has
+  carried `_consent_gate(` since Stage I-6, so a v0.9.0 tree satisfied it 8/8,
+  and the check that was meant to catch a wrong or stale source tree caught
+  nothing. Replaced with a structural check that parses each wrapper's AST and
+  requires a module-level `def _gate` **and** at least one call to it; a `def`
+  never called, or `_gate(` in a comment, is now refused. Teeth in
+  `offline-validate-1-wiring.py` §6 run the installer's own extracted program
+  against a reconstructed pre-3c wrapper and assert it is refused, so the guard
+  cannot silently regress.
+
+### Changed
+
+- **`qmcp_budget.py` create-lock comment corrected.** It said a failed
+  create-lock open is surfaced "to stderr/journal"; a qrexec-invoked dom0
+  service's stderr goes to neither the systemd journal nor the calling qube —
+  it lands in `/var/log/qubes/qrexec.<caller>.log`. Comment only; the
+  audit-loud behaviour it documents is unchanged.
+- **README brought up to the shipped state of the repo.** Corrected a
+  three-way-contradictory setup path (the published repo has no `public/`
+  subdirectory, so every fetch command and install argument now uses
+  `~/qubes_mcp`, and the stated installer default is accurate); added the
+  missing Stage I-3 install as a prerequisite of the I-4 step; fixed the Stage
+  E1 device-enumeration description to reflect the G0 redactor; corrected "two
+  backstops" to the four the coupled flip removes; added Stage 3d to the Wave 2
+  install order and noted it ships armed; added a Status-table row for Stage
+  I-6 and a pointer section for the shipped installers beyond the numbered path
+  (G0, the flip, I-6, peer-copy); refreshed the intro, design highlights and
+  status prose through Wave 2 / Stage 3d; and retired two stale claims (a
+  resolved reviewer ask, and a caveat residual closed in 0.9.9).
+
 ## [0.9.15] — 2026-09-27
 
 Hand copying out of an AI qube: `qvm-copy` shows the operator dialog again.

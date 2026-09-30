@@ -397,5 +397,58 @@ check("audit(): a divergence IS recorded, and the chain still verifies",
       and audit_mod.verify(withdiv)[0] is True)
 
 # --------------------------------------------------------------------------
+print("\n-- 6. install-stage-1.sh's stale-tree guard refuses a pre-3c wrapper --")
+# The program is EXTRACTED from the installer, not retyped here, so the two
+# cannot drift. Its predecessor was `grep -q '_gate('`, which `_consent_gate(`
+# satisfied in every wrapper since Stage I-6: a v0.9.0 tree passed it 8/8.
+import re
+import subprocess
+
+INSTALLER = os.path.join(HERE, "install-stage-1.sh")
+with open(INSTALLER) as fh:
+    _inst = fh.read()
+_m = re.search(r"^GATE_WIRED_PY='(.*?)'$", _inst, re.S | re.M)
+# Compare CODE lines: the installer's comment quotes the old grep on purpose.
+_code = "\n".join(l for l in _inst.splitlines() if not l.lstrip().startswith("#"))
+check("guard: the structural program is present in install-stage-1.sh",
+      _m is not None and "grep -q '_gate('" not in _code)
+GUARD = _m.group(1) if _m else "import sys; sys.exit(0)"
+_wm = re.search(r'^WRAPPERS="(.*?)"$', _inst, re.S | re.M)
+GUARDED = _wm.group(1).split() if _wm else []
+
+
+def guard_passes(src):
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(src)
+    try:
+        return subprocess.run([sys.executable, "-c", GUARD, fh.name]).returncode == 0
+    finally:
+        os.unlink(fh.name)
+
+
+_srcs = {}
+for rel in GUARDED:
+    with open(os.path.join(os.path.dirname(HERE), rel)) as fh:
+        _srcs[rel] = fh.read()
+check("guard: every wrapper the installer names passes it (8/8)",
+      len(_srcs) == 8 and all(guard_passes(s) for s in _srcs.values()),
+      f"named={len(_srcs)}")
+
+# A pre-3c wrapper: the hook was `_shadow_note`, `_consent_gate` already there.
+_BARE_GATE = re.compile(r"(?<![A-Za-z0-9_])_gate\(")
+_pre3c = {rel: _BARE_GATE.sub("_shadow_note(", s) for rel, s in _srcs.items()}
+check("teeth: the OLD grep still matches every pre-3c fixture",
+      bool(_pre3c) and all("_gate(" in s for s in _pre3c.values()),
+      "if this fails the fixture no longer reproduces the hole")
+check("guard: every pre-3c fixture is REFUSED",
+      bool(_pre3c) and not any(guard_passes(s) for s in _pre3c.values()))
+
+_one = next(iter(_pre3c.values()), "")
+check("guard: `_gate` defined but never called is REFUSED",
+      not guard_passes(_one + "\n\ndef _gate(*a, **kw):\n    return None\n"))
+check("guard: `_gate(` in a comment alone is REFUSED",
+      not guard_passes(_one + "\n# wired through _gate(...) since 3c\n"))
+
+# --------------------------------------------------------------------------
 print(f"\n{PASSED}/{PASSED + FAILED} checks passed")
 sys.exit(1 if FAILED else 0)

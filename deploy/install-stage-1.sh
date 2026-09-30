@@ -113,9 +113,24 @@ echo "    all 10 compile."
 # Stage 3c renamed this hook from `_shadow_note` (which computed the kernel's
 # verdict and discarded it) to `_gate` (which acts on it). The marker moved with
 # it, so this guard keeps checking the tree it is actually installing.
+#
+# The check is STRUCTURAL: a module-level `def _gate` AND at least one call to
+# it, read from the syntax tree. It used to be `grep -q '_gate('`, which every
+# wrapper has matched since Stage I-6 through `_consent_gate(` — a v0.9.0 tree
+# passed it 8/8, so it guarded nothing. offline-validate-1-wiring.py §6 runs
+# this exact program, extracted from this file, against a pre-3c wrapper.
+GATE_WIRED_PY='
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+defined = any(isinstance(n, ast.FunctionDef) and n.name == "_gate"
+              for n in tree.body)
+called = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_gate" for n in ast.walk(tree))
+sys.exit(0 if defined and called else 1)
+'
 echo "==> Confirming every wrapper actually carries the decision hook..."
 for f in $WRAPPERS; do
-    if ! grep -q '_gate(' "$STAGE_DIR/$f"; then
+    if ! python3 -c "$GATE_WIRED_PY" "$STAGE_DIR/$f"; then
         echo "FATAL: $f has no _gate call — wrong or stale source tree." >&2
         rm -rf "$STAGE_DIR"
         exit 1

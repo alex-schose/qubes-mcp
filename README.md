@@ -16,9 +16,13 @@ assistants. An untrusted-AI principal runs inside a dedicated qube
 tag — without dom0 access, without visibility into untagged qubes, and
 without the ability to mutate tags.
 
-Stages A through F3 and the Stage I Wave-1 sub-stages (I-0..I-5) are tested and
-working on Qubes R4.3-era systems — see the Status table below. Stages G–H are
-designed but deferred until Stage I completes.
+Stages A through F3, Stage G0, the Stage I Wave-1 sub-stages (I-0..I-5), and
+Wave 2 (the capability decision kernel through Stage 3d) are tested and working
+on Qubes R4.3-era systems — see the Status table below. The tier model and the
+decision kernel are live but **behaviour-neutral on install**: nothing changes
+what the AI may do until the operator tiers the fleet and runs the
+least-privilege flip, and enforcement ships in `shadow` mode. Stages G1/G2 and H
+are designed but deferred until Stage I completes.
 
 ## Architecture
 
@@ -63,10 +67,37 @@ outside its tag scope.
   literal string `"not found"` indistinguishably whether the target qube
   doesn't exist or simply isn't tagged. The MCP-side helper normalises all
   qrexec failure modes (policy deny, no-such-VM, transport error) to the same
-  opaque `"not found or refused"` so the lifecycle path doesn't leak either.
-- **Multi-stage rollout, reversible at each step.** See `CLAUDE.md` for the
-  full 8-stage design. Each stage has its own `install-*.sh`, `uninstall-*.sh`,
-  and `test-*.py` in `deploy/`.
+  opaque `"not found or refused"` so the lifecycle path doesn't leak either. The
+  same opacity holds on the *value* channel (I-1): a VM-valued property whose
+  referent is out of scope collapses to `<out-of-scope>`, and a `tags` read is
+  filtered to the qmcp vocabulary, so the fleet's authority topology is not an
+  AI-readable oracle.
+- **Graduated authority within the boundary (tiers, I-3..I-5).** Beyond the
+  binary tag, a cumulative ladder — `ai-managed` (read floor) < `ai-exec` <
+  `ai-net` < `ai-full`, plus an orthogonal write-only `ai-dump` sink — so a
+  prompt-injected agent need not hold full lifecycle authority on every qube it
+  can see. Tiers are **operator-assigned** (AI cannot write tags) and
+  **un-self-escalatable** (every create path strips inherited tier tags). Ships
+  in compat (untiered = full = today's boundary); the operator flips to least
+  privilege in one coordinated change.
+- **A hash-chained, AI-unreachable dom0 audit log (I-2).** Every state-changing
+  `qmcp.*` call appends one line carrying the sha256 of the previous, so any
+  edit, delete or reorder breaks the chain. No service reads it and no policy
+  line exposes it; it records a whitelisted summary, never a property or feature
+  value.
+- **A decision kernel that can't write theatre (Wave 2).** A dom0 kernel
+  *derives* each verdict from a domination lattice rather than a hand-authored
+  matrix, so a gate an existing capability already dominates cannot be written
+  at all. It ships in `shadow` (logs divergence, enforces nothing); the operator
+  arms it via `/etc/qmcp/enforce-mode`, and an armed `remove` becomes a
+  reversible tombstone rather than a deletion.
+- **Egress is inherited at birth, not defaulted (§3.4).** Every qube the AI
+  creates is born with its creator's netvm, read in dom0 from the qrexec source
+  identity — a Tor-side agent cannot spawn a clearnet qube. Retargeting an
+  existing qube's egress is refused (`netvm = null` de-escalation aside).
+- **Multi-stage rollout, reversible at each step.** See `CLAUDE.md` for the full
+  design and trust model. Each stage has its own `install-*.sh`,
+  `uninstall-*.sh`, and (for the AI-facing stages) `test-*.py` in `deploy/`.
 
 ## Reviewer asks
 
@@ -74,10 +105,11 @@ This is human-designed, AI-assisted code, and review from people who know the
 Qubes Admin API and qrexec policy (R4.2+) is genuinely wanted. The detailed,
 numbered questions — existence-oracle robustness at the qrexec layer, `@tag:`
 matching on `klass=DispVM`, single-egress vs. cascade as a Qubes idiom,
-event-stream payload minimisation, cap-as-contract disk budgeting,
-security-tag inheritance on `clone_vm` / `CreateDisposable` (a created qube
-must be stripped to its umbrella, not assumed clean), and more — are written
-up in **[OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)**.
+event-stream payload minimisation, cap-as-contract disk budgeting, and more —
+are written up in **[OPEN_QUESTIONS.md](OPEN_QUESTIONS.md)**. (One earlier ask,
+security-tag inheritance on `clone_vm` / `CreateDisposable` — a created qube must
+be stripped to its umbrella, not assumed clean — is now **implemented**: Stage
+I-5 strips every inherited tier tag on every create path.)
 
 Where this has been discussed:
 
@@ -92,7 +124,7 @@ Where this has been discussed:
 
 ## Status
 
-**Current version: 0.9.15** (pre-1.0 — see [CHANGELOG.md](CHANGELOG.md)).
+**Current version: 0.9.16** (pre-1.0 — see [CHANGELOG.md](CHANGELOG.md)).
 
 Development up to 0.9.0 was tracked as lettered *stages*; that vocabulary is kept
 in `deploy/` filenames and in the design document as the as-built record, and the
@@ -109,34 +141,41 @@ Stages A through F3 land the binary trust boundary: a qube tagged
 an untagged qube is invisible. The F band closes that surface with
 disk-budget visibility (F3).
 
-**Stage I (graduated authority) is the current work line.** It adds
-*graduated* authority within `ai-managed` — resource tiers, an
-action gate (per-call consent for destructive ops), per-trust-class
-source qubes, a sign-only secrets vault, and persona presets — so a
-hallucinating or prompt-injected agent cannot destroy real data
-*inside* the boundary just because it has a qrexec channel.
-Stage I lands as sub-stages I-0..I-11 in three waves; I-0 (cap-as-
-gate), I-1 (read-surface scope redaction), I-2 (dom0 audit log),
-I-3 (the tier taxonomy + resolution helper, landed behaviour-neutral),
-I-4 (tiers on the policy-scoped surfaces), and I-5 (tiers on the wrapper
-+ exec surfaces, with the least-privilege flip available) are done — all
-listed below. **Wave 1 (I-0..I-5) is complete**, behaviour-neutral until
-the operator tiers the fleet and runs the flip. **Wave 2 was redesigned
-after a clean-room install run**: instead of an operator-authored
-per-class gate matrix, a dom0 kernel *derives* each verdict from a
-domination lattice, so a gate that an existing capability already
-dominates cannot be written at all. Its Stage 1 (the kernel, in shadow
-mode), Stage 2 (ownership, birth tier, birth egress), Stage 3a (the
-tombstone and its reaper), Stage 3b (the enforcement-mode flag and the
-production smoke suite) and Stage 3c (the wrappers wired to obey the
-kernel) are below. **Every one of them is inert or in shadow on
-install**, so none has yet changed what the AI may do: 3c ships with
-`/etc/qmcp/enforce-mode` absent, which means shadow, which means each
-wrapper acts on its own verdict exactly as before.
+**Stage I (graduated authority) adds *graduated* authority within
+`ai-managed`** — resource tiers, an action gate (per-call consent for
+destructive ops), a per-trust-class principal axis, a sign-only secrets
+vault, and persona presets — so a hallucinating or prompt-injected agent
+cannot destroy real data *inside* the boundary just because it has a
+qrexec channel. It lands as sub-stages in waves.
+**Wave 1 (I-0..I-5) is complete:** I-0 (cap-as-gate), I-1 (read-surface
+scope redaction), I-2 (dom0 audit log), I-3 (the tier taxonomy +
+resolution helper), I-4 (tiers on the policy-scoped surfaces) and I-5
+(tiers on the wrapper + exec surfaces, with the least-privilege flip) —
+behaviour-neutral until the operator tiers the fleet and runs the flip.
+**Wave 2 was redesigned after a clean-room install run**: instead of an
+operator-authored per-class gate matrix, a dom0 kernel *derives* each
+verdict from a domination lattice, so a gate an existing capability
+already dominates cannot be written at all. It ships here through **Stage
+3d**: Stage 1 (the kernel, shadow mode), Stage 2 (ownership + birth tier +
+birth egress), Stage 3a (the tombstone and its reaper), Stage 3b (the
+three-mode enforcement flag and the production smoke suite), Stage 3c (the
+wrappers wired to obey the kernel), and Stage 3d (the calling principal is
+never a legitimate object). **All of Wave 2 is inert or in `shadow` on
+install** — 3c ships with `/etc/qmcp/enforce-mode` absent, so each wrapper
+acts on its own verdict exactly as before — **with one deliberate
+exception: Stage 3d ships armed**, because it closes an object-identity
+hole (a gateway carrying the umbrella was mutable from the AI seat) rather
+than making a capability decision, and a guard behind the flag would be
+inert in exactly the shipped posture the gap is live in.
+Two more shipped changes sit alongside the chain: the **FIX** pass (an
+adversarial audit that closed a create-path existence oracle with a
+reserved name namespace, an egress-retarget refusal, and dom0-exception
+scrubbing) and **COPY** (hand copying out of an AI qube by the normal
+operator dialog).
 **Stage G0 (gateway input boundary) was pulled ahead of Wave 2** — a
 2026-07-24 architecture review found reachable boundary breaks in the
 shipped tree, so the tier-independent hardening that closes them shipped
-now (see the G0 row). **The rest of Stage G (mcp-control host hardening,
+early (see the G0 row). **The rest of Stage G (mcp-control host hardening,
 G1/G2) and Stage H remain deferred** until Stage I completes — both depend
 on a non-binary trust model (G1's lockdown is per-tier; H's remote reach
 needs Stage I's dom0 gate-lift).
@@ -158,6 +197,7 @@ needs Stage I's dom0 gate-lift).
 | I-3 | Tier taxonomy + dom0 tier-resolution helper — the keystone of the resource axis. Graduates the binary boundary into a cumulative ladder within ai-managed: `ai-managed` (read floor) < `ai-exec` (+commands) < `ai-net` (+firewall write) < `ai-full` (+lifecycle/property/clone/spawn/feature/attach/detach); `ai-dump` is an orthogonal copy-IN-only sink. A shared dom0 helper (`qmcp_tier.py`, sibling-loaded like `qmcp_budget`/`qmcp_scope`/`qmcp_audit`) exposes `effective_capabilities(vm)` → a frozenset of capability tokens, so the wrappers ask `CAP_FULL in caps` and stay decoupled from the taxonomy. Behaviour-neutral: ships inert (no wrapper sources it until I-5) in compat mode (untiered ai-managed = full = today's boundary). AI can neither mutate tags (keystone) nor read the tier tags (a `tags` read stays `["ai-managed"]` — the authority topology is not an oracle). Two-phase migration: enforce in I-4/I-5, then flip `/etc/qmcp/tier-default` to `ro` for least privilege. No new RPC, no policy change. | tested |
 | I-4 | First enforcement step of the resource axis — a single-file policy diff graduating the directly-`@tag:`-scoped surfaces. `firewall.Get` + device-list stay at the `ai-managed` ro-floor; `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`; `ai-dump` gets a dedicated copy-IN-only `qubes.Filecopy * @tag:ai-managed @tag:ai-dump allow` (the Biba write-only sink — a **pure** `ai-dump` qube is push-only and invisible to reads/list/exec because it lacks the umbrella; the write-only property rests on the operator invariant that an `ai-dump` qube is never also `ai-managed`, which the installer checks and I-5 enforces). The policy layer matches tags literally and cannot call `qmcp_tier`, so firewall-write ships with a `@tag:ai-managed` **compat backstop** (keeps untiered qubes writable through migration → A–F3 stays green and the live egress qube keeps firewall control on deploy; behaviour-neutral on firewall in compat — only the `ai-dump` valve is new live behaviour). The flip (end of I-5) deletes the backstop **and** writes `ro` to `/etc/qmcp/tier-default` in one change. Policy-only; no new RPC, no new qube, no wrapper change. Proven offline (100-check policy simulation, compat + post-flip), a per-tier hardware slot, and an AI-side transparency test. | tested |
 | I-5 | Second enforcement step — tiers on the `@adminvm` **wrapper** surfaces (dom0 code) + the **exec** surfaces (policy), then the least-privilege flip. Lifecycle/SetProperty/SetFeature require `ai-full` on the target, Clone on the source, Spawn on the template, SpawnDisposable on the DVMT, Attach/Detach on **both** endpoints — via the sibling-loaded `qmcp_tier` helper, **fail-closed** (a missing/broken resolver denies, never allows). `RunInAIManaged`/`CopyToAIManaged` graduate in policy to `@tag:ai-exec`/`ai-net`/`ai-full` + a `@tag:ai-managed` compat backstop (mirrors I-4 firewall). Every create path **strips** any tier tag the platform propagates — `clone_vm` copies the source's tags, `CreateDisposable` inherits the DVMT's — so a created qube is always untiered (umbrella only); without the strip, AI could clone an `ai-full` qube into another and self-escalate past the flip. Behaviour-neutral in compat (untiered = full). The flip (separate slot, after the operator tiers the fleet) deletes **four** compat backstops (firewall.Set/Reload + Run/Copy) **and** writes `ro` to `/etc/qmcp/tier-default` in one coupled change. No new RPC, no new qube, no new ring. Proven offline (260 checks: wrapper-gate suite + policy simulator + I-4 regression) and on dom0 hardware (per-tier gate + the create-path strip, read back via `qvm-tags` in dom0 since tier tags are AI-unreachable). | tested |
+| I-6 | Per-call operator-consent action gate — **mechanism shipped, INERT**. A dom0 consent helper (`qmcp_consent.py`) + a small consent daemon (`qmcp-consentd`) + a zenity dialog let the operator require an interactive OK for selected `(service, action)` pairs (e.g. destructive lifecycle). All 8 mutation wrappers call the gate after the tier check and before the mutation, **fail-closed** (a missing/broken helper denies). Ships inert: the installed `/etc/qmcp/consent-policy` gates the **empty set**, so `consent_required()` is False for every call, the socket is never opened, and behaviour is byte-identical to pre-I-6; enforcement is a non-empty operator policy, which only ever *adds* a gate. A consent refusal is byte-identical to any other opaque refusal (no oracle). No new RPC; no policy change. | shipped inert |
 | G0 | Gateway input boundary (pulled ahead of Wave 2 after the 2026-07-24 review). Property allowlist — `provides_network` operator-only (no self-minted egress); qrexec target-name validator (`@adminvm`/`dom0`/malformed rejected before any call); device enumeration (attached + available) routed through the dom0 redactor `qmcp.ListAttachedDevicesAIManaged` that hides out-of-scope backend/consuming-frontend qube names, with direct `admin.vm.device.*` enumeration denied; `qubes.Filecopy` re-tiered to `ai-exec` on **both** endpoints + explicit deny (no fleet-wide push into `ai-ro` qubes); `mask_error_details` + opaque error collapse. Closes four review findings; offline + per-fix hardware slots green. | tested |
 | W2-1 | Wave 2 Stage 1 — the capability decision kernel (`qmcp_caps.py`), in **shadow mode**. `decide(actor, service, action, targets)` resolves first-match-wins: a target outside the umbrella → DENY; an escalation-class op (tag writes, `provides_network`, `template`, `netvm`, `name`, TemplateVM create) → DENY at every tier forever; a target in the operator's guarded class → GATE, checked *before* the domination logic so it cannot be argued away; an op an already-held capability fully dominates → ALLOW; else the `CAP_*` ladder. The anti-theatre rule is why gating `remove` while the actor holds exec is refused as a design — exec already reaches `rm -rf`, so the dialog protects nothing and trains the operator to click through. Enforces nothing: each of the 8 state-changing wrappers asks the kernel the question its I-5 gate just answered and records only a *disagreement*, as an optional `shadow` field omitted when they agree, so an agreeing call's audit line and chain hash are byte-identical to pre-Stage-1. Fail-**open** by design — the one inversion in the codebase, because it is not a gate. That divergence log is the deliverable and gates the later flip. | tested |
 | W2-2 | Wave 2 Stage 2 — **ownership + birth tier + birth egress**; the first stage that deliberately changes create-path behaviour, because it is what makes least privilege *operable*. A created qube is stamped atomically with the umbrella, `qmcp-owner_<principal>` (provenance in the project's reserved namespace — never `created-by-*`, which qubesd stamps with the calling domain and so cannot distinguish AI-created from operator-created), the source's **literal** tier clamped by the operator-owned `/etc/qmcp/birth-ceiling`, and every **restriction** the source carried (`qmcp-guarded`, `qmcp-egress-locked_*`, `anon-vm`) — restrictions inherit unconditionally, since a restriction the privilege clamp can remove is a laundering hole. The stamp is read back and any mismatch **rolls the create back**. Netvm is likewise **inherited** rather than defaulted: the source's egress, else the calling gateway's, else `/etc/qmcp/birth-egress`, else refuse — replacing a hardcoded `ai-net-router` that gave adopters network-less qubes and, on a multi-egress fleet, let a Tor-side agent spawn a clearnet qube. Reading the source's *literal* tag rather than its effective capability keeps the stage neutral in compat (an untiered source still yields an untiered child) and correct after the flip. **Scope, stated plainly: this governs BIRTH egress only** — retargeting an *existing* qube across egress classes is still permitted at `ai-full`, and that is the more dangerous half (a new qube is empty; an existing one may hold Tor-derived data). The kernel already answers escalation-class DENY for a `netvm` write but runs in shadow, so retarget closes when enforcement flips to `decide()`. Self-escalation stays impossible — nothing is born above its source, and tiers are operator-assigned because AI cannot write tags. Also deletes `server.py`'s declarative `_RING_MIN_TIER`: nothing above the dom0 boundary may resemble a control. Proven offline (96 checks across a logic suite and a wiring suite whose mocks reproduce qubesadmin's real tag/netvm propagation and carry teeth asserting they still do); the tier and owner tags are AI-unreachable by design, so hardware proof is a `qvm-tags` read in dom0. | tested — birth egress on hardware; the tag stamp offline |
@@ -183,7 +223,10 @@ The qrexec policy file references two names that must match your system:
   `policy/30-mcp-control.policy` *and* in the install scripts before deploying.
 - **`ai-managed`** — the qrexec tag that defines the sandbox. Don't rename
   unless you also update every `@tag:ai-managed` reference in the policy and
-  every `"ai-managed"` literal in the `qmcp.*` scripts.
+  every `"ai-managed"` literal in the `qmcp.*` scripts. The tier tags
+  (`ai-exec`, `ai-net`, `ai-full`, `ai-dump`) are matched the same way once you
+  reach Stage I-4/I-5; they are project vocabulary and need no renaming, but a
+  fleet hardening pass should know they exist.
 
 The Python package directory is `qubes_mcp/` inside the repo root. If you
 `pip install -e .` inside your venv (recommended), the package resolves
@@ -225,14 +268,16 @@ package by name from any working directory.
 ### Step 2 — Deploy Stage A (from dom0)
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-a.sh' > /tmp/install-a.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-a.sh' > /tmp/install-a.sh
 less /tmp/install-a.sh         # review before executing
 bash /tmp/install-a.sh mcp-control ~user/qubes_mcp
 ```
 
 The two positional arguments are the source qube and the path to the repo
-inside it. Defaults: `mcp-control` and `/home/user/qubes_mcp`. Pass them
-explicitly if you cloned to a different location.
+inside it. These commands pass `mcp-control` and `~user/qubes_mcp` explicitly,
+to match the Step 1 clone. (The scripts' own built-in default for the second
+argument is the maintainer's layout, `/home/user/qubes_mcp/public`, so always
+pass your own path — as shown — if you cloned elsewhere.)
 
 The script clones `debian-13` → `ai-debian-13` (if needed), tags it
 `ai-managed`, and installs the policy + qmcp scripts.
@@ -261,7 +306,7 @@ wrappers with the opaque-collapse versions).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-b.sh' > /tmp/install-b.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-b.sh' > /tmp/install-b.sh
 bash /tmp/install-b.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -288,7 +333,7 @@ and set firewall rules on `ai-net-router` and on its own qubes.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-c.sh' > /tmp/install-c.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-c.sh' > /tmp/install-c.sh
 EGRESS_UPSTREAM=sys-firewall bash /tmp/install-c.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -354,7 +399,7 @@ policy + RPC scripts change.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-d.sh' > /tmp/install-d.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-d.sh' > /tmp/install-d.sh
 bash /tmp/install-d.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -378,9 +423,13 @@ Stage E1 adds two dom0 wrappers (`qmcp.AttachDeviceAIManaged`,
 `qmcp.DetachDeviceAIManaged`) that attach virtual block/USB/mic devices
 between ai-managed qubes. Both backend and frontend must be ai-managed;
 the wrapper collapses missing/untagged on either side to opaque
-`"not found"`. Read-only enumeration (`admin.vm.device.{class}.{List,
-Available}`) is tag-scoped at the policy layer — same shape as Stage C
-firewall reads. No new qube provisioning.
+`"not found"`. Read-only enumeration now runs through the dom0 redactor
+`qmcp.ListAttachedDevicesAIManaged` (attached + available), which hides
+out-of-scope backend / consuming-frontend qube names; direct
+`admin.vm.device.*` enumeration is denied to AI. (E1 originally exposed the
+`admin.vm.device.*.{List,Available}` reads tag-scoped at the policy layer;
+Stage G0 moved all enumeration behind the redactor — see the G0 row.) No new
+qube provisioning.
 
 In practice, **block** is the useful case (e.g. shared scratch volume
 between two ai-managed AppVMs). **USB** requires `sys-usb` to be
@@ -391,7 +440,7 @@ wrappers are ready when the operator chooses to tag those backends.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-e1.sh' > /tmp/install-e1.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e1.sh' > /tmp/install-e1.sh
 bash /tmp/install-e1.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -427,7 +476,7 @@ move on" pattern collapses to a single call.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-e2.sh' > /tmp/install-e2.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-e2.sh' > /tmp/install-e2.sh
 bash /tmp/install-e2.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -455,7 +504,7 @@ provisioning — only the policy + RPC script change.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f1.sh' > /tmp/install-f1.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f1.sh' > /tmp/install-f1.sh
 bash /tmp/install-f1.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -492,7 +541,7 @@ SetFeatureAIManaged, finally aligned across all write/spawn surfaces).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f2.sh' > /tmp/install-f2.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f2.sh' > /tmp/install-f2.sh
 bash /tmp/install-f2.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -536,7 +585,7 @@ the wrapper + policy + cap file.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-f3.sh' > /tmp/install-f3.sh
 bash /tmp/install-f3.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -598,7 +647,7 @@ Stage F3 is a prerequisite (it seeds `/etc/qmcp/pool-cap`).
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-0.sh' > /tmp/install-I-0.sh
 bash /tmp/install-I-0.sh mcp-control ~user/qubes_mcp
 ```
 
@@ -662,8 +711,8 @@ restart the policy daemon.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
-bash /tmp/install-I-1.sh mcp-control ~user/qubes_mcp/public
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-1.sh' > /tmp/install-I-1.sh
+bash /tmp/install-I-1.sh mcp-control ~user/qubes_mcp
 ```
 
 Then verify from mcp-control:
@@ -707,8 +756,8 @@ policy daemon.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
-bash /tmp/install-I-2.sh mcp-control ~user/qubes_mcp/public
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-2.sh' > /tmp/install-I-2.sh
+bash /tmp/install-I-2.sh mcp-control ~user/qubes_mcp
 ```
 
 Inspect and verify the trail in dom0:
@@ -731,12 +780,25 @@ revert` restores the pre-I-2 wrapper source too.
 
 ### Step 15 — (Optional) Deploy Stage I-4 for tiered policy surfaces
 
+**Prerequisite — install the Stage I-3 tier helper first.** I-3 lands the
+tier taxonomy and its dom0 resolver (`qmcp_tier.py`); it is behaviour-neutral
+(no policy change, nothing sources it until I-5) but must be in dom0 before
+I-5, so deploy it now:
+
+```
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-3.sh' > /tmp/install-I-3.sh
+bash /tmp/install-I-3.sh mcp-control ~user/qubes_mcp
+.venv/bin/python deploy/test-stage-I-3.py    # from mcp-control
+```
+
 Stage I-4 is the first enforcement step of the resource axis — a
 **single-file policy diff** (no new RPC script, no new qube, no wrapper
 change). It graduates the directly-`@tag:`-scoped surfaces:
 
-- `firewall.Get` and `device.*.{List,Available}` stay at the `ai-managed`
-  ro-floor (unchanged).
+- `firewall.Get` stays at the `ai-managed` ro-floor (unchanged). Device
+  enumeration also stays a ro-floor read here, but note Stage G0 later moved
+  it behind the `qmcp.ListAttachedDevicesAIManaged` redactor and denied the
+  direct `admin.vm.device.*` reads (see the G0 row and Step 7).
 - `firewall.{Set,Reload}` move to `@tag:ai-net` + `@tag:ai-full`.
 - `ai-dump` gets a dedicated `qubes.Filecopy * @tag:ai-managed @tag:ai-dump
   allow` — a copy-IN-only sink. A **pure** `ai-dump` qube is **not** tagged
@@ -754,8 +816,10 @@ The policy layer matches `@tag:` selectors literally and cannot call the
 migration — so the A–F3 regression stays green and the live egress qube keeps
 firewall control the moment you deploy. While the backstop is present the
 firewall-write surface is **behaviour-neutral**; the one new live capability is
-the `ai-dump` valve. The **flip** (end of Stage I-5) deletes the two backstop
-lines **and** writes `ro` to `/etc/qmcp/tier-default` in the same change, so the
+the `ai-dump` valve. The **flip** (end of Stage I-5) deletes I-4's two firewall
+backstops — part of the **four** the coupled flip removes (the two firewall
+lines here plus the `RunInAIManaged` / `CopyToAIManaged` backstops added in I-5)
+— **and** writes `ro` to `/etc/qmcp/tier-default` in the same change, so the
 policy surface and the wrapper surface drop to least-privilege together. This
 step does not require the I-3 helper to be installed (the policy layer never
 sources it).
@@ -764,8 +828,8 @@ From dom0 (the installer validates the policy before replacing the live file —
 a malformed policy can break all of qrexec):
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-4.sh' > /tmp/install-I-4.sh
-bash /tmp/install-I-4.sh mcp-control ~user/qubes_mcp/public
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-4.sh' > /tmp/install-I-4.sh
+bash /tmp/install-I-4.sh mcp-control ~user/qubes_mcp
 ```
 
 Then verify from mcp-control:
@@ -822,8 +886,8 @@ disjointness), and validates the policy before replacing the live file.
 From dom0:
 
 ```
-qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/public/deploy/install-stage-I-5.sh' > /tmp/install-I-5.sh
-bash /tmp/install-I-5.sh mcp-control ~user/qubes_mcp/public
+qvm-run --pass-io mcp-control 'cat ~/qubes_mcp/deploy/install-stage-I-5.sh' > /tmp/install-I-5.sh
+bash /tmp/install-I-5.sh mcp-control ~user/qubes_mcp
 ```
 
 Then verify from mcp-control:
@@ -840,6 +904,28 @@ the operator's slot — the strip is read back via `qvm-tags` in dom0
 because tier tags are deliberately invisible to AI. `deploy/uninstall-stage-I-5.sh`
 reverts (or `/tmp/run.sh revert` restores the pre-I-5 wrappers + policy
 byte-exact).
+
+### Beyond the numbered path — shipped installers not walked through above
+
+The numbered steps stop at I-5. Several further stages ship their own idempotent
+installers in `deploy/`, each with the same `mcp-control ~user/qubes_mcp`
+invocation; run `ls deploy/` for the authoritative list. The notable ones:
+
+- **`install-stage-G0a.sh` … `-G0e.sh`** — the Stage G0 gateway input boundary
+  (property allowlist, target-name validator, device-enumeration redactor,
+  Filecopy re-tier, error masking). Tier-independent security hardening; see the
+  G0 row. Worth deploying even before you tier the fleet.
+- **`install-stage-I-6.sh`** — the consent mechanism, inert until you write a
+  non-empty `/etc/qmcp/consent-policy` (see the I-6 row).
+- **`install-stage-flip.sh`** — the least-privilege flip: run it **after** you
+  have tiered the fleet, to delete the four compat backstops and set
+  `/etc/qmcp/tier-default=ro` in one coupled change. `uninstall-stage-flip.sh`
+  reverses it.
+- **`install-stage-peercopy.sh`** — the `qubes.Filecopy` operator-dialog policy
+  (see the COPY row); keeps a flipped fleet flipped.
+
+The Wave 2 enforcement chain (Stages 1–3d) is described in its own section
+below and is not part of the adopter path yet.
 
 ### Moving files by hand, inside and out of the AI fleet
 
@@ -887,11 +973,15 @@ source is explicitly denied back into the fleet.)
 
 ### Wave 2 (pre-1.0) — the enforcement chain and its gate
 
-The Wave 2 stages are **not part of the adopter path yet**: each ships inert or
-in shadow, and together they prepare an enforcement flip that has not happened.
-They install in order (`install-stage-1.sh`, `-2`, `-3a`, `-3b`, `-3c`) with the
-same dom0 invocation as every step above. Nothing changes behaviour until an
-operator writes the flag Stage 3b provides and Stage 3c reads:
+The Wave 2 stages are **not part of the adopter path yet**: Stages 1–3c each
+ship inert or in shadow, and together they prepare an enforcement flip that has
+not happened. They install in order (`install-stage-1.sh`, `-2`, `-3a`, `-3b`,
+`-3c`, `-3d`) with the same dom0 invocation as every step above. **Stage 3d is
+the one exception to "inert": it ships armed**, because it closes an
+object-identity hole (a gateway wrongly carrying the umbrella was mutable from
+the AI seat) rather than making a capability decision — see the W2-3d row.
+Nothing else changes behaviour until an operator writes the flag Stage 3b
+provides and Stage 3c reads:
 
 | `/etc/qmcp/enforce-mode` | What the wrappers do |
 |---|---|
@@ -1063,10 +1153,11 @@ granted. The gateway-input boundary breaks a 2026-07-24 architecture review
 surfaced — an unrestricted property write (self-minted egress), device-enumeration
 oracles reaching dom0, out-of-scope qube names leaking through reads and device
 lists, and inter-qube file-copy over-reach — are closed in **Stage G0**. Within
-its granted scope the AI can do anything. Two honest limits remain: a few
-pre-existing failure-path error messages can still surface a referenced qube
-name (being collapsed to opaque refusals), and hardening `mcp-control` itself
-(sudo lockdown, dedicated MCP user) is deferred Stage G1/G2 work. Stage I and
+its granted scope the AI can do anything. Two honest limits remain: a
+non-`ai-managed` qube sitting inside the reserved name prefix stays detectable
+by an agent — one namespace rather than the whole host, the documented residual
+of the F-1 create-oracle fix — and hardening `mcp-control` itself (sudo
+lockdown, dedicated MCP user) is deferred Stage G1/G2 work. Stage I and
 Wave 2 (graduated authority) tier authority below the umbrella tag so a
 compromised or hallucinating agent need not hold full authority on every qube
 it can see.
