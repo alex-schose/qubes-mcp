@@ -4,11 +4,10 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Development up to 0.9.0 was tracked as lettered **stages** (A … F3, G0, I-0 … I-6).
-That vocabulary is retained in `deploy/` filenames and in the design document as
-the as-built record; from 0.9.0 onward, releases are versioned. The stage names
-in `deploy/` will be renamed to match in a later release — a mechanical change
-kept separate so it stays independently reviewable.
+Development up to 0.9.0 was tracked as lettered **stages** (A … F3, G0, I-0 … I-6),
+and 0.9.x as further stages. 0.9.17 replaced that design and deleted the
+per-stage installers and suites; the stage names below are the record of what
+each version shipped, and the git history keeps the code.
 
 **Every commit ships a version.** One commit, one patch bump, one entry here, one
 tag. There is no accumulating "unreleased" pile: if a change is worth committing
@@ -26,6 +25,115 @@ burning minor versions would misrepresent it.
 ## [Unreleased]
 
 Nothing — the working tree is the last released version.
+
+## [0.9.17] — 2026-10-01
+
+**BREAKING. M1, the core: two states instead of tiers, one shared check, one
+installer, a standard-library server.** This release replaces the 0.9.x design
+rather than extending it: it deletes 143 files (33,226 lines), adds 36, and
+rewrites most of what remains. An installed 0.9.16 must be migrated first, with
+the new tree's `python3 -m qmcp.cli migrate` (see "Install, migrate, uninstall"
+in `CLAUDE.md`); `deploy/install.sh` refuses to run until it is.
+
+### Changed
+
+- **Two states replace the tier ladder.** A qube in AI space (`ai-managed`) is
+  managed (the hub operates it) or guarded (`qmcp-guarded`: listed, read and
+  spawned from, never operated). A qube that provides network is guarded
+  whatever it carries. `qubes_list` now says which (`guarded`), where 0.9.x hid
+  the tier tags.
+- **The hub builds templates.** A managed TemplateVM or disposable template is
+  the hub's to edit, and it may clone a template it manages; the operator
+  guards any template that must stay a clean root.
+- **One fail-closed check** (`dom0/qmcp/core.py`) behind every dom0 service: the
+  caller must be the hub named in `/etc/qmcp/hub`; at most 8 concurrent calls
+  per caller; requests over 64 KiB refused before they are parsed; the caller
+  is never its own object; a qube outside AI space costs the same single
+  qubesd call as a missing one.
+- **One library, one shim.** The dom0 code is a library under
+  `/usr/local/lib/qmcp/`; one shim is installed under each `qmcp.*` service
+  name. The service names and their JSON shapes are unchanged, apart from the
+  `guarded` field in a listing.
+- **The rulebook** (`policy/30-mcp-control.policy`) is rewritten around two
+  sources, the hub and AI space. New: AI space cannot use Qubes' raw `@dispvm`
+  shortcut; cannot reach the hub by any service (in 0.9.x, Filecopy,
+  GetImageRGBA, OpenInVM, OpenURL and StartApp reached it through a dialog);
+  cannot drive qmcp's in-qube services or put a dom0 desktop notification in
+  front of the operator; talks to dom0 only through five boot services and
+  Qubes' own clock sync; and is denied every Admin API method qubesd 4.3
+  registers, and the policy API. The
+  hub gets catch-alls for dom0 and for qubes, with its boot services, clock
+  sync and dialogs allowed above them. No dialog-free copy remains: a copy out
+  of an AI qube gets the operator's dialog, or is refused into a guarded qube
+  or the hub.
+- **Strip on create** now also removes `qmcp-guarded`, so a child of a guarded
+  template is managed, and every create sets `default_dispvm` to none.
+- **Migration keeps 0.9.16's guarded list:** every qube in AI space named in
+  `/etc/qmcp/guarded` becomes guarded, and an unreadable list stops the
+  migration.
+- **Features are an allowlist:** `service.*`, `vm-config.*`, `menu-items`,
+  `default-menu-items`. **Properties:** `label`, `memory`, `maxmem`, `vcpus`,
+  and `netvm` only to null.
+- **The MCP server uses only Python's standard library**: newline-delimited
+  JSON-RPC over stdio, protocol versions 2025-06-18, 2025-03-26 and 2024-11-05,
+  a worker pool so a long events window never blocks other calls. New
+  `qubes-mcp` CLI runs any tool from a shell. fastmcp and its dependencies are
+  gone.
+- **The audit log** (schema 2) records the caller and the class of the
+  exception behind a failed change. A write reads only the end of the log, and
+  `qmcp audit rotate` starts a new file anchored on the old head.
+- `remove` is a real remove again: tombstones are gone.
+
+### Added
+
+- `qmcp`, the operator's command in dom0: `check` (GREEN / FAILED / INCOMPLETE),
+  `list`, `manage`, `guard`, `revoke`, `migrate`, `audit verify|tail|rotate`,
+  `version`.
+- `deploy/install.sh` and `deploy/uninstall.sh`, replacing every stage
+  installer and uninstaller. The installer runs every preflight check before
+  changing anything: its options, the fleet's shape, and the policy with
+  qrexec's own parser against the box's policy directory, including that no
+  file sorting earlier overrides 16 of its claims. It ends with `qmcp check`,
+  which repeats both policy checks. The uninstaller removes the policy first
+  and ends with a clean-state check that names what it keeps.
+- Three suites replacing the 36 stage suites: `tests/test_policy.py` (829
+  requests on qrexec's real parser, next to upstream's default policy and a
+  permissive one; fails if any of the 196 rules decides nothing),
+  `tests/test_dom0.py` (against a fake qubesadmin that copies tags, features
+  and `provides_network` as the platform does), `tests/test_server.py`; plus
+  `tests/seat_suite.py` and `tests/redteam_suite.py` for a real box (37 of 37
+  and 23 of 23 on a test machine running Qubes 4.3.1).
+
+### Removed
+
+- The tier ladder, compat mode, `/etc/qmcp/tier-default` and the flip tooling;
+  the guarded list `/etc/qmcp/guarded` (its qubes become guarded on migration);
+  the capability kernel and its shadow/strict/enforce modes; tombstones and
+  their reaper; the consent daemon; the device attach/detach/list services and
+  tools; `qubes_install_pkg`; the production smoke suite; 30 stage installers,
+  22 stage uninstallers and 36 stage suites; fastmcp.
+- Hub-supplied `guivm`/`audiovm` features and settable `template`, `name`,
+  `default_dispvm`.
+
+### Fixed
+
+- A failed rollback is no longer reported as "rolled back".
+- No raw exception text reaches a caller from any dom0 service.
+- Clone no longer rests on a check that could not see its source's class (the
+  0.9.x kernel was never told it): any managed qube may be cloned, templates
+  included, and a clone keeps its source's network, so a cloned template stays
+  off the network.
+- A TemplateVM's netvm no longer decides the network of a qube spawned from
+  it; 0.9.16's code let it, against its own documentation.
+- `default_dispvm` is operator-only; `preload-dispvm-max` and every other
+  unlisted feature are operator-only.
+- Every dom0 service caps its request size.
+- AI space can no longer get a shell in a disposable through any form of
+  `@dispvm`; in 0.9.x the bare keyword gave it root in a networked disposable
+  without a dialog. Opening a file or URL in a named disposable outside AI space
+  still gets Qubes' own dialog.
+- Every AI qube, not only the hub, is explicitly denied the Admin API.
+- The public docs describe the code and cite no operator-local files.
 
 ## [0.9.16] — 2026-09-30
 

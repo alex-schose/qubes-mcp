@@ -4,6 +4,7 @@
 Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. All AppVMs based on
 those templates inherit the service; AppVMs based on the operator's templates
 do not have it. Policy gates source=mcp-control → target=@tag:ai-managed
+(a guarded qube is refused)
 with user=root, so commands execute with root authority inside the sandbox.
 
 Input  (stdin, JSON): {

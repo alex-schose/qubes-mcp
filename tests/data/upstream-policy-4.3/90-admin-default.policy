@@ -1,0 +1,161 @@
+## Do not modify this file, create a new policy file with a lower number in the
+## filename instead. For example `30-admin-user.policy`.
+
+###
+### Default Admin API qrexec policy
+###
+
+## WARNING: most qrexec services here allows a qube to control system
+## configuration. It should be allowed only to trusted qubes.
+
+## Remember to add "target=dom0" option to any (allow/ask) entry you create.
+
+## For convenience of maintaining this policy, all services include one of:
+##  - include/admin-local-rwx (services to modify a specific qube configuration)
+##  - include/admin-local-ro (services to read a specific qube configuration)
+##  - include/admin-global-rwx (services to modify global parameters)
+##  - include/admin-global-ro (services to read global parameters)
+
+!include-service admin.vm.Console       * include/admin-local-rwx
+!include-service admin.vm.volume.Import * include/admin-local-rwx
+!include-service admin.vm.volume.ImportWithSize * include/admin-local-rwx
+
+!include-service admin.vm.device.mic.Assign * include/admin-local-rwx
+!include-service admin.vm.device.mic.Assigned * include/admin-local-ro
+!include-service admin.vm.device.mic.Attach * include/admin-local-rwx
+!include-service admin.vm.device.mic.Attached * include/admin-local-ro
+!include-service admin.vm.device.mic.Available * include/admin-local-ro
+!include-service admin.vm.device.mic.Detach * include/admin-local-rwx
+!include-service admin.vm.device.mic.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.mic.Unassign * include/admin-local-rwx
+!include-service admin.vm.device.usb.Assign * include/admin-local-rwx
+!include-service admin.vm.device.usb.Assigned * include/admin-local-ro
+!include-service admin.vm.device.usb.Attach * include/admin-local-rwx
+!include-service admin.vm.device.usb.Attached * include/admin-local-ro
+!include-service admin.vm.device.usb.Available * include/admin-local-ro
+!include-service admin.vm.device.usb.Detach * include/admin-local-rwx
+!include-service admin.vm.device.usb.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.usb.Unassign * include/admin-local-rwx
+
+!include-service admin.vmclass.List * include/admin-global-ro
+!include-service admin.vm.List * include/admin-global-ro
+!include-service admin.vm.property.List * include/admin-local-ro
+!include-service admin.property.List * include/admin-global-ro
+!include-service admin.vm.property.Get * include/admin-local-ro
+!include-service admin.property.Get * include/admin-global-ro
+!include-service admin.vm.property.GetAll * include/admin-local-ro
+!include-service admin.property.GetAll * include/admin-global-ro
+!include-service admin.vm.property.GetDefault * include/admin-local-ro
+!include-service admin.property.GetDefault * include/admin-global-ro
+!include-service admin.vm.property.Set * include/admin-local-rwx
+!include-service admin.property.Set * include/admin-global-rwx
+!include-service admin.vm.property.Help * include/admin-local-ro
+!include-service admin.property.Help * include/admin-global-ro
+!include-service admin.vm.property.Reset * include/admin-local-rwx
+!include-service admin.property.Reset * include/admin-global-rwx
+!include-service admin.vm.volume.List * include/admin-local-ro
+!include-service admin.vm.volume.Info * include/admin-local-ro
+!include-service admin.vm.volume.ListSnapshots * include/admin-local-ro
+!include-service admin.vm.volume.Revert * include/admin-local-rwx
+!include-service admin.vm.volume.CloneFrom * include/admin-local-rwx
+!include-service admin.vm.volume.CloneTo * include/admin-local-rwx
+!include-service admin.vm.volume.Resize * include/admin-local-rwx
+!include-service admin.vm.volume.Clear * include/admin-local-rwx
+!include-service admin.vm.volume.Set.revisions_to_keep * include/admin-local-rwx
+!include-service admin.vm.volume.Set.rw * include/admin-local-rwx
+!include-service admin.vm.volume.Set.ephemeral * include/admin-local-rwx
+!include-service admin.vm.tag.List * include/admin-local-ro
+!include-service admin.vm.tag.Get * include/admin-local-ro
+!include-service admin.vm.tag.Set * include/admin-local-rwx
+!include-service admin.vm.tag.Remove * include/admin-local-rwx
+!include-service admin.vm.Console * include/admin-local-rwx
+!include-service admin.pool.List * include/admin-global-ro
+!include-service admin.pool.ListDrivers * include/admin-global-ro
+!include-service admin.pool.Info * include/admin-global-ro
+!include-service admin.pool.UsageDetails * include/admin-global-ro
+!include-service admin.pool.Add * include/admin-global-rwx
+!include-service admin.pool.Remove * include/admin-global-rwx
+!include-service admin.pool.volume.List * include/admin-global-ro
+!include-service admin.pool.Set.revisions_to_keep * include/admin-global-rwx
+!include-service admin.pool.Set.ephemeral_volatile * include/admin-global-rwx
+!include-service admin.label.List * include/admin-global-ro
+!include-service admin.label.Get * include/admin-global-ro
+!include-service admin.label.Index * include/admin-global-ro
+!include-service admin.label.Create * include/admin-global-rwx
+!include-service admin.label.Remove * include/admin-global-rwx
+!include-service admin.vm.Start * include/admin-local-rwx
+!include-service admin.vm.Shutdown * include/admin-local-rwx
+!include-service admin.vm.Pause * include/admin-local-rwx
+!include-service admin.vm.Unpause * include/admin-local-rwx
+!include-service admin.vm.Suspend * include/admin-local-rwx
+!include-service admin.vm.Resume * include/admin-local-rwx
+!include-service admin.vm.Kill * include/admin-local-rwx
+!include-service admin.Events * include/admin-global-ro
+!include-service admin.vm.feature.List * include/admin-local-ro
+!include-service admin.vm.feature.Get * include/admin-local-ro
+!include-service admin.vm.feature.CheckWithTemplate * include/admin-local-ro
+!include-service admin.vm.feature.CheckWithNetvm * include/admin-local-ro
+!include-service admin.vm.feature.CheckWithAdminVM * include/admin-local-ro
+!include-service admin.vm.feature.CheckWithTemplateAndAdminVM * include/admin-local-ro
+!include-service admin.vm.feature.Remove * include/admin-local-rwx
+!include-service admin.vm.feature.Set * include/admin-local-rwx
+!include-service admin.vm.Create.AdminVM * include/admin-global-rwx
+!include-service admin.vm.Create.AppVM * include/admin-global-rwx
+!include-service admin.vm.Create.DispVM * include/admin-global-rwx
+!include-service admin.vm.Create.RemoteVM * include/admin-global-rwx
+!include-service admin.vm.Create.StandaloneVM * include/admin-global-rwx
+!include-service admin.vm.Create.TemplateVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.AdminVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.AppVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.DispVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.RemoteVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.StandaloneVM * include/admin-global-rwx
+!include-service admin.vm.CreateInPool.TemplateVM * include/admin-global-rwx
+!include-service admin.vm.CreateDisposable * include/admin-global-rwx
+!include-service admin.vm.Remove * include/admin-global-rwx
+!include-service admin.deviceclass.List * include/admin-global-ro
+!include-service admin.vm.device.pci.Available * include/admin-local-ro
+!include-service admin.vm.device.block.Available * include/admin-local-ro
+!include-service admin.vm.device.usb.Available * include/admin-local-ro
+!include-service admin.vm.device.mic.Available * include/admin-local-ro
+!include-service admin.vm.device.pci.Assigned * include/admin-local-ro
+!include-service admin.vm.device.block.Assigned * include/admin-local-ro
+!include-service admin.vm.device.usb.Assigned * include/admin-local-ro
+!include-service admin.vm.device.mic.Assigned * include/admin-local-ro
+!include-service admin.vm.device.pci.Attached * include/admin-local-ro
+!include-service admin.vm.device.block.Attached * include/admin-local-ro
+!include-service admin.vm.device.usb.Attached * include/admin-local-ro
+!include-service admin.vm.device.mic.Attached * include/admin-local-ro
+!include-service admin.vm.device.pci.Assign * include/admin-local-rwx
+!include-service admin.vm.device.block.Assign * include/admin-local-rwx
+!include-service admin.vm.device.usb.Assign * include/admin-local-rwx
+!include-service admin.vm.device.mic.Assign * include/admin-local-rwx
+!include-service admin.vm.device.pci.Unassign * include/admin-local-rwx
+!include-service admin.vm.device.block.Unassign * include/admin-local-rwx
+!include-service admin.vm.device.usb.Unassign * include/admin-local-rwx
+!include-service admin.vm.device.mic.Unassign * include/admin-local-rwx
+!include-service admin.vm.device.pci.Attach * include/admin-local-rwx
+!include-service admin.vm.device.block.Attach * include/admin-local-rwx
+!include-service admin.vm.device.usb.Attach * include/admin-local-rwx
+!include-service admin.vm.device.mic.Attach * include/admin-local-rwx
+!include-service admin.vm.device.pci.Detach * include/admin-local-rwx
+!include-service admin.vm.device.block.Detach * include/admin-local-rwx
+!include-service admin.vm.device.usb.Detach * include/admin-local-rwx
+!include-service admin.vm.device.mic.Detach * include/admin-local-rwx
+!include-service admin.vm.device.pci.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.block.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.usb.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.mic.Set.assignment * include/admin-local-rwx
+!include-service admin.vm.device.denied.List * include/admin-local-ro
+!include-service admin.vm.device.denied.Add * include/admin-local-rwx
+!include-service admin.vm.device.denied.Remove * include/admin-local-rwx
+!include-service admin.vm.firewall.Get * include/admin-local-ro
+!include-service admin.vm.firewall.Set * include/admin-local-rwx
+!include-service admin.vm.firewall.Reload * include/admin-local-rwx
+!include-service admin.backup.Execute * include/admin-global-rwx
+!include-service admin.backup.Cancel * include/admin-global-rwx
+!include-service admin.backup.Info * include/admin-local-ro
+!include-service admin.vm.Stats * include/admin-global-ro
+!include-service admin.vm.CurrentState * include/admin-local-ro
+!include-service admin.vm.notes.Get * include/admin-local-ro
+!include-service admin.vm.notes.Set * include/admin-local-rwx

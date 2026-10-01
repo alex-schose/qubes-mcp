@@ -1,545 +1,292 @@
-# /etc/qubes/policy.d/30-mcp-control.policy
-# Stages A + B + C + D + E1 + E2 + F1 + F2 + F3 + I-4 + I-5 — sandbox with
-# dom0-mediated lifecycle, exec, file copy, tag-scoped firewall control,
-# cloning, device attach/detach between ai-managed qubes, ephemeral
-# disposables, feature.Set on ai-managed qubes, bounded-window event
-# streaming scoped to ai-managed subjects, AI-scoped disk-budget
-# visibility (provisioned-bytes sum + operator-set cap), and graduated
-# authority on the directly-tag-scoped surfaces (Stage I-4: firewall WRITE →
-# the ai-net/ai-full tiers + the ai-dump write-only sink; Stage I-5: exec /
-# file-copy → the ai-exec tier). The @adminvm wrapper surfaces are tiered in
-# dom0 CODE (qmcp_tier), not here — see CLAUDE.md.
-# Source of truth: /home/user/qubes_mcp/CLAUDE.md on mcp-control.
-# MCP server NEVER edits this file. Operator-installed in dom0.
+# /etc/qubes/policy.d/30-mcp-control.policy -- qubes-mcp
 #
-# Stage I-4/I-5 — the policy layer matches @tag: selectors LITERALLY and cannot
-# call the qmcp_tier dom0 helper, so the helper's "untiered umbrella =
-# ai-full (compat)" default has no reach here. The directly-@tag:-scoped WRITE
-# surfaces (firewall Set/Reload — I-4; RunInAIManaged/CopyToAIManaged — I-5)
-# therefore each ship with a @tag:ai-managed COMPAT BACKSTOP that preserves
-# today's behaviour (every umbrella qube keeps firewall + exec → the A–F3
-# regression stays green); the tiered lines are inert while a backstop is
-# present.
-# THE FLIP (end of Stage I-5): delete the FOUR compat-backstop lines
-# (firewall.Set + firewall.Reload from I-4, RunInAIManaged + CopyToAIManaged
-# from I-5) AND write "ro" to /etc/qmcp/tier-default in the SAME change, so the
-# policy surface and the wrapper surface drop to least-privilege together.
-# Removing only some leaves the surfaces incoherent (see CLAUDE.md, I-4 block).
+# The whole qrexec rulebook for qubes-mcp. It is static: deploy/install.sh
+# installs it once, after checking it with qrexec's own parser, and nothing
+# writes it at runtime. The installer renders the hub's name into it (default
+# `mcp-control`, the only principal in this release).
 #
-# Evaluation: first-match-wins across all files in /etc/qubes/policy.d/.
-# Ordering inside THIS file:
-#   1. ALLOW block  (Stages A + B + C + D + E1 + E2 surface)
-#   2. EXPLICIT DENIES  (documented dangerous methods)
-#   3. CATCH-ALL DENY  (default-deny backstop for mcp-control)
+# Two principals appear below.
+#   mcp-control      the hub. It is NOT ai-managed. It reaches AI space only
+#                    through section B.
+#   @tag:ai-managed  AI space: every qube the hub manages or references.
+# A few denies also name @anyvm (any source) or @tag:ai-dump (the drop boxes).
+# A qube in AI space is MANAGED (ai-managed) or GUARDED (ai-managed plus
+# qmcp-guarded). Guarded qubes are listed, read and spawned from, and never
+# operated. Gateways are always guarded.
 #
-# The catch-all is load-bearing — do not move any allow line below it.
+# First match wins, across every file in /etc/qubes/policy.d/ in name order.
+# Order inside this file: A denies, B the hub, C copies out of AI space, D the
+# hub's own operator UX, E the hub's catch-alls. Keep every deny in A above
+# the lines it protects.
+#
+# Never put a comment on the same line as a rule. Write it on its own line.
 
 # =========================================================================
-# ALLOW BLOCK
+# A. DENIES
 # =========================================================================
 
-# --- Stage A: custom dom0 RPC services (lifecycle, discovery, properties).
-# Lifecycle (start/shutdown/kill/pause/unpause/remove) routes through
-# qmcp.LifecycleAIManaged rather than the tag-scoped admin.vm.* surface.
-# Reason: qrexec's `@tag:` selector does not match klass=DispVM targets
-# on at least Qubes R4.3 — the wrapper does the ai-managed check in
-# dom0 with qubesadmin authority instead, giving uniform behaviour
-# across all klasses.
+# A1. Guarded qubes are read and spawned from, never written. The hub cannot
+# run, copy or change firewall rules in one (it may still read its firewall),
+# and nothing from AI space reaches one at all.
+qmcp.RunInAIManaged        *  mcp-control      @tag:qmcp-guarded        deny
+qmcp.CopyToAIManaged       *  mcp-control      @tag:qmcp-guarded        deny
+admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-guarded        deny
+admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-guarded        deny
+qubes.Filecopy             *  mcp-control      @tag:qmcp-guarded        deny
+*                          *  @tag:ai-managed  @tag:qmcp-guarded        deny
 
-qmcp.ListAIManagedQubes      *  mcp-control  @adminvm         allow
-qmcp.SpawnAIManagedQube      *  mcp-control  @adminvm         allow
-qmcp.GetPropertyAIManaged    *  mcp-control  @adminvm         allow
-qmcp.SetPropertyAIManaged    *  mcp-control  @adminvm         allow
-qmcp.LifecycleAIManaged      *  mcp-control  @adminvm         allow
+# A2. Disposables: Qubes' raw @dispvm shortcut is closed for AI space.
+# A `@dispvm` rule target matches only the bare keyword. The second line works
+# from the template's side: any source, any @dispvm form, any template inside
+# AI space, so it still holds for a qube stripped of ai-managed. qmcp's own
+# disposables are created inside dom0 and never pass through here.
+*                          *  @tag:ai-managed  @dispvm                  deny
+*                          *  @anyvm           @dispvm:@tag:ai-managed  deny
 
-# --- Stage B + I-5: command execution and file transfer inside ai-managed
-# qubes. qmcp.RunInAIManaged and qmcp.CopyToAIManaged are services installed
-# in ai-managed templates (NOT dom0) — they execute in the target qube as root.
-#
-# Stage I-5 graduates these EXEC surfaces to the tier ladder, exactly as Stage
-# I-4 graduated firewall WRITE. exec is the ai-exec rung; the ladder is
-# cumulative (ai-net ⊃ ai-exec, ai-full ⊃ ai-net), so a qube tagged ai-net or
-# ai-full also gets exec — hence all three elevation lines. The fourth
-# @tag:ai-managed line on each is the COMPAT BACKSTOP (see the file header):
-# it keeps untiered umbrella qubes executable during migration so A–F3 stays
-# green, and is DELETED at the flip (paired with tier-default → "ro"). While
-# present it subsumes the exec/net/full lines, so the EXEC surface is
-# behaviour-neutral in compat. (The wrapper @adminvm surfaces — lifecycle/
-# property/clone/spawn/feature/attach/detach — are tiered in dom0 CODE via
-# qmcp_tier, not here; only the directly-@tag:-scoped exec surfaces are policy.)
+# A3. No command execution from AI space into another qube, whatever form the
+# target takes, including a named disposable template outside AI space.
+qubes.VMShell              *  @tag:ai-managed  @anyvm                   deny
+qubes.VMRootShell          *  @tag:ai-managed  @anyvm                   deny
+qubes.VMExec               *  @tag:ai-managed  @anyvm                   deny
+qubes.VMExecGUI            *  @tag:ai-managed  @anyvm                   deny
 
-# --- Wave 2 Stage 3d: the calling principal is never a legitimate OBJECT.
-# The dom0 WRAPPER surfaces are `* mcp-control @adminvm allow`, so the qube
-# being acted on is PAYLOAD and this engine cannot see it — those are guarded
-# in code by qmcp_principal.py. These four services are the other half: they
-# are @tag:-scoped, matched literally by qrexec, and a helper cannot reach them
-# (the I-4 lesson). Both halves move in the same change or the fleet gets an
-# F9 split-brain window.
-# Placement is load-bearing: first-match-wins, so each deny MUST stay above the
-# @tag: lines for its own service.
-# firewall.Get is deliberately absent — it is a read, and AI can already read
-# its own qube from inside it, so a line there would be invariant-2 theatre.
-#
-# ONLY the two firewall WRITE methods are here, and the reason the exec and
-# copy services are NOT is a measurement rather than an argument. A first draft
-# carried `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged` self-denies too, on
-# the theory that they mattered once G1 drops the gateway user's sudo. Measured
-# on the development box 2026-09-02, dom0's own policy daemon says otherwise:
-#
-#   qmcp.RunInAIManaged+: mcp-control -> mcp-control: allowed to mcp-control
-#   qmcp.RunInAIManaged:  mcp-control -> mcp-control: denied:
-#                         loopback qrexec connection not supported
-#
-# Policy ALLOWED it; the qrexec transport refused it, because a qube cannot
-# open a qrexec connection to itself. So there is no capability there to
-# remove, and a deny line would be a rule that can never match while reading
-# as a control — invariant 2's no-illusion defect, in the stage whose whole
-# discipline is not shipping it. The firewall methods are different and were
-# checked the same way: `admin.vm.firewall.Get` on the gateway ITSELF returns
-# `0action=accept`, byte-identical to the same call on an ordinary ai-managed
-# qube, because `target=@adminvm` redirects delivery to dom0 and that is not a
-# loopback. Those two are real gates and they stay.
+# A4. AI space never reaches the hub, by any service. The hub is named here,
+# never matched through @anyvm, so this cannot swallow anything else.
+*                          *  @tag:ai-managed  mcp-control              deny
 
-qmcp.RunInAIManaged          *  mcp-control  @tag:ai-exec     allow  user=root
-qmcp.RunInAIManaged          *  mcp-control  @tag:ai-net      allow  user=root
-qmcp.RunInAIManaged          *  mcp-control  @tag:ai-full     allow  user=root
-# COMPAT backstop (RunInAIManaged) — DELETE at the I-5 flip, paired with tier-default → "ro":
-qmcp.RunInAIManaged          *  mcp-control  @tag:ai-managed  allow  user=root
+# A4b. Only the hub drives qmcp's in-qube services. (Projects add their own
+# lines above this in M2.)
+qmcp.RunInAIManaged        *  @tag:ai-managed  @anyvm                   deny
+qmcp.CopyToAIManaged       *  @tag:ai-managed  @anyvm                   deny
 
-qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-exec     allow  user=root
-qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-net      allow  user=root
-qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-full     allow  user=root
-# COMPAT backstop (CopyToAIManaged) — DELETE at the I-5 flip, paired with tier-default → "ro":
-qmcp.CopyToAIManaged         *  mcp-control  @tag:ai-managed  allow  user=root
+# A5. AI space talks to dom0 only through the services a qube needs to boot and
+# report itself. These five allows are Qubes' own defaults for them, owned
+# here because the deny after them refuses every other service addressed to
+# dom0, including every Admin API call and the policy API. Qubes also
+# redirects two services from @default to dom0: qubes.GetDate stays (Qubes'
+# own rule already refuses Whonix qubes), qubes.Notifications does not, so no
+# AI qube can put a desktop notification in front of the operator.
+qubes.Notifications        *  @tag:ai-managed  @anyvm                   deny
+qubes.FeaturesRequest      *  @tag:ai-managed  @adminvm                 allow
+qubes.NotifyTools          *  @tag:ai-managed  @adminvm                 allow
+qubes.NotifyUpdates        *  @tag:ai-managed  @adminvm                 allow
+qubes.SyncAppMenus         *  @tag:ai-managed  @adminvm                 allow
+qubes.GetRandomizedTime    *  @tag:ai-managed  @adminvm                 allow
+*                          *  @tag:ai-managed  @adminvm                 deny
 
-# Stage G0c (finding [6]): inter-ai-managed Filecopy graduates to the tier
-# ladder — BOTH endpoints must be ai-exec+ (the single-elevation ladder means a
-# qube carries exactly one of ai-exec/ai-net/ai-full, so the peer-copy mesh is
-# the 3x3 cross-product below). Before G0c this was one @tag:ai-managed ->
-# @tag:ai-managed line, so one operator ai-exec grant let the agent push files
-# into EVERY ai-ro qube's ~/QubesIncoming (fleet-wide data plane — the flip
-# barely reduced blast radius). Inter-worker copy is now peer-to-peer between
-# working (ai-exec+) qubes only; pushing INTO a low-integrity qube uses the
-# dedicated ai-dump write-only sink below, not this mesh. Every pair the mesh
-# does not cover (an ai-exec -> ai-ro copy, say) ends at the explicit
-# `@tag:ai-managed -> @anyvm ask` at the end of this section: a dialog decided
-# by THIS file, never a fall-through to the system default.
-qubes.Filecopy              *  @tag:ai-exec  @tag:ai-exec  allow
-qubes.Filecopy              *  @tag:ai-exec  @tag:ai-net   allow
-qubes.Filecopy              *  @tag:ai-exec  @tag:ai-full  allow
-qubes.Filecopy              *  @tag:ai-net   @tag:ai-exec  allow
-qubes.Filecopy              *  @tag:ai-net   @tag:ai-net   allow
-qubes.Filecopy              *  @tag:ai-net   @tag:ai-full  allow
-qubes.Filecopy              *  @tag:ai-full  @tag:ai-exec  allow
-qubes.Filecopy              *  @tag:ai-full  @tag:ai-net   allow
-qubes.Filecopy              *  @tag:ai-full  @tag:ai-full  allow
-
-# --- Stage I-4: ai-dump — the write-only sink (Biba integrity valve).
-# An ai-dump qube is ORTHOGONAL to the tier ladder. The write-only guarantee
-# holds for a PURE sink — a qube tagged ai-dump and NOT ai-managed: it then
-# misses every read / exec / firewall / device surface (all scoped on the
-# ai-managed umbrella) by construction, so AI cannot read, list, enumerate, or
-# run in it. The ONE thing permitted is qubes.Filecopy INTO it from an
-# ai-managed source — AI may PUSH data to the sink but cannot read it back,
-# severing the exfiltration leg. Copy-IN only; nothing else.
-#
-# OPERATOR INVARIANT (load-bearing for the write-only property): an ai-dump
-# qube is NEVER also ai-managed. A HYBRID (ai-managed + ai-dump) is fully
-# readable — the ai-managed → ai-managed inter-copy line above matches it as a
-# SOURCE, so its contents could be copied back OUT, defeating the valve. AI
-# cannot create a hybrid (it cannot mutate tags — the keystone), so this is an
-# operator-misconfig guard, not a self-escalation path. install-stage-I-4.sh
-# WARNS on any hybrid at deploy; Stage I-5 machine-refuses it at fleet-tiering.
-#
-# SOURCE GATE = the umbrella @tag:ai-managed by design (NOT an elevation tag).
-# The upstream EXEC gate already bounds who can initiate a copy: qmcp.CopyToAIManaged
-# requires @tag:ai-exec post-flip, so only an exec-capable qube can drive a Filecopy
-# at all. Gating the SOURCE here on the umbrella (not ai-exec/ai-net/ai-full) keeps the
-# Biba valve reachable by any exec-capable qube without a redundant elevation
-# requirement. A future editor must NOT "graduate" this line to an elevation tag.
-
-qubes.Filecopy              *  @tag:ai-managed  @tag:ai-dump     allow
-
-# --- Everything else an AI qube copies: the normal Qubes dialog (v0.9.15).
-#
-# The mesh above is dialog-free between working qubes; the sink line is the
-# one-way drop box. Every OTHER qubes.Filecopy from an ai-managed source --
-# into an untiered or read-only AI qube, out to any qube outside the umbrella,
-# or with no target at all -- gets the ordinary dialog, where the operator
-# picks or confirms the destination. That is the operator's decision of
-# 2026-09-27: free where the mesh applies, the usual dialog everywhere else.
-#
-# WHAT THIS REPLACES, AND WHY THE OLD SHAPE WAS WRONG TWICE. v0.9.12 had an
-# ask scoped `@tag:ai-managed -> @tag:ai-managed` followed by a dialog-free
-# `@tag:ai-managed -> @anyvm deny`.
-#   1. `qvm-copy` (and the file manager's "copy to other qube") sends NO
-#      target: the request arrives as `@default`, and `@anyvm` matches
-#      `@default` (the parser's AnyVM.match accepts anything but dom0). So
-#      every such copy from an AI qube hit the deny before any ask could fire
-#      -- the operator's own report, twice. The tag-scoped ask only ever
-#      served callers that NAME a target (qvm-copy-to-vm).
-#   2. The reason given for not using `@anyvm` -- that an agent could name
-#      any qube and learn from whether a dialog appeared that it exists --
-#      does not hold. qrexec's IntendedTarget.verify() replaces a target that
-#      does not exist with `@default`, so under this ask a made-up name and a
-#      real one produce the same dialog. Verified against the real parser
-#      (python3-qrexec 4.3.14), not by reading this file.
-#
-# WHAT AN AGENT CAN STILL LEARN, stated rather than hidden:
-#   - `@dispvm:<name>` targets: a name that is not a disposable template is
-#     refused before any rule is read, so the NAMES OF DISPOSABLE TEMPLATES
-#     are probeable. A bare `@dispvm` deny does not close this (it only
-#     matches the bare keyword).
-#   - Any qube given its own deny line ABOVE this one becomes detectable
-#     (instant refusal vs a dialog). Prefer not to add per-qube denies here.
-#   - An agent can summon this dialog at will. It cannot answer it; the
-#     control is the operator's attention, as for every ask.
-#
-# The DENY just below stays, and it is still load-bearing: without it a
-# misconfigured hybrid (ai-managed AND ai-dump -- the operator invariant the
-# I-4 installer warns on) would reach the umbrella through this ask as a
-# SOURCE, and a pure sink copying back in would fall through to the Qubes
-# SYSTEM-DEFAULT ask, a dialog governed by a file this project does not own
-# (finding [8]). It leaves ai-dump -> OUT-of-umbrella alone, which is how the
-# operator drains a buffer by hand.
-#
-# Ordering is load-bearing: AFTER the mesh (tiered pairs keep their
-# dialog-free allow) and the sink line (the valve keeps its allow), with the
-# deny between them and the ask. The ask's source is @tag:ai-managed, so it
-# never touches the operator's own `qubes.Filecopy mcp-control @anyvm ask`
-# line below. An explicit ask in this file closes finding [8] exactly as the
-# old explicit deny did.
-qubes.Filecopy              *  @tag:ai-dump     @tag:ai-managed  deny
-qubes.Filecopy              *  @tag:ai-managed  @anyvm          ask
-
-# --- Stage C + I-4: per-qube firewall rule management on ai-managed qubes.
-# target=@adminvm routes the call to dom0 (firewall rules live in dom0's
-# qubes.xml; the firewall VM enforces them via iptables on its boot/reload).
-# The tag-scoped argument means AI can only read/write rules for qubes
-# carrying the matched tag. Untagged qubes are invisible at the firewall
-# surface, matching the lifecycle/property surfaces.
-#
-# Stage I-4 graduates the WRITE surface to the tier ladder:
-#   - firewall.Get        — stays at the ai-managed ro-floor (any tier reads).
-#   - firewall.Set/Reload — require ai-net OR ai-full (single-elevation ladder:
-#     an ai-full qube does NOT also carry ai-net, so both lines are needed).
-# The third @tag:ai-managed line on each WRITE method is the COMPAT BACKSTOP
-# (see the file header): it keeps untiered umbrella qubes writable during
-# migration so A–F3 stays green, and is DELETED at the flip (paired with the
-# tier-default → "ro" write). While present it subsumes the net/full lines,
-# so the WRITE surface is behaviour-neutral in compat; the net/full lines are
-# the enforcement that goes live the moment the backstop is removed.
-
-admin.vm.firewall.Get       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-
-# Stage 3d principal guard — must stay above this service's @tag: lines.
-admin.vm.firewall.Set       *  mcp-control  mcp-control      deny
-
-admin.vm.firewall.Set       *  mcp-control  @tag:ai-net      allow  target=@adminvm
-admin.vm.firewall.Set       *  mcp-control  @tag:ai-full     allow  target=@adminvm
-# COMPAT backstop (firewall.Set) — DELETE at the I-5 flip, paired with tier-default → "ro":
-admin.vm.firewall.Set       *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-
-# Stage 3d principal guard — must stay above this service's @tag: lines.
-admin.vm.firewall.Reload    *  mcp-control  mcp-control      deny
-
-admin.vm.firewall.Reload    *  mcp-control  @tag:ai-net      allow  target=@adminvm
-admin.vm.firewall.Reload    *  mcp-control  @tag:ai-full     allow  target=@adminvm
-# COMPAT backstop (firewall.Reload) — DELETE at the I-5 flip, paired with tier-default → "ro":
-admin.vm.firewall.Reload    *  mcp-control  @tag:ai-managed  allow  target=@adminvm
-
-# --- Stage D: clone an ai-managed qube into a new ai-managed qube.
-# qmcp.CloneAIManagedQube force-tags the clone in dom0 using the same
-# atomic + rollback pattern as qmcp.SpawnAIManagedQube. Source-tag check
-# happens inside the script; the policy only routes the call to dom0.
-
-qmcp.CloneAIManagedQube      *  mcp-control  @adminvm         allow
-
-# --- Stage E1: device attach/detach between ai-managed qubes.
-# Attach/Detach route through qmcp wrappers because both endpoints must
-# be ai-managed (the wrapper does the tag check on backend AND frontend
-# in dom0 with qubesadmin authority — qrexec policy can only gate one
-# side of the call). The wrappers shell out to qvm-device under the
-# hood, which absorbs the DeviceAssignment-API drift across Qubes 4.1
-# → 4.2 → 4.3.
-#
-# Read-only enumeration (List, Available) is tag-scoped at the policy
-# layer directly — pure dom0 admin reads, same pattern as Stage C's
-# admin.vm.firewall.Get. Untagged backends fall through to the
-# explicit-deny block below (which still lists the Attach/Detach
-# methods, denied for any direct caller bypassing the wrapper).
-
-qmcp.AttachDeviceAIManaged            *  mcp-control  @adminvm         allow
-qmcp.DetachDeviceAIManaged            *  mcp-control  @adminvm         allow
-# Stage G0d (finding [4]): attached-device listing is wrapped so out-of-scope
-# backend qube names are redacted. AI reads attached devices via this wrapper;
-# the direct admin.vm.device.<class>.List (which embeds the backend qube name of
-# an operator-attached device) is DENIED below. `.Available` stays direct — it
-# lists devices the ai-managed qube EXPOSES, whose backend is the qube itself.
-qmcp.ListAttachedDevicesAIManaged     *  mcp-control  @adminvm         allow
-
-# Stage G0d/G0e (findings [4] + [3]): ALL AI-facing device enumeration is now
-# wrapper-mediated — qmcp.ListAttachedDevicesAIManaged redacts out-of-scope
-# BACKEND names (attached mode) AND out-of-scope CONSUMING-FRONTEND names
-# (available mode's `attachment=` field). So EVERY direct admin.vm.device.<class>.
-# {Available,Attached,Assigned} is denied to AI. `.Available` was ro-floor-allow
-# pre-G0e; it leaked the consuming-frontend name, so it joins the deny set.
-# @anyvm structurally EXCLUDES @adminvm, so the operator's own usb.{List,Available}
-# @adminvm `ask` lines (further down, G0b) survive.
-admin.vm.device.block.Available  *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Available    *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Available    *  mcp-control  @anyvm  deny
-admin.vm.device.block.Attached   *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Attached     *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Attached     *  mcp-control  @anyvm  deny
-admin.vm.device.block.Assigned   *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Assigned     *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Assigned     *  mcp-control  @anyvm  deny
-# Finding [5]: PROJECT-OWNED @adminvm denies for the enum methods with NO operator
-# use — so dom0 device-enum is not left to the platform-default policy (which our
-# @anyvm lines + catch-all cannot reach for the @adminvm target). usb.{List,
-# Available} @adminvm intentionally stay operator-`ask` (below); the legacy .List
-# on 4.3 does not exist, so block/mic .List need no line.
-admin.vm.device.block.Available  *  mcp-control  @adminvm  deny
-admin.vm.device.mic.Available    *  mcp-control  @adminvm  deny
-admin.vm.device.block.Attached   *  mcp-control  @adminvm  deny
-admin.vm.device.usb.Attached     *  mcp-control  @adminvm  deny
-admin.vm.device.mic.Attached     *  mcp-control  @adminvm  deny
-admin.vm.device.block.Assigned   *  mcp-control  @adminvm  deny
-admin.vm.device.usb.Assigned     *  mcp-control  @adminvm  deny
-admin.vm.device.mic.Assigned     *  mcp-control  @adminvm  deny
-
-# --- Stage E2: ephemeral disposables via admin.vm.CreateDisposable.
-# The wrapper validates the DVMT is ai-managed AND has
-# template_for_dispvms=True, then calls CreateDisposable in dom0 and
-# force-tags the auto-named result before returning. auto_cleanup=True
-# is the Admin API default, so dom0 removes the qube on shutdown.
-# admin.vm.CreateDisposable stays in the explicit-deny block — the
-# wrapper is the only allowed path.
-
-qmcp.SpawnDisposableAIManaged    *  mcp-control  @adminvm         allow
-
-# --- Stage F1: feature.Set on ai-managed qubes.
-# qmcp.SetFeatureAIManaged validates the target is ai-managed, refuses
-# the operator-only `internal` key (AI must not hide a qube from the
-# operator's menus), and cross-ref-validates cross-VM feature keys
-# (audiovm/guivm) against the ai-managed set with an opaque refusal.
-# Direct admin.vm.feature.Set stays denied below — the wrapper is the
-# only path (same pattern as property.Set / CreateDisposable). The
-# feature READ surface (Get/List/CheckWithTemplate) stays denied; the
-# wrapper echoes the post-set value so no separate read is needed.
-
-qmcp.SetFeatureAIManaged         *  mcp-control  @adminvm         allow
-
-# --- Stage F2: bounded-window event streaming scoped to ai-managed qubes.
-# qmcp.AIManagedEvents subscribes to admin.Events in dom0 with full
-# admin authority, filters every event by the ai-managed tag on its
-# subject, and returns the collected batch when the caller-given
-# duration elapses (clamped to [1, 120] seconds in the wrapper). No
-# persistent dom0 process — one wrapper invocation, one window, one
-# response, exit. Direct admin.Events stays denied below (same pattern
-# as feature.Set / CreateDisposable / property.Set) — the wrapper is
-# the only path. The wrapper does the security-boundary tag filter
-# itself; the qrexec `@tag:` selector cannot gate this call because
-# admin.Events has no per-VM target argument.
-
-qmcp.AIManagedEvents             *  mcp-control  @adminvm         allow
-
-# --- Stage F3: AI-scoped disk-budget visibility.
-# qmcp.GetPoolStats runs in dom0 with full admin authority and returns
-# the sum of provisioned bytes across every volume on every ai-managed
-# qube, plus an operator-set cap read from /etc/qmcp/pool-cap. The
-# response shape is `{used, cap, headroom}` — no pool names, no
-# free-space, no operator-side volumes; AI sees only its own footprint
-# and the budget the operator allocated it. Direct admin.pool.* and
-# admin.vm.volume.{List,Info,Resize} stay denied below — the wrapper
-# is the only path (same pattern as feature.Set / CreateDisposable /
-# property.Set). The cap is a contract operator → AI, not a sensor
-# AI → operator; AI cannot mutate the cap (it's an operator-edited
-# file in dom0).
-
-qmcp.GetPoolStats                *  mcp-control  @adminvm         allow
-
-# --- System service allows ---
-# Background qubes-core-agent services that any normal qube needs to
-# function (time sync, app menu updates, notifications, icons). All target
-# dom0 (@adminvm); all are read/notification-only — AI cannot exploit them
-# via MCP tools because no tool wraps qubes.* services. Allowed without an
-# `ask` dialog because they fire frequently in the background and prompting
-# the operator on each would be unworkable.
-
-qubes.GetDate                   *  mcp-control  @adminvm      allow
-qubes.GetImageRGBA              *  mcp-control  @adminvm      allow
-qubes.WaitForSession            *  mcp-control  @adminvm      allow
-qubes.SyncAppMenus              *  mcp-control  @adminvm      allow
-qubes.NotifyTools               *  mcp-control  @adminvm      allow
-qubes.NotifyUpdates             *  mcp-control  @adminvm      allow
-
-# --- Operator UX allows ---
-# Without these, the human operator can't perform normal Qubes workflows
-# (file copy out, USB attach, clipboard, open-in-VM) from inside mcp-control,
-# because the catch-all DENY at the bottom of this file blocks every
-# unlisted call. Each line uses `ask` so dom0 shows a confirmation dialog
-# per action — the human is always in the loop.
-#
-# AI cannot exploit these: no MCP tool wraps qubes.* services, and the
-# stdio-via-SSH transport doesn't expose an interactive shell. The dialogs
-# would surface any AI attempt anyway.
-
-qubes.Filecopy                  *  mcp-control  @anyvm        ask
-qubes.OpenInVM                  *  mcp-control  @anyvm        ask
-qubes.OpenURL                   *  mcp-control  @anyvm        ask
-qubes.ClipboardCopy             *  mcp-control  @anyvm        ask
-qubes.ClipboardPaste            *  mcp-control  @anyvm        ask
-
-# USB attach to mcp-control itself (the typical case for the human at
-# the terminal). Attaching to OTHER qubes from mcp-control falls through
-# to the explicit deny below.
-#
-# Two services are involved: the Admin API gate (admin.vm.device.usb.*)
-# AND the data-plane service (qubes.USB) that carries the actual USB
-# stream between sys-usb and the consuming qube. Both must be allowed.
-admin.vm.device.usb.Attach      *  mcp-control  mcp-control   ask    target=@adminvm
-admin.vm.device.usb.Detach      *  mcp-control  mcp-control   ask    target=@adminvm
-# Stage G0b (finding [2]): these two were `allow` — but their source token is
-# mcp-control, IDENTICAL to the source an agent's calls carry, so an AI-shaped
-# qubes_device_list(qube="@adminvm") rode this line straight into dom0's USB
-# enumeration (an out-of-scope hardware oracle). qrexec cannot tell "human typed
-# it" from "agent forwarded it" on a shared source. Fix = defense in depth:
-# (a) the mcp-control-side _qrexec target validator rejects @adminvm on the TOOL
-# path before the call is made, and (b) these drop to `ask` (like the Attach/
-# Detach lines above) so a bypass of (a) — or a compromised mcp-control — surfaces
-# a dom0 dialog instead of a SILENT oracle. The human's genuine USB-attach
-# enumeration still works with one confirmation click.
-admin.vm.device.usb.Available   *  mcp-control  @adminvm      ask    target=@adminvm
-admin.vm.device.usb.List        *  mcp-control  @adminvm      ask    target=@adminvm
-qubes.USB                       *  mcp-control  sys-usb       ask
+# A6. AI space never calls the Admin API on a qube. Qubes leaves
+# these methods to include files that ship empty, so today an AI qube is
+# refused only because nothing allows it. These lines make the refusal ours.
+# A5 covers calls addressed to dom0; these cover calls addressed to a qube.
+# The list is every method qubesd 4.3 registers (qubes/api/admin.py,
+# release4.3; device classes pci, block, usb, mic), the two volume Import
+# services, and the policy API. @anyvm also matches @default and every
+# @dispvm form. tests/test_policy.py checks the list against tests/data/.
+admin.backup.Cancel                           *  @tag:ai-managed  @anyvm  deny
+admin.backup.Execute                          *  @tag:ai-managed  @anyvm  deny
+admin.backup.Info                             *  @tag:ai-managed  @anyvm  deny
+admin.deviceclass.List                        *  @tag:ai-managed  @anyvm  deny
+admin.Events                                  *  @tag:ai-managed  @anyvm  deny
+admin.label.Create                            *  @tag:ai-managed  @anyvm  deny
+admin.label.Get                               *  @tag:ai-managed  @anyvm  deny
+admin.label.Index                             *  @tag:ai-managed  @anyvm  deny
+admin.label.List                              *  @tag:ai-managed  @anyvm  deny
+admin.label.Remove                            *  @tag:ai-managed  @anyvm  deny
+admin.pool.Add                                *  @tag:ai-managed  @anyvm  deny
+admin.pool.Info                               *  @tag:ai-managed  @anyvm  deny
+admin.pool.List                               *  @tag:ai-managed  @anyvm  deny
+admin.pool.ListDrivers                        *  @tag:ai-managed  @anyvm  deny
+admin.pool.Remove                             *  @tag:ai-managed  @anyvm  deny
+admin.pool.Set.ephemeral_volatile             *  @tag:ai-managed  @anyvm  deny
+admin.pool.Set.revisions_to_keep              *  @tag:ai-managed  @anyvm  deny
+admin.pool.UsageDetails                       *  @tag:ai-managed  @anyvm  deny
+admin.pool.volume.List                        *  @tag:ai-managed  @anyvm  deny
+admin.property.Get                            *  @tag:ai-managed  @anyvm  deny
+admin.property.GetAll                         *  @tag:ai-managed  @anyvm  deny
+admin.property.GetDefault                     *  @tag:ai-managed  @anyvm  deny
+admin.property.Help                           *  @tag:ai-managed  @anyvm  deny
+admin.property.List                           *  @tag:ai-managed  @anyvm  deny
+admin.property.Reset                          *  @tag:ai-managed  @anyvm  deny
+admin.property.Set                            *  @tag:ai-managed  @anyvm  deny
+admin.vmclass.List                            *  @tag:ai-managed  @anyvm  deny
+admin.vm.Console                              *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.AdminVM                       *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.AppVM                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateDisposable                     *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.DispVM                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.AdminVM                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.AppVM                   *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.DispVM                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.RemoteVM                *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.StandaloneVM            *  @tag:ai-managed  @anyvm  deny
+admin.vm.CreateInPool.TemplateVM              *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.RemoteVM                      *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.StandaloneVM                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.Create.TemplateVM                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.CurrentState                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Assign                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Assigned                *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Attach                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Attached                *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Available               *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Detach                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Set.assignment          *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.block.Unassign                *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.denied.Add                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.denied.List                   *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.denied.Remove                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Assign                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Assigned                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Attach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Attached                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Available                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Detach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Set.assignment            *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.mic.Unassign                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Assign                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Assigned                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Attach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Attached                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Available                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Detach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Set.assignment            *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.pci.Unassign                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Assign                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Assigned                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Attach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Attached                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Available                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Detach                    *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Set.assignment            *  @tag:ai-managed  @anyvm  deny
+admin.vm.device.usb.Unassign                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.CheckWithAdminVM             *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.CheckWithNetvm               *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.CheckWithTemplate            *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.CheckWithTemplateAndAdminVM  *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.Get                          *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.List                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.Remove                       *  @tag:ai-managed  @anyvm  deny
+admin.vm.feature.Set                          *  @tag:ai-managed  @anyvm  deny
+admin.vm.firewall.Get                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.firewall.Reload                      *  @tag:ai-managed  @anyvm  deny
+admin.vm.firewall.Set                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.Kill                                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.List                                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.notes.Get                            *  @tag:ai-managed  @anyvm  deny
+admin.vm.notes.Set                            *  @tag:ai-managed  @anyvm  deny
+admin.vm.Pause                                *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.Get                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.GetAll                      *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.GetDefault                  *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.Help                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.List                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.Reset                       *  @tag:ai-managed  @anyvm  deny
+admin.vm.property.Set                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.Remove                               *  @tag:ai-managed  @anyvm  deny
+admin.vm.Resume                               *  @tag:ai-managed  @anyvm  deny
+admin.vm.Shutdown                             *  @tag:ai-managed  @anyvm  deny
+admin.vm.Start                                *  @tag:ai-managed  @anyvm  deny
+admin.vm.Stats                                *  @tag:ai-managed  @anyvm  deny
+admin.vm.Suspend                              *  @tag:ai-managed  @anyvm  deny
+admin.vm.tag.Get                              *  @tag:ai-managed  @anyvm  deny
+admin.vm.tag.List                             *  @tag:ai-managed  @anyvm  deny
+admin.vm.tag.Remove                           *  @tag:ai-managed  @anyvm  deny
+admin.vm.tag.Set                              *  @tag:ai-managed  @anyvm  deny
+admin.vm.Unpause                              *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Clear                         *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.CloneFrom                     *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.CloneTo                       *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Import                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.ImportWithSize                *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Info                          *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.List                          *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.ListSnapshots                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Resize                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Revert                        *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Set.ephemeral                 *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Set.revisions_to_keep         *  @tag:ai-managed  @anyvm  deny
+admin.vm.volume.Set.rw                        *  @tag:ai-managed  @anyvm  deny
+policy.List                                   *  @tag:ai-managed  @anyvm  deny
+policy.include.List                           *  @tag:ai-managed  @anyvm  deny
+policy.Get                                    *  @tag:ai-managed  @anyvm  deny
+policy.include.Get                            *  @tag:ai-managed  @anyvm  deny
+policy.GetFiles                               *  @tag:ai-managed  @anyvm  deny
+policy.Replace                                *  @tag:ai-managed  @anyvm  deny
+policy.include.Replace                        *  @tag:ai-managed  @anyvm  deny
+policy.Remove                                 *  @tag:ai-managed  @anyvm  deny
+policy.include.Remove                         *  @tag:ai-managed  @anyvm  deny
+policy.RegisterArgument                       *  @tag:ai-managed  @anyvm  deny
+policy.UnregisterArgument                     *  @tag:ai-managed  @anyvm  deny
+policy.EvalSimulate                           *  @tag:ai-managed  @anyvm  deny
+policy.EvalGUI                                *  @tag:ai-managed  @anyvm  deny
 
 # =========================================================================
-# EXPLICIT DENIES — documented; the catch-all below would cover these too,
-# but listing them explicitly makes intent visible to anyone auditing.
+# B. THE HUB
 # =========================================================================
 
-# Policy management — AI must never read or rewrite policy.
-policy.Get                       *  mcp-control  @anyvm  deny
-policy.GetFiles                  *  mcp-control  @anyvm  deny
-policy.List                      *  mcp-control  @anyvm  deny
-policy.Replace                   *  mcp-control  @anyvm  deny
-policy.RegisterArgument          *  mcp-control  @anyvm  deny
-policy.UnregisterArgument        *  mcp-control  @anyvm  deny
-policy.EvalSimulate              *  mcp-control  @anyvm  deny
-policy.EvalGUI                   *  mcp-control  @anyvm  deny
+# B1. The dom0 wrappers. Each one decides everything about the qubes it acts
+# on; this file only routes the call to dom0.
+qmcp.ListAIManagedQubes        *  mcp-control  @adminvm  allow
+qmcp.GetPropertyAIManaged      *  mcp-control  @adminvm  allow
+qmcp.SetPropertyAIManaged      *  mcp-control  @adminvm  allow
+qmcp.SetFeatureAIManaged       *  mcp-control  @adminvm  allow
+qmcp.LifecycleAIManaged        *  mcp-control  @adminvm  allow
+qmcp.SpawnAIManagedQube        *  mcp-control  @adminvm  allow
+qmcp.CloneAIManagedQube        *  mcp-control  @adminvm  allow
+qmcp.SpawnDisposableAIManaged  *  mcp-control  @adminvm  allow
+qmcp.AIManagedEvents           *  mcp-control  @adminvm  allow
+qmcp.GetPoolStats              *  mcp-control  @adminvm  allow
 
-# Pool & volume manipulation — could overwrite filesystems or exfiltrate.
-admin.pool.List                  *  mcp-control  @anyvm  deny
-admin.pool.Info                  *  mcp-control  @anyvm  deny
-admin.pool.Add                   *  mcp-control  @anyvm  deny
-admin.pool.Remove                *  mcp-control  @anyvm  deny
-admin.pool.volume.Import         *  mcp-control  @anyvm  deny
-admin.vm.volume.Import           *  mcp-control  @anyvm  deny
-admin.vm.volume.CloneFrom        *  mcp-control  @anyvm  deny
-admin.vm.volume.Revert           *  mcp-control  @anyvm  deny
-admin.vm.volume.Clear            *  mcp-control  @anyvm  deny
-
-# Backup execution — bulk exfiltration vector.
-admin.backup.Execute             *  mcp-control  @anyvm  deny
-admin.backup.Info                *  mcp-control  @anyvm  deny
-
-# Direct creation / clone — denied; AI uses qmcp.SpawnAIManagedQube / qmcp.CloneAIManagedQube.
-admin.vm.Create.AppVM            *  mcp-control  @anyvm  deny
-admin.vm.Create.StandaloneVM     *  mcp-control  @anyvm  deny
-admin.vm.Create.TemplateVM       *  mcp-control  @anyvm  deny
-admin.vm.Create.DispVMTemplate   *  mcp-control  @anyvm  deny
-admin.vm.CreateDisposable        *  mcp-control  @anyvm  deny
-admin.vm.Clone                   *  mcp-control  @anyvm  deny
-
-# Tag mutation — denied always.
-admin.vm.tag.Set                 *  mcp-control  @anyvm  deny
-admin.vm.tag.Remove              *  mcp-control  @anyvm  deny
-
-# Property read/write — denied direct; AI uses qmcp.{Get,Set}PropertyAIManaged.
-admin.vm.property.Get            *  mcp-control  @anyvm  deny
-admin.vm.property.GetAll         *  mcp-control  @anyvm  deny
-admin.vm.property.Set            *  mcp-control  @anyvm  deny
-admin.vm.property.Reset          *  mcp-control  @anyvm  deny
-admin.vm.property.Help           *  mcp-control  @anyvm  deny
-admin.vm.property.List           *  mcp-control  @anyvm  deny
-
-# Lifecycle — denied direct; AI uses qmcp.LifecycleAIManaged.
-# Stage D moved lifecycle into a dom0 wrapper because qrexec's @tag:
-# selector doesn't reach klass=DispVM targets on Qubes R4.3 (the wrapper
-# does the ai-managed check in dom0 with qubesadmin authority instead).
-admin.vm.Start                   *  mcp-control  @anyvm  deny
-admin.vm.Shutdown                *  mcp-control  @anyvm  deny
-admin.vm.Kill                    *  mcp-control  @anyvm  deny
-admin.vm.Pause                   *  mcp-control  @anyvm  deny
-admin.vm.Unpause                 *  mcp-control  @anyvm  deny
-admin.vm.Remove                  *  mcp-control  @anyvm  deny
-
-# Feature read/write — direct access denied. Set is wrapped by
-# qmcp.SetFeatureAIManaged (Stage F1, allowed above); the direct
-# admin.vm.feature.Set deny stays so the wrapper is the only path
-# (same pattern as CreateDisposable / property.Set). Get / List /
-# Remove / CheckWithTemplate stay fully denied — no stage surfaces a
-# feature read (the Set wrapper echoes its post-set value instead).
-admin.vm.feature.Get             *  mcp-control  @anyvm  deny
-admin.vm.feature.Set             *  mcp-control  @anyvm  deny
-admin.vm.feature.Remove          *  mcp-control  @anyvm  deny
-admin.vm.feature.List            *  mcp-control  @anyvm  deny
-admin.vm.feature.CheckWithTemplate  *  mcp-control  @anyvm  deny
-
-# Firewall — Stage C + I-4 allow tag-scoped above (Get at the ai-managed
-# ro-floor; Set/Reload at ai-net/ai-full plus the compat backstop). The
-# catch-all below refuses every untagged target AND, once the compat backstop
-# is removed at the flip, every WRITE on a qube below the ai-net tier — both
-# collapse to the same opaque refusal, so the firewall surface is no
-# existence/tier oracle. No explicit deny needed here.
-
-# Device API
-#  - block/usb/mic: Stage E1 wraps Attach/Detach via qmcp; List/Available
-#    are tag-scoped allows above. The Attach/Detach denies here catch any
-#    direct caller that bypasses the wrapper (the tag-scoped reads above
-#    already make the list/available denies unreachable, so they are
-#    omitted to keep the deny block honest about what it still gates).
-#  - pci: stays fully denied — PCI passthrough has a different trust
-#    model (requires no_strict_reset, qube reboot, dom0-side risk
-#    assessment) and is out of Stage E scope. A future stage may wrap it.
-admin.vm.device.pci.Attach       *  mcp-control  @anyvm  deny
-admin.vm.device.pci.Detach       *  mcp-control  @anyvm  deny
-admin.vm.device.pci.List         *  mcp-control  @anyvm  deny
-admin.vm.device.pci.Available    *  mcp-control  @anyvm  deny
-admin.vm.device.block.Attach     *  mcp-control  @anyvm  deny
-admin.vm.device.block.Detach     *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Attach       *  mcp-control  @anyvm  deny
-admin.vm.device.mic.Detach       *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Attach       *  mcp-control  @anyvm  deny
-admin.vm.device.usb.Detach       *  mcp-control  @anyvm  deny
-
-# Global discovery — denied to enforce invisibility.
-admin.vm.List                    *  mcp-control  @anyvm  deny
-admin.vm.Stats                   *  mcp-control  @anyvm  deny
-admin.label.List                 *  mcp-control  @anyvm  deny
-admin.label.Get                  *  mcp-control  @anyvm  deny
-admin.label.Index                *  mcp-control  @anyvm  deny
-admin.Events                     *  mcp-control  @anyvm  deny
-
-# Volume info/resize — direct access denied. Stage F3's
-# qmcp.GetPoolStats wraps the read surface AI-scoped (sums provisioned
-# bytes only across ai-managed qubes, returns just the aggregate +
-# operator cap); the wrapper runs in dom0 with admin authority and
-# bypasses qrexec for the underlying volume calls, so these denies
-# still gate any direct AI-side call attempt. Resize stays fully
-# denied (no stage wraps it).
-admin.vm.volume.List             *  mcp-control  @anyvm  deny
-admin.vm.volume.Info             *  mcp-control  @anyvm  deny
-admin.vm.volume.Resize           *  mcp-control  @anyvm  deny
-
-# Tag reads — denied direct (qmcp.ListAIManagedQubes is canonical discovery).
-admin.vm.tag.Get                 *  mcp-control  @anyvm  deny
-admin.vm.tag.List                *  mcp-control  @anyvm  deny
+# B2. Command execution, copy-out and firewall on AI space. Guarded targets
+# were refused in A1.
+qmcp.RunInAIManaged        *  mcp-control  @tag:ai-managed  allow  user=root
+qmcp.CopyToAIManaged       *  mcp-control  @tag:ai-managed  allow  user=root
+admin.vm.firewall.Get      *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.firewall.Set      *  mcp-control  @tag:ai-managed  allow  target=@adminvm
+admin.vm.firewall.Reload   *  mcp-control  @tag:ai-managed  allow  target=@adminvm
 
 # =========================================================================
-# CATCH-ALL DENY — default-deny backstop for mcp-control.
+# C. COPIES FROM AI SPACE: the operator dialog
 # =========================================================================
 
-*  *  mcp-control  @anyvm  deny
+# Every qubes.Filecopy from AI space that A did not refuse (into a guarded
+# qube or the hub) gets the normal Qubes dialog, where the operator picks or
+# confirms the destination (since v0.9.15). This
+# release has no dialog-free copy, between AI qubes or into a drop box;
+# per-project lines arrive with projects. qrexec turns a target that does not
+# exist into @default, so the ask reveals no qube names. The deny keeps a drop
+# box (ai-dump) from reaching back into AI space by any service, even by dialog.
+*                          *  @tag:ai-dump     @tag:ai-managed          deny
+qubes.Filecopy             *  @tag:ai-managed  @anyvm                   ask
+
+# =========================================================================
+# D. THE HUB'S OWN OPERATOR UX
+# =========================================================================
+
+# Background services the hub qube needs, and the dialogs the operator uses
+# from a terminal in it. An agent cannot reach these through any qmcp tool.
+qubes.GetDate                  *  mcp-control  @default     allow  target=dom0
+qubes.GetDate                  *  mcp-control  @adminvm     allow
+qubes.GetImageRGBA             *  mcp-control  @adminvm     allow
+qubes.WaitForSession           *  mcp-control  @adminvm     allow
+qubes.SyncAppMenus             *  mcp-control  @adminvm     allow
+qubes.NotifyTools              *  mcp-control  @adminvm     allow
+qubes.NotifyUpdates            *  mcp-control  @adminvm     allow
+qubes.FeaturesRequest          *  mcp-control  @adminvm     allow
+qubes.GetRandomizedTime        *  mcp-control  @adminvm     allow
+qubes.Filecopy                 *  mcp-control  @anyvm       ask
+qubes.OpenInVM                 *  mcp-control  @anyvm       ask
+qubes.OpenURL                  *  mcp-control  @anyvm       ask
+qubes.ClipboardCopy            *  mcp-control  @anyvm       ask
+qubes.ClipboardPaste           *  mcp-control  @anyvm       ask
+admin.vm.device.usb.Attach     *  mcp-control  mcp-control  ask  target=@adminvm
+admin.vm.device.usb.Detach     *  mcp-control  mcp-control  ask  target=@adminvm
+admin.vm.device.usb.Available  *  mcp-control  @adminvm     ask  target=@adminvm
+qubes.USB                      *  mcp-control  sys-usb      ask
+
+# =========================================================================
+# E. THE HUB'S CATCH-ALLS: everything not allowed above is refused
+# =========================================================================
+
+*                          *  mcp-control      @adminvm                 deny
+*                          *  mcp-control      @anyvm                   deny

@@ -1,0 +1,16 @@
+#!/usr/bin/python3
+"""Every qmcp.* qrexec service in dom0.
+
+deploy/install.sh installs this one file under each service name in
+/etc/qubes-rpc/ (qmcp.ListAIManagedQubes, qmcp.SpawnAIManagedQube, ...); it
+dispatches on the name it was started as. All logic lives in the qmcp library.
+If the library cannot be imported this exits with no reply, which the caller
+sees as a refusal.
+"""
+import os
+import sys
+
+sys.path.insert(0, "/usr/local/lib/qmcp")
+from qmcp.services import main  # noqa: E402
+
+sys.exit(main(os.path.basename(sys.argv[0]).split("+", 1)[0]))

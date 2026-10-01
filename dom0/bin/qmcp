@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+"""The operator's qmcp command in dom0. See `qmcp --help`."""
+import sys
+
+sys.path.insert(0, "/usr/local/lib/qmcp")
+from qmcp.cli import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))
