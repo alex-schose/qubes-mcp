@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=qubes-mcp
+GenericName=AI space and projects
+Comment=Projects, the qmcp check and the audit log of qubes-mcp
+Exec=/usr/local/bin/qmcp-gui
+Icon=preferences-system
+Terminal=false
+Categories=Settings;X-XFCE-SettingsDialog;

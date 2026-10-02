@@ -211,11 +211,13 @@ def verify(path: str | None = None) -> tuple[bool, int, str | None]:
 
 
 def tail(n: int = 20, path: str | None = None) -> list[dict]:
+    """The last `n` records. A log that does not exist yet has none; one that
+    cannot be read raises, so it is never shown as an empty one."""
     path = LOG_PATH if path is None else path
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             lines = [s for s in (ln.strip() for ln in f) if s]
-    except OSError:
+    except FileNotFoundError:
         return []
     out = []
     for line in lines[-n:]:

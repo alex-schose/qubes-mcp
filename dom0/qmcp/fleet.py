@@ -738,7 +738,7 @@ def revoke(app, name, shutdown: bool = True) -> str:
     Restrictions such as an egress lock go too: revoke is yours."""
     vm = _target(app, name)
     _not_in_a_slot(vm, name, "revoke")
-    for t in sorted(t for t in _tags(vm) if birth.controlled(t)):
+    for t in sorted((t for t in _tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
     if _safe(lambda: getattr(vm, "default_dispvm", None)) is not None:
         vm.default_dispvm = None
@@ -752,26 +752,53 @@ def revoke(app, name, shutdown: bool = True) -> str:
     return msg
 
 
-def listing(app) -> list:
+def listing(app, everything: bool = False) -> list:
+    """One row per qube in AI space. `everything` adds every other qube but
+    dom0, with state None: the operator's window offers them when a qube joins
+    AI space, and as a lead's template or network."""
     rows = []
     for vm in app.domains:
         st = core.state(vm)
-        if st is None:
+        klass = _safe(lambda: vm.klass)
+        if st is None and (not everything or klass == "AdminVM"):
             continue
         tpl = _safe(lambda: getattr(vm, "template", None))
         net = _safe(lambda: getattr(vm, "netvm", None))
         tags = _tags(vm)
         slots = projects.member_slots(tags) | projects.lead_slots(tags)
         rows.append({
-            "name": vm.name, "state": st, "klass": _safe(lambda: vm.klass),
+            "name": vm.name, "state": st, "klass": klass,
             "template": None if tpl is None else str(getattr(tpl, "name", tpl)),
             "netvm": None if net is None else str(getattr(net, "name", net)),
             "power": _safe(vm.get_power_state, "unknown"),
             "slot": ",".join(sorted(slots)) or None,
             "lead": projects.LEAD in tags,
             "owner": _owner(vm),
+            "gateway": core.is_gateway(vm),
+            "dvmt": bool(_safe(lambda: getattr(vm, "template_for_dispvms", False), False)),
+            "badges": sorted(t for t in tags if birth.controlled(t) or t == projects.DROP_BOX),
         })
     return rows
+
+
+def settings(app) -> dict:
+    """The operator files the services re-read on every call, read the way
+    they read them, and the disk AI space uses against the cap."""
+    hub = core.read_hub()
+    hub_vm = core.lookup(app, hub) if hub else None
+    try:
+        used = budget.persistent_sum(app)
+    except Exception:
+        used = None
+    return {
+        "hub": hub,
+        "hub_power": None if hub_vm is None else _safe(hub_vm.get_power_state, "unknown"),
+        "name_prefix": birth.read_name_prefix(),
+        "pool_cap": budget.read_cap(),
+        "private_cap": budget.read_private_cap(),
+        "ai_space_bytes": used,
+        "birth_egress": _read_word(birth.BIRTH_EGRESS_PATH) or None,
+    }
 
 
 # ------------------------------------------------------------------ projects (operator)
@@ -812,7 +839,7 @@ def _quota(value) -> int:
 def parse_size(text) -> int:
     """Bytes from `40G`, `512M`, `1T` or a plain number."""
     import re
-    m = re.fullmatch(r"\s*([0-9]+)\s*([BKMGT]?)(?:i?B)?\s*", str(text), re.I)
+    m = re.fullmatch(r"\s*([0-9]+)\s*([BKMGT]?)(?:i?B)?\s*", str(text), re.I | re.ASCII)
     if not m:
         raise ProjectError(f"'{text}' is not a size (e.g. 40G)")
     n = int(m.group(1)) * _SIZE_UNITS[m.group(2).upper()]
@@ -958,12 +985,24 @@ def _badges_of_slot(app, slot: str) -> list:
     return out
 
 
+def _removal_order(tag: str) -> tuple:
+    """Badges come off in this order, and go on in the reverse: first the
+    slot badges the rulebook routes on (`qmcp-lead-pNN` alone gives root exec
+    into a slot's members, `qmcp-proj-pNN` makes a qube reachable from its
+    lead), then the umbrella, then the rest. A failure part-way then leaves a
+    qube with less authority than the command meant, never more."""
+    if projects.slot_badge_parts(tag) is not None:
+        return (0, tag)
+    return (1, tag) if tag == core.UMBRELLA else (2, tag)
+
+
 def _set_tags(vm, add=(), remove=()):
-    """Add, then remove, then read back exactly."""
-    for t in sorted(add):
-        vm.tags.add(t)
-    for t in sorted(remove):
+    """Remove, then add, each in authority order (see `_removal_order`),
+    then read back exactly."""
+    for t in sorted(remove, key=_removal_order):
         vm.tags.discard(t)
+    for t in sorted(add, key=_removal_order, reverse=True):
+        vm.tags.add(t)
     tags = _tags(vm)
     if not set(add) <= tags or tags & set(remove):
         raise RuntimeError("tags did not read back as set")
@@ -1215,7 +1254,8 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
             raise ProjectError(f"the old lead is on {net}, which is not one of the project's worker "
                                f"networks; drop --keep-old or add the network")
     freed = None if (keep_old or old_vm is None) else p.lead
-    if keep_old and old_vm is not None and (lead_name or f"{p.space(prefix)}lead") == p.lead:
+    if (keep_old and old_vm is not None and lead_source != "promote"
+            and (lead_name or f"{p.space(prefix)}lead") == p.lead):
         raise ProjectError(f"the old lead keeps the name {p.lead}; pass --lead-name for the new one")
     name = _plan_lead(app, p.space(prefix), lead_source, lead_origin, lead_netvm, lead_name, freed)
     old = p.lead

@@ -26,6 +26,106 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.19] — 2026-10-02
+
+**The operator's window (M2b): the `qmcp` command as a window in dom0, running
+the command and nothing else.** Nothing changes for AI space: no service, no
+policy line and no tool moved. Install over 0.9.18.
+
+### Added
+
+- **`qmcp-gui`**, in the Qubes menu under Settings > Qubes Tools. A GTK window
+  with the tree of AI space and the projects (the hub with p00 and the qubes in
+  no slot, each project's lead, workers and sink, templates, gateways, other
+  guarded qubes, and Needs attention), the selection's every field, the check
+  light with the time it ran, the findings, the last 200 audit lines with
+  verify and rotate, and the settings, read-only.
+- **Every command that changes something, but `migrate`, is a form**: create,
+  edit and delete a project, change or remove its lead, add a dump sink, move a
+  qube between slots, manage, guard, revoke, add a qube to AI space, and rotate
+  the audit log. Each form shows, under its fields, the exact command OK will
+  run; the report afterwards shows the command, its exit status and its
+  output. A delete first shows the command's own plan; moving a qube from one
+  slot into another needs a tick, and the move form shows whether the qube's
+  network is one the project takes. A lead's name is typed after the project's
+  name space, shown in front of the field. Replacing a lead asks what happens
+  to the old one, with nothing chosen in advance, and every form whose OK
+  removes a qube says so in red.
+- **It runs the `qmcp` command and nothing else.** Reads run `qmcp ...` as the
+  operator's own dom0 user, in JSON wherever the command offers it, and are
+  stopped after 120 s; changes run `/usr/bin/sudo -n qmcp ...`, one at a time.
+  The window never imports qubesadmin and refuses to run as root. It refreshes
+  on open, after every change, and on Refresh.
+- **AI-chosen text is shown escaped.** The audit log keeps the names, keys and
+  options of every call the hub or a lead makes to a state-changing service
+  (never a value being set), refused calls included, up to 128 characters each
+  and before they are checked. The
+  window shows every string as the command's JSON does: a newline, a bidi
+  override or a zero-width character as a visible escape, markup as literal
+  text. Its widgets take plain text only, through helpers that refuse anything
+  not escaped.
+- **It shows authority the way the rulebook computes it.** A qube's place in
+  the tree comes from its badges, never its label colour. Needs attention
+  holds the qubes whose badges the rulebook acts on against the records: lead
+  badges the records do not back, a gateway without `qmcp-guarded` (Guard is
+  offered there), a drop box or the hub inside AI space, slot badges outside
+  it, two slots, a template in a project. Every other failure is on the Check
+  tab.
+- **A failed read is never shown as the fleet.** Once a refresh has read
+  everything, a later one with a failed read keeps the qubes, records, audit
+  lines and settings of the last complete one, and turns every change off until
+  a refresh reads everything again. The light and the Check tab always show the
+  latest check, or UNKNOWN if it did not answer.
+- **`qmcp settings [--json]`**: the hub, the name prefix, the pool and private
+  caps, the birth egress, the disk AI space uses, and the version.
+- **`qmcp check --json`**, and **`qmcp list --all`**, which adds every qube
+  outside AI space but dom0 (with no state). `qmcp list --json` rows add
+  `gateway`, `dvmt` and `badges` (the qube's badges in qmcp's vocabulary).
+- **`tests/test_gui.py`**: the window's forms driven through the real `qmcp`
+  command against the fake qubesadmin, the escaping against hostile text, a
+  structural check that no markup API and no unescaped widget text appears
+  in the window, and the rule that it cannot go stale: the suite fails on any
+  command, option or field of the command that the window neither offers nor
+  exempts by name, with a reason. It also fails on a bidi or zero-width
+  character anywhere in the tree. **`tests/GUI-CHECKLIST.md`** is the
+  click-through for a person.
+
+### Fixed
+
+- **Badges could be left with more authority than a failed command meant**
+  (since 0.9.18). The rulebook gives `qmcp-lead-pNN` alone root exec, copy and
+  firewall access into a slot's members, and lets a lead reach a qube wearing
+  its slot's `qmcp-proj-pNN`, even outside AI space. Badges were removed in
+  name order, so a qubesd
+  failure part-way could leave a removed lead with its slot badge but not
+  `qmcp-lead`, or a revoked member with its slot badge but outside AI space:
+  qubes the services refuse but the policy still serves. Every `qmcp project`
+  command and `qmcp revoke` now remove the slot badges first and the umbrella
+  next, and add them in the reverse order; tests inject the failure between
+  the two.
+- Promoting one of the hub's qubes to lead with `--keep-old` was refused
+  whenever the old lead had the default name, with advice (`--lead-name`) a
+  promotion cannot take (since 0.9.18). A promoted lead keeps its own name.
+- `uninstall.sh --purge` left the files `qmcp audit rotate` makes
+  (`/var/log/qmcp-audit.log.<time>`), and its clean-state check did not name
+  them (since 0.9.17). It now backs them up, removes them, and reports any left;
+  without `--purge` it says how many it keeps.
+- `qmcp audit tail` printed nothing for a log it could not read, as if the log
+  were empty; it now says so and exits 1.
+- `qmcp project create --quota` and `edit --quota` failed with a bare
+  `KeyError` on a unit that is a non-ASCII letter case-folding to an ASCII one
+  (U+212A KELVIN SIGN for `k`); sizes now accept ASCII only.
+
+### Changed
+
+- `qmcp project delete NAME` without `--yes` prints its plan without root; it
+  never changed anything, and the window shows it before it asks.
+- The installer installs `/usr/local/bin/qmcp-gui` and
+  `/usr/share/applications/qubes-mcp.desktop`, where the Qubes menu looks;
+  the uninstaller removes both and its clean-state check names them.
+- `qmcp.cli.build_parser()` holds every command and option, so the window's
+  tests can walk it.
+
 ## [0.9.18] — 2026-10-01
 
 **Projects (M2a): a second kind of principal, the lead, each operating its own

@@ -1,12 +1,16 @@
 """`qmcp` — the operator's command in dom0.
 
-    qmcp check                     is the fleet sound? (exit 0 GREEN, 1 FAILED, 3 INCOMPLETE)
-    qmcp list                      AI space: state, class, template, network, slot, owner
-    qmcp manage|guard|revoke QUBE  role actions: the only way badges change
+    qmcp check [--json]            is the fleet sound? (exit 0 GREEN, 1 FAILED, 3 INCOMPLETE)
+    qmcp list [--all] [--json]     AI space: state, class, template, network, slot, owner
+    qmcp settings [--json]         the operator files and the disk AI space uses
+    qmcp manage|guard|revoke QUBE  role actions
     qmcp project ...               projects: list, show, create, edit, lead, dump, move, delete
     qmcp migrate [--apply] ...     move a v0.9.16 tiered fleet to two states
     qmcp audit verify|tail [N]|rotate   the hash-chained record of state changes
     qmcp version
+
+The operator's window, `qmcp-gui`, runs these same commands: reads as you,
+changes under `sudo -n`.
 
 Run it as root, or as a member of the `qubes` group. The project commands that
 change anything write /etc/qmcp/projects.json or take its lock, so they need
@@ -39,15 +43,20 @@ def _version() -> str:
 
 def cmd_check(args) -> int:
     findings = fleet.check(_app())
+    result = fleet.overall(findings)
+    if args.json:
+        print(json.dumps({"result": result,
+                          "findings": [{"status": f.status, "check": f.check, "detail": f.detail}
+                                       for f in findings]}, indent=2))
+        return EXIT[result]
     for f in findings:
         print(repr(f))
-    result = fleet.overall(findings)
     print(f"\nqmcp check: {result}" + ("  (INCOMPLETE is not green)" if result == "INCOMPLETE" else ""))
     return EXIT[result]
 
 
 def cmd_list(args) -> int:
-    rows = fleet.listing(_app())
+    rows = fleet.listing(_app(), everything=args.all)
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
@@ -56,6 +65,16 @@ def cmd_list(args) -> int:
     print("  ".join(c.upper().ljust(widths[c]) for c in cols))
     for r in rows:
         print("  ".join(str(r[c] or "-").ljust(widths[c]) for c in cols))
+    return 0
+
+
+def cmd_settings(args) -> int:
+    values = dict(fleet.settings(_app()), version=_version())
+    if args.json:
+        print(json.dumps(values, indent=2))
+        return 0
+    for key, value in values.items():
+        print(f"{key}: {'-' if value is None else value}")
     return 0
 
 
@@ -107,6 +126,21 @@ def cmd_project(args) -> int:
                 raise fleet.ProjectError(f"no project '{args.name}'")
             print(json.dumps(dict(p.to_json(), slot=p.slot), indent=2))
             return 0
+        if what == "delete" and not args.yes:
+            # The plan changes nothing and reads only the records, so it needs no
+            # root: the operator's window shows it before it asks.
+            p = projects.find(fleet._load_records(), args.name)
+            if p is None and args.name in projects.PROJECT_SLOTS:
+                print(f"qmcp project delete: {args.name} has no record: this finishes a delete, "
+                      f"removing the qubes still wearing its member badge and stripping its "
+                      f"badges everywhere. Re-run with --yes.")
+                return 1
+            if p is None or p.slot == projects.HUB_SLOT:
+                raise fleet.ProjectError(f"no project '{args.name}'")
+            print(f"qmcp project delete: this removes {p.slot} '{p.label}': its lead "
+                  f"{p.lead or '(none)'} and every member qube, and keeps its dump sink "
+                  f"{p.dump or '(none)'}. Re-run with --yes.")
+            return 1
         _need_root(what)
         if what == "create":
             source, origin = _lead_source(args)
@@ -134,17 +168,9 @@ def cmd_project(args) -> int:
             report = fleet.move(app, args.name, args.target, confirm=args.yes)
         elif what == "delete":
             p = projects.find(fleet._load_records(), args.name)
-            if p is None and args.name in projects.PROJECT_SLOTS:
-                plan = (f"{args.name} has no record: this finishes a delete, removing the qubes "
-                        f"still wearing its member badge and stripping its badges everywhere.")
-            elif p is None or p.slot == projects.HUB_SLOT:
+            if (p is not None and p.slot == projects.HUB_SLOT) or \
+                    (p is None and args.name not in projects.PROJECT_SLOTS):
                 raise fleet.ProjectError(f"no project '{args.name}'")
-            else:
-                plan = (f"this removes {p.slot} '{p.label}': its lead {p.lead or '(none)'} and every "
-                        f"member qube, and keeps its dump sink {p.dump or '(none)'}.")
-            if not args.yes:
-                print(f"qmcp project delete: {plan} Re-run with --yes.")
-                return 1
             report = fleet.delete_project(app, args.name)
         else:
             raise fleet.ProjectError(f"unknown command {what}")
@@ -214,16 +240,28 @@ def cmd_audit(args) -> int:
         ok, n, err = audit.verify(args.path)
         print(json.dumps({"ok": ok, "entries": n, "error": err}))
         return 0 if ok else 1
-    for rec in audit.tail(args.n, args.path):
+    try:
+        records = audit.tail(args.n, args.path)
+    except OSError as e:
+        print(f"qmcp audit tail: cannot read the log ({e.strerror or type(e).__name__})",
+              file=sys.stderr)
+        return 1
+    for rec in records:
         print(json.dumps(rec, sort_keys=True))
     return 0
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Every command and option. The operator's window is tested against this
+    parser: a command or option it neither offers nor exempts fails its suite."""
     ap = argparse.ArgumentParser(prog="qmcp", description="qubes-mcp operator command (dom0)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("check", help="verify the fleet and the install")
+    p = sub.add_parser("check", help="verify the fleet and the install")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("list", help="list AI space")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="also every qube outside AI space but dom0")
+    p = sub.add_parser("settings", help="the operator files and the disk AI space uses")
     p.add_argument("--json", action="store_true")
     for name, text in (("manage", "make a qube managed (the hub may operate it)"),
                        ("guard", "make a qube guarded (reference only)"),
@@ -265,7 +303,8 @@ def main(argv=None) -> int:
     q.add_argument("target", help="p00, a project's label or slot, or none")
     q.add_argument("--yes", action="store_true",
                    help="confirm moving a qube out of one slot into another")
-    q = psub.add_parser("delete", help="remove a project's lead and members, keep its sink (root)")
+    q = psub.add_parser("delete", help="remove a project's lead and members, keep its sink "
+                                         "(root; without --yes, the plan only)")
     q.add_argument("name", help="label or slot; a slot with no record finishes a delete")
     q.add_argument("--yes", action="store_true")
     p = sub.add_parser("migrate", help="map v0.9.16 tiers to managed/guarded")
@@ -280,13 +319,17 @@ def main(argv=None) -> int:
     p.add_argument("n", nargs="?", type=int, default=20)
     p.add_argument("--path", default=None)
     sub.add_parser("version")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     if args.cmd == "version":
         print(_version())
         return 0
-    handler = {"check": cmd_check, "list": cmd_list, "manage": cmd_role,
-               "guard": cmd_role, "revoke": cmd_role, "project": cmd_project,
-               "migrate": cmd_migrate, "audit": cmd_audit}[args.cmd]
+    handler = {"check": cmd_check, "list": cmd_list, "settings": cmd_settings,
+               "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
+               "project": cmd_project, "migrate": cmd_migrate, "audit": cmd_audit}[args.cmd]
     return handler(args)
 
 

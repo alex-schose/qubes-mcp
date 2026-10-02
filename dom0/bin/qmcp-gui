@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+"""The operator's qmcp window in dom0. Run it as your own dom0 user, never root."""
+import sys
+
+sys.path.insert(0, "/usr/local/lib/qmcp")
+from qmcp.gui import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

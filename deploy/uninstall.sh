@@ -3,7 +3,8 @@
 #
 #   sudo bash uninstall.sh            remove the code, the policy and the runtime
 #                                     state; keep /etc/qmcp and the audit log
-#   sudo bash uninstall.sh --purge    also remove /etc/qmcp and the audit log
+#   sudo bash uninstall.sh --purge    also remove /etc/qmcp, the audit log and the
+#                                     files `qmcp audit rotate` made from it
 #   sudo bash uninstall.sh --check    change nothing; only report what remains
 #
 # It also removes anything v0.9.16 left behind, so it works on a box that never
@@ -13,10 +14,11 @@
 # The policy goes first. From that moment no AI caller can reach a qmcp.*
 # service, so nothing runs half-removed. The run ends with a clean-state check
 # and exits 0 only if nothing qubes-mcp installed is left beyond what it
-# reports as kept: /etc/qmcp and the audit log (unless --purge), the backups
-# under /var/lib/qmcp-rollback/, which are never removed — they hold copies of
-# the policy, /etc/qmcp and the audit log — and /var/log/qmcp-changes.log, the
-# change history some older installers appended to.
+# reports as kept: /etc/qmcp, the audit log and its rotated files (unless
+# --purge), the backups under /var/lib/qmcp-rollback/, which are never
+# removed — they hold copies of the policy, /etc/qmcp and the audit logs — and
+# /var/log/qmcp-changes.log, the change history some older installers appended
+# to.
 
 set -euo pipefail
 
@@ -36,12 +38,17 @@ qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
 qmcp.AIManagedEvents qmcp.GetPoolStats"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
-OTHER_PATHS="/usr/local/bin/qmcp /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
+OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
+/etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
 /etc/systemd/system/qmcp-consent.service /etc/systemd/system/qmcp-tombstone-reaper.service
 /etc/systemd/system/qmcp-tombstone-reaper.timer
 /etc/qmcp/tier-default /etc/qmcp/enforce-mode /etc/qmcp/birth-ceiling /etc/qmcp/principals
 /etc/qmcp/consent-policy /etc/qmcp/consent-timeout /etc/qmcp/budget.lock
 /etc/qmcp/tombstone-retention /etc/qmcp/guarded"
+
+# The files `qmcp audit rotate` makes: exactly audit.rotate()'s name, never a wider glob.
+ROTATED_GLOB='/var/log/qmcp-audit.log.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+rotated() { for f in $ROTATED_GLOB; do [ -e "$f" ] && echo "$f"; done; return 0; }   # 0 even when none: set -e
 
 die() { echo "uninstall.sh: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
@@ -57,7 +64,7 @@ if [ "$MODE" != check ]; then
     chmod 0700 /var/lib/qmcp-rollback "$BACKUP"
     [ -f "$POLICY" ] && cp -a "$POLICY" "$BACKUP/"
     [ -d /etc/qmcp ] && cp -a /etc/qmcp "$BACKUP/etc-qmcp"
-    [ -f /var/log/qmcp-audit.log ] && cp -a /var/log/qmcp-audit.log "$BACKUP/"
+    for f in /var/log/qmcp-audit.log $(rotated); do [ -f "$f" ] && cp -a "$f" "$BACKUP/"; done
     say "backed up to $BACKUP (root-only)"
 
     if [ -e "$POLICY" ]; then
@@ -79,7 +86,8 @@ if [ "$MODE" != check ]; then
     systemctl daemon-reload
     if [ "$MODE" = purge ]; then
         rm -rf /etc/qmcp /var/log/qmcp-audit.log
-        say "purged /etc/qmcp and /var/log/qmcp-audit.log"
+        for f in $(rotated); do rm -f "$f"; done
+        say "purged /etc/qmcp, /var/log/qmcp-audit.log and its rotated files"
     fi
 fi
 
@@ -101,9 +109,12 @@ done
 if [ "$MODE" = purge ]; then
     [ -e /etc/qmcp ] && report /etc/qmcp
     [ -e /var/log/qmcp-audit.log ] && report /var/log/qmcp-audit.log
+    for f in $(rotated); do report "$f"; done
 else
     [ -e /etc/qmcp ] && echo "    kept  /etc/qmcp (operator config; --purge removes it)"
     [ -e /var/log/qmcp-audit.log ] && echo "    kept  /var/log/qmcp-audit.log (--purge removes it)"
+    n=$(rotated | wc -l)
+    [ "$n" -gt 0 ] && echo "    kept  $n rotated audit log(s), /var/log/qmcp-audit.log.<time> (--purge removes them)"
 fi
 if [ -d /var/lib/qmcp-rollback ]; then
     echo "    kept  /var/lib/qmcp-rollback ($(find /var/lib/qmcp-rollback -mindepth 1 -maxdepth 1 | wc -l) backups; delete by hand)"

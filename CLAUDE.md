@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (0.9.18). Read it first in any
+**This file describes the code at this version (0.9.19). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -132,7 +132,10 @@ create lock as well as the record file's, so it waits for any create in
 flight. The record is written last, so a lead is no principal until it is
 complete. Removing a lead takes its badges first, then its record, then the
 qube, and touches the recorded lead only while it wears the slot's lead badge;
-the project keeps its workers. Deleting a project removes the lead and every
+the project keeps its workers. The rulebook routes on the slot's lead badge
+(`qmcp-lead-pNN` alone gives exec into the members), so every command adds it
+last and removes it first: a failure part-way never leaves it without
+`qmcp-lead`. Deleting a project removes the lead and every
 member, keeps the dump sink (minus its badge), and strips every badge of the
 slot from every qube before the slot can be reused; `qmcp project delete pNN
 --yes` finishes a delete that stopped half-way. Moving a qube into a project
@@ -162,7 +165,7 @@ finishes (see the residual risks).
 |---|---|
 | hub (`mcp-control`) | `qubes_mcp/`: the MCP server and the `qubes-mcp` CLI. Standard library only. It reaches AI space through the policy's hub section; beyond that, only its own boot services and the operator's dialogs. |
 | each lead | the same `qubes_mcp/`, which reaches its project through the policy's slot lines and the leads' section. |
-| dom0 | `/usr/local/lib/qmcp/qmcp/` (the library), `/etc/qubes-rpc/qmcp.*` (one shim under each service name), `/usr/local/bin/qmcp` (the operator's command), the policy, `/etc/qmcp/` (operator files, `projects.json` among them), `/run/qmcp/` (lock files). |
+| dom0 | `/usr/local/lib/qmcp/qmcp/` (the library), `/etc/qubes-rpc/qmcp.*` (one shim under each service name), `/usr/local/bin/qmcp` (the operator's command), `/usr/local/bin/qmcp-gui` and its menu entry (the operator's window), the policy, `/etc/qmcp/` (operator files, `projects.json` among them), `/run/qmcp/` (lock files). |
 | AI templates | `template-rpc/`: `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged`, installed in the templates AI qubes are built on. A qube on a template without them cannot be exec'd into. |
 
 ## The services
@@ -303,8 +306,9 @@ checks that every slot has exactly its own block and no line crosses a slot.
 
 | Command | |
 |---|---|
-| `qmcp check` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 24 checked claims; services, runtime directory or caps missing, or a create lock the services cannot write; a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's. Warns on stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix or a project's names, managed qubes pointing at a disposable template outside it, a birth-egress qube outside AI space, an audit log due for rotation, a project without a lead, an approved template or worker network that is not one, a member on a network off its project's list, a sink with a network, managed AppVMs in no slot, and project quotas that add up to more than the pool cap. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
-| `qmcp list` | AI space with state, class, template, network, power, slot, provenance. |
+| `qmcp check [--json]` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 24 checked claims; services, runtime directory or caps missing, or a create lock the services cannot write; a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's. Warns on stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix or a project's names, managed qubes pointing at a disposable template outside it, a birth-egress qube outside AI space, an audit log due for rotation, a project without a lead, an approved template or worker network that is not one, a member on a network off its project's list, a sink with a network, managed AppVMs in no slot, and project quotas that add up to more than the pool cap. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
+| `qmcp list [--all] [--json]` | AI space with state, class, template, network, power, slot and provenance; with `--json`, each row adds whether the qube provides network, whether it is a disposable template, and its badges. `--all` adds every other qube but dom0, with no state. |
+| `qmcp settings [--json]` | The operator files the services read (hub, name prefix, pool and private caps, birth egress), the disk AI space uses, and the version. |
 | `qmcp manage QUBE` / `qmcp guard QUBE` | The role actions. Both refuse the hub and a drop box; `manage` also refuses a gateway; `guard` refuses a lead or a member. |
 | `qmcp revoke QUBE` | Strips every qmcp badge, pins `default_dispvm` to none, shuts the qube down. Refuses a lead. |
 | `qmcp project list` / `show NAME` | The slots in use; one project's record. |
@@ -313,13 +317,79 @@ checks that every slot has exactly its own block and no line crosses a slot.
 | `qmcp project lead NAME --remove` / `--lead-…` | Remove the lead (the project keeps its workers), or give the project a new one; `--keep-old` keeps the old lead as a worker. |
 | `qmcp project dump NAME` | Create a dump sink for a project, or for p00 (`hub-dump`). |
 | `qmcp project move QUBE TARGET` | Move a managed AppVM into p00, a project, or no slot. Its network does not change, so a project takes it only on one of its worker networks; out of one slot into another needs `--yes`. |
-| `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink without its badge, strip every badge of the slot, free it. Given a slot with no record, finish a delete that stopped half-way. |
+| `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink without its badge, strip every badge of the slot, free it. Given a slot with no record, finish a delete that stopped half-way. Without `--yes` it prints what it would remove and changes nothing; that needs no root. |
 | `qmcp migrate [--apply]` | v0.9.16 tiers to two states (below). Dry run by default. |
 | `qmcp audit verify` / `tail` / `rotate` | The chain. `rotate` moves the log aside and starts a new one anchored on the old head; it needs root. |
 
 Every `qmcp project` command that changes something needs root: it writes
 `/etc/qmcp/projects.json` under a lock, by atomic rename, or (`move`) takes
 that lock.
+
+## The operator's window (dom0)
+
+`qmcp-gui` is the `qmcp` command as a window: in the Qubes menu under
+Settings > Qubes Tools, or in a dom0 terminal. Run it as your own dom0 user;
+it refuses to run as root.
+
+- **It runs the `qmcp` command and nothing else.** Every read is `qmcp ...`,
+  run as you, in JSON wherever the command offers it, and stopped after 120 s;
+  every change is `/usr/bin/sudo -n qmcp ...`, the command you would type, one
+  at a time. Each form shows that command under its fields before OK runs it,
+  and the report after it shows the command, its exit status and its output.
+  The window never imports qubesadmin, so it can do nothing the command cannot.
+- **What it shows.** The Qubes tab is a tree: the hub with p00 and the qubes in
+  no slot, each project with its lead, workers and sink, then templates,
+  gateways, other guarded qubes, and Needs attention. A qube's place comes from
+  the badges the rulebook routes on, never its label colour, which the hub may
+  set. Needs attention holds the qubes whose badges the rulebook acts on
+  against the records: lead badges the records do not back, a gateway without
+  `qmcp-guarded` (Guard is offered there), a drop box or the hub inside AI
+  space, slot badges outside it, a qube in two slots, a template in a project.
+  Every other failure of `qmcp check` is on the Check tab. Beside the tree, the
+  selection's every field, and the actions that fit it. The light is
+  `qmcp check`'s result with the time it ran; the Check tab lists its findings,
+  failures first. The Audit tab shows the last 200 lines, newest first, the
+  selected one in full, and verifies or rotates the chain. It holds the calls
+  the hub and the leads make to state-changing services, and the line each
+  rotation starts a log with, which names the file the earlier lines moved to;
+  the operator's own commands are not on it. The Settings tab shows
+  `qmcp settings`, read-only.
+- **What it does.** Every command that changes something, but `migrate` (a
+  one-time step from v0.9.16), is a form: create, edit and delete projects,
+  change or remove a lead, add a dump sink, move a qube between slots, manage,
+  guard, revoke, add a qube to AI space, and rotate the audit log. A delete
+  first reads the command's plan, which changes nothing, and shows it; moving a
+  qube from one slot into another needs a tick, and the move form shows whether
+  the qube's network is one the project takes. A form refuses what the command
+  would refuse for a reason it can see in its own fields (a kept lead's name,
+  say), before anything runs. A lead's name is typed after the project's name
+  space, which the form shows in front of the field, and is judged by the
+  command's own rule. Replacing a lead asks what happens to the old one (kept
+  as a worker, or removed) with nothing chosen in advance, and every form whose
+  OK removes a qube says so in red first.
+- **A failed read is never shown as the fleet.** Once a refresh has read
+  everything, a later one with a failed read keeps the qubes, records, audit
+  lines and settings of the last complete one, says which read failed and when
+  those were read, and turns every change off until a refresh reads
+  everything. The light and the Check tab always show the latest check, which
+  judges the fleet by itself, or UNKNOWN if it did not answer. Before the first
+  complete refresh, nothing that needs the records (a lead's standing, a slot
+  left without one) is judged until they are read.
+- **Text from AI space is shown as text.** The audit log keeps the names, keys
+  and options of every call the hub or a lead makes to a state-changing service
+  (never a value being set), refused calls included, up to 128 characters each
+  and before they are checked. The window shows every string as the command's JSON does: ASCII,
+  with a newline, a bidi override or a zero-width character as a visible
+  escape (`\n`, `\u202e`), and markup as literal text. Widgets take plain text
+  only, and its text helpers refuse anything that has not been escaped.
+- **It refreshes** when it opens, after every change, and when you press
+  Refresh; there is no timer, and the light says when the check last ran.
+- **It cannot go stale.** `tests/test_gui.py` walks the command's parser and
+  the fields of every read, and fails on any command, option or field the
+  window neither offers nor exempts by name, with a reason. The exemptions
+  today: `migrate` and `audit --path` (typed by hand), and `project show` and
+  `version`, which the window shows from other reads.
+  `tests/GUI-CHECKLIST.md` is the click-through for a person.
 
 ## Install, migrate, uninstall
 
@@ -331,7 +401,7 @@ disposable template with curl and network; Qubes' stock `default-dvm` has both):
 ```sh
 # in dom0
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.18.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.19.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -347,7 +417,7 @@ replaces under `/var/lib/qmcp-rollback/`, writes an empty
 with `qmcp check`'s status. It changes no qube's tags. `uninstall.sh` removes the policy first (so no AI
 caller reaches a half-removed service), then everything else, and ends with a
 clean-state check that names what it keeps; `--purge` also removes
-`/etc/qmcp` and the audit log. Backups under `/var/lib/qmcp-rollback/` are
+`/etc/qmcp`, the audit log and its rotated files. Backups under `/var/lib/qmcp-rollback/` are
 never removed, nor is `/var/log/qmcp-changes.log`, the change history some
 older installers kept. Qubes keep their tags.
 
@@ -383,6 +453,7 @@ changes nothing.
 | `tests/test_dom0.py` | anywhere with python3-qrexec | the dom0 library against `tests/fakequbes.py`, a fake qubesadmin that copies tags, features and properties on clones and disposables as the platform does |
 | `tests/test_projects.py` | anywhere with python3-qrexec | projects against the same fake: who is a lead, what a lead sees and does (and at what cost), what the hub's creates join, and every `qmcp project` command and project check |
 | `tests/test_server.py` | anywhere | the MCP server and CLI against a fake qrexec client |
+| `tests/test_gui.py` | anywhere; the widget tests where GTK 3 and a display exist | the operator's window, driving the real `qmcp` command against the same fake: the tree, the escaping, every form's command, and that no command, option or field is left out |
 | `tests/seat_suite.py` | in the hub, on a real box | the tools through the real chain |
 | `tests/redteam_suite.py` | in the hub, on a real box | attacks from the hub and from a managed qube, with positive controls; a probe that hangs on a dialog fails |
 | `tests/project_suite.py` | in the hub, on a real box | carries the client and `tests/lead_seat.py` into a project's lead and runs it there: the lead's tools through the real chain, the lead's raw calls, and probes as root from inside its workers |
@@ -459,8 +530,8 @@ real dom0's policy set.
 
 ## Roadmap
 
-M2 adds projects in three releases: 0.9.18 (this one) projects themselves,
-operated with the `qmcp` command; then the core of a dom0 GUI; then
+M2 adds projects in three releases: 0.9.18 projects themselves, operated
+with the `qmcp` command; 0.9.19 (this one) the core of a dom0 GUI; then
 proposals, with which the hub asks for a project, a new lead or a deletion and
 the operator accepts it in the GUI, the only approval path. M3 adds networks: a gateway registry, locked or free
 networks per project, an anonymity gate and model endpoints. M4 runs the
@@ -487,7 +558,7 @@ in-qube services on Arch and Fedora templates, M5 adds sealed qubes, and
   operator-created one; and `"disp-created-by-x".startswith("created-by-")` is
   `False`, so anything holding `admin.vm.tag.Set` can forge it.
 - **No MCP code in dom0.** dom0 holds the library, the shims, the operator's
-  command and the policy.
+  command and window, and the policy.
 - **No third-party dependencies on the hub.** The server uses only Python's
   standard library.
 - **No third-party SaaS or SSO.**
@@ -499,14 +570,16 @@ in-qube services on Arch and Fedora templates, M5 adds sealed qubes, and
 qubes_mcp/          the hub and the leads: server.py (MCP over stdio), tools.py
                     (the 18 tools), qrexec.py (transport), cli.py
 dom0/qmcp/          the dom0 library: core (the shared check), services, projects,
-                    birth, budget, scope, audit, fleet (check/migrate/roles/projects), cli
+                    birth, budget, scope, audit, fleet (check/migrate/roles/projects), cli,
+                    and the window: gui (GTK) over guimodel (what it decides, no GTK)
 dom0/rpc/           qmcp-service, the one shim installed under every service name
 dom0/bin/qmcp       the operator's command
+dom0/bin/qmcp-gui   the operator's window
 policy/             30-mcp-control.policy
 template-rpc/       the two in-qube services
-deploy/             install.sh, uninstall.sh, qmcp-tmpfiles.conf
-tests/              the suites above; data/ holds the upstream policy baseline
-                    and qubesd's method list
+deploy/             install.sh, uninstall.sh, qmcp-tmpfiles.conf, qubes-mcp.desktop
+tests/              the suites above, GUI-CHECKLIST.md; data/ holds the upstream policy
+                    baseline and qubesd's method list
 ```
 
 ## Versioning

@@ -18,14 +18,16 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.18 — projects.** Besides the hub, up to 15 projects, each with
-its own lead agent that creates and runs its own workers inside the project's
-names, templates, networks and disk quota, and sees nothing outside it; a copy
-out of the project needs the operator's dialog. The operator creates projects with the `qmcp` command in dom0. Next: the
-core of a dom0 GUI, then proposals (the hub asks, the operator accepts in the
-GUI); then gateways and anonymity (M3), other distributions (M4), sealed
-qubes (M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
-0.9.0–0.9.16; see `CHANGELOG.md`.
+**Status: 0.9.19 — the operator's window.** Besides the hub, up to 15
+projects, each with its own lead agent that creates and runs its own workers
+inside the project's names, templates, networks and disk quota, and sees
+nothing outside it; a copy out of the project needs the operator's dialog. The
+operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
+command with forms: every change it makes is a command it shows first. Next:
+proposals (the hub asks, the operator accepts in the window); then gateways
+and anonymity (M3), other distributions (M4), sealed qubes (M5) and the
+complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
+`CHANGELOG.md`.
 
 ## How it works
 
@@ -124,7 +126,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.18.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.19.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -139,6 +141,16 @@ overrides its 24 checked claims. It installs the policy last and ends with
 `--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
 keeps.
+
+It also installs **the operator's window**: *qubes-mcp* in the Qubes menu
+under Settings > Qubes Tools, or `qmcp-gui` in a dom0 terminal, run as your own
+user. It shows AI
+space and the projects as a tree, the `qmcp check` light, the audit log and the
+settings, and offers every command that changes something, but `migrate`, as
+a form. Each form shows the command it will run (`sudo -n qmcp ...`); the
+window runs nothing but the `qmcp` command.
+Text that AI chose, such as a name in the audit log, is shown escaped:
+`\u202e`, never a reversed line.
 
 Coming from 0.9.17? Install over it; nothing is retagged. Coming from 0.9.16?
 Run the staged migration first; see "Install, migrate, uninstall" in
@@ -178,8 +190,8 @@ The birth-egress file is needed unless the hub's own netvm is in AI space.
 
 Reach the hub over a network you control (a tailnet, Headscale, WireGuard).
 
-**5. Projects (optional).** A project gets its own lead agent and workers. In
-dom0, as root:
+**5. Projects (optional).** A project gets its own lead agent and workers.
+*New project...* in the window, or in dom0, as root:
 
 ```sh
 sudo qmcp project create osint --lead-template ai-debian-13 --lead-netvm ai-net-router \
@@ -191,8 +203,9 @@ built from the approved templates (the lead's own when it is in AI space, plus
 any `--template`), on the listed networks, inside the quota. `--lead-clone
 QUBE` copies one of the hub's own qubes that you prepared as an agent instead,
 and `--lead-promote QUBE` makes one of the hub's qubes the lead in place. Put the client in the lead as you did in the hub, give it its
-own model key, and connect its agent the same way. `qmcp project` also edits,
-moves qubes between slots, removes or changes a lead, and deletes a project.
+own model key, and connect its agent the same way. `qmcp project`, and the
+window, also edit, move qubes between slots, remove or change a lead, and
+delete a project.
 
 ## Tests
 
@@ -206,7 +219,10 @@ rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
 `tests/project_suite.py` run in the hub against a real dom0; the last carries
 `tests/lead_seat.py` into a project's lead and runs it there. On a test
 machine running Qubes 4.3.1 they passed 38 of 38 checks, 23 of 23 probes and
-66 of 66 checks on 2026-10-01.
+66 of 66 checks on 2026-10-01. `tests/test_gui.py` drives the window's forms
+through the real `qmcp` command and fails if the command has a command,
+option or field the window neither offers nor exempts; `tests/GUI-CHECKLIST.md`
+is the click-through for a person.
 
 ## Reviewer asks
 

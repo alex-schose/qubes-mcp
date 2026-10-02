@@ -822,6 +822,80 @@ class EditAndCli(ProjectBase):
 
 
 
+class BadgeOrder(ProjectBase):
+    """Found by the M2b audit (2026-10-02). The rulebook's slot lines route on
+    `qmcp-lead-pNN` alone (root exec, copy and firewall into the slot's
+    members), so no failure part-way may leave that badge on a qube that has
+    lost `qmcp-lead`: that is a principal the services refuse and the policy
+    still serves."""
+
+    def assert_no_bare_slot_badge(self):
+        tags = self.tags(LEAD)
+        self.assertFalse("qmcp-lead-p01" in tags and "qmcp-lead" not in tags, tags)
+
+    def test_removing_a_lead_that_fails_between_the_badges(self):
+        self.app.fail.add("tag.discard:qmcp-lead-p01")
+        with self.assertRaises(Exception):
+            fleet.remove_lead(self.app, "osint")
+        self.assert_no_bare_slot_badge()
+
+    def test_removing_a_lead_that_fails_on_the_last_badge(self):
+        self.app.fail.add("tag.discard:qmcp-lead")
+        with self.assertRaises(Exception):
+            fleet.remove_lead(self.app, "osint")
+        self.assert_no_bare_slot_badge()
+        self.assertNotIn("qmcp-lead-p01", self.tags(LEAD))      # the routed badge went first
+
+    def test_adding_puts_the_routed_badge_last(self):
+        vm = self.app.domains["ai-work2"]
+        self.app.fail.add("tag.add:qmcp-lead-p03")
+        with self.assertRaises(Exception):
+            fleet._set_tags(vm, add={"ai-managed", "qmcp-lead", "qmcp-lead-p03"})
+        self.assertIn("qmcp-lead", self.tags("ai-work2"))
+        self.assertNotIn("qmcp-lead-p03", self.tags("ai-work2"))
+
+
+class RevokeAndTagOrder(ProjectBase):
+    """From the M2b release gate (2026-10-02): `qmcp revoke` stripped badges in
+    name order, so `ai-managed` went before `qmcp-proj-pNN`. A failure between
+    the two left a qube outside AI space that its slot's lead still reaches
+    through the rulebook. And `_set_tags` added before it removed."""
+
+    def test_revoke_takes_the_slot_badge_first(self):
+        self.app.fail.add("tag.discard:qmcp-proj-p01")
+        with self.assertRaises(Exception):
+            fleet.revoke(self.app, "ai-osint-w1", shutdown=False)
+        tags = self.tags("ai-osint-w1")
+        self.assertFalse("qmcp-proj-p01" in tags and "ai-managed" not in tags, tags)
+        self.app.fail.clear()
+        fleet.revoke(self.app, "ai-osint-w1", shutdown=False)
+        self.assertFalse({t for t in self.tags("ai-osint-w1") if t.startswith(("qmcp-", "ai-"))})
+
+    def test_a_change_of_slot_never_holds_both(self):
+        vm = self.app.domains["ai-osint-w1"]
+        self.app.fail.add("tag.discard:qmcp-proj-p01")
+        with self.assertRaises(Exception):
+            fleet._set_tags(vm, add={"qmcp-proj-p02"}, remove={"qmcp-proj-p01"})
+        self.assertNotIn("qmcp-proj-p02", self.tags("ai-osint-w1"))   # removal comes first
+
+
+class PromoteKeepsItsName(ProjectBase):
+    """Found while testing the window, 2026-10-02: promoting one of the hub's
+    qubes with --keep-old was refused whenever the old lead had the default
+    name, with advice (--lead-name) a promotion cannot take: a promoted lead
+    keeps its own name, so the default name never clashes."""
+
+    def test_promote_with_keep_old(self):
+        report = fleet.set_lead(self.app, "osint", "promote", "ai-work2", keep_old=True)
+        self.assertIn("p01: lead ai-work2 (promoted)", report)
+        self.assertEqual(projects.find(self.records(), "osint").lead, "ai-work2")
+        self.assertIn("qmcp-proj-p01", self.tags(LEAD))
+
+    def test_a_fresh_lead_still_needs_another_name(self):
+        with self.assertRaises(fleet.ProjectError):
+            fleet.set_lead(self.app, "osint", "template", "ai-debian-13", keep_old=True)
+
+
 class HardwareFindings(ProjectBase):
     """Found on the development box (Qubes 4.3.1), 2026-10-01."""
 
