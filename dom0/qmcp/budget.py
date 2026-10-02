@@ -10,8 +10,13 @@ Two operator files, re-read on every call:
   /etc/qmcp/pool-cap     ceiling on the sum
   /etc/qmcp/private-cap  ceiling on any one qube's requested `private`
 
+A project's lead creates inside a second limit, the project's disk quota from
+its record: the same sum over the project's members only. A lead's create must
+fit both. The lead itself is not a member, so only the fleet cap counts it.
+
 `qmcp.GetPoolStats` and every create gate share `persistent_sum`, so the
-`(used, cap, headroom)` the hub reads predicts the gate exactly. Refusals
+`(used, cap, headroom)` the hub reads predicts its gate exactly, and a lead's
+predicts its quota; the fleet cap applies to a lead's create on top. Refusals
 never echo numbers.
 
 Creates are serialised by an exclusive lock held from the cap check through
@@ -40,6 +45,7 @@ ERR_CAP_EXCEEDED = "pool cap exceeded"
 ERR_STATS_UNAVAILABLE = "pool stats unavailable"
 ERR_PRIVATE_CAP_MISSING = "private cap not configured"
 ERR_PRIVATE_TOO_LARGE = "private size exceeds per-qube limit"
+ERR_QUOTA_EXCEEDED = "project quota exceeded"
 
 
 def _read_int_file(path: str) -> int | None:
@@ -78,8 +84,9 @@ def persistent_bytes(vm) -> int:
     return total
 
 
-def persistent_sum(app) -> int:
-    """Σ persistent_bytes over AI space. Raises if anything in AI space cannot
+def persistent_sum(app, badge: str | None = None) -> int:
+    """Σ persistent_bytes over AI space, or over the qubes in AI space that
+    wear `badge` (a project's member badge). Raises if anything counted cannot
     be read: an under-count would let a create through the cap. A qube whose
     tags cannot be read is not in AI space and is skipped."""
     total = 0
@@ -88,7 +95,7 @@ def persistent_sum(app) -> int:
             tags = set(vm.tags)
         except Exception:
             continue
-        if UMBRELLA in tags:
+        if UMBRELLA in tags and (badge is None or badge in tags):
             total += persistent_bytes(vm)
     return total
 
@@ -123,12 +130,32 @@ def check_cap(app, estimate: int, path: str | None = None) -> None:
         raise refuse(ERR_CAP_EXCEEDED)
 
 
+def check_quota(app, badge: str, quota: int, estimate: int) -> None:
+    """A lead's create must fit its project's quota (the members' sum)."""
+    try:
+        used = persistent_sum(app, badge)
+    except Exception as e:
+        raise Refusal({"ok": False, "error": ERR_STATS_UNAVAILABLE},
+                      error_class=type(e).__name__) from None
+    if used + estimate > quota:
+        raise refuse(ERR_QUOTA_EXCEEDED)
+
+
 def acquire_create_lock(path: str | None = None, timeout: float | None = None) -> int:
-    """The create lock, or a refusal. Released when the process exits."""
+    """The create lock, or a refusal. Released when the process exits.
+
+    The services (a non-root dom0 user in `qubes`) and the operator's project
+    commands (root) share this file, so whoever creates it must leave it
+    group-writable: created by root under sudo it came out 0600 (measured on
+    Qubes 4.3.1) and locked every service out of it. tmpfiles also declares
+    it 0660."""
+    old = os.umask(0o007)
     try:
         fd = os.open(LOCK_PATH if path is None else path, os.O_RDWR | os.O_CREAT, 0o660)
     except OSError:
         raise refuse("qmcp runtime directory unavailable") from None
+    finally:
+        os.umask(old)
     deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None else timeout)
     while True:
         try:

@@ -20,7 +20,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, birth, budget, core, fleet, services  # noqa: E402
+from qmcp import audit, birth, budget, core, fleet, projects, services  # noqa: E402
 import fakequbes  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
@@ -46,6 +46,8 @@ class Base(unittest.TestCase):
             (fleet, "ENFORCE_MODE_PATH", self.tmp / "enforce-mode"),
             (fleet, "GUARDED_LIST_PATH", self.tmp / "guarded"),
             (services, "DISPOSE_WAIT_S", 0.01),
+            (projects, "PROJECTS_PATH", self.tmp / "projects.json"),
+            (projects, "LOCK_PATH", self.tmp / "run" / "projects.lock"),
         ]:
             self._saved.append((mod, attr, getattr(mod, attr)))
             setattr(mod, attr, value if isinstance(value, float) else str(value))
@@ -304,7 +306,8 @@ class Creates(Base):
         r = self.spawn()
         self.assertEqual(r, {"ok": True, "name": "ai-new"})
         vm = self.app.domains["ai-new"]
-        self.assertEqual(self.tags("ai-new"), {"ai-managed", "qmcp-owner_mcp-control"})
+        # The hub's AppVMs join p00, its own slot.
+        self.assertEqual(self.tags("ai-new"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00"})
         self.assertEqual(vm.netvm.name, "ai-net-router")
         self.assertIsNone(vm.default_dispvm)     # the add_new_vm default was default-dvm
         # Pinned, not following a default: a qube left on the global default
@@ -362,7 +365,7 @@ class Creates(Base):
         tpl.tags.add("qmcp-egress-locked_ai-net-router")
         self.assertTrue(self.spawn()["ok"])
         self.assertEqual(self.tags("ai-new"), {"ai-managed", "qmcp-owner_mcp-control", "anon-vm",
-                                               "qmcp-egress-locked_ai-net-router"})
+                                               "qmcp-egress-locked_ai-net-router", "qmcp-proj-p00"})
 
     def test_private_size(self):
         self.egress("ai-net-router")
@@ -446,7 +449,7 @@ class Creates(Base):
         src.tags.discard("qmcp-owner_mcp-control")
         r = self.clone()
         self.assertEqual(r, {"ok": True, "name": "ai-clone"})
-        self.assertEqual(self.tags("ai-clone"), {"ai-managed", "qmcp-owner_mcp-control",
+        self.assertEqual(self.tags("ai-clone"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00",
                                                  "qmcp-egress-locked_ai-net-router", "operator-note"})
         vm = self.app.domains["ai-clone"]
         self.assertEqual(vm.netvm.name, "ai-net-router")   # the source answers for itself

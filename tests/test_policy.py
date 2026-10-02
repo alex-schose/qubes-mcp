@@ -50,12 +50,22 @@ ADMIN_METHODS = [m for m in (HERE / "data" / "qubesd-admin-methods-4.3.txt")
 HUB = "mcp-control"
 AI = "ai-managed"
 G = "qmcp-guarded"
+SLOTS = [f"p{n:02d}" for n in range(16)]
+PROJECT_SLOTS = SLOTS[1:]
 
 WRAPPERS = ["qmcp.ListAIManagedQubes", "qmcp.GetPropertyAIManaged",
             "qmcp.SetPropertyAIManaged", "qmcp.SetFeatureAIManaged",
             "qmcp.LifecycleAIManaged", "qmcp.SpawnAIManagedQube",
             "qmcp.CloneAIManagedQube", "qmcp.SpawnDisposableAIManaged",
             "qmcp.AIManagedEvents", "qmcp.GetPoolStats"]
+#: A lead calls every dom0 service except the event stream.
+LEAD_WRAPPERS = [w for w in WRAPPERS if w != "qmcp.AIManagedEvents"]
+LEAD_TO_MEMBER = [("qmcp.RunInAIManaged", "allow user=root"),
+                  ("qmcp.CopyToAIManaged", "allow user=root"),
+                  ("admin.vm.firewall.Get", "allow target=@adminvm"),
+                  ("admin.vm.firewall.Set", "allow target=@adminvm"),
+                  ("admin.vm.firewall.Reload", "allow target=@adminvm"),
+                  ("qubes.Filecopy", "allow")]
 POLICY_API = ["policy.List", "policy.include.List", "policy.Get", "policy.include.Get",
               "policy.GetFiles", "policy.Replace", "policy.include.Replace", "policy.Remove",
               "policy.include.Remove", "policy.RegisterArgument", "policy.UnregisterArgument",
@@ -102,6 +112,14 @@ FLEET = {
     "sys-firewall": _dom(),
     "sys-usb": _dom(),
 }
+# Every slot: a lead (p01-p15), two members and a dump sink.
+for _s in SLOTS:
+    if _s != "p00":
+        FLEET[f"lead-{_s}"] = _dom(tags=[AI, "qmcp-lead", f"qmcp-lead-{_s}"])
+    FLEET[f"w-{_s}-a"] = _dom(tags=[AI, f"qmcp-proj-{_s}"])
+    FLEET[f"w-{_s}-b"] = _dom(tags=[AI, f"qmcp-proj-{_s}"])
+    FLEET[f"sink-{_s}"] = _dom(tags=["ai-dump", f"qmcp-dump-{_s}"])
+FLEET["w-p01-g"] = _dom(tags=[AI, G, "qmcp-proj-p01"])
 SYSINFO = {"domains": FLEET}
 
 
@@ -289,6 +307,55 @@ def _cases() -> list[Case]:
     add("RESIDUAL managed template updates", "qubes.UpdatesProxy", "ai-tpl", "@default", "allow target=sys-net", "allow")
     add("appvm update proxy", "qubes.UpdatesProxy", "ai-work", "@default", "deny", "allow")
     add("operator qube untouched", "qubes.OpenInVM", "personal", "@dispvm", "allow", "allow")
+
+    # --- projects: every slot's own lines
+    for s in SLOTS:
+        for a, b in ((f"w-{s}-a", f"w-{s}-b"), (f"w-{s}-b", f"w-{s}-a")):
+            add(f"{s} member copies to member", "qubes.Filecopy", a, b, "allow", "allow")
+        add(f"{s} member copies to its sink", "qubes.Filecopy", f"w-{s}-a", f"sink-{s}", "allow", "allow")
+        add(f"{s} sink cannot copy back", "qubes.Filecopy", f"sink-{s}", f"w-{s}-a", "deny", "deny")
+        if s == "p00":
+            continue
+        for svc, want in LEAD_TO_MEMBER:
+            add(f"{s} lead -> member", svc, f"lead-{s}", f"w-{s}-a", want, want)
+        add(f"{s} lead copies to its sink: dialog", "qubes.Filecopy", f"lead-{s}", f"sink-{s}", "ask", "ask")
+        add(f"{s} worker reaches its lead", "qubes.Filecopy", f"w-{s}-a", f"lead-{s}", "deny", "deny")
+        add(f"{s} worker drives its lead", "qmcp.RunInAIManaged", f"w-{s}-a", f"lead-{s}", "deny", "deny")
+        for svc in LEAD_WRAPPERS:
+            add(f"{s} lead -> dom0 wrapper", svc, f"lead-{s}", "dom0", "allow", "allow")
+    # --- projects: nothing crosses a slot
+    for svc, _ in LEAD_TO_MEMBER[:5]:
+        add("lead -> another project's member", svc, "lead-p01", "w-p02-a", "deny", "deny")
+        add("lead -> the hub's p00 qube", svc, "lead-p01", "w-p00-a", "deny", "deny")
+        add("lead -> a guarded member", svc, "lead-p01", "w-p01-g", "deny", "deny")
+    add("lead copy into another project: dialog", "qubes.Filecopy", "lead-p01", "w-p02-a", "ask", "ask")
+    add("member copy into another project: dialog", "qubes.Filecopy", "w-p01-a", "w-p02-a", "ask", "ask")
+    add("member copy into another project's sink: dialog", "qubes.Filecopy", "w-p01-a", "sink-p02", "ask", "ask")
+    add("member copy into p00: dialog", "qubes.Filecopy", "w-p01-a", "w-p00-a", "ask", "ask")
+    add("p00 copy into a project: dialog", "qubes.Filecopy", "w-p00-a", "w-p01-a", "ask", "ask")
+    add("a guarded member is still guarded", "qubes.Filecopy", "w-p01-a", "w-p01-g", "deny", "deny")
+    for svc in CHILD_TO_HUB:
+        add("worker -> another lead", svc, "w-p01-a", "lead-p02", "deny", "deny")
+        add("lead -> another lead", svc, "lead-p01", "lead-p02", "deny", "deny")
+        add("sink -> its lead", svc, "sink-p01", "lead-p01", "deny", "deny")
+        add("lead -> the hub", svc, "lead-p01", HUB, "deny", "deny")
+    add("a lead's event stream", "qmcp.AIManagedEvents", "lead-p01", "dom0", "deny", "deny")
+    for svc in WRAPPERS:
+        add("worker -> dom0 wrapper", svc, "w-p01-a", "dom0", "deny", "deny")
+        add("hub's p00 qube -> dom0 wrapper", svc, "w-p00-a", "dom0", "deny", "deny")
+    add("lead admin.vm.List", "admin.vm.List", "lead-p01", "dom0", "deny", "deny")
+    add("lead tags its member", "admin.vm.tag.Set", "lead-p01", "w-p01-a", "deny", "deny")
+    add("lead property.Set on its member", "admin.vm.property.Set", "lead-p01", "w-p01-a", "deny", "deny")
+    add("lead VMShell into its member", "qubes.VMShell", "lead-p01", "w-p01-a", "deny", "deny")
+    add("lead raw @dispvm", "qubes.VMShell", "lead-p01", "@dispvm", "deny", "deny")
+    add("lead policy.Replace", "policy.Replace", "lead-p01", "dom0", "deny", "deny")
+    add("worker drives exec in a peer", "qmcp.RunInAIManaged", "w-p01-a", "w-p01-b", "deny", "deny")
+    add("p00 qube drives exec in a peer", "qmcp.RunInAIManaged", "w-p00-a", "w-p00-b", "deny", "deny")
+    # --- the hub operates every project
+    add("hub exec in a lead", "qmcp.RunInAIManaged", HUB, "lead-p01", "allow user=root", "allow user=root")
+    add("hub exec in a worker", "qmcp.RunInAIManaged", HUB, "w-p01-a", "allow user=root", "allow user=root")
+    add("hub copies into a sink: dialog", "qubes.Filecopy", HUB, "sink-p01", "ask", "ask")
+    add("hub exec in a sink", "qmcp.RunInAIManaged", HUB, "sink-p01", "deny", "deny")
     return c
 
 
@@ -376,16 +443,49 @@ class PolicyShape(unittest.TestCase):
         bad = [n for n, l in self.lines if "#" in l]
         self.assertEqual(bad, [], "a rule line carries a comment")
 
+    SLOT_SOURCES = ({"@tag:qmcp-lead"} | {f"@tag:qmcp-lead-{s}" for s in PROJECT_SLOTS}
+                    | {f"@tag:qmcp-proj-{s}" for s in SLOTS})
+
     def test_sources_are_ours(self):
-        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump"}
+        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump"} | self.SLOT_SOURCES
         bad = [(n, l) for n, l in self.lines if l.split()[2] not in allowed]
         self.assertEqual(bad, [])
 
     def test_every_allow_names_a_known_principal(self):
         # No allow or ask for an open-ended source: @anyvm and @tag:ai-dump only deny.
+        known = {HUB, "@tag:ai-managed"} | self.SLOT_SOURCES
         bad = [(n, l) for n, l in self.lines
-               if l.split()[4] in ("allow", "ask") and l.split()[2] not in (HUB, "@tag:ai-managed")]
+               if l.split()[4] in ("allow", "ask") and l.split()[2] not in known]
         self.assertEqual(bad, [])
+
+    def test_every_slot_has_exactly_its_block(self):
+        """No slot line reaches across slots, and none is missing or extra: a
+        typo in one slot of sixteen would otherwise read like all the rest."""
+        slot_lines = {}
+        for n, l in self.lines:
+            f = l.split()
+            tags = [x for x in (f[2], f[3]) if re.match(r"@tag:qmcp-(lead|proj|dump)-p\d\d$", x)]
+            if tags:
+                slots = {x[-3:] for x in tags}
+                self.assertEqual(len(slots), 1, f"line {n} crosses slots: {l}")
+                slot_lines.setdefault(slots.pop(), set()).add(" ".join(f))
+        self.assertEqual(sorted(slot_lines), SLOTS)
+        for s in SLOTS:
+            L, M, D = f"@tag:qmcp-lead-{s}", f"@tag:qmcp-proj-{s}", f"@tag:qmcp-dump-{s}"
+            want = {f"qubes.Filecopy * {M} {M} allow", f"qubes.Filecopy * {M} {D} allow"}
+            if s != "p00":
+                want |= {f"qmcp.RunInAIManaged * {L} {M} allow user=root",
+                         f"qmcp.CopyToAIManaged * {L} {M} allow user=root",
+                         f"admin.vm.firewall.Get * {L} {M} allow target=@adminvm",
+                         f"admin.vm.firewall.Set * {L} {M} allow target=@adminvm",
+                         f"admin.vm.firewall.Reload * {L} {M} allow target=@adminvm",
+                         f"qubes.Filecopy * {L} {M} allow"}
+            self.assertEqual(slot_lines[s], want, s)
+
+    def test_leads_reach_dom0_only_through_the_wrappers(self):
+        lead = [(l.split()[0], l.split()[3], l.split()[4]) for n, l in self.lines
+                if l.split()[2] == "@tag:qmcp-lead"]
+        self.assertEqual(sorted(lead), sorted((w, "@adminvm", "allow") for w in LEAD_WRAPPERS))
 
     def test_admin_api_list_is_complete(self):
         denied = {l.split()[0] for n, l in self.lines
@@ -393,12 +493,14 @@ class PolicyShape(unittest.TestCase):
         missing = sorted(set(ADMIN_METHODS) - denied)
         self.assertEqual(missing, [], "admin methods with no AI-space deny")
 
-    def test_no_dialog_free_copy_in_m1(self):
-        # This release has no dialog-free copy from AI space at all.
-        bad = [(n, l) for n, l in self.lines
-               if l.split()[0] == "qubes.Filecopy" and l.split()[2] == "@tag:ai-managed"
-               and l.split()[4] == "allow"]
-        self.assertEqual(bad, [])
+    def test_dialog_free_copies_stay_inside_a_slot(self):
+        # The only dialog-free copies are inside one slot or into its own sink.
+        for n, l in self.lines:
+            f = l.split()
+            if f[0] == "qubes.Filecopy" and f[4] == "allow":
+                self.assertRegex(f[2], r"^@tag:qmcp-(lead|proj)-p\d\d$", l)
+                self.assertRegex(f[3], r"^@tag:qmcp-(proj|dump)-p\d\d$", l)
+                self.assertEqual(f[2][-3:], f[3][-3:], l)
 
     def test_hub_is_a_name_never_a_tag(self):
         self.assertTrue(re.search(r"^\S+\s+\*\s+mcp-control\s", OURS.read_text(), re.M))

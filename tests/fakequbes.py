@@ -214,6 +214,7 @@ class FakeApp:
         self.fail: set = set()
         self.default_netvm = None
         self.default_dispvm = None
+        self.default_template = None
         self._disp_counter = 1000
         self.calls: list = []
 
@@ -320,7 +321,7 @@ def standard_fleet() -> FakeApp:
     app.vm("personal", netvm=fw)
     ddvm = app.vm("default-dvm", template_for_dispvms=True, netvm=fw)
     app.default_dispvm = ddvm
-    app.vm("debian-13", klass="TemplateVM")
+    app.default_template = app.vm("debian-13", klass="TemplateVM")
     app.vm("ai-debian-13", klass="TemplateVM", tags={"ai-managed"})
     app.vm("ai-tpl-g", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded"})
     router = app.vm("ai-net-router", provides_network=True, netvm=fw,

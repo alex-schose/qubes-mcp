@@ -13,9 +13,11 @@ stays detectable; `qmcp check` reports such qubes.
 **Strip on create.** `clone_vm` copies the source's tags and
 `admin.vm.CreateDisposable` copies the disposable template's, so a created
 qube must not be assumed clean. `stamp()` adds what the child must carry —
-the umbrella and a provenance badge — carries restrictions forward, removes
-every other tag in our controlled vocabulary (`qmcp-guarded` included: a child
-spawned from a guarded template is managed), and then reads the tags back and
+the umbrella, a provenance badge and, for a workload, the creator's slot
+badge — carries restrictions forward, removes every other tag in our
+controlled vocabulary (`qmcp-guarded` included: a child spawned from a guarded
+template is managed; and every role and slot badge, so a clone of a lead or
+of another project's member is neither), and then reads the tags back and
 asserts the exact result, both ways. The caller rolls the qube back if it
 raises. Tags outside our vocabulary (the operator's own, `created-by-*`) are
 left alone.
@@ -133,20 +135,22 @@ def is_restriction(tag: str) -> bool:
     return tag in RESTRICTION_TAGS or tag.startswith(RESTRICTION_PREFIXES)
 
 
-def expected_tags(source_tags, principal: str) -> set:
+def expected_tags(source_tags, principal: str, slot_badge: str | None = None) -> set:
     want = {UMBRELLA, owner_tag(principal)}
+    if slot_badge is not None:
+        want.add(slot_badge)
     want |= {t for t in set(source_tags) if is_restriction(t)}
     return want
 
 
-def stamp(io: TagIO, source_tags, principal: str) -> set:
+def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None) -> set:
     """Make the child's controlled tags exactly `expected_tags`, or raise.
 
     Add before remove: a failure in between leaves an over-badged qube that
     the caller's rollback can still find, never an umbrella-less one it
     cannot.
     """
-    want = expected_tags(source_tags, principal)
+    want = expected_tags(source_tags, principal, slot_badge)
     have = set(io.read())
     for tag in sorted(want - have):
         io.add(tag)

@@ -1,12 +1,16 @@
 """qmcp.services — the ten qmcp.* qrexec services.
 
 Each one is installed in dom0 under its service name by `dom0/rpc/qmcp-service`,
-which calls `main(<name>)`. Every call runs the same funnel: the caller must be
-a principal, holds one of its concurrency slots, sends at most 64 KiB, and gets
-exactly one JSON reply. State-changing services leave one audit line.
+which calls `main(<name>)`. Every call runs the same funnel: the caller holds
+one of its concurrency slots, sends at most 64 KiB, must then be a principal
+(the hub, or a lead whose badges and record agree), and gets exactly one JSON
+reply. State-changing services leave one audit line.
 
-Wire shapes are unchanged from v0.9.16, except that a listed qube now says
-whether it is guarded.
+The hub operates all of AI space. A lead operates its own project's members,
+spawns only from its project's approved templates, puts new workers only on
+its project's worker networks, creates only inside its project's name space
+and disk quota, and has no event stream. Everything else a lead names answers
+like a qube that does not exist.
 
 No exception text reaches the caller: every failure answers with a
 fixed phrase, and the exception's CLASS goes to the audit line, which the
@@ -19,7 +23,7 @@ import re
 import sys
 import time
 
-from qmcp import birth, budget, core, scope
+from qmcp import birth, budget, core, projects, scope
 from qmcp.core import refuse
 
 LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"})
@@ -40,6 +44,8 @@ MAX_FEATURE_VALUE = 4096
 LIFECYCLE_ACTIONS = frozenset({"start", "shutdown", "kill", "pause", "unpause", "remove"})
 #: DispVMTemplate is here because the hub may build disposable templates.
 SPAWN_KLASSES = frozenset({"AppVM", "DispVMTemplate", "DispVM"})
+#: A lead builds workloads only: disposable templates are never project members.
+LEAD_SPAWN_KLASSES = frozenset({"AppVM", "DispVM"})
 
 #: How long a failed rollback keeps retrying the removal of a disposable.
 DISPOSE_TRIES = 20
@@ -91,12 +97,78 @@ def _local_app():
         raise refuse("qubesadmin unavailable") from None
 
 
+def _records():
+    """The project records, for a check that needs every project (the hub's
+    name space). Unreadable records refuse: the check cannot be made."""
+    try:
+        return projects.load()
+    except projects.ProjectsUnreadable:
+        raise refuse("project records unreadable") from None
+
+
+def _slot_of(tags) -> str | None:
+    """The slot a qube belongs to, as a list shows it: a member's, or a lead's."""
+    slots = projects.member_slots(tags) | projects.lead_slots(tags)
+    return next(iter(slots)) if len(slots) == 1 else None
+
+
+def _create_name_refusal(name, who) -> str | None:
+    """Judged on the name, the prefix and the project records alone, before
+    any qube is looked up, so a create is no oracle over names. A lead creates
+    only inside its project's space; the hub, inside its prefix but outside
+    every project's space, so a lead collides only with its own workers or
+    with a qube the operator named inside its space or moved out of it."""
+    prefix = birth.read_name_prefix()
+    if not who.is_hub():
+        return birth.name_refusal(name, who.project.space(prefix))
+    err = birth.name_refusal(name, prefix)
+    if err:
+        return err
+    if projects.in_a_project_space(name, _records(), prefix):
+        return "name is inside a project's name space"
+    return None
+
+
+def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False, source_tags=()):
+    """The slot badge a new qube wears. A lead's workloads join its project.
+    The hub's AppVMs join p00; its disposables do not, since one often opens
+    hostile content and in p00 it could drop files into the hub's other qubes
+    without a dialog, and nor does its clone of a project's qube or a lead, for
+    the same reason. Templates and disposable templates join no slot."""
+    if new_klass not in ("AppVM", "DispVM") or template_for_dispvms:
+        return None
+    if not who.is_hub():
+        return projects.member_badge(who.slot)
+    tags = set(source_tags)
+    if projects.member_slots(tags) - {projects.HUB_SLOT} or projects.lead_slots(tags) \
+            or projects.LEAD in tags:
+        return None
+    return projects.member_badge(projects.HUB_SLOT) if new_klass == "AppVM" else None
+
+
+def _recheck(app, call, template=None, netvm=None) -> None:
+    """Under the create lock, the caller must still be what it was: a project
+    command holds the same lock, so a create that waited for one must not run
+    on authority it took away. A lead's template and network are checked again
+    against its record as it is now."""
+    who = core.principal(app, call.caller, core.read_hub())
+    if who.kind != call.principal.kind or who.slot != call.principal.slot:
+        raise core.Refusal(core.NOT_AUTHORIZED)
+    call.principal = who
+    if not who.is_hub():
+        if template is not None and template not in who.project.templates:
+            raise refuse("template is not on this project's approved list")
+        if netvm is not None and netvm not in who.project.named_networks():
+            raise refuse("netvm must be one of this project's worker networks")
+
+
 # ------------------------------------------------------------------ reads
 
 def svc_list(app, call, req):
+    who = call.principal
     out = []
     for vm in app.domains:
-        if not core.in_scope(vm):
+        if not core.visible(vm, who):
             continue
         try:
             power = vm.get_power_state()
@@ -110,20 +182,24 @@ def svc_list(app, call, req):
             template = getattr(vm, "template", None)
         except Exception:
             template = None
+        tags = core.tags_of(vm)
         out.append({
             "name": vm.name,
             "klass": vm.klass,
             "label": label,
-            "template": scope.scoped_name(app, template),
+            "template": scope.scoped_name(app, template, who),
             "power_state": power,
             "guarded": core.is_guarded(vm),
+            "slot": _slot_of(tags),
+            "lead": projects.LEAD in tags,
         })
     return {"ok": True, "qubes": out}
 
 
 def svc_get_property(app, call, req):
     name, prop = _string(req, "name"), _string(req, "property")
-    vm = core.readable(app, name)
+    who = call.principal
+    vm = core.readable(app, name, who)
     if prop == "power_state":
         return {"ok": True, "value": vm.get_power_state()}
     if prop == "tags":
@@ -143,30 +219,49 @@ def svc_get_property(app, call, req):
             netvm = getattr(vm, "netvm", None)
         except Exception:
             netvm = None
-        if netvm is not None and scope.scoped_name(app, netvm) == scope.OUT_OF_SCOPE:
+        if netvm is not None and scope.scoped_name(app, netvm, who) == scope.OUT_OF_SCOPE:
             return {"ok": True, "value": scope.OUT_OF_SCOPE}
     try:
         value = getattr(vm, prop)
     except AttributeError:
         raise refuse(f"property '{prop}' does not exist") from None
-    value = scope.scoped_value(app, value)
+    value = scope.scoped_value(app, value, who)
     if not isinstance(value, (str, int, float, bool, list, type(None))):
         raise refuse("property not readable")
     return {"ok": True, "value": value}
 
 
 def svc_pool_stats(app, call, req):
-    cap = budget.read_cap()
-    if cap is None:
-        raise refuse(budget.ERR_CAP_MISSING)
+    """The caller's disk budget: AI space against the fleet cap for the hub; the
+    project's members against its quota for a lead, with the project's name
+    space, approved templates, worker networks and dump sink. A lead never
+    sees the fleet's figures; a create the fleet cap refuses inside its quota
+    does tell it that the rest of AI space is full (`qmcp check` warns when the
+    projects' quotas add up to more than the cap)."""
+    who = call.principal
+    prefix = birth.read_name_prefix()
+    if who.is_hub():
+        cap = budget.read_cap()
+        if cap is None:
+            raise refuse(budget.ERR_CAP_MISSING)
+        badge = None
+    else:
+        cap, badge = who.project.quota, projects.member_badge(who.slot)
     try:
-        used = budget.persistent_sum(app)
+        used = budget.persistent_sum(app, badge)
     except Exception:
         raise refuse(budget.ERR_STATS_UNAVAILABLE) from None
-    return {"ok": True,
-            "ai_managed_bytes_used": used,
-            "ai_managed_bytes_cap": cap,
-            "ai_managed_bytes_headroom": max(0, cap - used)}
+    out = {"ok": True,
+           "ai_managed_bytes_used": used,
+           "ai_managed_bytes_cap": cap,
+           "ai_managed_bytes_headroom": max(0, cap - used),
+           "name_prefix": prefix}
+    if not who.is_hub():
+        p = who.project
+        out.update({"project": p.label, "name_prefix": p.space(prefix),
+                    "templates": list(p.templates), "networks": list(p.networks),
+                    "dump": p.dump})
+    return out
 
 
 # ------------------------------------------------------------------ writes
@@ -174,7 +269,7 @@ def svc_pool_stats(app, call, req):
 def svc_set_property(app, call, req):
     name, prop = _string(req, "name"), _string(req, "property")
     call.summary.update({"name": _clip(name), "property": _clip(prop)})
-    vm = core.operand(app, name, call.caller)
+    vm = core.operand(app, name, call.principal)
     if prop not in SETTABLE_PROPS:
         raise refuse("property not settable")
     if "value" not in req:
@@ -209,7 +304,7 @@ def _feature_allowed(key: str) -> bool:
 def svc_set_feature(app, call, req):
     name, feature = _string(req, "name"), _string(req, "feature")
     call.summary.update({"name": _clip(name), "feature": _clip(feature)})
-    vm = core.operand(app, name, call.caller)
+    vm = core.operand(app, name, call.principal)
     if not _feature_allowed(feature):
         raise refuse("feature not settable")
     value = req.get("value")
@@ -238,7 +333,10 @@ def svc_lifecycle(app, call, req):
     call.summary.update({"name": _clip(name), "action": _clip(action)})
     if action not in LIFECYCLE_ACTIONS:
         raise refuse(f"action must be one of: {sorted(LIFECYCLE_ACTIONS)}")
-    vm = core.operand(app, name, call.caller)
+    vm = core.operand(app, name, call.principal)
+    # A lead is a project's identity: removing one takes the operator's approval.
+    if action == "remove" and projects.LEAD in core.tags_of(vm):
+        raise refuse("removing a lead takes the operator's approval")
     try:
         if action == "remove":
             del app.domains[name]
@@ -320,11 +418,54 @@ def _not_a_gateway(vm, what: str) -> None:
         raise refuse(f"a {what} that provides network cannot be spawned from")
 
 
+def _lead_netvm(app, req, project, source_vm, authoritative: bool):
+    """A lead's create is born on its project's worker networks, never on the
+    lead's own network. A clone source or a disposable template answers for
+    itself, and its network must be on the list (or none). A spawn from a
+    TemplateVM takes the requested listed network, or the list's first.
+    Requests are judged against the list, which the lead knows, before any
+    lookup. After birth a network can only be cleared, never moved."""
+    named = project.named_networks()
+    specified = "netvm" in req
+    requested = req.get("netvm")
+    if specified and requested is not None and not isinstance(requested, str):
+        raise refuse("netvm must be a qube name or null")
+    if authoritative:
+        try:
+            src = _name_of(getattr(source_vm, "netvm", None))
+        except Exception:
+            raise refuse("birth egress could not be resolved") from None
+        if src is not None and src not in named:
+            raise refuse("the source's network is not one of this project's worker networks")
+        if specified:
+            if requested is None:
+                return None
+            if requested != src:
+                raise refuse("netvm must match the inherited birth egress")
+        if src is not None and not core.in_ai_space_by_name(app, src):
+            raise refuse("birth egress could not be resolved")
+        return src
+    if specified:
+        if requested is None:
+            return None
+        if requested not in named:
+            raise refuse("netvm must be one of this project's worker networks")
+        if not core.in_ai_space_by_name(app, requested):
+            raise refuse("netvm must reference an ai-managed qube")
+        return requested
+    default = project.networks[0]
+    if default is not None and not core.in_ai_space_by_name(app, default):
+        raise refuse("birth egress could not be resolved")
+    return default
+
+
 def _birth_netvm(app, call, req, source_vm, authoritative: bool):
     """The netvm a create must use (the birth chain in birth.py), honouring an explicit
     `netvm` in the request: null is always allowed (offline cannot leak); a
     name must be in AI space AND equal the inherited answer. The explicit name
     is checked by name, in one round trip either way, so it is no oracle."""
+    if not call.principal.is_hub():
+        return _lead_netvm(app, req, call.principal.project, source_vm, authoritative)
     specified = "netvm" in req
     requested = req.get("netvm")
     if specified and requested is not None and not isinstance(requested, str):
@@ -369,6 +510,15 @@ def _estimate(fn, *args) -> int:
                            error_class=type(e).__name__) from None
 
 
+def _check_budget(app, call, estimate: int) -> None:
+    """Under the create lock: a lead's project quota first, so a request over
+    its quota never reaches the fleet cap, then the fleet cap."""
+    who = call.principal
+    if not who.is_hub():
+        budget.check_quota(app, projects.member_badge(who.slot), who.project.quota, estimate)
+    budget.check_cap(app, estimate)
+
+
 def _private_size(req):
     size = req.get("private_size")
     if size is None:
@@ -389,16 +539,18 @@ def svc_spawn(app, call, req):
                          "klass": _clip(klass), "label": _clip(label),
                          "netvm": _clip(req.get("netvm")),
                          "private_size": _clip(req.get("private_size"))})
+    who = call.principal
     # The name is judged on its shape alone, before anything is looked up.
-    err = birth.name_refusal(name, birth.read_name_prefix())
+    err = _create_name_refusal(name, who)
     if err:
         raise refuse(err)
-    if klass not in SPAWN_KLASSES:
-        raise refuse(f"klass must be one of: {sorted(SPAWN_KLASSES)}")
+    klasses = SPAWN_KLASSES if who.is_hub() else LEAD_SPAWN_KLASSES
+    if klass not in klasses:
+        raise refuse(f"klass must be one of: {sorted(klasses)}")
     if label not in LABELS:
         raise refuse(f"label must be one of: {sorted(LABELS)}")
     private_size = _private_size(req)
-    tpl = core.reference(app, template, "template")
+    tpl = core.reference(app, template, "template", who)
     if klass in ("AppVM", "DispVMTemplate"):
         if tpl.klass != "TemplateVM":
             raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
@@ -410,8 +562,9 @@ def svc_spawn(app, call, req):
 
     budget.check_private_size(private_size)
     call.fds.append(budget.acquire_create_lock())
+    _recheck(app, call, template=template, netvm=netvm)
     _claim_name(app, call, name)
-    budget.check_cap(app, budget.estimate_new_private(private_size))
+    _check_budget(app, call, budget.estimate_new_private(private_size))
 
     create_klass = "AppVM" if klass == "DispVMTemplate" else klass
     try:
@@ -420,7 +573,8 @@ def svc_spawn(app, call, req):
         raise _create_failed(app, call, name, "create", e)
     step = "birth stamp"
     try:
-        birth.stamp(birth.TagIO.for_vm(vm), core.tags_of(tpl), call.caller)
+        birth.stamp(birth.TagIO.for_vm(vm), core.tags_of(tpl), call.caller,
+                    _slot_badge(who, create_klass, klass == "DispVMTemplate"))
         if klass == "DispVMTemplate":
             step = "disposable template flag"
             vm.template_for_dispvms = True
@@ -447,7 +601,8 @@ def svc_spawn(app, call, req):
 def svc_clone(app, call, req):
     source, name = req.get("source"), req.get("name")
     call.summary.update({"source": _clip(source), "name": _clip(name)})
-    err = birth.name_refusal(name, birth.read_name_prefix())
+    who = call.principal
+    err = _create_name_refusal(name, who)
     if err:
         raise refuse(err)
     if not isinstance(source, str):
@@ -456,15 +611,20 @@ def svc_clone(app, call, req):
     # everything in it, which a guarded qube must never become. A guarded
     # qube may still be spawned FROM; see the residuals in CLAUDE.md for what a
     # spawn carries over. The hub may clone a template it manages.
-    src = core.operand(app, source, call.caller)
+    src = core.operand(app, source, who)
+    src_is_template = src.klass == "TemplateVM" or bool(getattr(src, "template_for_dispvms", False))
+    if src_is_template and not who.is_hub():
+        # Templates and disposable templates are never project members.
+        raise core.Refusal(core.NOT_FOUND)
     _claim_name(app, call, name)
     # A clone is the same kind of qube as its source, so the source always
     # answers for its own network — a cloned template stays off the network.
     netvm = _birth_netvm(app, call, {}, src, authoritative=True)
 
     call.fds.append(budget.acquire_create_lock())
+    _recheck(app, call, netvm=netvm)
     _claim_name(app, call, name)
-    budget.check_cap(app, _estimate(budget.persistent_bytes, src))
+    _check_budget(app, call, _estimate(budget.persistent_bytes, src))
 
     source_tags = core.tags_of(src)
     try:
@@ -473,7 +633,8 @@ def svc_clone(app, call, req):
         raise _create_failed(app, call, name, "clone", e)
     step = "birth stamp"
     try:
-        birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller)
+        birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
+                    _slot_badge(who, src.klass, src_is_template, source_tags))
         step = "network check"
         if core.is_gateway(vm):
             raise RuntimeError("the new qube provides network")
@@ -524,14 +685,16 @@ def _dispose(app, name) -> bool:
 def svc_spawn_disposable(app, call, req):
     template = req.get("template")
     call.summary.update({"template": _clip(template)})
-    dvmt = core.reference(app, template, "template")
+    who = call.principal
+    dvmt = core.reference(app, template, "template", who)
     if not getattr(dvmt, "template_for_dispvms", False):
         raise refuse(f"template '{template}' must be a disposable template")
     _not_a_gateway(dvmt, "disposable template")
     netvm = _birth_netvm(app, call, {}, dvmt, authoritative=True)
 
     call.fds.append(budget.acquire_create_lock())
-    budget.check_cap(app, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
+    _recheck(app, call, template=template, netvm=netvm)
+    _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
 
     source_tags = core.tags_of(dvmt)
     try:
@@ -549,7 +712,8 @@ def svc_spawn_disposable(app, call, req):
     # since a disposable lives only until it halts.
     step = "birth stamp"
     try:
-        birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller)
+        birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
+                    _slot_badge(who, "DispVM"))
         step = "network check"
         if _prop_direct(app, disp, "provides_network")[1] == "True":
             raise RuntimeError("the new qube provides network")
@@ -601,6 +765,9 @@ def svc_events(app, call, req, dispatcher_factory=None):
     for the badges the hub may see; any other tag is dropped whole, event name
     included, since real tag events carry the tag in their name.
     """
+    if not call.principal.is_hub():
+        # Not in this release: a lead polls instead.
+        raise refuse("events are not available to leads")
     duration = req.get("duration")
     if isinstance(duration, bool) or not isinstance(duration, (int, float)):
         raise refuse(f"duration must be a number in [{EVENTS_MIN_S}, {EVENTS_MAX_S}]")
@@ -616,7 +783,7 @@ def svc_events(app, call, req, dispatcher_factory=None):
             raise refuse(f"events must be a list of at most {EVENTS_MAX_FILTERS} "
                          f"non-empty strings of at most {EVENTS_MAX_FILTER_LEN} characters")
     if qube is not None:
-        core.readable(app, qube)
+        core.readable(app, qube, call.principal)
 
     snapshot = set()
     for vm in app.domains:
@@ -716,10 +883,20 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
     handler, state_changing = entry
     try:
         call.caller = core.caller(environ)
-        core.role(call.caller)
-        call.fds.append(core.acquire_call_slot(call.caller))
+        # Concurrency first, before any qubesd work: the hub has its own slots,
+        # and every other caller draws on the leads' shared pool as well.
+        hub = core.read_hub()
+        if hub is not None and call.caller == hub:
+            call.fds.append(core.acquire_call_slot(call.caller))
+        else:
+            call.fds.append(core.acquire_call_slot(call.caller, limit=core.LEAD_CALLS))
+            call.fds.append(core.acquire_call_slot(core.LEADS_POOL_KEY, limit=core.LEADS_POOL))
+        # The request is read before the caller's authority is checked, so a
+        # request still arriving cannot outlast the authority it was checked
+        # against: a lead removed meanwhile is refused here.
         req = core.read_request(sys.stdin if stdin is None else stdin)
         app = (app_factory or _local_app)()
+        call.principal = core.principal(app, call.caller, hub)
         payload = handler(app, call, req)
     except core.Refusal as r:
         payload = r.payload

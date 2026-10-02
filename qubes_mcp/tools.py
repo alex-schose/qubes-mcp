@@ -3,8 +3,8 @@
 server.py (MCP over stdio) and cli.py (the `qubes-mcp` command) share this
 registry and its argument validator, so both accept exactly the same calls.
 
-Nothing in this module is a security control. It runs in the hub qube, on the
-agent's side of the boundary, and an agent that controls the process skips any
+Nothing in this module is a security control. It runs in the hub qube or in a
+project's lead, on the agent's side of the boundary, and an agent that controls the process skips any
 check made here. dom0 is the only enforcement point: which qubes are in scope,
 what is settable, which feature keys are allowed, the name prefix and the
 network a new qube gets are all decided by the dom0 services and the qrexec
@@ -271,14 +271,24 @@ def _run_payload(args: dict) -> dict:
 # --------------------------------------------------------------------------
 
 @_register("qubes_list", """
-    List the qubes in the hub's scope.
+    List the qubes in the caller's scope.
 
-    Each entry is {name, klass, label, template, power_state, guarded}.
+    The hub's scope is all of AI space. A project's lead sees its project's
+    workers, the templates its project may spawn from, and its project's worker
+    networks.
+
+    Each entry is {name, klass, label, template, power_state, guarded, slot,
+    lead}. `slot` is the project slot a qube belongs to (p00 is the hub's own
+    qubes, p01-p15 are projects), or null; `lead` is true for a project's lead.
 
     A qube in scope is in one of two states:
-    - managed (guarded: false): the hub may operate it: start and shut it down,
-      run commands in it, copy files, change its settings, clone or remove it.
-      This includes the templates and disposable templates the hub manages.
+    - managed (guarded: false): the caller may operate it: start and shut it
+      down, run commands in it, copy files, change its settings, clone or
+      remove it. For the hub this includes the templates and disposable
+      templates it manages, and the leads (which only the operator removes).
+      A lead may operate only the entries in its own slot (`slot` set); its
+      approved templates and networks are listed so it can spawn from and
+      onto them.
     - guarded (guarded: true): reference only. It is listed, can be read, and
       can be spawned from (as a template or a disposable template), but is
       never operated.
@@ -296,31 +306,37 @@ def _qubes_list(args: dict) -> dict:
 @_register("qubes_spawn", """
     Create a new qube. It is born managed.
 
-    - name: must start with the operator's reserved prefix (default "ai-");
-      any other name is refused.
+    - name: must start with the caller's name prefix (qubes_get_pool_stats
+      reports it): for the hub, the operator's reserved prefix (default
+      "ai-") but outside every project's names; for a lead, its project's
+      prefix (e.g. "ai-osint-"). Any other name is refused.
     - klass: "AppVM" (the default) or "DispVMTemplate", both built on a
       TemplateVM; or "DispVM", built on a disposable template (a qube with
-      template_for_dispvms=True).
-    - template: the qube to build on, managed or guarded. One that is out of
-      scope or does not exist is refused with "template must reference an
-      ai-managed qube", which never says which of the two it is.
-    - netvm: omit it and the network is inherited: the source's netvm (for a
-      DispVM, its disposable template's), else the hub's own netvm if that is
-      an AI qube, else the operator's configured default; if none applies the
-      create is refused. Pass null for no network, which is always allowed. A
-      name must equal the inherited value: it confirms the network, it cannot
-      choose a different one.
+      template_for_dispvms=True). A lead cannot create a DispVMTemplate.
+    - template: the qube to build on, managed or guarded. A lead may use only
+      its project's approved templates. One that is out of scope or does not
+      exist is refused with "template must reference an ai-managed qube",
+      which never says which of the two it is.
+    - netvm: omit it and the network is inherited. For the hub: the source's
+      netvm (for a DispVM, its disposable template's), else the hub's own
+      netvm if that is an AI qube, else the operator's configured default; if
+      none applies the create is refused, and a name must equal the inherited
+      value. For a lead: its project's default worker network, or another one
+      on the project's list; a DispVM keeps its disposable template's, which
+      must be on the list. A lead's own network is never used. Pass null for
+      no network, which is always allowed. After birth a qube's network can
+      only be cleared (netvm null), never moved to another one.
     - private_size: optional, in bytes. Grows the persistent private volume
-      beyond the Qubes default. It counts against the pool cap (see
-      qubes_get_pool_stats), and a size above the operator's per-qube limit is
-      refused.
+      beyond the Qubes default. It counts against the caller's disk budget
+      (see qubes_get_pool_stats), and a size above the operator's per-qube
+      limit is refused.
 
     dom0 runs one create at a time, so this call may wait for others to finish.
 
     Returns {"ok": true, "name": "<name>"}, with a "warning" if a secondary step
     failed, or {"ok": false, "error": "<reason>"}.
     """, {
-        "name": _prop("string", "Name of the new qube; must carry the reserved prefix."),
+        "name": _prop("string", "Name of the new qube; must carry the caller's prefix."),
         "template": _prop("string", "Template (or, for a DispVM, disposable template) "
                                     "to build on; managed or guarded."),
         "klass": _prop("string", "Kind of qube to create.",
@@ -484,7 +500,7 @@ def _qubes_remove(args: dict) -> dict:
     text fed to it.
 
     Returns {"ok": true, "rc": <int>, "stdout": "...", "stderr": "..."} or
-    {"ok": false, "error": "<reason>"}. A qube the hub may not operate, or that
+    {"ok": false, "error": "<reason>"}. A qube the caller may not operate, or that
     does not exist, gives the opaque {"ok": false, "error": "not found or refused"}.
     """, {
         "name": _prop("string", "The qube to run in."),
@@ -501,13 +517,15 @@ def _qubes_run(args: dict) -> dict:
 @_register("qubes_copy", """
     Copy a file or directory from a managed qube to another qube.
 
-    Every copy between qubes goes through an operator confirmation dialog in
-    dom0, so this call may wait for a human to answer it, and fails if the
-    operator declines. The copy lands on the target at
+    A copy between two qubes of the same project slot, or into that slot's
+    dump sink, goes through at once. Every other copy goes through an operator
+    confirmation dialog in dom0, so this call may wait for a human to answer
+    it, and fails if the operator declines. A copy into a guarded qube, a lead
+    or the hub is refused. The copy lands on the target at
     /home/user/QubesIncoming/<source>/<basename of path>.
 
     Returns {"ok": true, "target": "...", "path": "..."} or
-    {"ok": false, "error": "<reason>"}. A source the hub may not operate, or
+    {"ok": false, "error": "<reason>"}. A source the caller may not operate, or
     that does not exist, gives the opaque
     {"ok": false, "error": "not found or refused"}.
     """, {
@@ -528,7 +546,7 @@ def _qubes_copy(args: dict) -> dict:
 
     Returns {"ok": true, "rules": "<one rule per line>"} in the Qubes Admin API
     rule grammar, for example "action=accept proto=tcp dstports=443" and a
-    final "action=drop". A qube the hub may not operate, or that does not
+    final "action=drop". A qube the caller may not operate, or that does not
     exist, gives the opaque {"ok": false, "error": "not found or refused"}.
     """, {
         "name": _prop("string", "The qube whose rules to read."),
@@ -549,7 +567,7 @@ def _qubes_firewall_get(args: dict) -> dict:
     is not running yet: the rules are saved and apply when it starts.
 
     Returns {"ok": true, "reloaded": <bool>}; the opaque
-    {"ok": false, "error": "not found or refused"} for a qube the hub may not
+    {"ok": false, "error": "not found or refused"} for a qube the caller may not
     operate or that does not exist; or {"ok": false, "error": "set ok but
     reload failed: ..."} when the rules were saved but not applied.
     """, {
@@ -580,19 +598,21 @@ def _qubes_firewall_set(args: dict) -> dict:
 @_register("qubes_clone", """
     Clone a managed qube into a new managed qube.
 
-    The source must be managed; that includes the TemplateVMs the hub manages.
-    A guarded source is refused, and one that is out of scope or does not exist
-    is reported as "not found". The new name must start with the operator's
-    reserved prefix (default "ai-"). The clone copies the source's settings
-    and keeps the source's network, "none" included; a source on a network
-    outside the hub's scope is refused. A cloned template stays off the network.
+    The source must be managed: for the hub, anything it operates, including
+    the TemplateVMs it manages; for a lead, one of its project's workers. A
+    guarded source is refused, and one that is out of scope or does not exist
+    is reported as "not found". The new name must start with the caller's
+    prefix, as for qubes_spawn. The clone copies the source's settings and
+    keeps the source's network, "none" included; a source on a network outside
+    the caller's scope (for a lead, off its project's list) is refused. A
+    cloned template stays off the network.
 
     dom0 runs one create at a time, so this call may wait for others to finish.
 
     Returns {"ok": true, "name": "<new name>"} or {"ok": false, "error": "<reason>"}.
     """, {
         "source": _prop("string", "Managed qube to clone."),
-        "name": _prop("string", "Name of the clone; must carry the reserved prefix."),
+        "name": _prop("string", "Name of the clone; must carry the caller's prefix."),
     }, required=("source", "name"))
 def _qubes_clone(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.CloneAIManagedQube",
@@ -605,9 +625,12 @@ def _qubes_clone(args: dict) -> dict:
 
     `template` is a managed or guarded disposable template (a qube with
     template_for_dispvms=True); one that is out of scope or does not exist is
-    refused with "template must reference an ai-managed qube". The disposable
-    is born managed, gets an auto-assigned name, keeps its template's network
-    ("none" included), and is removed by dom0 once it halts. Start it with
+    refused with "template must reference an ai-managed qube". A lead may use
+    only its project's approved disposable templates, and only one whose
+    network is on its project's list (or none). The disposable is born
+    managed (a lead's joins its project), gets an auto-assigned name, keeps
+    its template's network ("none" included), and is removed by dom0 once it
+    halts. Start it with
     qubes_start, use it with qubes_run or qubes_copy, and end it with
     qubes_shutdown. For a single command, qubes_run_disposable does the whole
     cycle in one call.
@@ -650,7 +673,8 @@ def _teardown(name: str, stage: str) -> None:
     Run one command in a fresh disposable qube, then discard it.
 
     Spawns a disposable from `template` (a managed or guarded disposable
-    template), starts it, waits until it is running, runs the command as root,
+    template; for a lead, one of its project's, as for qubes_spawn_disposable),
+    starts it, waits until it is running, runs the command as root,
     and shuts it down; dom0 then removes it. If any step after the spawn fails,
     the disposable is shut down or killed so it is still removed. cmd, shell,
     timeout and stdin work as for qubes_run.
@@ -736,7 +760,8 @@ def _qubes_feature_set(args: dict) -> dict:
 
 
 @_register("qubes_events", """
-    Collect qube events over a bounded window.
+    Collect qube events over a bounded window. The hub only: a project's lead
+    has no event stream in this release, and polls qubes_state instead.
 
     Blocks for `duration` seconds (dom0 clamps it to 1-120) and returns the
     events seen on qubes in scope, as a list of {event, subject, subject_klass,
@@ -770,15 +795,22 @@ def _qubes_events(args: dict) -> dict:
 
 
 @_register("qubes_get_pool_stats", """
-    Report the disk space provisioned for AI qubes, and the operator's cap.
+    Report the caller's disk budget and where its new qubes go.
 
     Returns {"ok": true, "ai_managed_bytes_used": <int>,
-    "ai_managed_bytes_cap": <int>, "ai_managed_bytes_headroom": <int>}.
+    "ai_managed_bytes_cap": <int>, "ai_managed_bytes_headroom": <int>,
+    "name_prefix": "<prefix new names must carry>"}. For the hub the figures
+    are all of AI space against the operator's pool cap. For a project's lead
+    they are its project's workers against the project's quota, and the reply
+    adds "project" (its label), "templates" (what it may spawn from),
+    "networks" (where its workers may be born; null is "none", the first entry
+    is the default) and "dump" (its dump sink, or null).
     "used" is provisioned size, not bytes written. Check the headroom before a
     create (qubes_spawn, qubes_clone, a disposable) and stop creating when it
-    falls below the next allocation. The cap is the operator's and cannot be
-    changed from here. {"ok": false, "error": "pool cap not configured"} means
-    the operator has removed the cap: create nothing new, and ask the operator.
+    falls below the next allocation. The cap and the quota are the operator's
+    and cannot be changed from here. {"ok": false, "error": "pool cap not
+    configured"} means the operator has removed the cap: create nothing new,
+    and ask the operator.
     """, {})
 def _qubes_get_pool_stats(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.GetPoolStats", timeout=DOM0_TIMEOUT)

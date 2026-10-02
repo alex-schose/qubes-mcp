@@ -1,8 +1,8 @@
 """qubes-mcp: an MCP server over stdio, standard library only.
 
 Speaks newline-delimited JSON-RPC 2.0 on stdin and stdout, one UTF-8 message
-per line, and serves the tools in qubes_mcp.tools. It runs in the hub qube; an
-agent reaches it over stdio, often through SSH.
+per line, and serves the tools in qubes_mcp.tools. It runs in the hub qube or in a
+project's lead; an agent reaches it over stdio, often through SSH.
 
 - stdout carries JSON-RPC and nothing else. main() points file descriptor 1 at
   stderr before serving, so a stray print, a library warning or a child

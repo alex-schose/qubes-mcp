@@ -3,9 +3,10 @@
 
 Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. Runs as root in the
 source qube. Uses qvm-copy-to-vm, which invokes the standard qubes.Filecopy
-qrexec service from this qube. 30-mcp-control.policy answers that with the
-operator's confirmation dialog for every destination, and refuses a guarded
-one outright, so a copy may wait for a human (up to the timeout below).
+qrexec service from this qube. 30-mcp-control.policy lets it through at once
+inside one project slot or into that slot's dump sink, refuses it into a
+guarded qube, the hub or a lead, and answers anything else with the operator's
+confirmation dialog, so a copy may wait for a human (up to the timeout below).
 
 Input  (stdin, JSON): {
     "target": "<ai-managed qube name>",

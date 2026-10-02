@@ -9,19 +9,23 @@ so the boundary is enforced, not trusted.
 > **Threat-model-driven implementation: human-designed boundaries, AI-assisted
 > code. Review from Qubes engineers welcome and needed.**
 
-An MCP server runs in one qube, the **hub** (`mcp-control`). Agents connect to
-it over stdio (usually through SSH) and call its tools. Every tool is a qrexec
+An MCP server runs in one qube, the **hub** (`mcp-control`), and in each
+project's **lead**. Agents connect to it over stdio (usually through SSH) and
+call its tools. Every tool is a qrexec
 call, and dom0 decides it. Most go to a small library in dom0 that decides
 which qube is in scope, what may change and what a new qube is born with;
 running a command, copying a file out and the firewall go to the qube or the
-Admin API under dom0's qrexec policy. The hub can do what dom0 allows it, and
-nothing more.
+Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
+allows it, and nothing more.
 
-**Status: 0.9.17 — M1, the core.** One principal (the hub), two states
-(managed and guarded), a static qrexec policy, one installer. Projects with
-their own lead agents (M2), gateways and anonymity (M3), other distributions
-(M4), sealed qubes (M5) and the complete dom0 GUI (1.0.0) follow. 0.9.17
-replaces the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+**Status: 0.9.18 — projects.** Besides the hub, up to 15 projects, each with
+its own lead agent that creates and runs its own workers inside the project's
+names, templates, networks and disk quota, and sees nothing outside it; a copy
+out of the project needs the operator's dialog. The operator creates projects with the `qmcp` command in dom0. Next: the
+core of a dom0 GUI, then proposals (the hub asks, the operator accepts in the
+GUI); then gateways and anonymity (M3), other distributions (M4), sealed
+qubes (M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
+0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -29,14 +33,17 @@ replaces the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
   dom0 (trusted)
     30-mcp-control.policy     static rulebook, checked by qrexec's own parser at install
     qmcp.* services           one shared, fail-closed check; identity = the qrexec caller
-    qmcp (command)            the operator's tool: check, list, manage, guard, revoke, migrate
+    qmcp (command)            the operator's tool: check, list, manage, guard, revoke,
+                              project, migrate
         ▲  qrexec only
         │
   mcp-control (the hub)       MCP server, standard library only; reaches what dom0 allows
         │  qrexec, decided in dom0
         ▼
   AI space (tag ai-managed)
-    managed qubes             the hub operates them: lifecycle, exec as root, files, settings
+    the hub's own qubes       slot p00: the hub operates them
+    project p01 … p15         a lead (its own MCP server and agent) and the workers it makes;
+                              the hub operates these too, the lead only its own project
     guarded qubes             listed, read, spawned from — never operated (gateways always)
 ```
 
@@ -47,13 +54,24 @@ replaces the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
   templates and disposable templates it manages, so it can build them.
   Guarded qubes — gateways, and any template the operator wants kept clean —
   are references only.
+- **Projects.** A lead operates only its project's workers, spawns only from
+  the templates the operator approved for the project, puts workers only on
+  the project's networks, and creates only inside its names (`ai-<label>-`)
+  and disk quota. Workers call no qmcp service, cannot reach their lead or
+  the hub, and reach another project only by a copy through the operator's
+  dialog. Copies inside a project, and into its dump sink, need no dialog.
+  What a project's qubes can reach is bounded by its egress, which you choose;
+  inside it the hub and the lead narrow with firewall rules.
 - **Creates** take only names the hub chooses inside a reserved prefix
   (default `ai-`; Qubes names disposables itself), strip the qmcp badges a new
   qube must not carry, stamp it, and prove its network before handing it back.
 - **AI space cannot call dom0** beyond the services a qube needs to boot and
-  keep its clock, cannot reach the hub, cannot use Qubes' raw disposable
-  shortcut, and cannot touch the Admin API. A copy out of an AI qube gets the
-  operator's dialog, and a copy into a guarded qube is refused.
+  keep its clock (a lead also calls nine qmcp services), cannot reach the hub
+  or a lead, cannot use Qubes' raw disposable shortcut, and cannot touch the
+  Admin API, except a lead's firewall methods on its own workers. A copy needs
+  the operator's dialog unless it stays inside one slot or goes into that
+  slot's dump sink, and a copy into a guarded qube, the hub or a lead is
+  refused.
 - **Every change made through a dom0 service** (creates, removes, lifecycle,
   properties, features) is recorded on a hash-chained log in dom0 that AI
   cannot read. Logging is best-effort: a failed write never blocks the change.
@@ -74,7 +92,10 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_spawn_disposable`, `qubes_run_disposable` | disposables, or one command in a fresh disposable |
 | `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's |
 | `qubes_events` | a window of events for qubes in scope |
-| `qubes_get_pool_stats` | the disk budget AI space lives inside |
+| `qubes_get_pool_stats` | the caller's disk budget: AI space for the hub, the project for a lead, with the names, templates and networks a lead may use |
+
+The hub and a lead run the same server and see the same tools; dom0 scopes
+each call to its caller. A lead has no event stream.
 
 From `~/qubes-mcp` in the hub, `python3 -m qubes_mcp.cli <tool> key=value ...`
 runs any tool from a shell.
@@ -103,7 +124,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.17.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.18.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -113,14 +134,15 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 16 checked claims. It installs the policy last and ends with
+overrides its 24 checked claims. It installs the policy last and ends with
 `qmcp check`. Options: `--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`,
 `--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
 keeps.
 
-Coming from 0.9.16? Run the staged migration first; see "Install, migrate,
-uninstall" in [CLAUDE.md](CLAUDE.md).
+Coming from 0.9.17? Install over it; nothing is retagged. Coming from 0.9.16?
+Run the staged migration first; see "Install, migrate, uninstall" in
+[CLAUDE.md](CLAUDE.md).
 
 **3. AI space.** Agents run commands only in qubes whose template carries the
 two in-qube services. Install them into a template, then put it and your AI
@@ -156,6 +178,22 @@ The birth-egress file is needed unless the hub's own netvm is in AI space.
 
 Reach the hub over a network you control (a tailnet, Headscale, WireGuard).
 
+**5. Projects (optional).** A project gets its own lead agent and workers. In
+dom0, as root:
+
+```sh
+sudo qmcp project create osint --lead-template ai-debian-13 --lead-netvm ai-net-router \
+  --network ai-net-router --network none --quota 40G --dump
+```
+
+The lead is born as `ai-osint-lead`; its workers will be named `ai-osint-*`,
+built from the approved templates (the lead's own when it is in AI space, plus
+any `--template`), on the listed networks, inside the quota. `--lead-clone
+QUBE` copies one of the hub's own qubes that you prepared as an agent instead,
+and `--lead-promote QUBE` makes one of the hub's qubes the lead in place. Put the client in the lead as you did in the hub, give it its
+own model key, and connect its agent the same way. `qmcp project` also edits,
+moves qubes between slots, removes or changes a lead, and deletes a project.
+
 ## Tests
 
 ```sh
@@ -164,9 +202,11 @@ python3 -W error::DeprecationWarning -m unittest discover -s tests -p 'test_*.py
 
 The policy suite runs every rule through qrexec's real parser (it needs
 `python3-qrexec`), next to upstream Qubes 4.3's default policy, and fails if any
-rule decides nothing. `tests/seat_suite.py` and `tests/redteam_suite.py` run in
-the hub against a real dom0; on a test machine running Qubes 4.3.1 they passed
-37 of 37 checks and 23 of 23 probes on 2026-10-01.
+rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
+`tests/project_suite.py` run in the hub against a real dom0; the last carries
+`tests/lead_seat.py` into a project's lead and runs it there. On a test
+machine running Qubes 4.3.1 they passed 38 of 38 checks, 23 of 23 probes and
+66 of 66 checks on 2026-10-01.
 
 ## Reviewer asks
 

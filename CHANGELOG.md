@@ -26,6 +26,100 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.18] — 2026-10-01
+
+**Projects (M2a): a second kind of principal, the lead, each operating its own
+workers in one of 15 project slots.** Nothing is retagged on upgrade: install
+over 0.9.17, and the qubes you already manage stay in no slot until you move
+them.
+
+### Added
+
+- **Projects.** Sixteen slots: p00 holds the hub's own working qubes, p01–p15
+  are projects. A project is a lead, the workers it creates, and optionally a
+  dump sink. Its record, in `/etc/qmcp/projects.json` (root-owned, written by
+  the operator's command; the installer writes it empty), holds its label, lead,
+  approved templates,
+  worker networks, disk quota and sink. dom0 writes the badges the rulebook
+  routes on: `qmcp-proj-pNN` on a member, `qmcp-lead` and `qmcp-lead-pNN` on a
+  lead, `qmcp-dump-pNN` (with `ai-dump`) on a sink.
+- **Leads.** A lead calls nine of the ten dom0 services, not the event stream.
+  A caller is a lead only while its record names it and it wears exactly that
+  slot's lead badges, no member badge, and is not guarded; anything else is
+  no principal. It operates only its own members; spawns only from its
+  project's approved templates; creates AppVMs and disposables, never a
+  disposable template; names them inside its project's space (`ai-<label>-`);
+  births them on its project's worker networks (its own network is never
+  inherited); and
+  stays inside its project's disk quota as well as the pool cap. A name
+  outside its project costs it exactly what a missing name costs: one qubesd
+  call, the same answer.
+- **The rulebook's project slots.** Per slot, a lead runs commands, copies
+  files out and reads or writes the firewall in its members and copies files
+  into them; members copy among themselves and into their sink, without a
+  dialog. New hard denies: nothing in AI space reaches a lead, and the
+  drop-box deny now sits above every slot line. The policy is reordered so
+  that AI space's general denies come after the lines for leads and members
+  (A hard denies, B slots, C leads to dom0, D the rest of AI space, E the hub,
+  F copies, G and H the hub's own). 196 rules become 328; the installer checks
+  24 claims against the box's policy set, 8 of them new.
+- **`qmcp project`**: `list`, `show`, `create` (a lead fresh from a template,
+  cloned from one of the hub's own qubes prepared as an agent, or promoted in
+  place from the hub's own qubes), `edit`, `lead` (remove the lead and keep the workers, or give the
+  project a new one), `dump`, `move` (a qube into p00, a project, or no slot)
+  and `delete` (the lead and members go, the sink stays without its badge, and
+  the slot's badges are stripped everywhere before it can be reused).
+- **Project checks in `qmcp check`**, failing on a member or lead badge
+  outside AI space, a sink inside it, a qube in two slots, a slot badge with
+  no project, a template in a project, a lead whose badges and record
+  disagree, any qube wearing lead badges that is not its slot's recorded lead,
+  and a sink that is not its record's; warning on a project without a lead,
+  managed AppVMs in no slot, a member on a network off its list, and project
+  quotas that add up to more than the pool cap.
+- **Authority is checked when the work is done.** A service reads its request
+  before it checks the caller, and a create checks its caller again under the
+  create lock. Every project command holds that lock too, checks everything
+  it can before it changes anything, touches a recorded lead only while it
+  wears the slot's lead badge, and reports what it did when it fails part-way;
+  `qmcp project delete pNN --yes` finishes a delete that stopped half-way.
+- **Suites:** `tests/test_projects.py` (offline), and `tests/project_suite.py`,
+  which carries the client and `tests/lead_seat.py` into a lead from the hub
+  and runs it there against a real dom0.
+
+### Changed
+
+- **The hub's AppVMs join p00** when it creates them, so copies among the hub's
+  own qubes need no dialog. Its disposables, its clones of a project's qube or
+  of a lead, templates and disposable templates join no slot. A name the hub
+  chooses must lie outside every project's space.
+- **The hub cannot remove a lead**; it still starts, stops, clones and runs
+  commands in one. Removing or changing a lead is the operator's.
+- **Concurrent dom0 calls:** the hub keeps its 8; a lead may hold 4, and all
+  leads together 16, in a pool separate from the hub's. Measured on Qubes
+  4.3.1, one call costs dom0 about 14 MiB.
+- `qubes_list` entries add `slot` and `lead`; `qubes_get_pool_stats` adds
+  `name_prefix`, and for a lead reports its project's quota, templates,
+  networks and sink instead of the fleet's figures. Tool descriptions now
+  describe both callers.
+- `qmcp list` shows each qube's slot. `qmcp guard` refuses a lead or a member
+  and `qmcp revoke` refuses a lead.
+- The anti-goal "No Admin API for AI space" names its one exception: a lead's
+  firewall methods on its own members. `CLAUDE.md` now says how the firewall
+  layers stack: the egress you choose is the ceiling, and inside it the hub and
+  a lead narrow with rules.
+- **The create lock is declared in tmpfiles** (`/run/qmcp/create.lock`,
+  root:qubes 0660, corrected if it exists) and always opened group-writable.
+  The operator's project commands take it as root; created first by root it
+  came out 0600 on Qubes 4.3.1 and every create by the services refused.
+  `qmcp check` fails when the services cannot write it.
+
+### Fixed
+
+- `tests/seat_suite.py` checked that a copy into a guarded qube is refused by
+  copying `/etc/hostname`, which Qubes qubes lack, so the check passed on the
+  missing file before the policy was ever asked. It now copies a file it
+  writes first.
+
 ## [0.9.17] — 2026-10-01
 
 **BREAKING. M1, the core: two states instead of tiers, one shared check, one

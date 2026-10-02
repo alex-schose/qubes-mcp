@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.17.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.18.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -31,6 +31,10 @@
 #   /etc/qubes/policy.d/30-mcp-control.policy   the rulebook, hub name rendered in
 #   /etc/tmpfiles.d/qmcp.conf        the runtime directory the caps use
 #   /etc/qmcp/{hub,pool-cap,private-cap,birth-egress}   only when absent
+#   /etc/qmcp/projects.json          the project records, empty, only when absent;
+#                                    `qmcp project` writes it (as root)
+# It changes no qube's tags: managed qubes from an older release stay in no
+# project slot until `qmcp project move` puts them in one.
 # It removes everything v0.9.16 installed that this release no longer has, and
 # backs up what it replaces under /var/lib/qmcp-rollback/<timestamp>/.
 #
@@ -80,7 +84,7 @@ say() { echo "==> $*"; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash $0)"
 [ -e /etc/qubes-release ] && command -v qvm-ls >/dev/null || die "this is not dom0"
-for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/rpc/qmcp-service \
+for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py dom0/rpc/qmcp-service \
          dom0/bin/qmcp policy/30-mcp-control.policy deploy/qmcp-tmpfiles.conf pyproject.toml; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
 done
@@ -115,6 +119,13 @@ if [ -n "$BIRTH_EGRESS" ]; then
     qvm-check -q "$BIRTH_EGRESS" 2>/dev/null || die "the birth-egress qube '$BIRTH_EGRESS' does not exist"
     qvm-tags "$BIRTH_EGRESS" list 2>/dev/null | grep -qx ai-managed \
         || echo "install.sh: warning: '$BIRTH_EGRESS' is not in AI space; template spawns are refused until it is" >&2
+fi
+
+# Project records that exist must load: while they cannot, the services refuse
+# every lead, and every create that names a qube.
+if [ -e "$ETC_QMCP/projects.json" ]; then
+    PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import projects; projects.load()' 2>/dev/null \
+        || die "$ETC_QMCP/projects.json does not load; fix it (qmcp check names the problem) before installing"
 fi
 
 # The fleet must already be in the two-state shape: no tier tags, gateways
@@ -261,6 +272,8 @@ write_if_absent "$ETC_QMCP/hub" "$HUB"
 write_if_absent "$ETC_QMCP/pool-cap" "$POOL_CAP"
 write_if_absent "$ETC_QMCP/private-cap" "$PRIVATE_CAP"
 [ -n "$BIRTH_EGRESS" ] && write_if_absent "$ETC_QMCP/birth-egress" "$BIRTH_EGRESS"
+write_if_absent "$ETC_QMCP/projects.json" '{"version": 1, "slots": {}}'
+chown root:root "$ETC_QMCP/projects.json"
 touch "$AUDIT_LOG"
 chown root:qubes "$AUDIT_LOG"
 chmod 0660 "$AUDIT_LOG"

@@ -1,18 +1,24 @@
 """qmcp.core — the shared, fail-closed check every qmcp.* service runs.
 
 Identity is qrexec's: the caller is `QREXEC_REMOTE_DOMAIN`, set by dom0's
-qrexec daemon, and nothing sits between a principal and this code. In this
-release the only principal is the hub, named in `/etc/qmcp/hub`; projects and
-their leads arrive in M2.
+qrexec daemon, and nothing sits between a principal and this code. Two kinds
+of principal call the services:
+
+- the HUB, named in `/etc/qmcp/hub`. It operates every managed qube.
+- a LEAD, named in a project record (`qmcp.projects`) and wearing that slot's
+  lead badges. Both must agree, or the caller is no principal. A lead
+  operates its own project's members and references its approved templates.
 
 A qube is in AI space when it carries the umbrella tag `ai-managed`. Inside AI
-space it is MANAGED (the hub may operate it, templates included) or GUARDED
-(`qmcp-guarded`, or a gateway: listed, read and referenced, never operated).
-Everything outside AI space answers exactly like a qube that does not exist.
+space it is MANAGED (operable by its principal, templates included for the
+hub) or GUARDED (`qmcp-guarded`, or a gateway: listed, read and referenced,
+never operated). Everything a principal may not see answers exactly like a
+qube that does not exist, at the same cost.
 
 Every check here fails closed. An unreadable tag set is out of scope, an
 unreadable `provides_network` is guarded, a missing hub file means no caller
-is the hub, and a missing runtime directory refuses the call.
+is the hub, an unreadable project record means no caller is a lead, and a
+missing runtime directory refuses the call.
 """
 from __future__ import annotations
 
@@ -22,6 +28,8 @@ import os
 import re
 import sys
 
+from qmcp import projects
+
 UMBRELLA = "ai-managed"
 GUARDED = "qmcp-guarded"
 
@@ -30,8 +38,15 @@ RUN_DIR = "/run/qmcp"
 
 #: Requests larger than this are refused before they are parsed.
 MAX_REQUEST_BYTES = 64 * 1024
-#: Concurrent qmcp.* calls one caller may hold open in dom0.
+#: Concurrent qmcp.* calls the hub may hold open in dom0.
 MAX_CONCURRENT_CALLS = 8
+#: Concurrent calls one lead may hold, and all leads together. The leads' pool
+#: is separate from the hub's slots, so no lead can lock the hub out. Measured
+#: on Qubes 4.3.1: a call costs dom0 about 14 MiB, so the worst case of
+#: 8 + 16 calls stays near 330 MiB.
+LEAD_CALLS = 4
+LEADS_POOL = 16
+LEADS_POOL_KEY = "@leads"
 
 #: A Qubes qube name. Used on everything that becomes a lookup, so a name that
 #: could not exist is refused without asking qubesd about it.
@@ -84,12 +99,61 @@ def read_hub(path: str | None = None) -> str | None:
     return word if valid_qube_name(word) else None
 
 
-def role(caller_name: str, hub_path: str | None = None) -> str:
-    """The caller's role. In this release only the hub has one."""
-    hub = read_hub(hub_path)
+class Principal:
+    """Who is calling: the hub, or a lead with its project record."""
+
+    __slots__ = ("name", "kind", "project")
+
+    def __init__(self, name: str, kind: str, project=None) -> None:
+        self.name, self.kind, self.project = name, kind, project
+
+    @property
+    def slot(self):
+        return None if self.project is None else self.project.slot
+
+    def is_hub(self) -> bool:
+        return self.kind == "hub"
+
+    def __repr__(self):
+        return f"<Principal {self.kind} {self.name}>"
+
+
+def lead_badges_agree(tags, slot: str) -> bool:
+    """A lead wears the umbrella, `qmcp-lead` and exactly its own slot's lead
+    badge, no member badge, and is not guarded."""
+    tags = set(tags)
+    return (UMBRELLA in tags and projects.LEAD in tags and GUARDED not in tags
+            and projects.lead_slots(tags) == {slot} and not projects.member_slots(tags))
+
+
+def principal(app, caller_name: str, hub: str | None = None) -> Principal:
+    """The caller as a principal, or NOT_AUTHORIZED.
+
+    The hub is recognised from its file, at no qubesd cost. A lead must be
+    named as the lead of a project in the record file AND wear that slot's
+    lead badges, read with one qubesd call. A record without the badges, or
+    badges without a record, is no principal: the record says what a slot
+    may do, and the badges are what the rulebook routes on.
+    """
+    if hub is None:
+        hub = read_hub()
     if hub is not None and caller_name == hub:
-        return "hub"
-    raise Refusal(NOT_AUTHORIZED)
+        return Principal(caller_name, "hub")
+    try:
+        records = projects.load()
+    except projects.ProjectsUnreadable:
+        raise Refusal(NOT_AUTHORIZED) from None
+    project = projects.by_lead(records, caller_name)
+    if project is None or project.slot == projects.HUB_SLOT:
+        raise Refusal(NOT_AUTHORIZED)
+    try:
+        raw = app.qubesd_call(caller_name, "admin.vm.tag.List")
+        tags = set(raw.decode(errors="replace").split())
+    except Exception:
+        raise Refusal(NOT_AUTHORIZED) from None
+    if not lead_badges_agree(tags, project.slot):
+        raise Refusal(NOT_AUTHORIZED)
+    return Principal(caller_name, "lead", project)
 
 
 # ------------------------------------------------------------------ the caps
@@ -125,7 +189,8 @@ def acquire_call_slot(caller_name: str, run_dir: str | None = None,
     Each qrexec call is its own dom0 process, so the slot is an flock on one
     of `limit` files; the kernel releases it when this process exits. Fails
     closed: without the runtime directory there is no limit to enforce, and
-    that is reported rather than skipped.
+    that is reported rather than skipped. The leads' shared pool uses the
+    same mechanism under `LEADS_POOL_KEY`, which no qube name can equal.
     """
     base = os.path.join(RUN_DIR if run_dir is None else run_dir, "calls")
     for i in range(MAX_CONCURRENT_CALLS if limit is None else limit):
@@ -219,34 +284,93 @@ def _resolve(app, name, refusal: "Refusal"):
     return vm
 
 
-def operand(app, name, caller_name: str):
-    """A qube the caller is about to operate: it must be managed.
+def is_member(vm, slot: str) -> bool:
+    """In AI space, wearing `slot`'s member badge, and not a lead."""
+    tags = tags_of(vm)
+    return (UMBRELLA in tags and projects.member_badge(slot) in tags
+            and projects.LEAD not in tags)
+
+
+def member_by_name(app, name, slot: str) -> bool:
+    """Is the qube called `name` a member of `slot`? One qubesd round trip
+    either way, for the same reason as `in_ai_space_by_name`: a lead must not
+    tell a qube of another project, or of the hub, from a missing name."""
+    if not valid_qube_name(name):
+        return False
+    try:
+        return app.qubesd_call(name, "admin.vm.tag.Get",
+                               projects.member_badge(slot)).strip() == b"1"
+    except Exception:
+        return False
+
+
+def _resolve_member(app, name, slot: str, refusal: "Refusal"):
+    if not member_by_name(app, name, slot):
+        raise refusal
+    vm = lookup(app, name)
+    if vm is None or not is_member(vm, slot):
+        raise refusal
+    return vm
+
+
+def visible(vm, who: "Principal | None") -> bool:
+    """May `who` see this qube in a list, a read or a reference?
+
+    The hub sees AI space. A lead sees its members, its approved templates and
+    its worker networks, all inside AI space."""
+    if not in_scope(vm):
+        return False
+    if who is None or who.is_hub():
+        return True
+    p = who.project
+    name = getattr(vm, "name", None)
+    return is_member(vm, p.slot) or name in p.templates or name in p.named_networks()
+
+
+def operand(app, name, who: Principal):
+    """A qube the caller is about to operate: it must be managed, and for a
+    lead, a member of its project.
 
     Missing and out of scope collapse to one answer, in content and in cost,
-    so this is no existence oracle. The caller is never its own object: the hub is never in AI space, so in this release that refusal
-    fires only on a misconfigured fleet, and `qmcp check` reports that fleet.
-    A guarded qube gets its own refusal: it is already visible in the list, so
-    saying why costs nothing.
+    so this is no existence oracle. The caller is never its own object: the
+    hub is never in AI space and a lead is never a member, so that refusal
+    fires only on a misconfigured fleet, which `qmcp check` reports. A guarded
+    qube gets its own refusal: it is already visible in the list, so saying
+    why costs nothing.
     """
-    vm = _resolve(app, name, Refusal(NOT_FOUND))
-    if name == caller_name:
+    if who.is_hub():
+        vm = _resolve(app, name, Refusal(NOT_FOUND))
+    else:
+        vm = _resolve_member(app, name, who.slot, Refusal(NOT_FOUND))
+    if name == who.name:
         raise Refusal(NOT_FOUND)
     if is_guarded(vm):
         raise Refusal(GUARDED_REFUSAL)
     return vm
 
 
-def readable(app, name):
-    """A qube the caller reads: managed or guarded."""
-    return _resolve(app, name, Refusal(NOT_FOUND))
+def readable(app, name, who: Principal):
+    """A qube the caller reads: for the hub, managed or guarded; for a lead, a
+    member, or one of its approved templates or worker networks (names it
+    already knows, so looking them up reveals nothing)."""
+    if who.is_hub():
+        return _resolve(app, name, Refusal(NOT_FOUND))
+    p = who.project
+    if name in p.templates or name in p.named_networks():
+        return _resolve(app, name, Refusal(NOT_FOUND))
+    return _resolve_member(app, name, p.slot, Refusal(NOT_FOUND))
 
 
-def reference(app, name, what: str):
+def reference(app, name, what: str, who: Principal):
     """A qube used only as a reference (a template, a disposable template).
 
-    Managed or guarded both qualify. The refusal never echoes the name, so a
-    create is no oracle over names outside AI space.
+    Managed or guarded both qualify. A lead may reference only the templates
+    on its project's approved list, decided on the list alone, before any
+    lookup. The refusal never echoes the name, so a create is no oracle over
+    names outside AI space.
     """
+    if not who.is_hub() and name not in who.project.templates:
+        raise refuse(f"{what} is not on this project's approved list")
     return _resolve(app, name, refuse(f"{what} must reference an ai-managed qube"))
 
 
@@ -255,11 +379,12 @@ def reference(app, name, what: str):
 class Call:
     """One invocation: what the audit line will say about it."""
 
-    __slots__ = ("service", "caller", "summary", "error_class", "fds")
+    __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds")
 
     def __init__(self, service: str) -> None:
         self.service = service
         self.caller = None
+        self.principal = None
         #: Lock descriptors (call slot, create lock) closed after the reply.
         #: A service process would release them on exit anyway; closing them
         #: explicitly keeps the library correct for a long-lived caller.

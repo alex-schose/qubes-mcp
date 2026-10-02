@@ -16,9 +16,10 @@ box and its fixture names; this never touches theirs.
 Reports PASS / FAIL / NOT-RUN per check and exits 0 GREEN, 2 FAILED,
 3 INCOMPLETE. INCOMPLETE is not green.
 
-Copies between managed qubes need the operator's dialog, so the
-suite asserts only the dialog-free paths: a copy into a guarded qube is refused
-without one. The dialog path itself is covered by tests/test_policy.py.
+Copies between the hub's own qubes (p00) need no dialog, and the suite copies
+between two of them. Other copies out of AI space need the operator's dialog,
+so the suite asserts only the dialog-free paths: a copy into a guarded qube is
+refused without one. The dialog path itself is covered by tests/test_policy.py.
 """
 from __future__ import annotations
 
@@ -144,8 +145,13 @@ def main() -> int:
     check("firewall read", r.get("ok") is True, json.dumps(r))
     r = call("qubes_firewall_set", name=w, rules="action=accept\n", reload=True)
     check("firewall write", r.get("ok") is True, json.dumps(r))
-    r = call("qubes_copy", source=w, target=GUARDED_QUBE, path="/etc/hostname", timeout=60)
-    check("copy into a guarded qube refused, no dialog", r.get("ok") is False, json.dumps(r))
+    # A file that exists, so the refusal is the policy's and not a missing
+    # path's (until 0.9.18 this used /etc/hostname, which Qubes qubes lack).
+    src = "/home/user/qmcp-seat-copy.txt"
+    call("qubes_run", name=w, cmd=f"echo seat-{RUN} > {src}", shell=True, timeout=30)
+    r = call("qubes_copy", source=w, target=GUARDED_QUBE, path=src, timeout=60)
+    check("copy into a guarded qube refused, no dialog",
+          r.get("ok") is False and "does not exist" not in str(r.get("error")), json.dumps(r))
 
     # ---------------------------------------------------------------- clone, and templates the hub builds
     c = f"{PREFIX}-c1"
@@ -161,6 +167,12 @@ def main() -> int:
         check("the clone is managed", r.get("values", {}).get("tags") == ["ai-managed"], json.dumps(r))
     r = call("qubes_clone", source=GUARDED_QUBE, name=f"{PREFIX}-gc")
     check("clone of a guarded qube refused", r.get("error") == "guarded: reference only", json.dumps(r))
+    # The hub's own AppVMs share p00: a copy between them needs no dialog.
+    if c in created:
+        call("qubes_start", name=w)
+        r = call("qubes_copy", source=w, target=c, path=src, timeout=120)
+        check("copy between two of the hub's p00 qubes, no dialog", r.get("ok") is True, json.dumps(r))
+        call("qubes_shutdown", name=c)
 
     # ---------------------------------------------------------------- disposables
     d, r = spawn("dvm", klass="DispVMTemplate")

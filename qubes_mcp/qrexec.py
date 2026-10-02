@@ -1,6 +1,6 @@
 """qrexec transport for the qubes-mcp tools.
 
-Every call leaves the hub qube through qrexec-client-vm, in one of three shapes:
+Every call leaves the hub (or a project's lead) through qrexec-client-vm, in one of three shapes:
 
 - call_qmcp:    a qmcp.* service in dom0 (target @adminvm); JSON in, JSON out.
 - call_service: a qmcp.* service inside a named qube; JSON in, JSON out.
@@ -51,7 +51,7 @@ def client_path() -> str:
 # overlong) is refused BEFORE any qrexec call, so an agent-supplied name cannot
 # ride a policy line meant for another target, and cannot inject an option into
 # qrexec-client-vm's argv. This is defence in depth in the untrusted process: a
-# compromised hub bypasses it, which is why the dom0 policy is scoped on its
+# compromised hub or lead bypasses it, which is why the dom0 policy is scoped on its
 # own. `dom0` passes the charset, so it is denied explicitly, in any letter case.
 # \A ... \Z, not ^...$: Python's `$` also matches just before a trailing
 # newline, so `^...$` would accept "dom0\n" and forward the newline to
@@ -145,7 +145,7 @@ def call_qmcp(service: str, payload: dict | None = None, timeout: float = 60.0) 
 def call_service(qube: str, service: str, payload: dict | None = None,
                  timeout: float = 120.0) -> dict:
     """Invoke a qmcp.* service inside a NAMED qube (qmcp.RunInAIManaged,
-    qmcp.CopyToAIManaged). Policy decides whether the hub may reach it."""
+    qmcp.CopyToAIManaged). Policy decides whether the caller may reach it."""
     if not _valid_target(qube):
         # Byte-identical to a policy denial, so a rejected name is no
         # validation oracle; no subprocess is started.
