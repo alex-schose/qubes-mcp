@@ -9,6 +9,14 @@ Run it in dom0, as your own user. You need a TemplateVM in AI space
 GREEN. The names `t1`, `ai-t1h`, `ai-t1-lead`, `ai-t1-boss` and `t1-dump` must
 not exist yet. Answer by step number: "pass", or what you saw instead.
 
+Steps 18 to 21 play the hub's part as well, so they also need a terminal in
+the hub (the qube the Settings tab names under *Hub (fixed at install)*), from
+which they send the requests an agent would. The names `t2`, `t3` and
+`ai-t2-lead` must not exist yet. The projects' quotas (*Disk quota* in each
+project's details) plus 4 GiB must stay within *Pool cap (all of AI space)* on
+the Settings tab: past it, the proposal in step 18 asks for a second tick that
+the step does not expect.
+
 Every form shows, under its fields, the exact command OK will run. Check it
 against the step each time; it is the window's promise that what you see is
 what runs.
@@ -67,11 +75,15 @@ what runs.
     shows the name on one line, with `\u202e` and `\n` as visible text, never
     reversed or broken across lines, and `<b>` as plain text. Select the row:
     the pane below shows the whole line, still escaped.
-13. **Verify and rotate.** *Verify the chain*: "chain OK". *Rotate...*, OK;
+13. **Verify and rotate.** Before rotating, expect the Audit tab to hold a line
+    with caller `operator` for each change you made in steps 3 to 11 (services
+    `qmcp manage`, `qmcp project move`, `qmcp project create` and so on), and
+    none for Refresh or for *Verify the chain*: the log holds the calls the hub
+    and the leads make to state-changing services, and every command of yours
+    that changes something. *Verify the chain*: "chain OK". *Rotate...*, OK;
     verify again: "chain OK". Expect the list to hold one line, the rotation,
-    and the pane under it to name the file the earlier lines moved to. The log
-    holds the calls the hub and the leads make to state-changing services, and
-    that rotation line; your other commands are not on it.
+    with caller `operator`, and the pane under it to name the file the earlier
+    lines moved to.
 14. **The light.** In dom0, `qvm-tags ai-t1h add qmcp-proj-p09`, then Refresh.
     Expect: `qmcp check: FAILED`, and the Check tab lists the failure first.
     `qvm-tags ai-t1h del qmcp-proj-p09`, Refresh: GREEN again.
@@ -83,4 +95,93 @@ what runs.
     the disk AI space uses, and the version, with no way to edit them.
 17. **Busy.** Start any change, and while it runs, try another button.
     Expect: every action button is greyed out until the first one reports.
-18. **Clean up.** `qvm-remove -f t1-dump ai-t1h`. Expect: `qmcp check` GREEN.
+18. **A proposal arrives.** In the hub, propose a project as an agent would,
+    with markup in its title:
+
+    ```sh
+    printf '%s' '{"type": "project-create", "title": "<b>t2</b> for testing",
+      "label": "t2", "lead": {"from": "template", "qube": "<template>"},
+      "networks": ["none"], "quota": 4294967296}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Expect a one-line reply with `"ok": true` and `"id": N`; note N. A reply
+    with `"ok": false` means the request is malformed (the error names the
+    field): fix the command, not the window. In dom0, expect a desktop
+    notification "Proposal N from the hub is waiting in the qubes-mcp window.",
+    without the title. Press Refresh. Expect the tab to read *Proposals (1)*
+    (one more than before, if others are waiting), and the list's top row to
+    read N, `pending`, `project-create`, `t2`, with the title as plain text,
+    `<b>t2</b> for testing`, never bold.
+19. **Read it and accept it.** Select it. Expect the pane to show, among its
+    lines: *State* `pending: waiting for you`; *Title (written by AI)* the
+    same plain text; *Lead* `a fresh qube from the template <template>`;
+    *Worker networks (first is the default)* `["none"]`; *Workers' disk quota*
+    `4G` (a quota that is not whole GiB shows in bytes, exactly);
+    *Equivalent command* `qmcp project create t2 --lead-template
+    <template> --network none --quota 4G`; *Second tick* `not needed: one
+    click is enough`. No red text and no tick box below it. Press *Accept...*.
+    The form shows `/usr/bin/sudo -n /usr/local/bin/qmcp proposal accept N
+    --sha256` followed by 64 hex digits: compare them with the pane's
+    *Fingerprint (sha256)*, which must be the same. OK. Expect a report ending
+    in `proposal N: accepted`; the tab count back down by one; the pane reading
+    *Decision* `accepted`, with the command's own report under *Report*;
+    *Accept...*, *Reject...* and *Close...* all greyed out; and on the Qubes
+    tab the project `t2` with its lead `ai-t2-lead`.
+20. **The second tick.** In the hub, propose deleting it:
+
+    ```sh
+    printf '%s' '{"type": "project-delete", "title": "remove t2", "project": "t2"}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Refresh, select it. Expect: *Plan* naming `ai-t2-lead`; red text under the
+    pane saying accepting it needs the second tick, because it deletes the
+    project t2; *Second tick digest*, 64 hex digits; a tick box *I have read
+    these reasons*, empty; *Accept...* and *Close...* greyed out, *Reject...*
+    not. Tick the box: *Accept...* turns on. Press Refresh: afterwards the box
+    is still ticked, since the reasons are the same. Press *Accept...*: the
+    command now ends in `--yes` and 64 hex digits, which must be the same as
+    *Second tick digest*, and the form repeats the red text. OK. Expect
+    `proposal M: accepted`, and `t2` and `ai-t2-lead` gone from the Qubes tab.
+21. **A refusal, and a rejection.** In the hub, propose a project whose lead
+    template does not exist:
+
+    ```sh
+    printf '%s' '{"type": "project-create", "title": "no such template",
+      "label": "t3", "lead": {"from": "template", "qube": "no-such-template"},
+      "networks": ["none"], "quota": 1073741824}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Expect `"ok": true`: the hub's request is checked for its shape only,
+    never for whether a qube exists. Refresh, select it, *Accept...*, OK.
+    Expect a report marked FAILED, with `stopped: 'no-such-template' is not a
+    TemplateVM` and then `proposal K: failed`. That is the command refusing:
+    nothing was created, and the proposal is closed, *Decision* `failed`; the
+    hub may submit it again. Send the same request once more, Refresh, select
+    the new proposal, *Reject...*, OK. Expect `proposal L: rejected`, *Report*
+    `-`, and nothing created. On the Audit tab, expect a `qmcp.SubmitProposal`
+    line with the hub as caller for each of the four requests, and a
+    `qmcp proposal accept` or `qmcp proposal reject` line with caller
+    `operator` for each of your four decisions.
+22. **A proposal that needs closing.** This step damages one file in the
+    proposal store on purpose, as a disk fault might, and the window repairs
+    it. In a dom0 terminal, with NNNNNN the number L from step 21 written as
+    six digits (proposal 4 is `000004`):
+    `sudo sh -c 'printf garbage > /var/lib/qmcp/proposals/NNNNNN.decision'`.
+    Press Refresh. Expect the row of L to read `failed, needs closing`, and the
+    Check tab a WARN for *proposal store* naming L. Select it. Expect *Problem*
+    `decision file unreadable (JSONDecodeError)`; *Needs closing* saying Close
+    records it as failed and nothing in the fleet changes; *Close...* on,
+    *Accept...* and *Reject...* greyed out, and no tick box. Press *Close...*:
+    the form gives the same reason and shows `/usr/bin/sudo -n
+    /usr/local/bin/qmcp proposal reject L`. OK. Expect `proposal L: failed`;
+    the row reading `failed`; the pane reading *Decision* `failed` and *Report*
+    `its decision file did not read; closed by the operator`, with no *Needs
+    closing* line; the Check tab's *proposal store* PASS; and
+    `ls /var/lib/qmcp/proposals/` listing `NNNNNN.decision.unreadable` beside
+    `NNNNNN.decision`: the damaged file is kept, never deleted.
+23. **Clean up.** `qvm-remove -f t1-dump ai-t1h`, the two qubes steps 1 to 17
+    leave behind; skip it if you ran only steps 18 to 22. Expect: `qmcp check` GREEN.
+    The decided proposals stay in the list: nothing removes them.

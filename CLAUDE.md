@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (0.9.19). Read it first in any
+**This file describes the code at this version (0.9.20). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -35,9 +35,10 @@ These are load-bearing. Do not change them without the operator's sign-off.
 - **AI space is the tag `ai-managed`.** A qube outside it is invisible: every
   dom0 service answers a qube outside AI space exactly as it answers a qube that
   does not exist — the same reply, after the same single qubesd call — and
-  reads redact any reference to one as `<out-of-scope>`. The one exception is a
-  create colliding with a name inside the reserved prefix (see the residual
-  risks).
+  reads redact any reference to one as `<out-of-scope>`. There are two
+  exceptions: a create colliding with a name inside the reserved prefix, and
+  the outcome of a proposal the operator accepts, which tells the hub whether
+  the names it used exist (see the residual risks).
 - **Two states.** A qube in AI space is **managed** (the hub may operate it) or
   **guarded** (listed, read and used as a reference — spawned from — but never
   operated). Guarded means the tag `qmcp-guarded`, or providing network: a
@@ -51,6 +52,12 @@ These are load-bearing. Do not change them without the operator's sign-off.
   command in dom0 is the operator's tool for changing badges and projects; the
   only tags qmcp writes on its own are the stamp a create puts on the qube it
   just made.
+- **The hub asks; only the operator decides.** The hub cannot create a
+  project, add a dump sink, change or remove a lead, delete a project, edit a
+  project's templates, networks or quota, or give a lead a network. It may
+  propose each of those, as the options of one `qmcp project` command, and
+  nothing changes until the operator accepts the proposal in dom0: in the
+  window, or with the command the window runs. Leads cannot propose.
 - **Strip on create.** `clone_vm` copies the source's tags and a disposable
   copies its template's, so every create path removes every tag in qmcp's
   vocabulary the platform copied (`qmcp-guarded`, every role and slot badge,
@@ -63,7 +70,7 @@ These are load-bearing. Do not change them without the operator's sign-off.
 - **The rulebook is static.** `/etc/qubes/policy.d/30-mcp-control.policy` is
   installed once and never written at runtime. Before it is installed it is
   parsed by qrexec's own parser against the box's real policy directory, and
-  24 of its claims are checked to be decided by it, not by a file that sorts
+  26 of its claims are checked to be decided by it, not by a file that sorts
   earlier.
 - **No dom0 exception text reaches a caller.** Every dom0 service failure
   answers with a fixed phrase, which may name the caller's own input, the
@@ -72,13 +79,17 @@ These are load-bearing. Do not change them without the operator's sign-off.
   the operator can read and AI cannot. (The in-qube services return a
   command's own output and errors, from inside the qube the hub is operating.)
 - **Audit.** Every call to a state-changing dom0 service — spawn, clone,
-  disposable, property, feature, lifecycle — leaves one line on a hash-chained
-  log in dom0 (`/var/log/qmcp-audit.log`, `root:qubes 0660`), with the caller,
-  the service and a summary of the names, keys and options in the request.
-  The value of a property or feature being set is never logged. No service and
-  no policy line exposes the log. Logging is best-effort: it never changes what
-  the caller sees. Running a command, copying out and firewall writes are
-  decided by the policy, not by a dom0 service, and are not on this log.
+  disposable, property, feature, lifecycle, a submitted proposal — leaves one
+  line on a hash-chained log in dom0 (`/var/log/qmcp-audit.log`, `root:qubes
+  0660`), with the caller, the service and a summary of the names, keys and
+  options in the request. So does every command of the operator's that changes
+  something, as caller `operator`, with the command and the names it acts on;
+  accepting or rejecting a proposal names its fingerprint. The value of a
+  property or feature being set, a quota and a proposal's title are never
+  logged. No service and no policy line exposes the log. Logging is
+  best-effort: it never changes what the caller sees, or whether the operator's
+  command runs. Running a command, copying out and firewall writes are decided
+  by the policy, not by a dom0 service, and are not on this log.
 
 ## Projects
 
@@ -101,8 +112,8 @@ The badges the rulebook routes on: `qmcp-proj-pNN` on a member, `qmcp-lead` and
 `qmcp-lead-pNN` on a lead (which wears no member badge), and `qmcp-dump-pNN`
 with `ai-dump` on a sink, which is never in AI space.
 
-**A lead** calls nine of the ten dom0 services (not the event stream; it
-polls instead). It operates only its project's members, references only its
+**A lead** calls nine of the twelve dom0 services: not the event stream (it
+polls instead), and not the hub's two proposal services. It operates only its project's members, references only its
 approved templates and worker networks, creates AppVMs and disposables (never a
 disposable template) inside its name space and quota, and its workers are
 born on its project's networks; the lead's own network is never inherited.
@@ -123,8 +134,9 @@ content and in p00 it could drop files into the hub's other qubes without a
 dialog, and nor does its clone of a project's qube or of a lead, for the same
 reason. Templates and disposable templates join no slot.
 
-**The operator** creates a project with `qmcp project create`, which makes
-the lead in one of three ways: fresh from a template, as a clone of one of
+**The operator** creates a project with `qmcp project create`, or by
+accepting the hub's proposal to create one (below). Either way the command
+makes the lead in one of three ways: fresh from a template, as a clone of one of
 the hub's own AppVMs that the operator prepared as an agent, or by promoting
 one of the hub's own AppVMs in place. Every project
 command checks everything it can before it changes anything, and holds the
@@ -159,13 +171,95 @@ arriving is refused; a create checks its caller again once it holds the create
 lock, which every project command holds too. A call already past its check
 finishes (see the residual risks).
 
+## Proposals
+
+The hub asks for what only the operator may do by **submitting a proposal**
+(`qmcp.SubmitProposal`): the options of one `qmcp project` command, never a
+plan or a list of commands. A proposal names a project by its label (or `p00`
+for the hub's own dump sink), never by its slot: by the time the operator
+accepts, a slot can hold a project the proposal was not about. Five kinds:
+
+| Type | The command it is the options of |
+|---|---|
+| `project-create` | `qmcp project create`: the label, where the lead comes from (`template`, `clone` or `promote`), its network and name, more approved templates, the worker networks, the quota, a dump sink or not |
+| `project-edit` | `qmcp project edit`, but as changes: templates and worker networks to add or remove, a new default network, a new quota |
+| `project-dump` | `qmcp project dump` |
+| `project-lead` | `qmcp project lead`: remove the lead, or a new one, saying whether the old lead stays as a worker or is removed (there is no default) |
+| `project-delete` | `qmcp project delete --yes` |
+
+- **Submitting checks the shape only.** dom0 looks no qube up, so submitting
+  is no oracle over names outside AI space: the hub may name a template it
+  cannot see. Once the operator accepts, `accepted` or `failed` tells the hub
+  whether the names it used exist. dom0 stores its own normalised copy, canonical JSON in
+  `/var/lib/qmcp/proposals/`, and the copy's sha256 is the proposal's
+  fingerprint. A title of 1–100 printable ASCII characters goes with it; the
+  window shows it labelled "written by AI". A quota is at most 1 EiB. At most
+  10 may be pending; each expires after 7 days, which is read whenever the
+  store is, with no timer.
+- **The operator is told** by a desktop notification in dom0, whose text is
+  fixed ("Proposal N from the hub is waiting in the qubes-mcp window."), never
+  the hub's words: notification servers render markup and links in the body
+  (measured on Qubes 4.3.1: xfce4-notifyd advertises `body-markup` and
+  `body-hyperlinks`). It is best-effort: a submit never fails because no
+  notification could be shown.
+- **Accepting runs that command's own code**, with the operator's authority:
+  `qmcp proposal accept N --sha256 F`, which the window runs with the
+  fingerprint it showed. A stored file that no longer hashes to `F` is refused,
+  so what the operator read is what runs. The command checks everything it
+  can before it changes anything, against the fleet as it is then; it changes
+  in the order that fails toward less authority, undoes what it can (a create
+  that fails is undone), and reports any partial step. A removed qube cannot be
+  put back: a lead change whose new lead fails after the old one was removed
+  leaves the project without a lead, which is safe, and the report says so.
+  Its outcome closes the proposal: `accepted`, or `failed` with the report.
+  A refusal before the command runs (another fingerprint, the second tick not
+  given, unreadable records) changes nothing, and the proposal stays pending.
+  An edit is applied to the record as it is at accept and changes only the
+  entries it names, so a later change of the operator's to anything else
+  stands.
+- **The second tick.** `qmcp proposal show` computes, against the fleet as it
+  is, why a proposal needs more than one click: any removal (deleting a
+  project, removing a lead, replacing one without keeping the old); a network
+  that neither the hub nor any qube in AI space uses today and no project
+  lists (a gateway's own upstream does not count as in use: a qube placed on
+  it directly would skip the gateway); promoting one of the hub's qubes into a
+  lead; a quota that would make the projects' quotas add up to more than the
+  pool cap. A lead whose badges cannot be read counts as one that will be
+  removed, and a network that cannot be read as a new one: a failed read never
+  makes a removal one click. `accept` computes the reasons again while it
+  holds the project commands' locks, so no project command and no create can
+  change what they rest on before its command runs. The networks AI space
+  uses can still change meanwhile (the hub may clear a qube's network at any
+  time); the network a proposal names is in the command shown either way. The window shows them in red. `show` gives a tick, the
+  digest of exactly those reasons, and `accept` refuses without `--yes TICK`
+  while there are any, and with a tick given for other reasons: a tick given
+  for "removes the old lead X" never accepts "removes the old lead Y".
+- **The hub learns a state word**: pending, accepted, rejected, expired or
+  failed, with its own stored proposal (`qmcp.ProposalStatus`). Never the
+  command's report or a reason: the report holds dom0's exception classes and
+  the operator's view of the fleet.
+- **A proposal whose command may have run is never pending again.** An accept
+  marks the proposal before its command runs and holds the mark locked until
+  the decision is written; a mark that outlives its accept (dom0 stopped
+  part-way) reads as `failed`, and so does a decision file that does not parse.
+  `qmcp check` warns about them until the operator reads them
+  (`qmcp proposal show N`) and closes them (`qmcp proposal reject N`).
+- **Where.** The store is `root:qubes 2770`, declared in tmpfiles: the services
+  (a non-root dom0 user in `qubes`)
+  write the proposals, and the operator's accept and reject, as root, write the
+  decisions beside them, which the services read back. `/run/qmcp/proposals.lock`
+  serialises them for the moment it takes to check and mark a proposal; an
+  accept takes the project commands' locks first and holds them through its
+  command, but lets the store's go once the proposal is marked, so a submit
+  never waits on a running command.
+
 ## What lives where
 
 | Where | What |
 |---|---|
 | hub (`mcp-control`) | `qubes_mcp/`: the MCP server and the `qubes-mcp` CLI. Standard library only. It reaches AI space through the policy's hub section; beyond that, only its own boot services and the operator's dialogs. |
 | each lead | the same `qubes_mcp/`, which reaches its project through the policy's slot lines and the leads' section. |
-| dom0 | `/usr/local/lib/qmcp/qmcp/` (the library), `/etc/qubes-rpc/qmcp.*` (one shim under each service name), `/usr/local/bin/qmcp` (the operator's command), `/usr/local/bin/qmcp-gui` and its menu entry (the operator's window), the policy, `/etc/qmcp/` (operator files, `projects.json` among them), `/run/qmcp/` (lock files). |
+| dom0 | `/usr/local/lib/qmcp/qmcp/` (the library), `/etc/qubes-rpc/qmcp.*` (one shim under each service name), `/usr/local/bin/qmcp` (the operator's command), `/usr/local/bin/qmcp-gui` and its menu entry (the operator's window), the policy, `/etc/qmcp/` (operator files, `projects.json` among them), `/var/lib/qmcp/proposals/` (the hub's proposals and their decisions), `/run/qmcp/` (lock files). |
 | AI templates | `template-rpc/`: `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged`, installed in the templates AI qubes are built on. A qube on a template without them cannot be exec'd into. |
 
 ## The services
@@ -196,7 +290,9 @@ networks where they are read or referenced.
 | `qmcp.CloneAIManagedQube` | Clone a managed qube, templates included. A guarded source is refused: a clone is a managed, editable copy of everything in it. |
 | `qmcp.SpawnDisposableAIManaged` | A disposable from a managed or guarded disposable template, born managed. Uses Qubes 4.3's preloaded disposables when the template has `preload-dispvm-max` (measured: a `qubes_run_disposable` cycle took 1.5 s with `preload-dispvm-max=1`, about 8 s without). |
 | `qmcp.AIManagedEvents` | The hub only. A window of admin events (1–120 s) whose subject is in AI space; at most 16 filters of at most 64 characters. Tag events surface only for the two visible badges. |
-| `qmcp.GetPoolStats` | `ai_managed_bytes_used`, `_cap` and `_headroom`, and `name_prefix`: for the hub, AI space against the operator's cap; for a lead, its workers against its quota, with its project's label, approved templates, worker networks and dump sink. A lead never sees the fleet's figures. |
+| `qmcp.GetPoolStats` | `ai_managed_bytes_used`, `_cap` and `_headroom`, and `name_prefix`: for the hub, AI space against the operator's cap, and every project's record (slot, label, lead, templates, worker networks, quota, disk used, and whether it has a dump sink, never the sink's name, which is outside AI space; a recorded name that has left AI space reads `<out-of-scope>`; null when the records cannot be read); for a lead, its workers against its quota, with its project's label, approved templates, worker networks and dump sink. A lead never sees the fleet's figures. |
+| `qmcp.SubmitProposal` | The hub only. Stores a proposal for the operator after checking its shape (see Proposals); touches no qube. |
+| `qmcp.ProposalStatus` | The hub only. Its proposals' states, newest first; with `id`, one of them with its stored copy. |
 
 **Creates.** A name the hub chooses must carry the reserved prefix
 (`/etc/qmcp/name-prefix`, default `ai-`) and lie outside every project's name
@@ -273,7 +369,8 @@ space's denies.
   copies files into them; members copy among themselves and into their slot's
   dump sink. p00 has only its members' copies: the hub reaches its own qubes
   through E. No line crosses a slot.
-- **C. Leads to dom0:** nine of the ten dom0 services, not the event stream.
+- **C. Leads to dom0:** nine of the twelve dom0 services: not the event
+  stream, and not the hub's two proposal services, which D2 then refuses.
 - **D. The rest of AI space.**
   - D1: nobody else in AI space drives qmcp's in-qube services.
   - D2: AI space talks to dom0 only through the five services a qube needs to
@@ -286,8 +383,8 @@ space's denies.
   - D3: the Admin API (the 122 methods qubesd 4.3 registers, the two volume
     Import services) and the policy API are denied to AI space for every target
     form other than dom0, which D2 covers.
-- **E. The hub:** the ten dom0 services; exec, copy-out and firewall on AI
-  space.
+- **E. The hub:** the twelve dom0 services; exec, copy-out and firewall on
+  AI space.
 - **F. Copies from AI space:** the operator's dialog, unless A refused them
   (into a guarded qube, the hub or a lead) or B allowed them (inside one slot,
   or into its sink). Every copy across projects gets the dialog. qrexec turns
@@ -306,7 +403,7 @@ checks that every slot has exactly its own block and no line crosses a slot.
 
 | Command | |
 |---|---|
-| `qmcp check [--json]` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 24 checked claims; services, runtime directory or caps missing, or a create lock the services cannot write; a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's. Warns on stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix or a project's names, managed qubes pointing at a disposable template outside it, a birth-egress qube outside AI space, an audit log due for rotation, a project without a lead, an approved template or worker network that is not one, a member on a network off its project's list, a sink with a network, managed AppVMs in no slot, and project quotas that add up to more than the pool cap. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
+| `qmcp check [--json]` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 26 checked claims; services, runtime directory or caps missing; no `qubes` group; a runtime directory, create lock, proposal lock or audit log the services cannot write, that is, not group-writable or not the `qubes` group's (an audit log missing, since they cannot create one), or `/run/qmcp` not setgid; the proposal store missing, or not the `qubes` group's, group-writable and setgid; a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's. Warns on stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix or a project's names, managed qubes pointing at a disposable template outside it, a birth-egress qube outside AI space, an audit log due for rotation, a project without a lead, an approved template or worker network that is not one, a member on a network off its project's list, a sink with a network, managed AppVMs in no slot, project quotas that add up to more than the pool cap, and a proposal that cannot be read or whose accept never finished. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
 | `qmcp list [--all] [--json]` | AI space with state, class, template, network, power, slot and provenance; with `--json`, each row adds whether the qube provides network, whether it is a disposable template, and its badges. `--all` adds every other qube but dom0, with no state. |
 | `qmcp settings [--json]` | The operator files the services read (hub, name prefix, pool and private caps, birth egress), the disk AI space uses, and the version. |
 | `qmcp manage QUBE` / `qmcp guard QUBE` | The role actions. Both refuse the hub and a drop box; `manage` also refuses a gateway; `guard` refuses a lead or a member. |
@@ -318,12 +415,21 @@ checks that every slot has exactly its own block and no line crosses a slot.
 | `qmcp project dump NAME` | Create a dump sink for a project, or for p00 (`hub-dump`). |
 | `qmcp project move QUBE TARGET` | Move a managed AppVM into p00, a project, or no slot. Its network does not change, so a project takes it only on one of its worker networks; out of one slot into another needs `--yes`. |
 | `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink without its badge, strip every badge of the slot, free it. Given a slot with no record, finish a delete that stopped half-way. Without `--yes` it prints what it would remove and changes nothing; that needs no root. |
+| `qmcp proposal list [--json]` / `show N [--json]` | The hub's proposals, newest first; one proposal with its stored options, the command it is the options of (an edit shows its project before and after instead), why it needs the second tick, the plan of a delete, and its decision and report once decided. Reads, as any member of `qubes`. |
+| `qmcp proposal accept N --sha256 F [--yes TICK]` | Run proposal `N`'s command as the operator, if its stored file still hashes to `F`; `--yes TICK` is the second tick, the tick `show` gave for the reasons it showed, refused if those reasons have changed. Root. |
+| `qmcp proposal reject N` | Close it without running anything. Also closes a proposal that needs closing: an unreadable one (rejected), one whose accept never finished, and one whose decision file does not read (both `failed`; the unreadable decision file is kept beside the new one). Root. |
 | `qmcp migrate [--apply]` | v0.9.16 tiers to two states (below). Dry run by default. |
 | `qmcp audit verify` / `tail` / `rotate` | The chain. `rotate` moves the log aside and starts a new one anchored on the old head; it needs root. |
 
 Every `qmcp project` command that changes something needs root: it writes
 `/etc/qmcp/projects.json` under a lock, by atomic rename, or (`move`) takes
-that lock.
+that lock. So do `qmcp proposal accept` and `reject`. Every command that
+changes something leaves one line on the audit chain as caller `operator`
+(the command, the names it acts on and its options; a quota only as "set");
+reads, plans and dry runs leave none, and neither does a command the argument
+parser refuses (`migrate`'s `--map` check included) or one refused for not
+running as root; one its own checks refuse, a malformed `--quota` or lead name
+among them, leaves a line with `ok` false.
 
 ## The operator's window (dom0)
 
@@ -350,14 +456,32 @@ it refuses to run as root.
   `qmcp check`'s result with the time it ran; the Check tab lists its findings,
   failures first. The Audit tab shows the last 200 lines, newest first, the
   selected one in full, and verifies or rotates the chain. It holds the calls
-  the hub and the leads make to state-changing services, and the line each
-  rotation starts a log with, which names the file the earlier lines moved to;
-  the operator's own commands are not on it. The Settings tab shows
+  the hub and the leads make to state-changing services, every command of the
+  operator's that changes something (caller `operator`, accepting and
+  rejecting proposals included), and the line each rotation starts a log with,
+  which names the file the earlier lines moved to. The Settings tab shows
   `qmcp settings`, read-only.
+- **The Proposals tab** lists the hub's proposals, newest first, and its label
+  counts the pending ones ("Proposals (2)"). Selecting one runs
+  `qmcp proposal show N --json` and shows every field: the options dom0
+  stored, the equivalent command (an edit shows each part of its project now
+  and after instead), a delete's plan, the decision and report of a decided
+  one, and the title, labelled "written by AI". A pending proposal can be
+  accepted or rejected through a form that shows the command it will run;
+  Accept's carries the fingerprint from that `show`. When accepting needs the
+  second tick,
+  the reasons are in red and Accept stays off until the tick box is ticked,
+  which adds `--yes` with the tick `show` gave for those reasons. The tick
+  box clears when the proposal's fingerprint or
+  reasons change. A proposal that needs closing (a file that does not read, or
+  an accept that never finished) can be closed with `qmcp proposal reject`;
+  no other closed proposal has a button. A `show` that fails keeps the last
+  good view of that proposal and turns its buttons off.
 - **What it does.** Every command that changes something, but `migrate` (a
   one-time step from v0.9.16), is a form: create, edit and delete projects,
   change or remove a lead, add a dump sink, move a qube between slots, manage,
-  guard, revoke, add a qube to AI space, and rotate the audit log. A delete
+  guard, revoke, add a qube to AI space, accept or reject the hub's proposals,
+  and rotate the audit log. A delete
   first reads the command's plan, which changes nothing, and shows it; moving a
   qube from one slot into another needs a tick, and the move form shows whether
   the qube's network is one the project takes. A form refuses what the command
@@ -401,7 +525,7 @@ disposable template with curl and network; Qubes' stock `default-dvm` has both):
 ```sh
 # in dom0
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.19.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.20.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -411,15 +535,18 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh   # --hub, --birth-egress, --pool-cap
 `install.sh` runs every preflight check before it changes anything: its options
 must be well-formed, the fleet must be in the two-state shape, existing project
 records must load, and the rendered policy must parse on this box and decide
-each of the 24 claims itself. It removes what v0.9.16 installed, backs up what it
+each of the 26 claims itself. It removes what v0.9.16 installed, backs up what it
 replaces under `/var/lib/qmcp-rollback/`, writes an empty
 `/etc/qmcp/projects.json` if there is none, installs the policy last, and exits
 with `qmcp check`'s status. It changes no qube's tags. `uninstall.sh` removes the policy first (so no AI
 caller reaches a half-removed service), then everything else, and ends with a
 clean-state check that names what it keeps; `--purge` also removes
-`/etc/qmcp`, the audit log and its rotated files. Backups under `/var/lib/qmcp-rollback/` are
+`/etc/qmcp`, the proposal store `/var/lib/qmcp`, the audit log and its rotated
+files. Backups under `/var/lib/qmcp-rollback/` are
 never removed, nor is `/var/log/qmcp-changes.log`, the change history some
 older installers kept. Qubes keep their tags.
+
+**From v0.9.18 or v0.9.19**: install. The proposal store starts empty.
 
 **From v0.9.17**: install. Managed qubes from 0.9.17 stay in no slot: the hub
 reaches them as before and copies between them still ask you. `qmcp check`
@@ -452,6 +579,7 @@ changes nothing.
 | `tests/test_policy.py` | anywhere with python3-qrexec | the rulebook matrix above |
 | `tests/test_dom0.py` | anywhere with python3-qrexec | the dom0 library against `tests/fakequbes.py`, a fake qubesadmin that copies tags, features and properties on clones and disposables as the platform does |
 | `tests/test_projects.py` | anywhere with python3-qrexec | projects against the same fake: who is a lead, what a lead sees and does (and at what cost), what the hub's creates join, and every `qmcp project` command and project check |
+| `tests/test_proposals.py` | anywhere with python3-qrexec | proposals against the same fake: who may submit, the shape, the store, the second tick, accepting and rejecting through the real commands, an accept that never finished, and the operator's audit lines |
 | `tests/test_server.py` | anywhere | the MCP server and CLI against a fake qrexec client |
 | `tests/test_gui.py` | anywhere; the widget tests where GTK 3 and a display exist | the operator's window, driving the real `qmcp` command against the same fake: the tree, the escaping, every form's command, and that no command, option or field is left out |
 | `tests/seat_suite.py` | in the hub, on a real box | the tools through the real chain |
@@ -516,8 +644,10 @@ real dom0's policy set.
   network path.
 - **A named disposable template outside AI space** (`@dispvm:<name>`) still gets
   Qubes' own `ask` for OpenInVM, OpenURL, StartApp and GetImageRGBA from AI
-  space; the exec services are denied. Qubes refuses a name that is not a
-  disposable template before reading any rule, so those names are probeable.
+  space, and this policy's own `ask` for Filecopy, OpenInVM, OpenURL and the
+  clipboard from the hub; the exec services are denied. Qubes refuses a name
+  that is not a disposable template before reading any rule, so those names
+  are probeable from both.
 - **A qube taken out of AI space by hand** keeps Qubes' disposable shortcut to
   its `default_dispvm`; creates and `qmcp revoke` pin it to none.
 - **The policy cannot see `provides_network`.** A gateway without
@@ -527,13 +657,25 @@ real dom0's policy set.
   is detectable through a create collision; `qmcp check` lists such qubes.
 - **A preloaded disposable** waits in AI space with its template's tags —
   guarded if the template is, managed if it is not — until it is claimed.
+- **The hub can put a notification in front of the operator**: one per
+  proposal, with fixed text and its number, at most 10 pending at a time.
+- **A proposal's title is the hub's text.** The window labels it "written by
+  AI" and shows it escaped, beside the options dom0 checked; read the options.
+- **Accepting tells the hub something.** `accepted` or `failed` says whether
+  the names it used exist; that happens only when the operator accepts, and a
+  rejection tells it nothing.
+- **A compromised hub can fill the queue:** an eleventh proposal is refused
+  until the operator rejects some or they expire after 7 days.
+- **An accept that never finished** (dom0 stopped while its command ran)
+  closes the proposal as `failed`; its command may have run part of the way,
+  and `qmcp check` warns until the operator reads it and closes it.
 
 ## Roadmap
 
-M2 adds projects in three releases: 0.9.18 projects themselves, operated
-with the `qmcp` command; 0.9.19 (this one) the core of a dom0 GUI; then
-proposals, with which the hub asks for a project, a new lead or a deletion and
-the operator accepts it in the GUI, the only approval path. M3 adds networks: a gateway registry, locked or free
+M2 added projects in three releases: 0.9.18 projects themselves, operated
+with the `qmcp` command; 0.9.19 the core of a dom0 GUI; 0.9.20 (this one)
+proposals, with which the hub asks for a project, a change to one, a new lead
+or a deletion and the operator accepts it in dom0, the only approval path. M3 adds networks: a gateway registry, locked or free
 networks per project, an anonymity gate and model endpoints. M4 runs the
 in-qube services on Arch and Fedora templates, M5 adds sealed qubes, and
 1.0.0 completes the GUI.
@@ -568,9 +710,10 @@ in-qube services on Arch and Fedora templates, M5 adds sealed qubes, and
 
 ```
 qubes_mcp/          the hub and the leads: server.py (MCP over stdio), tools.py
-                    (the 18 tools), qrexec.py (transport), cli.py
+                    (the 24 tools), qrexec.py (transport), cli.py
 dom0/qmcp/          the dom0 library: core (the shared check), services, projects,
-                    birth, budget, scope, audit, fleet (check/migrate/roles/projects), cli,
+                    proposals, birth, budget, scope, audit, fleet (check/migrate/roles/
+                    projects), cli,
                     and the window: gui (GTK) over guimodel (what it decides, no GTK)
 dom0/rpc/           qmcp-service, the one shim installed under every service name
 dom0/bin/qmcp       the operator's command

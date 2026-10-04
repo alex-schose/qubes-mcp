@@ -5,6 +5,7 @@
     qmcp settings [--json]         the operator files and the disk AI space uses
     qmcp manage|guard|revoke QUBE  role actions
     qmcp project ...               projects: list, show, create, edit, lead, dump, move, delete
+    qmcp proposal ...              the hub's proposals: list, show, accept, reject
     qmcp migrate [--apply] ...     move a v0.9.16 tiered fleet to two states
     qmcp audit verify|tail [N]|rotate   the hash-chained record of state changes
     qmcp version
@@ -14,7 +15,13 @@ changes under `sudo -n`.
 
 Run it as root, or as a member of the `qubes` group. The project commands that
 change anything write /etc/qmcp/projects.json or take its lock, so they need
-root.
+root; so do accepting and rejecting a proposal.
+
+Every command that changes something leaves one line on the audit chain, as
+caller "operator": the command, the names it acts on and its options, a quota
+only as "set". Reads, plans and dry runs leave none, nor does a command the
+argument parser refuses (migrate's --map check included) or one refused for not
+running as root; one its own checks refuse leaves a line with ok false.
 """
 from __future__ import annotations
 
@@ -23,7 +30,7 @@ import json
 import os
 import sys
 
-from qmcp import audit, fleet, projects
+from qmcp import audit, fleet, projects, proposals
 
 EXIT = {"GREEN": 0, "FAILED": 1, "INCOMPLETE": 3}
 
@@ -127,19 +134,13 @@ def cmd_project(args) -> int:
             print(json.dumps(dict(p.to_json(), slot=p.slot), indent=2))
             return 0
         if what == "delete" and not args.yes:
-            # The plan changes nothing and reads only the records, so it needs no
-            # root: the operator's window shows it before it asks.
-            p = projects.find(fleet._load_records(), args.name)
-            if p is None and args.name in projects.PROJECT_SLOTS:
-                print(f"qmcp project delete: {args.name} has no record: this finishes a delete, "
-                      f"removing the qubes still wearing its member badge and stripping its "
-                      f"badges everywhere. Re-run with --yes.")
-                return 1
-            if p is None or p.slot == projects.HUB_SLOT:
-                raise fleet.ProjectError(f"no project '{args.name}'")
-            print(f"qmcp project delete: this removes {p.slot} '{p.label}': its lead "
-                  f"{p.lead or '(none)'} and every member qube, and keeps its dump sink "
-                  f"{p.dump or '(none)'}. Re-run with --yes.")
+            # The plan changes nothing and reads only the records and the qube
+            # list, so it needs no root: the operator's window shows it before
+            # it asks, and so does a proposal to delete.
+            runs, plan = fleet.delete_plan(app, fleet._load_records(), args.name)
+            if not runs:
+                raise fleet.ProjectError(plan)
+            print(f"qmcp project delete: {plan}. Re-run with --yes.")
             return 1
         _need_root(what)
         if what == "create":
@@ -183,7 +184,63 @@ def cmd_project(args) -> int:
         return 1
     for line in report:
         print(line)
-    return 1 if any("NOT " in line for line in report) else 0
+    # A failed step is recorded as one; a line's text holds names, and a name
+    # may hold any word.
+    return 1 if getattr(report, "failed", None) else 0
+
+
+def cmd_proposal(args) -> int:
+    what = args.what
+    try:
+        if what == "list":
+            rows = proposals.listing()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            for r in rows:
+                print(f"{r['id']:>4}  {r['state']:<10}  {r['type'] or '?':<14}  "
+                      f"{r['subject'] or '-':<8}  {r['title'] or r['problem']}")
+            return 0
+        if what == "show":
+            doc = proposals.show(_app(), args.id)
+            if args.json:
+                print(json.dumps(doc, indent=2))
+                return 0
+            for key in proposals.SHOW_FIELDS:
+                value = doc[key]
+                if key == "second_tick":
+                    value = "; ".join(value) if value else "not needed"
+                elif key == "tick" and value:
+                    value = f"{value}  (accept with --yes {value})"
+                elif isinstance(value, (dict, list)):
+                    value = json.dumps(value, sort_keys=True)
+                print(f"{key}: {'-' if value is None else value}")
+            return 0
+        if os.geteuid() != 0:
+            raise SystemExit(f"qmcp proposal {what}: run as root (sudo qmcp proposal {what} ...); "
+                             f"it runs the proposal's command, or writes its decision")
+        if what == "accept":
+            ok, report = proposals.accept(_app(), args.id, args.sha256, tick=args.yes)
+            for line in report:
+                print(line)
+            print(f"proposal {args.id}: {'accepted' if ok else 'failed'}")
+            return 0 if ok else 1
+        closed = proposals.reject(args.id)
+        print(f"proposal {args.id}: {closed}")
+        return 0
+    except proposals.Refused as e:
+        for line in getattr(e, "report", []):
+            print(line)
+        print(f"qmcp proposal {what}: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"qmcp proposal {what}: cannot read {proposals.PROPOSALS_DIR} "
+              f"({e.strerror or type(e).__name__})", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # qubesd unreachable while reading the fleet, say: the class only.
+        print(f"qmcp proposal {what}: {type(e).__name__}", file=sys.stderr)
+        return 1
 
 
 def _add_lead_options(p) -> None:
@@ -307,6 +364,23 @@ def build_parser() -> argparse.ArgumentParser:
                                          "(root; without --yes, the plan only)")
     q.add_argument("name", help="label or slot; a slot with no record finishes a delete")
     q.add_argument("--yes", action="store_true")
+    p = sub.add_parser("proposal", help="the hub's proposals: what it asks you to do")
+    psub = p.add_subparsers(dest="what", required=True)
+    q = psub.add_parser("list", help="every proposal, newest first")
+    q.add_argument("--json", action="store_true")
+    q = psub.add_parser("show", help="one proposal: what accepting it does now, and why it needs "
+                                     "the second tick if it does")
+    q.add_argument("id", type=int)
+    q.add_argument("--json", action="store_true")
+    q = psub.add_parser("accept", help="run a proposal's command as you (root)")
+    q.add_argument("id", type=int)
+    q.add_argument("--sha256", required=True, metavar="FINGERPRINT",
+                   help="the fingerprint `show` gave: a stored file that differs is refused")
+    q.add_argument("--yes", metavar="TICK",
+                   help="the second tick, for a proposal `show` says needs one: the tick `show` "
+                        "gave, which names the reasons it answers")
+    q = psub.add_parser("reject", help="close a proposal without running it (root)")
+    q.add_argument("id", type=int)
     p = sub.add_parser("migrate", help="map v0.9.16 tiers to managed/guarded")
     p.add_argument("--apply", action="store_true", help="make the changes (default: dry run)")
     p.add_argument("--map", action="append", metavar="QUBE=managed|guarded")
@@ -322,6 +396,64 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _names(values) -> list:
+    return [str(v)[:128] for v in list(values or ())[:32]]
+
+
+def operator_line(args):
+    """(command, summary) for the audit line a command leaves, or None for one
+    that changes nothing: a read, a plan, a dry run. The summary holds the
+    names it acts on and its options; a quota only as "set". Accept
+    and reject write their own line, with the proposal's fingerprint; a
+    rotation writes the first line of the new log itself."""
+    c = args.cmd
+    if c in ("manage", "guard", "revoke"):
+        summary = {"qube": str(args.qube)[:128]}
+        if c == "revoke":
+            summary["no_shutdown"] = bool(args.no_shutdown)
+        return f"qmcp {c}", summary
+    if c == "migrate" and args.apply:
+        return "qmcp migrate", {"map": _names(args.map), "exec_default": args.exec_default,
+                                "compat_default": args.compat_default}
+    if c != "project" or args.what in ("list", "show") or \
+            (args.what == "delete" and not args.yes):
+        return None
+    w = args.what
+    summary = {"project": str(args.name)[:128]}
+    if w in ("create", "lead"):
+        source, origin = _lead_source(args)
+        if source:
+            summary[f"lead_{source}"] = str(origin)[:128]
+        for key in ("lead_netvm", "lead_name"):
+            if getattr(args, key) is not None:
+                summary[key] = str(getattr(args, key))[:128]
+    if w == "create":
+        summary.update({"templates": _names(args.template), "networks": _names(args.network),
+                        "dump": bool(args.dump)})
+        if args.quota is not None:
+            summary["quota"] = "set"
+    elif w == "edit":
+        if args.template is not None:
+            summary["templates"] = _names(args.template)
+        if args.network is not None:
+            summary["networks"] = _names(args.network)
+        if args.quota is not None:
+            summary["quota"] = "set"
+    elif w == "lead":
+        summary.update({"remove": bool(args.remove), "keep_old": bool(args.keep_old)})
+    elif w == "dump":
+        summary["name"] = None if args.sink_name is None else str(args.sink_name)[:128]
+    elif w == "move":
+        summary = {"qube": str(args.name)[:128], "target": str(args.target)[:128],
+                   "yes": bool(args.yes)}
+    return f"qmcp project {w}", summary
+
+
+def _record(line, rc: int) -> None:
+    command, summary = line
+    audit.audit(command, "operator", summary, rc == 0, None if rc == 0 else f"exit status {rc}")
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "version":
@@ -329,8 +461,20 @@ def main(argv=None) -> int:
         return 0
     handler = {"check": cmd_check, "list": cmd_list, "settings": cmd_settings,
                "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
-               "project": cmd_project, "migrate": cmd_migrate, "audit": cmd_audit}[args.cmd]
-    return handler(args)
+               "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
+               "audit": cmd_audit}[args.cmd]
+    line = operator_line(args)
+    if line is None:
+        return handler(args)
+    try:
+        rc = handler(args)
+    except SystemExit:
+        raise                   # refused before it ran: not root, or a malformed --map
+    except BaseException:
+        _record(line, 1)
+        raise
+    _record(line, rc)
+    return rc
 
 
 if __name__ == "__main__":

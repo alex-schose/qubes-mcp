@@ -57,9 +57,12 @@ WRAPPERS = ["qmcp.ListAIManagedQubes", "qmcp.GetPropertyAIManaged",
             "qmcp.SetPropertyAIManaged", "qmcp.SetFeatureAIManaged",
             "qmcp.LifecycleAIManaged", "qmcp.SpawnAIManagedQube",
             "qmcp.CloneAIManagedQube", "qmcp.SpawnDisposableAIManaged",
-            "qmcp.AIManagedEvents", "qmcp.GetPoolStats"]
-#: A lead calls every dom0 service except the event stream.
-LEAD_WRAPPERS = [w for w in WRAPPERS if w != "qmcp.AIManagedEvents"]
+            "qmcp.AIManagedEvents", "qmcp.GetPoolStats",
+            "qmcp.SubmitProposal", "qmcp.ProposalStatus"]
+#: Proposals are the hub's: no lead line routes them, so D2 refuses a lead.
+PROPOSAL_SERVICES = ["qmcp.SubmitProposal", "qmcp.ProposalStatus"]
+#: A lead calls every dom0 service but the event stream and the hub's proposals.
+LEAD_WRAPPERS = [w for w in WRAPPERS if w != "qmcp.AIManagedEvents" and w not in PROPOSAL_SERVICES]
 LEAD_TO_MEMBER = [("qmcp.RunInAIManaged", "allow user=root"),
                   ("qmcp.CopyToAIManaged", "allow user=root"),
                   ("admin.vm.firewall.Get", "allow target=@adminvm"),
@@ -340,6 +343,8 @@ def _cases() -> list[Case]:
         add("sink -> its lead", svc, "sink-p01", "lead-p01", "deny", "deny")
         add("lead -> the hub", svc, "lead-p01", HUB, "deny", "deny")
     add("a lead's event stream", "qmcp.AIManagedEvents", "lead-p01", "dom0", "deny", "deny")
+    for svc in PROPOSAL_SERVICES:
+        add("a lead's proposal call", svc, "lead-p01", "dom0", "deny", "deny")
     for svc in WRAPPERS:
         add("worker -> dom0 wrapper", svc, "w-p01-a", "dom0", "deny", "deny")
         add("hub's p00 qube -> dom0 wrapper", svc, "w-p00-a", "dom0", "deny", "deny")

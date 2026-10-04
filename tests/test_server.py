@@ -46,7 +46,29 @@ EXPECTED_TOOLS = [
     "qubes_start", "qubes_shutdown", "qubes_remove", "qubes_run", "qubes_copy",
     "qubes_firewall_get", "qubes_firewall_set", "qubes_clone", "qubes_spawn_disposable",
     "qubes_run_disposable", "qubes_feature_set", "qubes_events", "qubes_get_pool_stats",
+    "qubes_propose_project", "qubes_propose_project_edit", "qubes_propose_dump",
+    "qubes_propose_lead", "qubes_propose_project_delete", "qubes_proposals",
 ]
+# Each proposal tool and the dom0 proposal type it submits.
+PROPOSAL_TYPES = {
+    "qubes_propose_project": "project-create",
+    "qubes_propose_project_edit": "project-edit",
+    "qubes_propose_dump": "project-dump",
+    "qubes_propose_lead": "project-lead",
+    "qubes_propose_project_delete": "project-delete",
+}
+SUBMIT = "qmcp.SubmitProposal"
+STATUS = "qmcp.ProposalStatus"
+GiB = 1024 ** 3
+# The smallest arguments each proposal tool accepts.
+MINIMAL_PROPOSALS = {
+    "qubes_propose_project": {"title": "OSINT", "label": "osint", "networks": ["ai-gw"],
+                              "quota": 1, "lead": {"from": "template", "qube": "debian-12-xfce"}},
+    "qubes_propose_project_edit": {"title": "More disk", "project": "osint", "quota": 1},
+    "qubes_propose_dump": {"title": "A sink", "project": "osint"},
+    "qubes_propose_lead": {"title": "No lead", "project": "osint", "remove": True},
+    "qubes_propose_project_delete": {"title": "Done", "project": "osint"},
+}
 REMOVED_TOOLS = ["qubes_device_list", "qubes_device_attach", "qubes_device_detach",
                  "qubes_install_pkg"]
 VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
@@ -293,7 +315,7 @@ _FORBIDDEN = re.compile(
 
 
 class RegistryTests(unittest.TestCase):
-    def test_exactly_the_18_tools(self):
+    def test_exactly_the_24_tools(self):
         self.assertEqual(list(tools.TOOLS), EXPECTED_TOOLS)
         for name in REMOVED_TOOLS:
             self.assertNotIn(name, tools.TOOLS)
@@ -327,6 +349,45 @@ class RegistryTests(unittest.TestCase):
             self.assertNotIn("default", prop, f"{where}: a required argument has a default")
         if "default" in prop:
             self.assertIsNone(tools._problem(prop, prop["default"], where), where)
+        if "object" in types:
+            # An object argument (a lead's source) is held to the same rules one
+            # level down: named properties only, each described and checked.
+            self.assertIsInstance(prop.get("properties"), dict, where)
+            self.assertIs(prop.get("additionalProperties"), False, where)
+            inner = prop.get("required", [])
+            self.assertLessEqual(set(inner), set(prop["properties"]), where)
+            for key, sub in prop["properties"].items():
+                self._check_property(f"{where}.{key}", sub, key in inner)
+        else:
+            self.assertFalse({"properties", "required", "additionalProperties"} & set(prop),
+                             where)
+
+    def test_proposal_descriptions_say_how_proposals_work(self):
+        # What the operator asked every proposal tool to tell the model,
+        # checked on the text with its line breaks folded.
+        def flat(name: str) -> str:
+            tool = tools.TOOLS[name]
+            return " ".join((tool.description + json.dumps(tool.input_schema)).split())
+
+        for name in PROPOSAL_TYPES:
+            with self.subTest(tool=name):
+                text = flat(name)
+                for phrase in ("Nothing changes until the operator accepts the proposal in dom0",
+                               "Only the hub can propose; a project's lead is refused.",
+                               'closes as "failed"', "submit it again", "qubes_proposals",
+                               "written by AI"):
+                    self.assertIn(phrase, text)
+                # A dump sink removes nothing and adds no network: no second tick.
+                self.assertEqual("second tick" in text, name != "qubes_propose_dump")
+        for phrase in ("keep_old, which has no default", "true keeps the old lead as a worker",
+                       "false removes it with everything in it"):
+            self.assertIn(phrase, flat("qubes_propose_lead"))
+        self.assertIn("as it is when the operator accepts it", flat("qubes_propose_project_edit"))
+        for phrase in ("pending", "accepted", "rejected", "expired", "failed",
+                       "a project's lead is refused", "never a reason"):
+            self.assertIn(phrase, flat("qubes_proposals"))
+        for phrase in ('"projects"', "has_dump", '"projects" is null when'):
+            self.assertIn(phrase, flat("qubes_get_pool_stats"))
 
     def test_descriptions_speak_the_two_state_model(self):
         for tool in tools.TOOLS.values():
@@ -424,6 +485,162 @@ class ValidatorTests(unittest.TestCase):
     def test_unknown_tool(self):
         with self.assertRaises(tools.UnknownTool):
             tools.call_tool("qubes_device_list", {})
+
+    def test_proposal_arguments_are_checked_at_every_depth(self):
+        lead = {"from": "template", "qube": "debian-12-xfce"}
+        base = {"title": "OSINT", "label": "osint", "lead": lead, "networks": ["ai-gw"],
+                "quota": 1}
+        self.validate("qubes_propose_project", base)
+        for arguments, fragment in [
+                ({**base, "lead": {"from": "template"}}, "missing required argument 'lead'.qube"),
+                ({**base, "lead": {**lead, "name": "x"}}, "unknown argument 'lead'.name"),
+                ({**base, "lead": {"from": "copy", "qube": "t"}},
+                 "argument 'lead'.from: must be one of \"template\", \"clone\", \"promote\""),
+                ({**base, "lead": {"from": "clone", "qube": 7}},
+                 "argument 'lead'.qube: expected string, got integer"),
+                ({**base, "lead": "debian-12-xfce"}, "argument 'lead': expected object, got string"),
+                ({**base, "lead": None}, "argument 'lead': expected object, got null"),
+                ({**base, "networks": "ai-gw"}, "argument 'networks': expected array, got string"),
+                ({**base, "networks": [7]},
+                 "argument 'networks'[0]: expected string or null, got integer"),
+                ({**base, "templates": ["t", 1]},
+                 "argument 'templates'[1]: expected string, got integer"),
+                ({**base, "dump": "yes"}, "argument 'dump': expected boolean, got string"),
+                ({**base, "dump": None}, "argument 'dump': expected boolean, got null"),
+                ({**base, "title": 5}, "argument 'title': expected string, got integer"),
+                # The tool names the type itself; an agent cannot pick another.
+                ({**base, "type": "project-delete"}, "unknown argument 'type'"),
+                ({k: v for k, v in base.items() if k != "title"}, "missing required argument 'title'"),
+                ({k: v for k, v in base.items() if k != "quota"}, "missing required argument 'quota'")]:
+            with self.subTest(arguments=arguments):
+                self.assert_rejected("qubes_propose_project", arguments, fragment)
+        for name, minimal in MINIMAL_PROPOSALS.items():
+            with self.subTest(tool=name):
+                self.assertEqual(self.validate(name, minimal), minimal)
+                self.assert_rejected(name, {k: v for k, v in minimal.items() if k != "title"},
+                                     "missing required argument 'title'")
+                self.assert_rejected(name, {**minimal, "yes": True}, "unknown argument 'yes'")
+        self.assert_rejected("qubes_propose_project_edit",
+                             {"title": "t", "project": "osint", "add_networks": [True]},
+                             "argument 'add_networks'[0]: expected string or null, got boolean")
+        self.assert_rejected("qubes_propose_dump", {"title": "t", "project": 3},
+                             "argument 'project': expected string, got integer")
+        self.assert_rejected("qubes_proposals", {"id": "3"},
+                             "argument 'id': expected integer or null, got string")
+
+    def test_a_boolean_is_not_an_integer_in_proposals(self):
+        base = {"title": "t", "project": "osint"}
+        self.assert_rejected("qubes_propose_project",
+                             {**MINIMAL_PROPOSALS["qubes_propose_project"], "quota": True},
+                             "argument 'quota': expected integer or string, got boolean")
+        self.assert_rejected("qubes_propose_project_edit", {**base, "quota": False},
+                             "argument 'quota': expected integer, string or null, got boolean")
+        self.assert_rejected("qubes_proposals", {"id": True},
+                             "argument 'id': expected integer or null, got boolean")
+        self.assert_rejected("qubes_proposals", {"id": 3.0}, "got number")
+        # ...and an integer is not a boolean either: keep_old must be said as one.
+        self.assert_rejected("qubes_propose_lead", {**base, "remove": 1},
+                             "argument 'remove': expected boolean or null, got integer")
+        self.assert_rejected("qubes_propose_lead",
+                             {**base, "lead": {"from": "clone", "qube": "ai-a"}, "keep_old": 0},
+                             "argument 'keep_old': expected boolean or null, got integer")
+
+    def test_proposal_arguments_pass_as_given_with_no_defaults(self):
+        # dom0 fills in what an omitted field means; the tool adds nothing.
+        removal = {"title": "t", "project": "osint", "remove": True, "lead": None, "keep_old": None}
+        self.assertEqual(self.validate("qubes_propose_lead", removal), removal)
+        delete = {"title": "t", "project": "osint"}
+        self.assertEqual(self.validate("qubes_propose_project_delete", delete), delete)
+        self.assertEqual(self.validate("qubes_proposals", {}), {"id": None})
+
+    def test_a_long_key_inside_an_object_is_capped(self):
+        with self.assertRaises(tools.ArgumentError) as caught:
+            self.validate("qubes_propose_lead", {"title": "t", "project": "osint",
+                                                 "lead": {"from": "clone", "qube": "ai-a",
+                                                          "k" * 500: 1}})
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("unknown argument 'lead'.kkk"), message)
+        self.assertTrue(message.endswith("..."), message)
+        self.assertLess(len(message), 100)
+
+
+class QuotaTests(unittest.TestCase):
+    """A quota reaches dom0 in bytes: a size string is converted on the way,
+    and one that cannot be is an argument error, never a dom0 call."""
+
+    CREATE = {"title": "OSINT", "label": "osint", "networks": ["ai-gw"],
+              "lead": {"from": "template", "qube": "debian-12-xfce"}}
+    EDIT = {"title": "More disk", "project": "osint"}
+
+    def edit(self, quota) -> dict:
+        return tools.validate_arguments(tools.TOOLS["qubes_propose_project_edit"],
+                                        {**self.EDIT, "quota": quota})
+
+    def assert_refused(self, quota, fragment: str) -> None:
+        for name, base in (("qubes_propose_project", self.CREATE),
+                           ("qubes_propose_project_edit", self.EDIT)):
+            with self.subTest(tool=name, quota=quota), \
+                    self.assertRaises(tools.ArgumentError) as caught:
+                tools.validate_arguments(tools.TOOLS[name], {**base, "quota": quota})
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_sizes_become_bytes(self):
+        for text, expected in [("40G", 40 * GiB), ("512M", 512 * 1024 ** 2), ("1T", 1024 ** 4),
+                               ("8K", 8192), ("100B", 100), ("4096", 4096), ("40GiB", 40 * GiB),
+                               ("40gb", 40 * GiB), ("2t", 2 * 1024 ** 4), (" 40 G ", 40 * GiB),
+                               ("1048576T", 2 ** 60)]:
+            with self.subTest(text=text):
+                self.assertEqual(self.edit(text)["quota"], expected)
+        for number in (1, 40 * GiB, 2 ** 60):
+            self.assertEqual(self.edit(number)["quota"], number)
+        for past in ("9" * 20, 10 ** 30, 2 ** 60 + 1, "1048577T"):
+            with self.subTest(past=past), self.assertRaises(tools.ArgumentError) as caught:
+                self.edit(past)
+            self.assertIn("at most 1 EiB", str(caught.exception))
+        created = tools.validate_arguments(tools.TOOLS["qubes_propose_project"],
+                                           {**self.CREATE, "quota": "40G"})
+        self.assertEqual(created, {**self.CREATE, "quota": 40 * GiB})
+
+    def test_junk_is_not_a_size(self):
+        for text in ("", " ", "G", "40X", "forty", "1.5G", "-1G", "+1G", "1e9", "0x10", "40 G B",
+                     "4O96", "40GG", "1" + "0" * 20, "40G\n\n1"):
+            self.assert_refused(text, "is not a size: give bytes, or a whole number")
+
+    def test_zero_and_negative_are_refused(self):
+        for value in (0, -1, -(2 ** 40), "0", "0G", "000T"):
+            self.assert_refused(value, "argument 'quota': must be more than zero bytes")
+
+    def test_a_boolean_or_a_float_is_refused_by_type(self):
+        self.assert_refused(True, "got boolean")
+        self.assert_refused(False, "got boolean")
+        self.assert_refused(4.5, "got number")
+        self.assert_refused(4096.0, "got number")
+        # The converter refuses a boolean by itself too, should a schema ever allow one.
+        with self.assertRaises(tools.ArgumentError):
+            tools._size_bytes(True, "argument 'quota'")
+
+    def test_null_and_omitted_leave_an_edit_quota_unchanged(self):
+        self.assertIsNone(self.edit(None)["quota"])
+        omitted = tools.validate_arguments(tools.TOOLS["qubes_propose_project_edit"],
+                                           {**self.EDIT, "add_templates": ["t"]})
+        self.assertNotIn("quota", omitted)
+
+    def test_a_new_project_needs_a_quota(self):
+        with self.assertRaises(tools.ArgumentError) as caught:
+            tools.validate_arguments(tools.TOOLS["qubes_propose_project"],
+                                     {**self.CREATE, "quota": None})
+        self.assertIn("argument 'quota': expected integer or string, got null",
+                      str(caught.exception))
+
+    def test_the_caller_s_arguments_are_not_modified(self):
+        arguments = {**self.EDIT, "quota": "40G"}
+        converted = tools.validate_arguments(tools.TOOLS["qubes_propose_project_edit"], arguments)
+        self.assertEqual(converted["quota"], 40 * GiB)
+        self.assertEqual(arguments["quota"], "40G")
+
+    def test_only_the_tools_with_a_quota_convert(self):
+        converting = {name for name, tool in tools.TOOLS.items() if tool.prepare is not None}
+        self.assertEqual(converting, {"qubes_propose_project", "qubes_propose_project_edit"})
 
 
 # --------------------------------------------------------------------------
@@ -589,7 +806,10 @@ class ClientTimeoutTests(unittest.TestCase):
             ("qubes_run_disposable", {"template": "ai-dvm", "cmd": ["id"], "timeout": 5},
              [(A, "qmcp.SpawnDisposableAIManaged", 300), (A, LIFE, 120), (A, PROP, 60),
               ("disp7", "qmcp.RunInAIManaged", 35), (A, LIFE, 120)]),
-        ]
+            ("qubes_proposals", {}, [(A, STATUS, 60)]),
+            ("qubes_proposals", {"id": 4}, [(A, STATUS, 60)]),
+        ] + [(name, arguments, [(A, SUBMIT, 60)])
+             for name, arguments in MINIMAL_PROPOSALS.items()]
         covered = {name for name, _, _ in cases}
         self.assertEqual(covered, set(EXPECTED_TOOLS))
         for name, arguments, expected in cases:
@@ -847,6 +1067,20 @@ class ProtocolTests(ServerCase):
              "must be one of"),
             ("qubes_feature_set", {"name": "ai-a", "feature": "service.x", "value": None},
              "got null"),
+            ("qubes_propose_project_edit", {"title": "t", "project": "osint", "quota": "lots"},
+             "argument 'quota': 'lots' is not a size"),
+            ("qubes_propose_project_edit", {"title": "t", "project": "osint", "quota": 0},
+             "argument 'quota': must be more than zero bytes"),
+            ("qubes_propose_project", {**MINIMAL_PROPOSALS["qubes_propose_project"],
+                                       "quota": True}, "got boolean"),
+            ("qubes_propose_project", {**MINIMAL_PROPOSALS["qubes_propose_project"],
+                                       "lead": {"from": "steal", "qube": "x"}},
+             "argument 'lead'.from: must be one of"),
+            ("qubes_propose_lead", {"title": "t", "project": "osint", "keep_old": "no"},
+             "argument 'keep_old': expected boolean or null, got string"),
+            ("qubes_propose_project_delete", {"title": "t", "project": "osint", "type": "x"},
+             "unknown argument 'type'"),
+            ("qubes_proposals", {"id": False}, "got boolean"),
         ]
         for tool, arguments, fragment in cases:
             with self.subTest(tool=tool, arguments=arguments):
@@ -1007,6 +1241,60 @@ PAYLOAD_CASES = [
      [(A, "qmcp.AIManagedEvents", {"duration": 2, "qube": "ai-a",
                                    "events": ["domain-start", "property-set"]})]),
     ("qubes_get_pool_stats", {}, [(A, "qmcp.GetPoolStats", None)]),
+] + [(name, arguments, [(A, SUBMIT, {"type": kind, **arguments})])
+     for name, kind, arguments in (
+        # Every field each proposal type takes, sent as given under its type,
+        # with a quota in bytes. ProposalContractTests runs each of these
+        # through dom0's own normalise().
+        ("qubes_propose_project", "project-create", MINIMAL_PROPOSALS["qubes_propose_project"]),
+        ("qubes_propose_project", "project-create", {
+            "title": "OSINT scraping", "label": "osint",
+            "lead": {"from": "clone", "qube": "ai-agent"}, "lead_name": "ai-osint-boss",
+            "lead_netvm": "none", "templates": ["ai-deb", "ai-dvm"],
+            "networks": ["ai-tor", "none"], "quota": 512 * 1024 ** 2, "dump": True}),
+        ("qubes_propose_project", "project-create", {
+            "title": "Promote", "label": "web2", "lead": {"from": "promote", "qube": "ai-agent"},
+            "lead_name": None, "lead_netvm": None, "templates": [], "networks": ["ai-gw"],
+            "quota": 40 * GiB, "dump": False}),
+        ("qubes_propose_project_edit", "project-edit", MINIMAL_PROPOSALS["qubes_propose_project_edit"]),
+        ("qubes_propose_project_edit", "project-edit", {
+            "title": "Tor first", "project": "osint", "add_templates": ["ai-deb"],
+            "remove_templates": ["ai-old"], "add_networks": ["ai-tor"],
+            "remove_networks": ["none"], "default_network": "ai-tor", "quota": 1024 ** 4}),
+        ("qubes_propose_project_edit", "project-edit", {
+            "title": "Templates only", "project": "osint", "add_templates": ["ai-deb"],
+            "default_network": None, "quota": None}),
+        ("qubes_propose_dump", "project-dump", MINIMAL_PROPOSALS["qubes_propose_dump"]),
+        ("qubes_propose_dump", "project-dump", {"title": "Hub sink", "project": "p00",
+                                                "name": "hub-out"}),
+        ("qubes_propose_dump", "project-dump", {"title": "Sink", "project": "p00", "name": None}),
+        ("qubes_propose_lead", "project-lead", MINIMAL_PROPOSALS["qubes_propose_lead"]),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "No lead", "project": "osint", "remove": True, "lead": None,
+            "lead_name": None, "lead_netvm": None, "keep_old": None}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "Fresh lead", "project": "osint",
+            "lead": {"from": "template", "qube": "debian-12-xfce"}, "keep_old": False}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "Keep the old lead", "project": "osint", "remove": False,
+            "lead": {"from": "clone", "qube": "ai-agent"}, "lead_name": "ai-osint-lead2",
+            "lead_netvm": "ai-gw", "keep_old": True}),
+        ("qubes_propose_project_delete", "project-delete",
+         MINIMAL_PROPOSALS["qubes_propose_project_delete"]),
+     )
+] + [
+    ("qubes_proposals", {}, [(A, STATUS, {})]),
+    ("qubes_proposals", {"id": None}, [(A, STATUS, {})]),
+    ("qubes_proposals", {"id": 12}, [(A, STATUS, {"id": 12})]),
+]
+# A size string reaches dom0 in bytes; the expected payloads above give them so.
+PAYLOAD_CASES += [
+    ("qubes_propose_project", {**MINIMAL_PROPOSALS["qubes_propose_project"], "quota": "40G"},
+     [(A, SUBMIT, {"type": "project-create",
+                   **MINIMAL_PROPOSALS["qubes_propose_project"], "quota": 40 * GiB})]),
+    ("qubes_propose_project_edit", {"title": "More disk", "project": "osint", "quota": "1T"},
+     [(A, SUBMIT, {"type": "project-edit", "title": "More disk", "project": "osint",
+                   "quota": 1024 ** 4})]),
 ]
 
 
@@ -1174,6 +1462,125 @@ class ToolCallTests(ServerCase):
         self.assertEqual(self.call("qubes_firewall_get", {"name": "ai-a"}),
                          {"ok": True, "rules": "action=drop\n"})
 
+    def test_a_submitted_proposal_comes_back_as_dom0_says(self):
+        stored = {"ok": True, "id": 7, "sha256": "ab" * 32, "state": "pending",
+                  "expires": "2026-10-09T12:00:00Z"}
+        self.fake.answer({SUBMIT: {"json": stored}})
+        for name, arguments in MINIMAL_PROPOSALS.items():
+            with self.subTest(tool=name):
+                self.assertEqual(self.call(name, arguments), stored)
+        refusal = {"ok": False, "error": "invalid proposal: keep_old: say whether the old lead "
+                                         "stays as a worker (true) or is removed with "
+                                         "everything in it (false)"}
+        self.fake.answer({SUBMIT: {"json": refusal}})
+        self.assertEqual(self.call("qubes_propose_lead", {
+            "title": "New lead", "project": "osint",
+            "lead": {"from": "template", "qube": "debian-12-xfce"}}), refusal)
+
+    def test_a_lead_proposing_gets_the_opaque_refusal(self):
+        # The policy refuses a lead's call before dom0 runs: an empty reply.
+        self.fake.answer({SUBMIT: {"raw": "", "stderr": "Request refused", "rc": 126},
+                          STATUS: {"raw": "", "stderr": "Request refused", "rc": 126}})
+        self.assertEqual(self.call("qubes_propose_project_delete",
+                                   MINIMAL_PROPOSALS["qubes_propose_project_delete"]), REFUSED)
+        self.assertEqual(self.call("qubes_proposals"), REFUSED)
+
+    def test_proposal_status_comes_back_as_dom0_says(self):
+        row = {"id": 3, "state": "failed", "type": "project-delete", "title": "Done",
+               "submitted": "2026-10-02T09:00:00Z", "expires": "2026-10-09T09:00:00Z",
+               "sha256": "cd" * 32}
+        listing = {"ok": True, "proposals": [row]}
+        one = {"ok": True, **row, "proposal": {"type": "project-delete", "title": "Done",
+                                               "project": "osint"}}
+        self.fake.answer({STATUS: [{"match": {"id": 3}, "json": one},
+                                   {"json": listing}]})
+        self.assertEqual(self.call("qubes_proposals"), listing)
+        self.assertEqual(self.call("qubes_proposals", {"id": 3}), one)
+        self.assertEqual(self.fake.calls(), [(A, STATUS, {}), (A, STATUS, {"id": 3})])
+
+
+class ProposalContractTests(unittest.TestCase):
+    """The proposal tools against dom0's own schema, qmcp.proposals, which is
+    standard library only, so this runs wherever the rest does. dom0 decides
+    what a proposal is; these fail when the tools and dom0 come apart."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        dom0 = str(PUBLIC_DIR / "dom0")
+        if dom0 not in sys.path:
+            sys.path.insert(0, dom0)
+        from qmcp import fleet, proposals
+        cls.proposals, cls.fleet = proposals, fleet
+
+    def submitted(self):
+        for tool, arguments, expected in PAYLOAD_CASES:
+            for _, service, payload in expected:
+                if service == SUBMIT:
+                    yield tool, arguments, payload
+
+    def test_one_tool_per_proposal_type(self):
+        self.assertEqual(sorted(PROPOSAL_TYPES.values()), sorted(self.proposals.TYPES))
+        self.assertEqual(set(PROPOSAL_TYPES), set(MINIMAL_PROPOSALS))
+
+    def test_dom0_stores_every_payload_as_the_tool_sent_it(self):
+        seen = set()
+        for tool, arguments, payload in self.submitted():
+            with self.subTest(tool=tool, arguments=arguments):
+                self.assertEqual(payload["type"], PROPOSAL_TYPES[tool])
+                normal = self.proposals.normalise(payload, "ai-")
+                self.assertEqual({key: normal[key] for key in payload}, payload)
+                seen.add(tool)
+        self.assertEqual(seen, set(PROPOSAL_TYPES))
+
+    def test_each_tool_takes_exactly_the_fields_dom0_takes(self):
+        # A proposal's normal form names every field its type stores, which is
+        # every field it accepts, unless dom0 took a field and dropped it: a
+        # dom0 bug this cannot see.
+        for tool, arguments, payload in self.submitted():
+            with self.subTest(tool=tool):
+                normal = self.proposals.normalise(payload, "ai-")
+                schema = tools.TOOLS[tool].input_schema["properties"]
+                self.assertEqual(set(schema) | {"type"}, set(normal))
+                with self.assertRaises(self.proposals.Invalid):
+                    self.proposals.normalise({**payload, "extra": 1}, "ai-")
+
+    def test_the_lead_source_is_dom0_s(self):
+        for name in ("qubes_propose_project", "qubes_propose_lead"):
+            with self.subTest(tool=name):
+                lead = tools.TOOLS[name].input_schema["properties"]["lead"]
+                self.assertEqual(lead["properties"]["from"]["enum"],
+                                 list(self.proposals.LEAD_SOURCES))
+                self.assertEqual(set(lead["properties"]), {"from", "qube"})
+                self.assertEqual(sorted(lead["required"]), ["from", "qube"])
+
+    def test_a_size_means_what_the_operator_s_quota_means(self):
+        # Every string either side reads, read the same; every one either
+        # refuses, refused by both, the 1 EiB bound included.
+        for text in ("40G", "40g", "40GB", "40GiB", "40gib", " 40 G ", "512M", "1T", "8K",
+                     "100B", "4096", "40iB", "40BB", "0", "0G", "", "G", "1.5G", "-1G",
+                     "40X", "4O96", "40 G B", "1e9", "9" * 20, str(2 ** 60), str(2 ** 60 + 1),
+                     "1048576T", "1048577T"):
+            with self.subTest(text=text):
+                try:
+                    operator = self.fleet._quota(text)
+                except self.fleet.ProjectError:
+                    operator = None
+                try:
+                    tool = tools._size_bytes(text, "argument 'quota'")
+                except tools.ArgumentError:
+                    tool = None
+                self.assertEqual(tool, operator)
+
+    def test_a_size_past_twenty_digits_is_refused_here(self):
+        # More than 20 digits is never read here; the operator's parser reads it
+        # and the 1 EiB bound then refuses it, so the two still agree.
+        text = "1" + "0" * 20
+        self.assertEqual(self.fleet.parse_size(text), 10 ** 20)
+        with self.assertRaises(self.fleet.ProjectError):
+            self.fleet._quota(text)
+        with self.assertRaises(tools.ArgumentError):
+            tools._size_bytes(text, "argument 'quota'")
+
 
 # --------------------------------------------------------------------------
 # The qubes-mcp CLI
@@ -1267,6 +1674,32 @@ class CliTests(FakeCase):
         self.assertEqual(done.returncode, 0)
         self.assertIn(b"netvm", done.stdout)
         self.assertIn(b"required", done.stdout)
+        done = self.cli("qubes_propose_lead", "--help")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"keep_old (boolean or null)", done.stdout)
+        self.assertIn(b"lead (object or null)", done.stdout)
+
+    def test_a_proposal_from_the_command_line(self):
+        done = self.cli("qubes_propose_project", "title=Scrape OSINT", "label=osint",
+                        'lead={"from": "template", "qube": "debian-12-xfce"}',
+                        'networks=["ai-gw", "none"]', "quota=40G", "dump=true")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.fake.calls(), [(A, SUBMIT, {
+            "type": "project-create", "title": "Scrape OSINT", "label": "osint",
+            "lead": {"from": "template", "qube": "debian-12-xfce"},
+            "networks": ["ai-gw", "none"], "quota": 40 * GiB, "dump": True})])
+
+    def test_a_bad_quota_exits_2_and_reaches_nothing(self):
+        for value, fragment in (("40X", "argument 'quota': '40X' is not a size"),
+                                ("0", "argument 'quota': must be more than zero bytes"),
+                                ("true", "got boolean")):
+            with self.subTest(value=value):
+                done = self.cli("qubes_propose_project_edit", "title=t", "project=osint",
+                                f"quota={value}")
+                self.assertEqual(done.returncode, 2)
+                self.assertIn(fragment, done.stderr.decode())
+                self.assertEqual(done.stdout, b"")
+        self.assertEqual(self.fake.calls(), [])
 
 
 if __name__ == "__main__":

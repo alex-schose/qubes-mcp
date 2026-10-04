@@ -244,7 +244,8 @@ qubes.Filecopy             *  @tag:qmcp-proj-p15  @tag:qmcp-dump-p15  allow
 
 # The dom0 services a lead may call. Each one decides everything about the
 # qubes it acts on, from the lead's project record; this file only routes the
-# call. A lead has no event stream in this release.
+# call. A lead has no event stream in this release, and proposals are the
+# hub's: D2 refuses a lead's qmcp.SubmitProposal and qmcp.ProposalStatus.
 qmcp.ListAIManagedQubes        *  @tag:qmcp-lead  @adminvm  allow
 qmcp.GetPropertyAIManaged      *  @tag:qmcp-lead  @adminvm  allow
 qmcp.SetPropertyAIManaged      *  @tag:qmcp-lead  @adminvm  allow
@@ -431,7 +432,9 @@ policy.EvalGUI                                *  @tag:ai-managed  @anyvm  deny
 # =========================================================================
 
 # E1. The dom0 wrappers. Each one decides everything about the qubes it acts
-# on; this file only routes the call to dom0.
+# on; this file only routes the call to dom0. The last two touch no qube: the
+# hub submits a proposal for the operator to accept or reject in dom0, and
+# reads what became of its proposals.
 qmcp.ListAIManagedQubes        *  mcp-control  @adminvm  allow
 qmcp.GetPropertyAIManaged      *  mcp-control  @adminvm  allow
 qmcp.SetPropertyAIManaged      *  mcp-control  @adminvm  allow
@@ -442,6 +445,8 @@ qmcp.CloneAIManagedQube        *  mcp-control  @adminvm  allow
 qmcp.SpawnDisposableAIManaged  *  mcp-control  @adminvm  allow
 qmcp.AIManagedEvents           *  mcp-control  @adminvm  allow
 qmcp.GetPoolStats              *  mcp-control  @adminvm  allow
+qmcp.SubmitProposal            *  mcp-control  @adminvm  allow
+qmcp.ProposalStatus            *  mcp-control  @adminvm  allow
 
 # E2. Command execution, copy-out and firewall on AI space. Guarded targets
 # were refused in A1.

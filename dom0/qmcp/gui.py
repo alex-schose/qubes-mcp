@@ -3,7 +3,8 @@
 It runs the `qmcp` command and nothing else (see `qmcp.guimodel`): every read
 as the operator's own dom0 user, every change under `sudo -n`, shown first in
 the form that makes it and again in the report after it. It never runs as
-root.
+root. A proposal from the hub is read with `qmcp proposal show` when it is
+selected, and accepted with the fingerprint that show gave.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()` and
@@ -622,12 +623,42 @@ class AddForm(Form):
         return gm.role("manage" if self.managed.get_active() else "guard", name)
 
 
+class ProposalForm(Form):
+    """Accept, reject or close one proposal. Accept's command carries the
+    fingerprint of the `show` on display, and, when the second tick was given
+    beside the reasons (which its form repeats in red), `--yes` with the digest
+    of those reasons from the same show. Close runs the same `reject` as
+    Reject, for a proposal the command says needs closing. At OK the window
+    checks that the show on display is still the one this form was opened on."""
+
+    #: action -> (title, OK button, what the form says it does)
+    KINDS = {
+        "accept_proposal": ("Accept proposal {}", "Accept", gm.accept_intro),
+        "reject_proposal": ("Reject proposal {}", "Reject", gm.reject_intro),
+        "close_proposal": ("Close proposal {}", "Close", gm.close_intro),
+    }
+
+    def __init__(self, parent, doc, ident, ticked=False):
+        title, ok, intro = self.KINDS[ident]
+        super().__init__(parent, title.format(doc.get("id")), ok, intro(doc))
+        if ident == "accept_proposal":
+            _set(self.warning, gm.second_tick_text(doc))
+        self.doc, self.ident, self.ticked = doc, ident, ticked
+        self.done_building()
+
+    def build(self):
+        if self.ident == "accept_proposal":
+            return gm.accept_proposal(self.doc.get("id"), self.doc.get("sha256"),
+                                      gm.tick_of(self.doc) if self.ticked else None)
+        return gm.reject_proposal(self.doc.get("id"))
+
+
 # ======================================================================= the window
 
 class Window(Gtk.Window):
-    """The tree of AI space and projects, the check light, the audit log and
-    the settings; every command that changes something, but `migrate`, is a
-    button and a form."""
+    """The tree of AI space and projects, the hub's proposals, the check light,
+    the audit log and the settings; every command that changes something, but
+    `migrate`, is a button and a form."""
 
     ACTIONS = (
         ("new_project", "New project..."), ("edit_project", "Edit project..."),
@@ -661,6 +692,12 @@ class Window(Gtk.Window):
         self.settings: dict = {}
         self.check_doc = None
         self.audit_rows: list = []
+        self.proposal_rows: list = []
+        self.proposals_read = False
+        #: The selected proposal, as its last `show` read it.
+        self.pane = gm.ProposalPane()
+        self._filling = False         # the list is being rebuilt: not a new selection
+        self._tick_key = None         # what the second tick on show answers
         self.nodes: dict = {}
         self.selected = None
         self.last_form = None
@@ -702,6 +739,8 @@ class Window(Gtk.Window):
         self.notebook = Gtk.Notebook()
         outer.pack_start(self.notebook, True, True, 0)
         self.notebook.append_page(self._qubes_page(), _label(esc("Qubes")))
+        self.proposals_tab = _label(esc(gm.proposals_tab(None)))
+        self.notebook.append_page(self._proposals_page(), self.proposals_tab)
         self.notebook.append_page(self._check_page(), _label(esc("Check")))
         self.notebook.append_page(self._audit_page(), _label(esc("Audit")))
         self.notebook.append_page(self._settings_page(), _label(esc("Settings")))
@@ -733,6 +772,49 @@ class Window(Gtk.Window):
         paned.set_position(820)
         return paned
 
+    def _proposals_page(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.proposal_store = Gtk.ListStore(*([str] * (1 + len(gm.PROPOSAL_COLUMNS))))
+        view = Gtk.TreeView(model=self.proposal_store)
+        for i, (key, heading) in enumerate(gm.PROPOSAL_COLUMNS):
+            _column(view, esc(heading), i + 1, expand=(key == "title"), clip=(key == "title"))
+        _named(view, esc("proposals"))
+        view.get_selection().connect("changed", self._on_proposal_select)
+        self.proposal_view = view
+        paned.pack1(_scrolled(view), True, False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(right, f"set_margin_{side}")(8)
+        self.proposal_note = _label(esc(self.pane.note(None)), wrap=True)
+        _named(self.proposal_note, esc("proposal status"))
+        right.pack_start(self.proposal_note, False, False, 0)
+        self.proposal_details = Gtk.Grid(column_spacing=12, row_spacing=4)
+        right.pack_start(_scrolled(self.proposal_details, 260), True, True, 0)
+        # Why accepting needs the second tick, in red, and the tick that gives it.
+        self.proposal_warning = _label(esc(""), wrap=True, selectable=True)
+        self.proposal_warning.get_style_context().add_class("qmcp-FAILED")
+        _named(self.proposal_warning, esc("second tick reasons"))
+        right.pack_start(self.proposal_warning, False, False, 0)
+        self.proposal_tick = _check(esc("I have read these reasons"))
+        _named(self.proposal_tick, esc("second tick"))
+        self.proposal_tick.set_no_show_all(True)
+        self.proposal_tick.set_visible(False)
+        self.proposal_tick.connect("toggled", lambda *_: self._sync())
+        right.pack_start(self.proposal_tick, False, False, 0)
+        bar = Gtk.Box(spacing=6, homogeneous=True)
+        self.proposal_buttons = {}
+        for ident, text in (("accept_proposal", "Accept..."), ("reject_proposal", "Reject..."),
+                            ("close_proposal", "Close...")):
+            button = _button(esc(text), lambda _b, ident=ident: self.act(ident))
+            self.proposal_buttons[ident] = button
+            bar.pack_start(button, True, True, 0)
+        right.pack_start(bar, False, False, 0)
+        right.set_size_request(420, -1)
+        paned.pack2(right, False, False)
+        paned.set_position(780)
+        return paned
+
     def _check_page(self):
         self.check_store = Gtk.ListStore(*([str] * 4))
         view = Gtk.TreeView(model=self.check_store)
@@ -751,9 +833,9 @@ class Window(Gtk.Window):
         self.rotate_button = _button(esc("Rotate..."), lambda *_: self.act("rotate"))
         bar.pack_start(self.rotate_button, False, False, 0)
         self.verify_label = _label(esc(f"Calls from the hub and the leads to dom0's state-changing "
-                                       f"services, and each rotation's first line, newest first "
-                                       f"(the last {gm.AUDIT_TAIL}). Your other commands are not "
-                                       "on this log."), wrap=True)
+                                       f"services, and every command of yours that changes "
+                                       f"something (caller operator), newest first (the last "
+                                       f"{gm.AUDIT_TAIL})."), wrap=True)
         _named(self.verify_label, esc("verify result"))
         bar.pack_start(self.verify_label, True, True, 0)
         box.pack_start(bar, False, False, 0)
@@ -781,6 +863,11 @@ class Window(Gtk.Window):
 
     # ------------------------------------------------------------------ reads
     def refresh(self):
+        # Whatever this refresh will show, the selected proposal's last show may
+        # predate it (an accept that just ran, a lead changed): its buttons stay
+        # off until it is read again.
+        self.pane.stale()
+        self._render_proposal()
         if self.pending:
             self.again = True
             return
@@ -805,14 +892,14 @@ class Window(Gtk.Window):
             self.refresh()
 
     def _absorb(self):
-        """Take the qubes, records, audit lines and settings of a refresh
-        together, or not at all. Once a refresh has read everything, a later
-        one with a failed read keeps those from the last complete one (never
-        fresh qubes judged against old records) and turns changes off. The
-        light and the Check tab always show this refresh's check, which judges
-        the fleet by itself, or UNKNOWN if it did not answer. Before the first
-        complete refresh, what was read is shown, and nothing that needs the
-        records is judged until they are read."""
+        """Take the qubes, records, proposals, audit lines and settings of a
+        refresh together, or not at all. Once a refresh has read everything, a
+        later one with a failed read keeps those from the last complete one
+        (never fresh qubes judged against old records) and turns changes off.
+        The light and the Check tab always show this refresh's check, which
+        judges the fleet by itself, or UNKNOWN if it did not answer. Before the
+        first complete refresh, what was read is shown, and nothing that needs
+        the records is judged until they are read."""
         self.errors = {}
 
         def parsed(name, parse, kind):
@@ -834,6 +921,7 @@ class Window(Gtk.Window):
         settings = parsed("settings", gm.parse_json, dict)
         check = parsed("check", gm.parse_json, dict)
         audit_rows = parsed("audit", gm.parse_audit, list)
+        proposal_rows = parsed("proposals", gm.parse_json, list)
         self.check_doc = check            # a light from a failed read would be a guess
         self.complete = not self.errors
         if self.view_time is not None and not self.complete:
@@ -849,6 +937,9 @@ class Window(Gtk.Window):
             self.settings = settings
         if audit_rows is not None:
             self.audit_rows = audit_rows
+        if proposal_rows is not None:
+            self.proposal_rows = proposal_rows
+            self.proposals_read = True
         if self.complete:
             self.view_time = time.strftime("%H:%M:%S")
 
@@ -898,6 +989,7 @@ class Window(Gtk.Window):
             "it as root. The name prefix is /etc/qmcp/name-prefix. The hub is fixed at install."),
             wrap=True), 0, n, 2, 1)
         self.settings_grid.show_all()
+        self._render_proposals()
 
         if self.errors:
             shown = (f"Showing the qubes and records read at {self.view_time}. "
@@ -944,21 +1036,98 @@ class Window(Gtk.Window):
         if 0 <= index < len(self.audit_rows):
             _set_lines(self.audit_detail, gm.audit_detail(self.audit_rows[index]))
 
+    def _render_proposals(self):
+        """The list and the tab's count, from the view on show. The selected
+        proposal is read again, so its pane is never older than the list."""
+        rows = gm.proposal_rows(self.proposal_rows)
+        pid = self.pane.pid
+        self._filling = True
+        try:
+            self.proposal_store.clear()
+            for row in rows:
+                it = _list_append(self.proposal_store, str(row["id"]), gm.proposal_cells(row))
+                if row["id"] == pid:
+                    self.proposal_view.get_selection().select_iter(it)
+        finally:
+            self._filling = False
+        _set(self.proposals_tab, esc(gm.proposals_tab(self.proposal_rows if self.proposals_read
+                                                      else None)))
+        self._read_proposal(pid if any(r["id"] == pid for r in rows) else None)
+
+    def _on_proposal_select(self, selection):
+        if self._filling:
+            return
+        model, it = selection.get_selected()
+        self._read_proposal(int(model[it][0]) if it is not None else None)
+
+    def _read_proposal(self, pid):
+        """Read the selected proposal with `qmcp proposal show`, as the user.
+        Until it answers, Accept and Reject are off."""
+        seq = self.pane.select(pid)
+        self._render_proposal()
+        if seq is not None:
+            self.runner.run(gm.show_proposal(pid),
+                            lambda result, seq=seq: self._shown(seq, result),
+                            timeout=READ_TIMEOUT_S)
+
+    def _shown(self, seq, result):
+        if self.pane.answer(seq, result, time.strftime("%H:%M:%S")):
+            self._render_proposal()
+
+    def _render_proposal(self):
+        """Every field of the selected proposal's last show; the reasons it
+        needs the second tick, in red, and the tick, which answers exactly
+        those reasons for exactly that stored proposal."""
+        pane = self.pane
+        _clear(self.proposal_details)
+        for i, (heading, text) in enumerate(gm.proposal_details(pane.doc)):
+            self.proposal_details.attach(_label(esc(heading)), 0, i, 1, 1)
+            value = _label(text, selectable=True, wrap=True)
+            _named(value, esc(heading))
+            self.proposal_details.attach(value, 1, i, 1, 1)
+        self.proposal_details.show_all()
+        listed = bool(gm.proposal_rows(self.proposal_rows)) if self.proposals_read else None
+        _set(self.proposal_note, esc(pane.note(listed)))
+        _set(self.proposal_warning, gm.second_tick_text(pane.doc))
+        key = gm.tick_key(pane.doc)
+        if key != self._tick_key:
+            self._tick_key = key
+            self.proposal_tick.set_active(False)
+        self.proposal_tick.set_visible(key is not None)
+        self._sync()
+
     def _sync(self):
         writable = self.complete and not self.busy
         available = gm.actions(self.node(), self.records) if writable else set()
         for ident, button in self.buttons.items():
             button.set_sensitive(ident in available)
         self.rotate_button.set_sensitive(writable)
+        decide = self._deciding()
+        for ident, button in self.proposal_buttons.items():
+            button.set_sensitive(ident in decide)
+
+    def _deciding(self) -> set:
+        """What the Proposals tab allows now, buttons and forms alike: what the
+        selected proposal's last show allows, with the tick as it is, while
+        changes are on."""
+        if not self.complete or self.busy:
+            return set()
+        return self.pane.actions(self.proposal_tick.get_active())
 
     # ------------------------------------------------------------------ changes
-    def _open(self, form, title, then=None):
+    def _open(self, form, title, then=None, check=None):
+        """`check`, asked at OK, returns why what the form was opened on no
+        longer holds, or None; then the form refuses and nothing runs."""
         def response(dialog, resp):
             if resp != Gtk.ResponseType.OK:
                 dialog.destroy()
                 return
             if self.busy or not self.complete:
                 dialog.refuse("another command is running, or the last refresh failed")
+                return
+            why = check() if check is not None else None
+            if why:
+                dialog.refuse(why)
                 return
             try:
                 argv = dialog.argv()
@@ -1016,6 +1185,8 @@ class Window(Gtk.Window):
                 self, "Rotate the audit log", "Rotate",
                 "Moves the log aside and starts a new one anchored on the old head hash.",
                 gm.audit_rotate()), "Rotate the audit log")
+        if ident in ProposalForm.KINDS:
+            return self.decide(ident)
         if node is None:
             return None
         if ident == "edit_project":
@@ -1068,6 +1239,22 @@ class Window(Gtk.Window):
                                    warning="The lead and every member qube are removed, with "
                                            "everything in them. This cannot be undone."), title)
         return self.write(title, gm.delete_plan(key), planned, timeout=READ_TIMEOUT_S)
+
+    def decide(self, ident):
+        """Accept, reject or close the selected proposal, through a form that
+        shows the command first: only what its last show allows, and Accept
+        with the tick given when the command asks for the second tick. At OK
+        the form runs only if the show on display still allows it and is the
+        same proposal, fingerprint and second tick as when it opened."""
+        ticked = self.proposal_tick.get_active()
+        if ident not in self._deciding():
+            return None
+        doc = self.pane.doc
+        form = ProposalForm(self, doc, ident, ticked=(ident == "accept_proposal" and ticked
+                                                      and gm.tick_key(doc) is not None))
+        return self._open(form, ProposalForm.KINDS[ident][0].format(doc.get("id")),
+                          check=lambda: gm.proposal_changed(doc, ident, self.pane,
+                                                            self.proposal_tick.get_active()))
 
     def verify(self):
         def done(result):

@@ -2,9 +2,11 @@
 # deploy/uninstall.sh — remove qubes-mcp from dom0, then prove it is gone.
 #
 #   sudo bash uninstall.sh            remove the code, the policy and the runtime
-#                                     state; keep /etc/qmcp and the audit log
-#   sudo bash uninstall.sh --purge    also remove /etc/qmcp, the audit log and the
-#                                     files `qmcp audit rotate` made from it
+#                                     state; keep /etc/qmcp, the hub's proposals
+#                                     (/var/lib/qmcp) and the audit log
+#   sudo bash uninstall.sh --purge    also remove /etc/qmcp, /var/lib/qmcp, the
+#                                     audit log and the files `qmcp audit rotate`
+#                                     made from it
 #   sudo bash uninstall.sh --check    change nothing; only report what remains
 #
 # It also removes anything v0.9.16 left behind, so it works on a box that never
@@ -14,9 +16,10 @@
 # The policy goes first. From that moment no AI caller can reach a qmcp.*
 # service, so nothing runs half-removed. The run ends with a clean-state check
 # and exits 0 only if nothing qubes-mcp installed is left beyond what it
-# reports as kept: /etc/qmcp, the audit log and its rotated files (unless
-# --purge), the backups under /var/lib/qmcp-rollback/, which are never
-# removed — they hold copies of the policy, /etc/qmcp and the audit logs — and
+# reports as kept: /etc/qmcp, /var/lib/qmcp, the audit log and its rotated files
+# (unless --purge), the backups under /var/lib/qmcp-rollback/, which are never
+# removed — they hold copies of the policy, /etc/qmcp, /var/lib/qmcp and the
+# audit logs — and
 # /var/log/qmcp-changes.log, the change history some older installers appended
 # to.
 
@@ -36,7 +39,7 @@ POLICY=/etc/qubes/policy.d/30-mcp-control.policy
 LEGACY_RPC="qmcp.AttachDeviceAIManaged qmcp.DetachDeviceAIManaged qmcp.ListAttachedDevicesAIManaged
 qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp.SetFeatureAIManaged
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
-qmcp.AIManagedEvents qmcp.GetPoolStats"
+qmcp.AIManagedEvents qmcp.GetPoolStats qmcp.SubmitProposal qmcp.ProposalStatus"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
 OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
 /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
@@ -64,6 +67,7 @@ if [ "$MODE" != check ]; then
     chmod 0700 /var/lib/qmcp-rollback "$BACKUP"
     [ -f "$POLICY" ] && cp -a "$POLICY" "$BACKUP/"
     [ -d /etc/qmcp ] && cp -a /etc/qmcp "$BACKUP/etc-qmcp"
+    [ -d /var/lib/qmcp ] && cp -a /var/lib/qmcp "$BACKUP/var-lib-qmcp"
     for f in /var/log/qmcp-audit.log $(rotated); do [ -f "$f" ] && cp -a "$f" "$BACKUP/"; done
     say "backed up to $BACKUP (root-only)"
 
@@ -85,9 +89,9 @@ if [ "$MODE" != check ]; then
     if [ -d "$LIB" ]; then rm -rf "$LIB"; say "removed $LIB"; fi
     systemctl daemon-reload
     if [ "$MODE" = purge ]; then
-        rm -rf /etc/qmcp /var/log/qmcp-audit.log
+        rm -rf /etc/qmcp /var/lib/qmcp /var/log/qmcp-audit.log
         for f in $(rotated); do rm -f "$f"; done
-        say "purged /etc/qmcp, /var/log/qmcp-audit.log and its rotated files"
+        say "purged /etc/qmcp, /var/lib/qmcp (the hub's proposals), /var/log/qmcp-audit.log and its rotated files"
     fi
 fi
 
@@ -108,10 +112,12 @@ for unit in $LEGACY_UNITS; do
 done
 if [ "$MODE" = purge ]; then
     [ -e /etc/qmcp ] && report /etc/qmcp
+    [ -e /var/lib/qmcp ] && report /var/lib/qmcp
     [ -e /var/log/qmcp-audit.log ] && report /var/log/qmcp-audit.log
     for f in $(rotated); do report "$f"; done
 else
     [ -e /etc/qmcp ] && echo "    kept  /etc/qmcp (operator config; --purge removes it)"
+    [ -e /var/lib/qmcp ] && echo "    kept  /var/lib/qmcp (the hub's proposals and their decisions; --purge removes it)"
     [ -e /var/log/qmcp-audit.log ] && echo "    kept  /var/log/qmcp-audit.log (--purge removes it)"
     n=$(rotated | wc -l)
     [ "$n" -gt 0 ] && echo "    kept  $n rotated audit log(s), /var/log/qmcp-audit.log.<time> (--purge removes them)"

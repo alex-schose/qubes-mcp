@@ -81,6 +81,20 @@ def from_hub(inside):
     check("an oversized request is refused before parsing", b"request too large" in out, f"{out[:120]!r}")
     rc, out = raw("@adminvm", "qmcp.SetPropertyAIManaged", b'{"name":["ai-x"],"property":7}')
     check("type-confused input is refused, not crashed", b'"ok": false' in out, f"{out[:120]!r}")
+    # Proposals: the hub may submit, but only proposals of a valid shape are
+    # stored. These are refused, so the suite leaves nothing for the operator.
+    rc, out = raw("@adminvm", "qmcp.SubmitProposal", b'{"type":"project-create","title":"x"}')
+    check("a proposal missing its fields is refused", b"invalid proposal" in out, f"{out[:120]!r}")
+    rc, out = raw("@adminvm", "qmcp.SubmitProposal",
+                  b'{"type":"project-delete","title":"a\\u202eb","project":"p01"}')
+    check("a proposal title with a bidi override is refused", b"title" in out and b'"ok": false' in out,
+          f"{out[:120]!r}")
+    rc, out = raw("@adminvm", "qmcp.SubmitProposal", b'{"type":"qube-remove","title":"x","name":"ai-x"}')
+    check("a proposal of an unknown type is refused", b"invalid proposal" in out, f"{out[:120]!r}")
+    rc, out = raw("@adminvm", "qmcp.SubmitProposal", b'{"title":"' + b"x" * 70000 + b'"}')
+    check("an oversized proposal is refused before parsing", b"request too large" in out, f"{out[:120]!r}")
+    rc, out = raw("@adminvm", "qmcp.ProposalStatus", b"{}")
+    check("the hub reads its proposals' states", rc == 0 and b'"proposals"' in out, f"{out[:120]!r}")
     # More concurrent calls than the per-caller cap; at least one is refused.
     with concurrent.futures.ThreadPoolExecutor(10) as pool:
         outs = list(pool.map(lambda _: raw("@adminvm", "qmcp.AIManagedEvents",
@@ -95,6 +109,8 @@ def from_hub(inside):
 PROBES = [
     ("CONTROL: an allowed call from inside succeeds", "@default", "qubes.GetDate"),
     ("a qmcp wrapper from AI space", "dom0", "qmcp.ListAIManagedQubes"),
+    ("a proposal from AI space", "dom0", "qmcp.SubmitProposal"),
+    ("proposal states from AI space", "dom0", "qmcp.ProposalStatus"),
     ("admin.vm.List from AI space", "dom0", "admin.vm.List"),
     ("policy.List from AI space", "dom0", "policy.List"),
     ("admin.vm.tag.Set on another AI qube", "{peer}", "admin.vm.tag.Set+qmcp-x"),

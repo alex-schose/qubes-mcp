@@ -18,16 +18,16 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.19 — the operator's window.** Besides the hub, up to 15
-projects, each with its own lead agent that creates and runs its own workers
-inside the project's names, templates, networks and disk quota, and sees
-nothing outside it; a copy out of the project needs the operator's dialog. The
-operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
-command with forms: every change it makes is a command it shows first. Next:
-proposals (the hub asks, the operator accepts in the window); then gateways
-and anonymity (M3), other distributions (M4), sealed qubes (M5) and the
-complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
-`CHANGELOG.md`.
+**Status: 0.9.20 — proposals.** Besides the hub, up to 15 projects, each with
+its own lead agent that creates and runs its own workers inside the project's
+names, templates, networks and disk quota, and sees nothing outside it; a copy
+out of the project needs the operator's dialog. The operator runs it all from
+`qmcp-gui`, a window in dom0 that is the `qmcp` command with forms: every
+change it makes is a command it shows first. The hub may ask for a project, a
+change to one, a new lead or a deletion; nothing happens until the operator
+accepts it in dom0, in that window or with `qmcp proposal accept`. Next: gateways and anonymity (M3), other
+distributions (M4), sealed qubes (M5) and the complete GUI (1.0.0). 0.9.17
+replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -36,7 +36,7 @@ complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
     30-mcp-control.policy     static rulebook, checked by qrexec's own parser at install
     qmcp.* services           one shared, fail-closed check; identity = the qrexec caller
     qmcp (command)            the operator's tool: check, list, manage, guard, revoke,
-                              project, migrate
+                              project, proposal, migrate
         ▲  qrexec only
         │
   mcp-control (the hub)       MCP server, standard library only; reaches what dom0 allows
@@ -51,7 +51,11 @@ complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
 
 - **AI space** is every qube carrying `ai-managed`. Everything else is
   invisible: a qube outside AI space answers exactly like one that does not
-  exist, and reads redact references to it.
+  exist, and reads redact references to it. Three things still tell the hub
+  whether a name exists: a create colliding inside the reserved prefix; a
+  proposal the operator accepted, which succeeds or fails; and a call to
+  `@dispvm:<name>`, which Qubes refuses at once unless the name is a
+  disposable template (see the residual risks in [CLAUDE.md](CLAUDE.md)).
 - **Managed or guarded.** The hub operates managed qubes, including the
   templates and disposable templates it manages, so it can build them.
   Guarded qubes — gateways, and any template the operator wants kept clean —
@@ -64,6 +68,16 @@ complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
   dialog. Copies inside a project, and into its dump sink, need no dialog.
   What a project's qubes can reach is bounded by its egress, which you choose;
   inside it the hub and the lead narrow with firewall rules.
+- **Proposals.** The hub cannot create a project, change or remove a lead,
+  delete a project, or change a project's templates, networks or quota. It
+  may propose each of those, as the options of one `qmcp project` command,
+  and the operator accepts or rejects it in dom0, in the window or with
+  `qmcp proposal accept` or `reject`: accepting runs that command's own
+  code, refused if the stored proposal is not the one shown. Removing a lead
+  or a project, a network AI space does not use yet, promoting one of the
+  hub's qubes and an over-committed quota need a second tick. The hub learns
+  only whether it was accepted, rejected, expired or failed; dom0 announces
+  each proposal with a desktop notification whose text the hub cannot choose.
 - **Creates** take only names the hub chooses inside a reserved prefix
   (default `ai-`; Qubes names disposables itself), strip the qmcp badges a new
   qube must not carry, stamp it, and prove its network before handing it back.
@@ -75,8 +89,9 @@ complete GUI (1.0.0). 0.9.17 replaced the tier model of 0.9.0–0.9.16; see
   slot's dump sink, and a copy into a guarded qube, the hub or a lead is
   refused.
 - **Every change made through a dom0 service** (creates, removes, lifecycle,
-  properties, features) is recorded on a hash-chained log in dom0 that AI
-  cannot read. Logging is best-effort: a failed write never blocks the change.
+  properties, features, proposals), and every change the operator makes with
+  the `qmcp` command or the window, is recorded on a hash-chained log in dom0
+  that AI cannot read. Logging is best-effort: a failed write never blocks the change.
   Commands, copies and firewall writes are decided by the policy and are not
   on it.
 
@@ -94,10 +109,12 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_spawn_disposable`, `qubes_run_disposable` | disposables, or one command in a fresh disposable |
 | `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's |
 | `qubes_events` | a window of events for qubes in scope |
-| `qubes_get_pool_stats` | the caller's disk budget: AI space for the hub, the project for a lead, with the names, templates and networks a lead may use |
+| `qubes_get_pool_stats` | the caller's disk budget: AI space and every project's record for the hub, the project for a lead, with the names, templates and networks a lead may use |
+| `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a deletion |
+| `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
 The hub and a lead run the same server and see the same tools; dom0 scopes
-each call to its caller. A lead has no event stream.
+each call to its caller. A lead has no event stream and cannot propose.
 
 From `~/qubes-mcp` in the hub, `python3 -m qubes_mcp.cli <tool> key=value ...`
 runs any tool from a shell.
@@ -126,7 +143,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.19.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.20.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -136,7 +153,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 24 checked claims. It installs the policy last and ends with
+overrides its 26 checked claims. It installs the policy last and ends with
 `qmcp check`. Options: `--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`,
 `--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
@@ -152,7 +169,7 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.17? Install over it; nothing is retagged. Coming from 0.9.16?
+Coming from 0.9.17, 0.9.18 or 0.9.19? Install over it; nothing is retagged. Coming from 0.9.16?
 Run the staged migration first; see "Install, migrate, uninstall" in
 [CLAUDE.md](CLAUDE.md).
 
@@ -207,6 +224,11 @@ own model key, and connect its agent the same way. `qmcp project`, and the
 window, also edit, move qubes between slots, remove or change a lead, and
 delete a project.
 
+Or let the hub ask: its agent calls `qubes_propose_project` (or another
+`qubes_propose_*` tool), dom0 shows a notification, and you accept or reject
+the proposal in the window, where the options the hub sent, what accepting
+does now and anything that needs a second tick are shown first.
+
 ## Tests
 
 ```sh
@@ -218,11 +240,14 @@ The policy suite runs every rule through qrexec's real parser (it needs
 rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
 `tests/project_suite.py` run in the hub against a real dom0; the last carries
 `tests/lead_seat.py` into a project's lead and runs it there. On a test
-machine running Qubes 4.3.1 they passed 38 of 38 checks, 23 of 23 probes and
-66 of 66 checks on 2026-10-01. `tests/test_gui.py` drives the window's forms
-through the real `qmcp` command and fails if the command has a command,
-option or field the window neither offers nor exempts; `tests/GUI-CHECKLIST.md`
-is the click-through for a person.
+machine running Qubes 4.3.1 they passed 38 of 38 checks, 30 of 30 probes and
+68 of 68 checks on 2026-10-02, the lead seat inside a lead made by an accepted
+proposal. `tests/test_proposals.py` covers proposals: who may submit, the
+store, the second tick, accepting and rejecting through the real commands.
+`tests/test_gui.py` drives the window's forms through the real `qmcp` command
+and fails if the command has a command, option or field the window neither
+offers nor exempts; `tests/GUI-CHECKLIST.md` is the click-through for a
+person.
 
 ## Reviewer asks
 

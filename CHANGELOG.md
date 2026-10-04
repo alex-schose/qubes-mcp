@@ -26,6 +26,124 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.20] — 2026-10-04
+
+**Proposals (M2c): the hub asks, the operator accepts.** The hub may now ask for
+what only the operator may do: create a project, edit one, add a dump sink,
+change or remove a lead, delete a project. It cannot do any of these itself, as
+before; nothing changes until the operator accepts the proposal in dom0. The
+operator's own commands now go on the audit chain too. Install over 0.9.19; the
+policy gains two lines for the hub.
+
+### Added
+
+- **Proposals.** `qmcp.SubmitProposal` (the hub only) stores a proposal: the
+  options of one `qmcp project` command, never a plan or a list of commands.
+  Five types: `project-create`, `project-edit` (what it adds, removes or sets,
+  applied to the record as it is at accept and changing only the entries it
+  names, so a later change of the operator's to anything else stands),
+  `project-dump`, `project-lead` (remove the lead, or a new one, saying whether
+  the old lead stays as a worker; there is no default) and `project-delete`.
+  Submitting checks the shape and looks no qube up, so it is no oracle over
+  names outside AI space; once the operator accepts, `accepted` or `failed`
+  tells the hub whether the names it used exist. dom0 stores its own
+  normalised copy in `/var/lib/qmcp/proposals/`; its sha256 is the proposal's
+  fingerprint. At most 10 pending; each expires after 7 days.
+- **`qmcp proposal list|show|accept|reject`.** `show` gives the stored
+  options, the command they are the options of (an edit shows its project
+  before and after instead), a delete's plan, and why accepting needs the
+  second tick: removing a qube (deleting a project, removing a lead, or
+  replacing one without keeping it), a network that neither the hub nor any
+  non-gateway qube in AI space uses and no project lists, a promoted lead, or
+  a quota that would make the projects' quotas add up to more than the pool
+  cap; and a tick, the digest of those reasons. `accept N --sha256 F [--yes
+  TICK]` runs the command's own code as the operator, refuses a stored file
+  that no longer hashes to `F`, and refuses without `--yes TICK` while the
+  second tick is needed, or with a tick given for other reasons than the ones
+  it finds now. `reject N` closes a proposal without running anything,
+  including one that needs closing (a file that does not read, or an accept
+  that never finished, which `qmcp check` warns about); an unreadable decision
+  file is kept beside the new one. When the command refuses or fails, the
+  accept closes the proposal as `failed`, with the command's report; a refusal
+  before it runs (another fingerprint, no second tick) changes nothing.
+- **`qmcp.ProposalStatus`** (the hub only): the hub's proposals as state words
+  (pending, accepted, rejected, expired, failed) and its own stored copies;
+  never the command's report or a reason.
+- **A desktop notification** in dom0 for each proposal, with fixed text and the
+  proposal's number, never the hub's words: the notification server renders
+  markup and links in the body. Best-effort.
+- **The hub reads every project's record** in `qmcp.GetPoolStats`: slot,
+  label, lead, templates, worker networks, quota, disk used, and whether it
+  has a dump sink (never the sink's name, which is outside AI space).
+- **Hub tools:** `qubes_propose_project`, `qubes_propose_project_edit`,
+  `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_project_delete`
+  and `qubes_proposals`. A quota may be given as `40G`; the client sends bytes.
+  In a proposal's network lists, null means no network, as the records write
+  it; `"none"` does too.
+- **The window's Proposals tab:** the hub's proposals, newest first, with the
+  pending count in the tab's label; the selected one in full (its options, the
+  equivalent command or an edit's project now and after, a delete's plan, the
+  decision and report once decided) and its title, labelled "written by AI".
+  Accept and Reject are forms that show the command they run; Accept's carries
+  the fingerprint of the proposal on display. When the second tick is needed
+  its reasons are in red and Accept stays off until it is ticked. A proposal
+  that needs closing (a file that does not read, or an accept that never
+  finished) can be closed there. The Audit tab says the operator's own
+  commands are on the log.
+- **The operator's own changes are on the audit chain** (caller `operator`):
+  every command that changes something, with the command, the names it acts on
+  and its options (a quota only as "set"); accepting and rejecting a proposal,
+  with its fingerprint. Reads, plans and dry runs leave none, nor does a
+  command the argument parser refuses (`migrate`'s `--map` check included) or
+  one refused for not running as root; one its own checks refuse leaves a
+  line with `ok` false. A rotation now starts the new log as the operator.
+- **`tests/test_proposals.py`**, and proposal checks in the policy matrix, the
+  red-team suite and the lead seat.
+
+### Changed
+
+- The policy routes `qmcp.SubmitProposal` and `qmcp.ProposalStatus` from the
+  hub to dom0; a lead's or any other AI-space call to them is refused by the
+  existing deny of every other service addressed to dom0. 26 precedence claims
+  (was 24).
+- `qmcp check` holds the runtime files the services share with root to the
+  `qubes` group: it fails when `/run/qmcp`, its `calls/`, the create lock, the
+  proposal store, its lock or the audit log is not that group's and
+  group-writable (`calls/` and the create lock were checked for the group's
+  write bit only, `/run/qmcp` not at all), when `/run/qmcp` or the proposal
+  store is not setgid, when the store is missing, when the audit log is
+  missing (the services cannot create it), and when the host has no `qubes`
+  group; it warns on a proposal that cannot be read, or whose accept never
+  finished.
+- tmpfiles declares the proposal store, its lock and the audit log, each
+  root:qubes, so a file root creates first can never lock the services out.
+- `uninstall.sh` keeps `/var/lib/qmcp` (the proposals) unless `--purge`, and
+  backs it up.
+- `qmcp project delete NAME` (the plan) names the member qubes it would remove.
+
+### Fixed
+
+- **A `qmcp project` command's exit status was read from its report's text**
+  (since 0.9.18): any line holding `NOT ` counted as a failed step, so a
+  command that completed on a qube whose name ends in `NOT` could exit 1, and
+  the window reported it failed. Failed steps are now recorded as such. Found
+  while building proposals, where the same check would have recorded a
+  completed accept as failed.
+- **A create that failed and could not be undone reported `undone`** (since
+  0.9.18): when removing the new lead failed too, the report still said the
+  project was undone. It now says `NOT undone` and names what is left.
+- **A quota had no upper bound**; past 1 EiB it is refused, and project
+  records holding one do not load.
+- **The audit log, created by root** (once the operator's commands write to
+  it), would have been root's group and closed to the services; root now gives
+  a log it has just created to `qubes`.
+- `uninstall.sh` named its services in a list of its own, so a service added
+  later would have been left installed, and its clean-state check would not
+  have noticed. A test now holds the list to the library's.
+- The offline suite depended on the umask it ran under: under 022 a check test
+  failed (since 0.9.18). Its base now makes the runtime directories as
+  tmpfiles does.
+
 ## [0.9.19] — 2026-10-02
 
 **The operator's window (M2b): the `qmcp` command as a window in dom0, running

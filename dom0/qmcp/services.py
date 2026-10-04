@@ -1,4 +1,4 @@
-"""qmcp.services — the ten qmcp.* qrexec services.
+"""qmcp.services — the twelve qmcp.* qrexec services.
 
 Each one is installed in dom0 under its service name by `dom0/rpc/qmcp-service`,
 which calls `main(<name>)`. Every call runs the same funnel: the caller holds
@@ -15,6 +15,11 @@ like a qube that does not exist.
 No exception text reaches the caller: every failure answers with a
 fixed phrase, and the exception's CLASS goes to the audit line, which the
 operator can read and AI cannot.
+
+Two services are the hub's alone and touch no qube: `qmcp.SubmitProposal`
+stores a proposal for the operator (`qmcp.proposals`), and
+`qmcp.ProposalStatus` tells the hub what became of its proposals, in state
+words only.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ import re
 import sys
 import time
 
-from qmcp import birth, budget, core, projects, scope
+from qmcp import birth, budget, core, projects, proposals, scope
 from qmcp.core import refuse
 
 LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"})
@@ -256,11 +261,50 @@ def svc_pool_stats(app, call, req):
            "ai_managed_bytes_cap": cap,
            "ai_managed_bytes_headroom": max(0, cap - used),
            "name_prefix": prefix}
-    if not who.is_hub():
+    if who.is_hub():
+        out["projects"] = _project_rows(app)
+    else:
         p = who.project
         out.update({"project": p.label, "name_prefix": p.space(prefix),
                     "templates": list(p.templates), "networks": list(p.networks),
                     "dump": p.dump})
+    return out
+
+
+def _project_rows(app):
+    """Every project's record as the hub may read it, so it can propose an edit
+    that fits. A name in a record that is no longer in AI space (a template
+    the operator took out, say) reads `<out-of-scope>`, as every read redacts
+    one; the dump sink is outside AI space, so only whether there is one is
+    told. One pass over the qubes gives both the names in scope and each
+    slot's disk use; a slot's use that cannot be read is null, never zero, and
+    records that cannot be read are null, never an empty list."""
+    try:
+        records = projects.load()
+    except projects.ProjectsUnreadable:
+        return None
+    in_scope, used, unreadable = set(), {}, set()
+    for vm in app.domains:
+        try:
+            tags = set(vm.tags)
+        except Exception:
+            continue
+        if core.UMBRELLA not in tags:
+            continue
+        in_scope.add(vm.name)
+        for slot in projects.member_slots(tags):
+            try:
+                used[slot] = used.get(slot, 0) + budget.persistent_bytes(vm)
+            except Exception:
+                unreadable.add(slot)
+    shown = lambda name: name if name is None or name in in_scope else scope.OUT_OF_SCOPE  # noqa: E731
+    out = []
+    for slot, p in sorted(records.items()):
+        out.append({"slot": slot, "label": p.label, "lead": shown(p.lead),
+                    "templates": [shown(t) for t in p.templates],
+                    "networks": [shown(n) for n in p.networks], "quota": p.quota,
+                    "used": None if slot in unreadable else used.get(slot, 0),
+                    "has_dump": p.dump is not None})
     return out
 
 
@@ -858,6 +902,52 @@ def svc_events(app, call, req, dispatcher_factory=None):
     return out
 
 
+# ------------------------------------------------------------------ proposals
+
+HUB_ONLY = "proposals are the hub's: only the hub submits them and reads them"
+
+
+def svc_submit_proposal(app, call, req):
+    """Store a proposal for the operator. Only its shape is checked: no qube
+    is looked up, so the reply says nothing about names outside AI space."""
+    call.summary["type"] = _clip(req.get("type"))
+    if not call.principal.is_hub():
+        raise refuse(HUB_ONLY)
+    try:
+        proposal = proposals.normalise(req, birth.read_name_prefix())
+    except proposals.Invalid as e:
+        raise refuse(f"invalid proposal: {e}") from None
+    call.summary["subject"] = _clip(proposals.subject(proposal))
+    try:
+        pid, sha256, expires = proposals.submit(proposal, call.caller)
+    except proposals.Refused as e:
+        # Full, Busy, or the store's lock unavailable: fixed phrases.
+        raise refuse(str(e)) from None
+    except OSError as e:
+        call.error_class = type(e).__name__
+        raise refuse("the proposal store is unavailable") from None
+    call.summary.update({"id": pid, "sha256": sha256})
+    proposals.announce(pid)
+    return {"ok": True, "id": pid, "sha256": sha256, "state": "pending", "expires": expires}
+
+
+def svc_proposal_status(app, call, req):
+    """What became of the hub's proposals: state words and its own stored
+    proposal, never the command's report or a reason."""
+    if not call.principal.is_hub():
+        raise refuse(HUB_ONLY)
+    pid = req.get("id")
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0):
+        raise refuse("id must be a positive integer")
+    try:
+        view = proposals.hub_view(call.caller, pid)
+    except proposals.Refused as e:
+        raise refuse(str(e)) from None
+    except OSError:
+        raise refuse("the proposal store is unavailable") from None
+    return dict({"ok": True}, **view)
+
+
 # ------------------------------------------------------------------ dispatch
 
 #: name -> (handler, state-changing)
@@ -872,6 +962,8 @@ SERVICES = {
     "qmcp.SpawnAIManagedQube": (svc_spawn, True),
     "qmcp.CloneAIManagedQube": (svc_clone, True),
     "qmcp.SpawnDisposableAIManaged": (svc_spawn_disposable, True),
+    "qmcp.SubmitProposal": (svc_submit_proposal, True),
+    "qmcp.ProposalStatus": (svc_proposal_status, False),
 }
 
 

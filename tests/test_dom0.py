@@ -7,6 +7,7 @@ that the library does not let it through.
 """
 from __future__ import annotations
 
+import grp
 import io
 import json
 import os
@@ -20,7 +21,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, birth, budget, core, fleet, projects, services  # noqa: E402
+from qmcp import audit, birth, budget, core, fleet, projects, proposals, services  # noqa: E402
 import fakequbes  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
@@ -48,11 +49,24 @@ class Base(unittest.TestCase):
             (services, "DISPOSE_WAIT_S", 0.01),
             (projects, "PROJECTS_PATH", self.tmp / "projects.json"),
             (projects, "LOCK_PATH", self.tmp / "run" / "projects.lock"),
+            (proposals, "PROPOSALS_DIR", self.tmp / "proposals"),
+            (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
+            (proposals, "BUS_DIR", self.tmp / "no-session"),
+            # The files the fixtures make are this user's group, as tmpfiles makes
+            # them the services' group on a real dom0.
+            (fleet, "SERVICES_GROUP", grp.getgrgid(os.getegid()).gr_name),
         ]:
             self._saved.append((mod, attr, getattr(mod, attr)))
             setattr(mod, attr, value if isinstance(value, float) else str(value))
         self.addCleanup(self._restore)
         (self.tmp / "run" / "calls").mkdir(parents=True)
+        for d in ("run", "run/calls"):              # as tmpfiles makes them, whatever the umask
+            os.chmod(self.tmp / d, 0o2770)
+        (self.tmp / "proposals").mkdir(mode=0o2770)
+        os.chmod(self.tmp / "proposals", 0o2770)
+        # As the installer and tmpfiles leave it: present, group-writable.
+        (self.tmp / "audit.log").touch(mode=0o660)
+        os.chmod(self.tmp / "audit.log", 0o660)
         (self.tmp / "hub").write_text(HUB + "\n")
         (self.tmp / "pool-cap").write_text(str(1000 * GiB) + "\n")
         (self.tmp / "private-cap").write_text(str(20 * GiB) + "\n")

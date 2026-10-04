@@ -17,6 +17,9 @@ Four guarantees, each with a test that fails when it breaks:
 - **Roles come from records and badges, never a label colour** (`Model`).
 - **It never imports qubesadmin and never runs as root** (`Structure`,
   `Widgets`).
+- **A proposal runs only as it was read**: accepted with the fingerprint of the
+  `proposal show` on display, with the second tick when the command asks for
+  one, and never from a show that failed (`ProposalModel`, `Widgets`).
 
 The GTK tests build widgets without showing them, and are skipped where GTK
 cannot start (no PyGObject, or no display).
@@ -25,12 +28,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import io
 import json
 import os
 import pathlib
 import subprocess
 import sys
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -38,13 +43,29 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, cli, fleet, projects  # noqa: E402
+from qmcp import audit, cli, fleet, projects, proposals  # noqa: E402
 from qmcp import guimodel as gm  # noqa: E402
+from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, OTHER_LEAD, ProjectBase  # noqa: E402
 
 GUI_SRC = HERE.parent / "dom0" / "qmcp" / "gui.py"
 MODEL_SRC = HERE.parent / "dom0" / "qmcp" / "guimodel.py"
+#: One proposal of every type the hub can submit, each valid on the projects
+#: fixture. Only the delete needs the second tick there.
+PROPOSALS = {
+    "create": {"type": "project-create", "title": "new project <b>newp</b>", "label": "newp",
+               "lead": {"from": "template", "qube": "ai-debian-13"},
+               "networks": ["ai-net-router"], "quota": 5 * GiB},
+    "edit": {"type": "project-edit", "title": "more room for other", "project": "other",
+             "add_networks": ["ai-net-router"], "default_network": "ai-net-router",
+             "quota": 15 * GiB},
+    "dump": {"type": "project-dump", "title": "a sink for other", "project": "other"},
+    "lead": {"type": "project-lead", "title": "a new lead for other", "project": "other",
+             "lead": {"from": "clone", "qube": "ai-work2"}, "lead_name": "ai-other-boss",
+             "keep_old": True},
+    "delete": {"type": "project-delete", "title": "remove osint", "project": "osint"},
+}
 HOSTILE = "ai-x\u202egnp.exe\nFAKE ok:true <b>bold</b> &amp; \x00\x7f\u200b\x1b[31m"
 
 
@@ -135,6 +156,15 @@ class GuiBase(ProjectBase):
 
     def node(self, key):
         return next(n for n in gm.walk(self.tree()) if n.key == key)
+
+    def submit_proposal(self, name, **changes):
+        """A proposal from the hub, through the real service."""
+        reply = self.call("qmcp.SubmitProposal", dict(PROPOSALS[name], **changes))
+        self.assertTrue(reply["ok"], reply)
+        return reply
+
+    def show(self, pid):
+        return gm.parse_proposal(self.runner.execute(gm.show_proposal(pid)), pid)
 
 
 # ======================================================================= escaping
@@ -267,6 +297,9 @@ SAMPLES = {
     gm.role: [dict(action="manage", qube="x1"), dict(action="guard", qube="x1"),
               dict(action="revoke", qube="x1", keep_running=True)],
     gm.audit_rotate: [dict()],
+    gm.show_proposal: [dict(pid=1)],
+    gm.accept_proposal: [dict(pid=1, sha256="0" * 64), dict(pid=2, sha256="ab" * 32, tick="cd" * 32)],
+    gm.reject_proposal: [dict(pid=1)],
 }
 
 
@@ -337,6 +370,46 @@ class Parity(GuiBase):
         shown = {k for k, _ in gm.AUDIT_FIELDS}
         self.assertEqual(fields - shown, set(gm.AUDIT_NOT_SHOWN))
         self.assertLessEqual(shown, fields)
+
+    def test_every_field_of_every_proposal_read_is_shown(self):
+        # One proposal of every type, through the real service and the real
+        # command; two decided, so a decision with a report is read as well.
+        ids = {name: self.submit_proposal(name)["id"] for name in PROPOSALS}
+        self.runner.execute(gm.accept_proposal(ids["dump"], self.show(ids["dump"])["sha256"]))
+        self.runner.execute(gm.reject_proposal(ids["lead"]))
+        rows = self.read_json("proposal", "list", "--json")
+        self.assertEqual(len(rows), len(PROPOSALS))
+        listed = {k for k, _ in gm.PROPOSAL_FIELDS}
+        self.assertEqual(set().union(*(r.keys() for r in rows)), listed)
+        self.assertLessEqual({k for k, _ in gm.PROPOSAL_COLUMNS}, listed)
+        docs = [self.read_json("proposal", "show", str(r["id"]), "--json") for r in rows]
+        for doc in docs:
+            self.assertEqual(set(doc), listed | {k for k, _ in gm.PROPOSAL_SHOW_FIELDS}
+                             | set(gm.PROPOSAL_BY_PART))
+        options = set().union(*(doc["proposal"].keys() for doc in docs))
+        self.assertEqual(options - {"type", "title"}, {k for k, _ in gm.PROPOSAL_OPTIONS})
+        edits = [doc for doc in docs if doc["before"] is not None]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(set(edits[0]["before"]) | set(edits[0]["after"]),
+                         {k for k, _ in gm.EDIT_FIELDS})
+        decisions = [doc["decision"] for doc in docs if doc["decision"] is not None]
+        self.assertEqual(len(decisions), 2)
+        fields = set().union(*(d.keys() for d in decisions))
+        self.assertEqual(fields - {k for k, _ in gm.DECISION_FIELDS}, set(gm.DECISION_NOT_SHOWN))
+        self.assertLessEqual({k for k, _ in gm.DECISION_FIELDS}, fields)
+        # Named is not enough: each field that carries something is on screen.
+        parts = {"proposal": gm.PROPOSAL_OPTIONS, "before": gm.EDIT_FIELDS,
+                 "after": gm.EDIT_FIELDS, "decision": gm.DECISION_FIELDS}
+        self.assertEqual(set(parts), set(gm.PROPOSAL_BY_PART))
+        self.assertTrue(any(doc["tick"] for doc in docs))
+        for doc in docs:
+            shown = {h for h, _ in gm.proposal_details(doc)}
+            for key, heading in gm.PROPOSAL_SHOW_FIELDS:
+                if doc[key] or (key == "second_tick" and doc["state"] == "pending"):
+                    self.assertIn(heading, shown, (doc["id"], key))
+            for key, table in parts.items():
+                if doc[key]:
+                    self.assertTrue({h for _, h in table} & shown, (doc["id"], key))
 
 
 # ======================================================================= the model
@@ -553,6 +626,338 @@ class Model(GuiBase):
         self.assertEqual(rows[1][2], "x\\ny")
 
 
+# ======================================================================= proposals: the model
+
+class ProposalModel(GuiBase):
+    """The Proposals tab's decisions, against the real service and command."""
+
+    def listing(self):
+        return gm.proposal_rows(self.read_json("proposal", "list", "--json"))
+
+    def test_rows_newest_first_and_the_tab_counts_what_waits(self):
+        self.assertEqual(gm.proposals_tab(self.listing()), "Proposals (0)")
+        a = self.submit_proposal("create")
+        b = self.submit_proposal("delete")
+        rows = self.listing()
+        self.assertEqual([r["id"] for r in rows], [b["id"], a["id"]])
+        self.assertEqual(gm.proposals_tab(rows), "Proposals (2)")
+        self.assertEqual(gm.proposal_cells(rows[1]),
+                         [str(a["id"]), "pending", "project-create", "newp",
+                          "new project <b>newp</b>", rows[1]["submitted"]])
+        self.assertEqual(self.runner.execute(gm.reject_proposal(b["id"])).rc, 0)
+        self.assertEqual(gm.proposals_tab(self.listing()), "Proposals (1)")
+        self.assertEqual(gm.proposals_tab(None), "Proposals (?)")      # never read: no count
+        self.assertEqual(gm.proposal_rows([{"id": True}, {"id": "1"}, ["x"], {"id": 4}]),
+                         [{"id": 4}])
+
+    def test_details_show_every_field_of_every_proposal(self):
+        ids = {name: self.submit_proposal(name)["id"] for name in PROPOSALS}
+        self.runner.execute(gm.accept_proposal(ids["dump"], self.show(ids["dump"])["sha256"]))
+        self.runner.execute(gm.reject_proposal(ids["lead"]))
+        for name, pid in ids.items():
+            doc = self.show(pid)
+            details = gm.proposal_details(doc)
+            headings = [h for h, _ in details]
+            self.assertEqual(len(headings), len(set(headings)), headings)
+            for _, value in details:
+                self.assertIsInstance(value, gm.Shown)
+            want = {h for k, h in gm.PROPOSAL_FIELDS
+                    if not (k in ("problem", "needs_closing") and not doc[k])}
+            want |= {h for k, h in gm.PROPOSAL_OPTIONS if k in doc["proposal"]}
+            if doc["command"] is not None:
+                want.add("Equivalent command")
+            if doc["state"] == "pending":
+                want.add("Second tick")
+            if doc["tick"] is not None:
+                want.add("Second tick digest")
+            if doc["before"] is not None:
+                want |= {h for _, h in gm.EDIT_FIELDS}
+            if doc["plan"] is not None:
+                want.add("Plan")
+            if doc["decision"] is not None:
+                want |= {h for _, h in gm.DECISION_FIELDS}
+            self.assertEqual(set(headings), want, name)
+        create = dict(gm.proposal_details(self.show(ids["create"])))
+        self.assertEqual(create["State"], "pending: waiting for you")
+        self.assertEqual(create["Title (written by AI)"], "new project <b>newp</b>")
+        self.assertEqual(create["Lead"], "a fresh qube from the template ai-debian-13")
+        self.assertEqual(create["Workers' disk quota"], "5G")              # exact
+        self.assertEqual(create["Equivalent command"], "qmcp project create newp --lead-template "
+                                                       "ai-debian-13 --network ai-net-router --quota 5G")
+        self.assertEqual(create["Second tick"], "not needed: one click is enough")
+        edit = dict(gm.proposal_details(self.show(ids["edit"])))
+        self.assertNotIn("Equivalent command", edit)           # an edit applies to the record then
+        self.assertEqual(edit["Worker networks, now -> after"], "none -> ai-net-router, none")
+        self.assertEqual(edit["Quota, now -> after"], "10G -> 15G")
+        self.assertEqual(edit["Templates, now -> after"], "ai-tpl-g -> ai-tpl-g")
+        dump = dict(gm.proposal_details(self.show(ids["dump"])))
+        self.assertEqual(dump["Decision"], "accepted")
+        self.assertIn("other-dump", dump["Report"])
+        self.assertNotIn("Second tick", dump)                   # only computed while pending
+        lead = dict(gm.proposal_details(self.show(ids["lead"])))
+        self.assertEqual((lead["Decision"], lead["Report"]), ("rejected", "-"))
+        self.assertEqual(lead["Lead"], "a clone of ai-work2")
+        delete = dict(gm.proposal_details(self.show(ids["delete"])))
+        self.assertIn("this removes p01 'osint'", delete["Plan"])
+        self.assertEqual(delete["Second tick"], "needed: the reasons are in red below")
+
+    def test_a_title_is_text_written_by_ai(self):
+        # The schema lets in printable ASCII only, which still holds markup,
+        # quotes and backslashes: the window shows them as the command's JSON does.
+        title = '<b>Approve</b> &amp; "now" <span foreground="red">' + chr(92) + "n</span>"
+        reply = self.submit_proposal("create", title=title)
+        doc = self.show(reply["id"])
+        self.assertEqual(doc["title"], title)
+        shown = dict(gm.proposal_details(doc))["Title (written by AI)"]
+        self.assertEqual(shown, json.dumps(title)[1:-1])
+        self.assertIn("<b>Approve</b>", shown)
+        self.assertIn(shown, self.read("proposal", "list", "--json").out)
+        self.assertIn(shown, gm.proposal_cells(self.listing()[0]))
+        # A line break or a bidi override never gets that far...
+        for bad in ("a" + chr(10) + "b", "a" + chr(0x202E) + "b", ""):
+            self.assertFalse(self.call("qmcp.SubmitProposal",
+                                       dict(PROPOSALS["create"], title=bad))["ok"], ascii(bad))
+        # ...and were one stored, it would still reach the screen as visible escapes.
+        doc = dict(doc, title=HOSTILE, subject=HOSTILE, caller=HOSTILE)
+        for heading, value in gm.proposal_details(doc) + list(zip(gm.PROPOSAL_COLUMNS,
+                                                                  gm.proposal_cells(doc))):
+            self.assertTrue(value.isascii() and chr(10) not in value, (heading, value))
+        self.assertIn(chr(92) + "u202e", dict(gm.proposal_details(doc))["Title (written by AI)"])
+
+    def test_the_second_tick_gates_accept(self):
+        create = self.submit_proposal("create")
+        delete = self.submit_proposal("delete")
+        doc = self.show(delete["id"])
+        self.assertTrue(doc["second_tick"])
+        self.assertEqual(gm.proposal_actions(doc), {"reject_proposal"})
+        self.assertEqual(gm.proposal_actions(doc, ticked=True), {"accept_proposal", "reject_proposal"})
+        text = gm.second_tick_text(doc)
+        self.assertTrue(text.startswith("Accepting it needs the second tick:"))
+        self.assertIn("- deletes the project osint", text)
+        self.assertEqual(gm.tick_key(doc), (delete["id"], delete["sha256"], doc["tick"]))
+        self.assertEqual(dict(gm.proposal_details(doc))["Second tick digest"], doc["tick"])
+        # Without --yes the command refuses, and the proposal stays pending.
+        refused = self.runner.execute(gm.accept_proposal(delete["id"], doc["sha256"]))
+        self.assertEqual(refused.rc, 1)
+        self.assertIn("needs the second tick", refused.err)
+        self.assertEqual(self.show(delete["id"])["state"], "pending")
+        doc = self.show(create["id"])
+        self.assertEqual(doc["second_tick"], [])
+        self.assertEqual(gm.proposal_actions(doc), {"accept_proposal", "reject_proposal"})
+        self.assertIsNone(gm.tick_key(doc))
+        self.assertEqual(gm.second_tick_text(doc), "")
+        # A tick for other reasons is refused, and the proposal stays pending.
+        moved = self.runner.execute(gm.accept_proposal(delete["id"], delete["sha256"], "ab" * 32))
+        self.assertEqual(moved.rc, 1)
+        self.assertIn("not the ones it was given for", moved.err)
+        self.assertEqual(self.show(delete["id"])["state"], "pending")
+        argv = gm.accept_proposal(delete["id"], delete["sha256"], self.show(delete["id"])["tick"])
+        self.assertEqual(argv[-2:], ["--yes", self.show(delete["id"])["tick"]])
+        self.assertEqual(self.runner.execute(argv).rc, 0)
+        self.assertIsNone(projects.find(projects.load(), "osint"))
+
+    def test_closed_proposals_offer_nothing(self):
+        accepted = self.submit_proposal("dump")
+        rejected = self.submit_proposal("create")
+        failed = self.submit_proposal("create", label="bad",
+                                      lead={"from": "template", "qube": "ai-no-such"})
+        running = self.submit_proposal("create", label="run")
+        expired, _, _ = proposals.submit(proposals.normalise(PROPOSALS["edit"], "ai-"), HUB,
+                                         now=time.time() - proposals.EXPIRY_S - 60)
+        self.assertEqual(self.runner.execute(gm.accept_proposal(accepted["id"], accepted["sha256"])).rc, 0)
+        self.assertEqual(self.runner.execute(gm.reject_proposal(rejected["id"])).rc, 0)
+        result = self.runner.execute(gm.accept_proposal(failed["id"], failed["sha256"]))
+        self.assertEqual(result.rc, 1)                          # the command refused: it closes as failed
+        self.assertIn("is not a TemplateVM", result.out)
+        store = pathlib.Path(proposals.PROPOSALS_DIR)
+        # An accept still running holds its claim locked.
+        claim = store / f"{running['id']:06d}.accepting"
+        claim.write_text("{}")
+        fd = os.open(claim, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        for pid, state in ((accepted["id"], "accepted"), (rejected["id"], "rejected"),
+                           (failed["id"], "failed"), (expired, "expired"),
+                           (running["id"], "accepting")):
+            doc = self.show(pid)
+            self.assertEqual((doc["state"], doc["needs_closing"]), (state, False))
+            self.assertEqual(gm.proposal_actions(doc, ticked=True), set(), state)
+            self.assertIsNone(gm.tick_key(doc), state)
+            self.assertEqual(gm.second_tick_text(doc), "", state)
+            self.assertNotIn("needs closing", gm.proposal_cells(doc)[1])
+
+    def test_what_needs_closing_gets_close_and_closes_as_the_command_does(self):
+        # The three cases the command says need closing: a stored file that does
+        # not read, a decision file that does not read, and an accept that never
+        # finished. Each offers Close alone, and closes in the state the pane
+        # said it would, by the command's own word.
+        decided = self.submit_proposal("create")
+        stale = self.submit_proposal("create", label="stale")
+        self.assertEqual(self.runner.execute(gm.reject_proposal(decided["id"])).rc, 0)
+        store = pathlib.Path(proposals.PROPOSALS_DIR)
+        (store / "000099.json").write_text("{not json")
+        (store / f"{decided['id']:06d}.decision").write_text("garbage")
+        (store / f"{stale['id']:06d}.accepting").write_bytes(b"")    # nobody holds it
+
+        def store_check():
+            return [(f["status"], f["detail"]) for f in self.read_json("check", "--json")["findings"]
+                    if f["check"] == "proposal store"]
+        [(status, detail)] = store_check()                          # check warns first
+        self.assertEqual(status, "warn")
+        self.assertEqual(set(detail.split(" with ")[0].split(" ", 1)[1].split(", ")),
+                         {"99", str(decided["id"]), str(stale["id"])})
+        for pid, state, closed in ((99, "unreadable", "rejected"), (decided["id"], "failed", "failed"),
+                                   (stale["id"], "failed", "failed")):
+            doc = self.show(pid)
+            self.assertEqual((doc["state"], doc["needs_closing"]), (state, True))
+            self.assertEqual(gm.proposal_actions(doc, ticked=True), {"close_proposal"})
+            self.assertEqual(gm.closes_as(doc), closed)
+            self.assertIn(f"records the proposal as {closed}", gm.close_intro(doc))
+            self.assertIn(f"Why: {doc['problem']}.", gm.close_intro(doc))
+            self.assertIn(f"Close records it as {closed}",
+                          dict(gm.proposal_details(doc))["Needs closing"])
+            self.assertEqual(gm.proposal_cells(doc)[1], f"{state}, needs closing")
+            result = self.runner.execute(gm.reject_proposal(pid))   # what Close runs
+            self.assertEqual(result.out, f"proposal {pid}: {closed}\n")
+            doc = self.show(pid)
+            self.assertEqual((doc["state"], doc["needs_closing"]), (closed, False))
+            self.assertEqual(gm.proposal_actions(doc, ticked=True), set())
+            self.assertNotIn("Needs closing", dict(gm.proposal_details(doc)))
+        self.assertEqual([s for s, _ in store_check()], ["pass"])
+        # Not while an accept is running, whatever else is wrong: the command
+        # refuses that, so the window does not offer it.
+        self.assertEqual(gm.proposal_actions({"state": "accepting", "needs_closing": True}), set())
+
+    def test_a_failed_show_keeps_the_last_view_of_that_proposal_only(self):
+        a = self.submit_proposal("create")
+        b = self.submit_proposal("delete")
+        pane = gm.ProposalPane()
+        self.assertEqual(pane.note(None), "The proposals have not been read.")
+        self.assertEqual(pane.note(False), "No proposals from the hub.")
+        seq = pane.select(a["id"])
+        self.assertEqual(pane.actions(), set())                 # reading: nothing allowed yet
+        self.assertTrue(pane.answer(seq, self.runner.execute(gm.show_proposal(a["id"])), "10:00:00"))
+        self.assertEqual(pane.actions(), {"accept_proposal", "reject_proposal"})
+        good = pane.doc
+        # A show that exits non-zero failed, whatever it printed.
+        with self.assertRaises(gm.ReadError):
+            gm.parse_proposal(gm.Result(gm.show_proposal(a["id"]), 1, json.dumps(good)), a["id"])
+        failed = gm.Result(gm.show_proposal(a["id"]), 1, "", "qmcp proposal show: no answer")
+        # Read again, as a refresh does, and the show fails: the last view stays,
+        # says so, and nothing may change until a show reads.
+        self.assertTrue(pane.answer(pane.select(a["id"]), failed, "10:01:00"))
+        self.assertIs(pane.doc, good)
+        self.assertEqual(pane.actions(ticked=True), set())
+        self.assertIn(f"Could not read proposal {a['id']}", pane.note())
+        self.assertIn("Showing it as read at 10:00:00", pane.note())
+        # Another proposal's failed show never shows the first one.
+        self.assertTrue(pane.answer(pane.select(b["id"]), failed, "10:02:00"))
+        self.assertIsNone(pane.doc)
+        self.assertEqual(pane.actions(ticked=True), set())
+        self.assertNotIn("Showing it", pane.note())
+        # An answer about another proposal is not taken for this one.
+        pane.answer(pane.select(b["id"]), self.runner.execute(gm.show_proposal(a["id"])), "10:03:00")
+        self.assertIsNone(pane.doc)
+        self.assertIn("unexpected answer", pane.error)
+        # A show that answers after a newer one was asked for changes nothing.
+        old, new = pane.select(a["id"]), pane.select(a["id"])
+        self.assertFalse(pane.answer(old, self.runner.execute(gm.show_proposal(a["id"])), "10:04:00"))
+        self.assertIsNone(pane.doc)
+        self.assertTrue(pane.reading)
+        self.assertTrue(pane.answer(new, self.runner.execute(gm.show_proposal(a["id"])), "10:05:00"))
+        self.assertEqual(pane.doc["id"], a["id"])
+        self.assertEqual(pane.note(), f"Proposal {a['id']}, read at 10:05:00.")
+        pane.select(None)
+        self.assertEqual((pane.doc, pane.actions()), (None, set()))
+
+    def test_a_refresh_makes_the_pane_stale_until_it_reads_again(self):
+        a = self.submit_proposal("create")
+        pane = gm.ProposalPane()
+        pane.stale()                                            # nothing selected: nothing to do
+        self.assertFalse(pane.reading)
+        show = lambda: self.runner.execute(gm.show_proposal(a["id"]))  # noqa: E731
+        pane.answer(pane.select(a["id"]), show(), "10:00:00")
+        self.assertEqual(pane.actions(), {"accept_proposal", "reject_proposal"})
+        doc = pane.doc
+        running = pane.select(a["id"])                          # a show already running...
+        pane.stale()                                            # ...when a refresh starts
+        self.assertEqual((pane.actions(), pane.doc), (set(), doc))
+        self.assertEqual(pane.note(), f"Reading proposal {a['id']}...")
+        self.assertFalse(pane.answer(running, show(), "10:01:00"))   # may predate the change
+        self.assertEqual(pane.actions(), set())
+        self.assertTrue(pane.answer(pane.select(a["id"]), show(), "10:02:00"))
+        self.assertEqual(pane.actions(), {"accept_proposal", "reject_proposal"})
+
+    def test_an_open_form_is_checked_against_the_show_on_display(self):
+        a = self.submit_proposal("create")
+        d = self.submit_proposal("delete")
+        pane = gm.ProposalPane()
+        show = lambda pid: self.runner.execute(gm.show_proposal(pid))  # noqa: E731
+        pane.answer(pane.select(a["id"]), show(a["id"]), "10:00:00")
+        opened = pane.doc
+        changed = "the proposal changed since this form opened; read it again"
+        self.assertIsNone(gm.proposal_changed(opened, "accept_proposal", pane, False))
+        pane.stale()
+        self.assertEqual(gm.proposal_changed(opened, "accept_proposal", pane, False), changed)
+        pane.answer(pane.select(a["id"]), show(a["id"]), "10:01:00")
+        self.assertIsNone(gm.proposal_changed(opened, "accept_proposal", pane, False))
+        for key, value in (("id", 99), ("sha256", "ab" * 32), ("tick", "cd" * 32)):
+            pane.doc = dict(opened, **{key: value})
+            self.assertEqual(gm.proposal_changed(opened, "reject_proposal", pane, False), changed, key)
+        pane.answer(pane.select(a["id"]), gm.Result(gm.show_proposal(a["id"]), 1, "", "x"), "t")
+        self.assertEqual(gm.proposal_changed(opened, "reject_proposal", pane, False), changed)
+        # Accept needs the tick as it is at OK, not only as it was at opening.
+        pane.answer(pane.select(d["id"]), show(d["id"]), "10:02:00")
+        opened = pane.doc
+        self.assertEqual(gm.proposal_changed(opened, "accept_proposal", pane, False), changed)
+        self.assertIsNone(gm.proposal_changed(opened, "accept_proposal", pane, True))
+
+    def test_quotas_are_shown_exactly(self):
+        # Rounded to 0.1 GiB, a quota one byte past 5 GiB read as 5.0 GiB.
+        odd = 5 * GiB + 1
+        create = dict(gm.proposal_details(self.show(self.submit_proposal("create", quota=odd)["id"])))
+        self.assertEqual(create["Workers' disk quota"], str(odd))
+        self.assertIn(f"--quota {odd}", create["Equivalent command"])
+        edit = dict(gm.proposal_details(self.show(self.submit_proposal("edit", quota=odd)["id"])))
+        self.assertEqual(edit["Quota, now -> after"], f"10G -> {odd}")
+
+    def test_proposal_commands_are_exactly_what_runs(self):
+        sha = "ab" * 32
+        self.assertEqual(gm.show_proposal(3), [gm.QMCP, "proposal", "show", "3", "--json"])  # a read
+        self.assertEqual(gm.accept_proposal(3, sha),
+                         ["/usr/bin/sudo", "-n", gm.QMCP, "proposal", "accept", "3", "--sha256", sha])
+        self.assertEqual(gm.accept_proposal(3, sha, tick="cd" * 32)[-2:], ["--yes", "cd" * 32])
+        for bad in ("", "CD" * 32, "cd" * 31, "--json", True):
+            with self.assertRaises(gm.FormError, msg=repr(bad)):
+                gm.accept_proposal(3, sha, tick=bad)
+        self.assertEqual(gm.reject_proposal(3), ["/usr/bin/sudo", "-n", gm.QMCP, "proposal", "reject", "3"])
+        for pid in (0, -1, True, "3", None, 3.0):
+            with self.assertRaises(gm.FormError, msg=repr(pid)):
+                gm.reject_proposal(pid)
+        # The window refuses a fingerprint exactly when the command does, on a
+        # proposal that exists and stays pending through every refusal.
+        reply = self.submit_proposal("create")
+        pid = str(reply["id"])
+        for bad in (None, "", "AB" * 32, "ab" * 31, "ab" * 33, "--yes", "g" * 64):
+            with self.assertRaises(gm.FormError, msg=repr(bad)):
+                gm.accept_proposal(reply["id"], bad)
+            if bad is not None:
+                argv = [*gm.SUDO, gm.QMCP, "proposal", "accept", pid, "--sha256", bad]
+                self.assertNotEqual(self.runner.execute(argv).rc, 0, bad)
+        self.assertEqual(self.show(reply["id"])["state"], "pending")
+        self.assertEqual(self.runner.execute(gm.accept_proposal(reply["id"], reply["sha256"])).rc, 0)
+
+    def test_the_forms_say_what_accepting_and_rejecting_do(self):
+        reply = self.submit_proposal("create")
+        doc = self.show(reply["id"])
+        intro = gm.accept_intro(doc)
+        self.assertIn(f"Accepts proposal {reply['id']} from {HUB}: project-create newp", intro)
+        self.assertIn("The equivalent command: qmcp project create newp", intro)
+        edit = self.show(self.submit_proposal("edit")["id"])
+        self.assertIn("now -> after", gm.accept_intro(edit))
+        self.assertIn("without running anything", gm.reject_intro(doc))
+
+
 # ======================================================================= the command's new reads
 
 class CliReads(GuiBase):
@@ -640,6 +1045,19 @@ class CliPlanAndSizes(GuiBase):
         result = self.read("project", "delete", "osint", "--yes")  # the delete itself needs root
         self.assertIn("run as root", result.err)
         self.assertIsNotNone(projects.find(projects.load(), "osint"))
+
+    def test_a_quota_past_one_eib_is_refused_by_the_form_and_the_command(self):
+        self.assertEqual(projects.MAX_QUOTA, 1048576 * 1024 ** 4)       # 1 EiB = 1048576T
+        gm.edit_project("osint", quota="1048576T")                       # the cap itself is a quota
+        for builder, kw in ((gm.edit_project, dict(key="osint", quota="1048577T")),
+                            (gm.create_project, dict(label="ok", lead_source="template",
+                                                     lead_origin="t", networks=["none"],
+                                                     quota="1048577T"))):
+            with self.assertRaises(gm.FormError, msg=builder.__name__):
+                builder(**kw)
+        result = self.runner.execute(gm.write_cmd("project", "edit", "osint", "--quota", "1048577T"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn("at most 1 EiB", result.err)
 
     def test_sizes_are_ascii(self):
         for text in ("5\u212a", "\uff15G", "5\u0130"):         # KELVIN SIGN, FULLWIDTH 5, dotted I
@@ -875,6 +1293,32 @@ class Widgets(GuiBase):
     def sensitive(self):
         return {k for k, b in self.win.buttons.items() if b.get_sensitive()}
 
+    def deciding(self):
+        """The Proposals tab's buttons that are on."""
+        return {k for k, b in self.win.proposal_buttons.items() if b.get_sensitive()}
+
+    def select_proposal(self, pid):
+        def visit(model, path, it):
+            if model[it][0] == str(pid):
+                self.win.proposal_view.get_selection().select_iter(it)
+                return True
+            return False
+        self.win.proposal_store.foreach(visit)
+        self.assertEqual(self.win.pane.pid, pid)
+
+    def propose(self, name, **changes):
+        """A proposal from the hub; then Refresh, and select it."""
+        reply = self.submit_proposal(name, **changes)
+        self.win.refresh()
+        self.select_proposal(reply["id"])
+        return reply
+
+    def pane(self):
+        """The Proposals tab's details pane, heading -> text."""
+        grid = self.win.proposal_details
+        return {grid.get_child_at(0, i).get_text(): grid.get_child_at(1, i).get_text()
+                for i in range(len(grid.get_children()) // 2)}
+
     def test_every_builder_parameter_has_a_field_in_its_form(self):
         # The parity test proves each builder can make every option; this
         # proves the form that calls it lets the operator set each one.
@@ -882,7 +1326,15 @@ class Widgets(GuiBase):
         self.select("project:p01")
         record = self.win.node().data
         row = next(r for r in self.win.fleet if r["name"] == "ai-work2")
+        self.propose("delete")
+        doc = self.win.pane.doc
         forms = {
+            # The number and the fingerprint come from the show on display; the
+            # second tick is the box beside its reasons, on the Proposals tab.
+            gm.accept_proposal: (self.gui.ProposalForm(self.win, doc, "accept_proposal", True), {
+                "pid": "doc", "sha256": "doc", "tick": "ticked"}),
+            gm.reject_proposal: (self.gui.ProposalForm(self.win, doc, "reject_proposal"),
+                                 {"pid": "doc"}),
             gm.create_project: (self.gui.ProjectForm(self.win, self.win.fleet, HUB), {
                 "label": "label_entry", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "templates": "templates",
@@ -907,9 +1359,16 @@ class Widgets(GuiBase):
             form.destroy()
         for ident in ("remove_lead", "delete_project", "add_to_ai_space", "manage", "guard"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
+        self.assertTrue(self.win.proposal_tick.get_visible())
+        # Close runs reject_proposal too, from its own form (test_a_proposal_that_needs_closing...).
+        self.assertEqual(set(self.win.proposal_buttons),
+                         {"accept_proposal", "reject_proposal", "close_proposal"})
         for builder in set(gm.BUILDERS) - set(forms):
+            # show_proposal runs when a proposal is selected, as delete_plan
+            # runs before the delete form.
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
-                                             "audit_rotate"}, "a builder without a form")
+                                             "audit_rotate", "show_proposal"},
+                          "a builder without a form")
 
     def test_refresh_fills_every_page_from_the_command(self):
         keys = [r[0] for r in self.rows(self.win.store)]
@@ -1239,6 +1698,14 @@ class Widgets(GuiBase):
         self.win.act("delete_project")
         argvs.append(self.runner.calls[-1])                     # the plan, a read
         argvs.append(self.win.last_form.argv())                 # the delete itself
+        self.runner.calls.clear()
+        self.propose("delete")                                  # it needs the second tick
+        argvs.append(self.runner.calls[-1])                     # the show, a read
+        self.win.proposal_tick.set_active(True)
+        for ident in ("accept_proposal", "reject_proposal"):
+            form = self.win.act(ident)
+            argvs.append(form.argv())
+            form.destroy()
         covered = set()
         for argv in argvs:
             covered |= covered_by(parser, argv)
@@ -1353,11 +1820,19 @@ class Widgets(GuiBase):
     def test_the_audit_pane_says_whose_calls_it_shows(self):
         buf = self.win.audit_detail.get_buffer()
         text = lambda: buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)  # noqa: E731
-        self.assertIn("No calls from the hub or a lead", text())
-        self.assertIn("Your other commands are not", self.win.verify_label.get_text())
+        self.assertIn("Nothing on this log yet", text())
+        self.assertIn("every command of yours that changes something", text())
+        self.assertIn("(caller operator)", self.win.verify_label.get_text())
+        self.assertNotIn("not on", self.win.verify_label.get_text() + text())
+        # The operator's own commands are on the audit chain, as caller operator.
+        self.select("qube:ai-tpl-g")
+        self.submit(self.win.act("manage"))
+        newest = self.rows(self.win.audit_store)[0]
+        self.assertEqual((newest[3], newest[4]), ("operator", "qmcp manage"))
         self.submit(self.win.act("rotate"))
         self.assertIn("This log starts at a rotation", text())
         self.assertIn("--path /var/log/", text())
+        self.assertEqual(self.rows(self.win.audit_store)[0][3], "operator")
 
     def test_a_failed_refresh_keeps_the_whole_previous_view(self):
         # From the M2b release gate: after one good read, a failed project read
@@ -1403,6 +1878,378 @@ class Widgets(GuiBase):
         pathlib.Path(audit.LOG_PATH).write_text('{"seq": 1, "hash": "x"}\n')
         self.win.verify()
         self.assertIn("BROKEN", self.win.verify_label.get_text())
+
+    # ------------------------------------------------------------------ proposals
+
+    def test_a_proposal_from_the_hub_to_the_fleet(self):
+        self.assertEqual(self.win.proposals_tab.get_text(), "Proposals (0)")
+        self.assertEqual(self.win.proposal_note.get_text(), "No proposals from the hub.")
+        reply = self.submit_proposal("create")
+        self.win.refresh()
+        self.assertEqual(self.win.proposals_tab.get_text(), "Proposals (1)")
+        row = self.rows(self.win.proposal_store)[0]
+        self.assertEqual(row[:6], [str(reply["id"]), str(reply["id"]), "pending", "project-create",
+                                   "newp", "new project <b>newp</b>"])
+        self.assertEqual(self.deciding(), set())                 # nothing selected
+        self.runner.calls.clear()
+        self.select_proposal(reply["id"])
+        self.assertEqual(self.runner.calls, [gm.show_proposal(reply["id"])])   # a read, as you
+        pane = self.pane()
+        self.assertEqual(pane["Title (written by AI)"], "new project <b>newp</b>")
+        self.assertEqual(pane["Fingerprint (sha256)"], reply["sha256"])
+        self.assertEqual(pane["Equivalent command"], "qmcp project create newp --lead-template "
+                                                     "ai-debian-13 --network ai-net-router --quota 5G")
+        self.assertFalse(self.win.proposal_tick.get_visible())   # one click is enough
+        self.assertEqual(self.win.proposal_warning.get_text(), "")
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+        form = self.win.act("accept_proposal")
+        argv = form.argv()
+        self.assertEqual(argv, gm.accept_proposal(reply["id"], pane["Fingerprint (sha256)"]))
+        self.assertEqual(form.preview.get_text(), gm.shown(argv))
+        # Replies held, as a real runner delivers them: from the moment the
+        # accept runs until the proposal is read again, nothing may be decided
+        # from the show taken before it.
+        self.runner.hold = True
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual([c for c, _ in self.runner.held], [argv])           # what was shown runs
+        self.assertEqual(self.deciding(), set())
+        self.runner.release()                                     # it ran; a refresh starts
+        answered = 0
+        while self.runner.held:
+            self.assertEqual(self.deciding(), set(), f"after {answered} replies")
+            self.runner.release()
+            answered += 1
+        self.runner.hold = False
+        self.assertEqual(answered, len(gm.READS) + 1)             # the reads, then the re-show
+        title, result = self.reports[-1]
+        self.assertEqual((title, result.argv, result.rc), (f"Accept proposal {reply['id']}", argv, 0))
+        self.assertEqual(argv[:2], list(gm.SUDO))
+        self.assertIn(f"proposal {reply['id']}: accepted", result.out)
+        p = projects.find(projects.load(), "newp")
+        self.assertEqual((p.lead, p.networks, p.quota), ("ai-newp-lead", ("ai-net-router",), 5 * GiB))
+        self.assertIn(f"project:{p.slot}", [r[0] for r in self.rows(self.win.store)])   # refreshed
+        self.assertEqual(self.win.proposals_tab.get_text(), "Proposals (0)")
+        pane = self.pane()                                        # read again after the change
+        self.assertEqual(pane["Decision"], "accepted")
+        self.assertIn("p03: lead ai-newp-lead (created)", pane["Report"])
+        self.assertEqual(self.deciding(), set())                 # closed: nothing to do
+        calls = {(r.get("caller"), r.get("service")) for r in self.win.audit_rows}
+        self.assertLessEqual({(HUB, "qmcp.SubmitProposal"), ("operator", "qmcp proposal accept")},
+                             calls)
+
+    def test_accept_is_off_until_the_tick_when_reasons_exist(self):
+        reply = self.propose("delete", project="other")
+        self.assertTrue(self.win.proposal_tick.get_visible())
+        self.assertFalse(self.win.proposal_tick.get_active())
+        warning = self.win.proposal_warning.get_text()
+        self.assertIn("- deletes the project other", warning)
+        self.assertTrue(self.win.proposal_warning.get_style_context().has_class("qmcp-FAILED"))
+        self.assertIn("this removes p02 'other'", self.pane()["Plan"])
+        self.assertEqual(self.deciding(), {"reject_proposal"})
+        self.assertIsNone(self.win.act("accept_proposal"))       # no form without the tick
+        self.win.proposal_tick.set_active(True)
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+        # The tick sent is the digest the show on display gave, exactly.
+        tick = self.pane()["Second tick digest"]
+        self.assertEqual(tick, self.win.pane.doc["tick"])
+        self.assertEqual(tick, self.show(reply["id"])["tick"])
+        form = self.win.act("accept_proposal")
+        argv = form.argv()
+        self.assertEqual(argv, gm.accept_proposal(reply["id"], reply["sha256"], tick))
+        self.assertEqual(argv[-2:], ["--yes", tick])
+        self.assertEqual(form.warning.get_text(), warning)       # the reasons again, in red
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        self.runner.calls.clear()
+        result = self.submit(form)
+        self.assertEqual((self.runner.calls[0], result.argv), (argv, argv))   # as shown, it ran
+        self.assertIsNone(projects.find(projects.load(), "other"))
+        self.assertNotIn(OTHER_LEAD, self.app.domains)
+        self.assertFalse(self.win.proposal_tick.get_visible())   # closed: no tick, no buttons
+        self.assertEqual(self.deciding(), set())
+
+    def test_the_tick_answers_one_proposal_only(self):
+        first = self.propose("delete", project="other")
+        self.win.proposal_tick.set_active(True)
+        self.win.refresh()                                       # the same reasons, read again
+        self.assertEqual(self.win.pane.pid, first["id"])
+        self.assertTrue(self.win.proposal_tick.get_active())
+        second = self.propose("delete")
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertFalse(self.win.proposal_tick.get_active())
+        self.assertEqual(self.deciding(), {"reject_proposal"})
+        self.select_proposal(first["id"])
+        self.assertFalse(self.win.proposal_tick.get_active())   # never carried back either
+
+    def test_a_proposal_changed_after_it_was_read_is_refused(self):
+        # What the operator read is what runs: the form carries the fingerprint
+        # of the show on display, and the command refuses a stored file that no
+        # longer hashes to it. Nothing runs, the proposal stays pending, and the
+        # refresh after the report reads it again.
+        reply = self.propose("create")
+        form = self.win.act("accept_proposal")
+        path = pathlib.Path(proposals.PROPOSALS_DIR) / f"{reply['id']:06d}.json"
+        record = json.loads(path.read_text())
+        record["proposal"]["networks"] = ["none"]               # still a proposal dom0 could store
+        path.write_bytes(proposals.canonical(record))
+        result = self.submit(form, ok=False)
+        self.assertIn("its fingerprint differs", result.err)
+        self.assertIn(reply["sha256"], result.argv)
+        self.assertIsNone(projects.find(projects.load(), "newp"))
+        self.assertEqual(self.win.pane.doc["state"], "pending")
+        self.assertNotEqual(self.pane()["Fingerprint (sha256)"], reply["sha256"])
+        self.assertIn("--network none", self.pane()["Equivalent command"])
+
+    def release_all(self, check=None):
+        """Answer every held command in order, `check()` before each; returns
+        how many there were."""
+        n = 0
+        while self.runner.held:
+            if check is not None:
+                check(n)
+            self.runner.release()
+            n += 1
+        return n
+
+    def change_others_lead_on_the_qubes_tab(self):
+        """A new lead for other, the old one kept as a worker: the change form."""
+        self.select("project:p02")
+        form = self.win.act("change_lead")
+        form.source["clone"].set_active(True)
+        form.origin.set_active_id("ai-work2")
+        form.lead_name.set_text("l2")
+        form.old_lead.set_active_id("keep")
+        return form
+
+    def test_after_a_change_no_proposal_button_is_on_until_the_re_show(self):
+        # The second review's reproduction, replies held as a real runner holds
+        # them. A lead proposal for other, ticked for the reason "removes the
+        # old lead ai-other-lead"; then other's lead is changed to ai-other-l2
+        # on the Qubes tab. Accept from the old show and tick would have sent
+        # --yes and removed ai-other-l2.
+        reply = self.propose("lead", keep_old=False)
+        self.assertIn("removes the old lead ai-other-lead", self.win.proposal_warning.get_text())
+        self.win.proposal_tick.set_active(True)
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+        old = self.win.pane.doc
+        form = self.change_others_lead_on_the_qubes_tab()
+        self.runner.hold = True
+        form.response(Gtk.ResponseType.OK)                       # the change runs, held
+        self.assertEqual(self.deciding(), set())
+
+        def off(n):
+            self.assertEqual(self.deciding(), set(), f"after {n} replies")
+            self.assertIsNone(self.win.act("accept_proposal"), f"after {n} replies")
+        # The change, the reads of the refresh it starts, then the re-show.
+        self.assertEqual(self.release_all(off), 1 + len(gm.READS) + 1)
+        self.runner.hold = False
+        self.assertEqual(projects.find(projects.load(), "other").lead, "ai-other-l2")
+        self.assertIn("removes the old lead ai-other-l2", self.win.proposal_warning.get_text())
+        self.assertNotEqual(self.win.pane.doc["tick"], old["tick"])
+        self.assertFalse(self.win.proposal_tick.get_active())   # the old tick does not carry over
+        self.assertEqual(self.deciding(), {"reject_proposal"})
+        self.assertIn("ai-other-l2", self.app.domains)
+        self.assertEqual(self.show(reply["id"])["state"], "pending")
+
+    def test_an_open_form_runs_nothing_once_its_proposal_reads_differently(self):
+        reply = self.propose("lead", keep_old=False)
+        self.win.proposal_tick.set_active(True)
+        form = self.win.act("accept_proposal")                   # opened on the old reasons
+        self.assertEqual(form.argv()[-2], "--yes")
+        # A refresh starts with the form open. While it reads, OK refuses...
+        self.runner.hold = True
+        self.win.refresh()
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertIn("the proposal changed since this form opened", form.error.get_text())
+        self.assertFalse(form.ok.get_sensitive())
+        # ...and once the lead has changed under it, from a dom0 terminal, the
+        # re-show reads other reasons: OK still runs nothing.
+        self.assertEqual(self.runner.execute(gm.change_lead("other", "clone", "ai-work2",
+                                                            "ai-other-l2", None, True)).rc, 0)
+        self.release_all()
+        self.runner.hold = False
+        self.assertIn("removes the old lead ai-other-l2", self.win.proposal_warning.get_text())
+        form.response(Gtk.ResponseType.OK)
+        # Ticked again, for the new reasons: the form still carries the old
+        # digest, so it still runs nothing.
+        self.win.proposal_tick.set_active(True)
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(writes(), before)                       # nothing ran
+        self.assertIn("the proposal changed since this form opened", form.error.get_text())
+        self.assertIn("ai-other-l2", self.app.domains)
+        self.assertEqual(self.show(reply["id"])["state"], "pending")
+
+    def test_an_open_form_runs_nothing_once_its_show_fails(self):
+        reply = self.propose("create")
+        form = self.win.act("accept_proposal")
+        self.runner.hold = True
+        self.runner.fail.add(tuple(gm.show_proposal(reply["id"])))
+        self.win.refresh()
+        self.release_all()                                       # the reads; the re-show fails
+        self.runner.hold = False
+        self.assertIn(f"Could not read proposal {reply['id']}", self.win.proposal_note.get_text())
+        self.assertEqual(self.deciding(), set())
+        self.runner.calls.clear()
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(self.runner.calls, [])                  # nothing ran
+        self.assertIn("the proposal changed since this form opened", form.error.get_text())
+        self.assertIsNone(projects.find(projects.load(), "newp"))
+        self.assertEqual(self.show(reply["id"])["state"], "pending")
+
+    def test_an_open_form_still_runs_when_its_proposal_reads_the_same(self):
+        # The control for the two tests above: a refresh that reads the same
+        # proposal, fingerprint and second tick leaves the form able to run.
+        reply = self.propose("delete", project="other")
+        self.win.proposal_tick.set_active(True)
+        form = self.win.act("accept_proposal")
+        self.runner.hold = True
+        self.win.refresh()
+        self.release_all()
+        self.runner.hold = False
+        self.assertTrue(self.win.proposal_tick.get_active())
+        tick = self.win.pane.doc["tick"]
+        self.assertTrue(tick)
+        result = self.submit(form)
+        self.assertEqual(result.argv, gm.accept_proposal(reply["id"], reply["sha256"], tick))
+        self.assertIsNone(projects.find(projects.load(), "other"))
+
+    def test_reject_runs_nothing(self):
+        reply = self.propose("create")
+        form = self.win.act("reject_proposal")
+        self.assertEqual(form.argv(), gm.reject_proposal(reply["id"]))
+        intro = [c.get_text() for c in form.get_content_area().get_children()
+                 if isinstance(c, Gtk.Label)][0]
+        self.assertIn("without running anything", intro)
+        self.assertEqual(form.warning.get_text(), "")
+        result = self.submit(form)
+        self.assertEqual(result.out, f"proposal {reply['id']}: rejected\n")
+        self.assertIsNone(projects.find(projects.load(), "newp"))
+        self.assertEqual((self.pane()["Decision"], self.pane()["Report"]), ("rejected", "-"))
+        self.assertEqual(self.deciding(), set())
+
+    def test_one_proposal_command_at_a_time(self):
+        first = self.submit_proposal("create")
+        second = self.submit_proposal("dump")
+        self.win.refresh()
+        self.select_proposal(first["id"])
+        form = self.win.act("accept_proposal")
+        other = self.win.act("reject_proposal")                  # opened before the accept runs
+        self.addCleanup(other.destroy)
+        self.runner.hold = True
+        form.response(Gtk.ResponseType.OK)
+        self.assertTrue(self.win.busy)
+        self.assertEqual((self.deciding(), self.sensitive()), (set(), set()))
+        self.assertFalse(self.win.write("t", gm.reject_proposal(second["id"])))
+        self.assertIsNone(self.win.act("reject_proposal"))       # no form opens while one runs
+        other.response(Gtk.ResponseType.OK)                      # and one already open refuses
+        self.assertIn("another command is running", other.error.get_text())
+        self.runner.hold = False
+        self.runner.release()
+        self.assertFalse(self.win.busy)
+        self.assertEqual([title for title, _ in self.reports], [f"Accept proposal {first['id']}"])
+        self.assertEqual(self.show(second["id"])["state"], "pending")
+
+    def test_a_failed_list_read_turns_proposal_changes_off(self):
+        reply = self.propose("create")
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+        self.runner.fail.add(tuple(gm.READS["proposals"]))
+        self.win.refresh()
+        self.assertEqual(self.deciding(), set())
+        self.assertEqual([r[0] for r in self.rows(self.win.proposal_store)], [str(reply["id"])])
+        self.assertEqual(self.win.proposals_tab.get_text(), "Proposals (1)")   # the last good list
+        self.assertIn("Changes are off", self.win.status.get_text())
+        self.assertEqual(self.sensitive(), set())
+        self.runner.fail.clear()
+        self.win.refresh()
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+
+    def test_a_failed_show_keeps_the_pane_and_turns_its_buttons_off(self):
+        reply = self.propose("create")
+        before = self.pane()
+        self.runner.fail.add(tuple(gm.show_proposal(reply["id"])))
+        self.win.refresh()
+        self.assertEqual(self.pane(), before)                    # the last good view of it
+        note = self.win.proposal_note.get_text()
+        self.assertIn(f"Could not read proposal {reply['id']}", note)
+        self.assertIn("Showing it as read at", note)
+        self.assertEqual(self.deciding(), set())
+        self.assertIn("new_project", self.sensitive())           # the rest of the window is current
+        self.runner.fail.clear()
+        self.win.refresh()
+        self.assertEqual(self.deciding(), {"accept_proposal", "reject_proposal"})
+
+    def test_proposals_never_read_count_nothing(self):
+        runner = CliRunner(self.app)
+        runner.fail.add(tuple(gm.READS["proposals"]))
+        win = self.gui.Window(runner=runner, show_forms=False, report=lambda *a: None)
+        self.addCleanup(win.destroy)
+        win.refresh()
+        self.assertEqual(win.proposals_tab.get_text(), "Proposals (?)")
+        self.assertEqual(win.proposal_note.get_text(), "The proposals have not been read.")
+        self.assertFalse(any(b.get_sensitive() for b in win.buttons.values()))
+
+    def test_every_cell_of_a_proposal_is_escaped(self):
+        title = '<b>bold</b> &amp; "q" <span foreground="red">x</span>'
+        reply = self.propose("create", title=title)
+        row = self.rows(self.win.proposal_store)[0]
+        self.assertEqual(row[5], json.dumps(title)[1:-1])
+        self.assertIn("<b>bold</b>", row[5])                     # as text: no markup on screen
+        self.assertEqual(self.pane()["Title (written by AI)"], row[5])
+        for text in row[1:] + list(self.pane().values()) + [self.win.proposal_note.get_text()]:
+            self.assertTrue(text.isascii() and chr(10) not in text, text)
+        self.assertEqual(self.win.pane.doc["title"], title)
+        self.assertEqual(reply["id"], self.win.pane.pid)
+
+    def test_a_decided_proposal_offers_nothing(self):
+        reply = self.submit_proposal("create")
+        self.assertEqual(self.runner.execute(gm.reject_proposal(reply["id"])).rc, 0)
+        self.win.refresh()
+        self.select_proposal(reply["id"])
+        self.assertEqual(self.pane()["State"], "rejected")
+        self.assertNotIn("Needs closing", self.pane())
+        self.assertEqual(self.deciding(), set())
+        for ident in self.win.proposal_buttons:
+            self.assertIsNone(self.win.act(ident), ident)
+        self.assertFalse(self.win.proposal_tick.get_visible())
+
+    def test_a_proposal_that_needs_closing_gets_close(self):
+        # A decision file that does not read: the command says the proposal
+        # needs closing, `qmcp check` warns, and the window offers Close, which
+        # runs reject. Afterwards the tab shows it closed, and the warning is gone.
+        reply = self.submit_proposal("create")
+        self.assertEqual(self.runner.execute(gm.reject_proposal(reply["id"])).rc, 0)
+        store = pathlib.Path(proposals.PROPOSALS_DIR)
+        (store / f"{reply['id']:06d}.decision").write_text("garbage")
+        self.win.refresh()
+        checks = lambda: {r[2]: r[1] for r in self.rows(self.win.check_store)}  # noqa: E731
+        self.assertEqual(checks()["proposal store"], "WARN")
+        self.assertEqual(self.rows(self.win.proposal_store)[0][2], "failed, needs closing")
+        self.select_proposal(reply["id"])
+        pane = self.pane()
+        self.assertIn("decision file unreadable", pane["Problem"])
+        self.assertIn("Close records it as failed", pane["Needs closing"])
+        self.assertEqual(self.deciding(), {"close_proposal"})
+        self.assertFalse(self.win.proposal_tick.get_visible())
+        self.assertIsNone(self.win.act("reject_proposal"))       # Close, named for what it does
+        form = self.win.act("close_proposal")
+        self.assertEqual(form.get_title(), f"Close proposal {reply['id']}")
+        self.assertEqual(form.argv(), gm.reject_proposal(reply["id"]))
+        intro = [c.get_text() for c in form.get_content_area().get_children()
+                 if isinstance(c, Gtk.Label)][0]
+        self.assertIn("Why: decision file unreadable", intro)
+        self.assertIn("records the proposal as failed", intro)
+        result = self.submit(form)
+        self.assertEqual(result.out, f"proposal {reply['id']}: failed\n")
+        self.assertEqual(self.rows(self.win.proposal_store)[0][2], "failed")
+        pane = self.pane()
+        self.assertNotIn("Needs closing", pane)
+        self.assertEqual(pane["Decision"], "failed")
+        self.assertIn("did not read; closed by the operator", pane["Report"])
+        self.assertEqual(self.deciding(), set())
+        self.assertEqual(checks()["proposal store"], "PASS")
+        self.assertEqual((store / f"{reply['id']:06d}.decision.unreadable").read_text(), "garbage")
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,

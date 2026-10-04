@@ -19,6 +19,7 @@ import copy
 import inspect
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -44,6 +45,12 @@ class Tool:
     description: str
     input_schema: dict
     handler: Callable[[dict], dict]
+    # Runs on the validated arguments, after the schema check, for what the
+    # schema subset cannot say: it converts an argument that may be written
+    # two ways (a quota as bytes or as "40G") and raises ArgumentError for a
+    # value of the right type that cannot be sent. Shape only, like the rest
+    # of the validator; never a security check.
+    prepare: Callable[[dict], dict] | None = None
 
 
 class UnknownTool(LookupError):
@@ -57,7 +64,8 @@ class ArgumentError(ValueError):
 TOOLS: dict[str, Tool] = {}
 
 
-def _register(name: str, description: str, properties: dict, required: tuple = ()):
+def _register(name: str, description: str, properties: dict, required: tuple = (),
+              prepare: Callable[[dict], dict] | None = None):
     schema: dict = {"type": "object", "properties": copy.deepcopy(properties),
                     "additionalProperties": False}
     if required:
@@ -66,7 +74,7 @@ def _register(name: str, description: str, properties: dict, required: tuple = (
     def register(handler: Callable[[dict], dict]) -> Callable[[dict], dict]:
         if name in TOOLS:
             raise RuntimeError(f"tool {name} registered twice")
-        TOOLS[name] = Tool(name, inspect.cleandoc(description), schema, handler)
+        TOOLS[name] = Tool(name, inspect.cleandoc(description), schema, handler, prepare)
         return handler
     return register
 
@@ -79,7 +87,8 @@ def _prop(json_type, description: str, **extra) -> dict:
 
 # --------------------------------------------------------------------------
 # Argument validation: a small subset of JSON Schema (type, with unions as a
-# list; items; properties; required; additionalProperties: false; enum).
+# list; items; properties; required; additionalProperties: false; enum), at
+# any depth, then the tool's prepare hook, if it has one.
 # --------------------------------------------------------------------------
 
 SCHEMA_KEYWORDS = frozenset({
@@ -152,7 +161,9 @@ def _problem(schema: dict, value, where: str) -> str | None:
         properties = schema.get("properties", {})
 
         def named(key: str) -> str:
-            return f"{where}.{key}" if where else f"argument {_shown(key)}"
+            # A key inside an object argument (lead.from) comes from the caller
+            # too, so it is capped the same way, without the quotes.
+            return f"{where}.{_shown(key)[1:-1]}" if where else f"argument {_shown(key)}"
 
         for key in schema.get("required", ()):
             if key not in value:
@@ -188,7 +199,8 @@ def get_tool(name) -> Tool:
 
 def validate_arguments(tool: Tool, arguments) -> dict:
     """Check `arguments` against the tool's inputSchema and return a copy with
-    the defaults of omitted optional arguments filled in. Raises ArgumentError."""
+    the defaults of omitted optional arguments filled in, then passed through
+    the tool's prepare hook if it has one. Raises ArgumentError."""
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, dict):
@@ -200,7 +212,7 @@ def validate_arguments(tool: Tool, arguments) -> dict:
     for key, sub in tool.input_schema["properties"].items():
         if key not in out and "default" in sub:
             out[key] = copy.deepcopy(sub["default"])
-    return out
+    return out if tool.prepare is None else tool.prepare(out)
 
 
 def call_tool(name: str, arguments) -> dict:
@@ -222,6 +234,42 @@ _SHELL = _prop("boolean", "Run cmd through /bin/sh -c.", default=False)
 _RUN_TIMEOUT = _prop("integer", "Time limit for the command inside the qube, in seconds.",
                      default=60)
 _STDIN = _prop("string", "Text fed to the command's standard input.", default="")
+
+# A size as the operator's `qmcp project --quota` reads one: a whole number and
+# an optional unit in powers of 1024 (K, M, G or T), which may be followed by B
+# or iB, in any letter case: "40G", "40GiB" and "40gb" are all 40 * 1024**3
+# bytes; and, as there, at most 1 EiB, past any disk. At most 20 digits are
+# read, so the number always converts before that bound is applied.
+_SIZE_RE = re.compile(r"\s*([0-9]{1,20})\s*([BKMGT]?)(?:i?B)?\s*", re.IGNORECASE | re.ASCII)
+_SIZE_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+_MAX_QUOTA = 2 ** 60
+
+
+def _size_bytes(value, where: str) -> int:
+    """A positive whole number of bytes, from an integer or a size string.
+    Raises ArgumentError, so a size that cannot be sent never reaches dom0."""
+    # The schema refuses a boolean already. bool is an int subclass, so it is
+    # refused here too rather than let True become one byte.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ArgumentError(f"{where}: expected integer or string, got {json_type(value)}")
+    if isinstance(value, str):
+        match = _SIZE_RE.fullmatch(value)
+        if match is None:
+            raise ArgumentError(f"{where}: {_shown(value)} is not a size: give bytes, or a "
+                                f"whole number and K, M, G or T (512M, 40G, 1T)")
+        value = int(match.group(1)) * _SIZE_UNITS[match.group(2).upper()]
+    if value <= 0:
+        raise ArgumentError(f"{where}: must be more than zero bytes")
+    if value > _MAX_QUOTA:
+        raise ArgumentError(f"{where}: at most 1 EiB")
+    return value
+
+
+def _quota_in_bytes(args: dict) -> dict:
+    """The prepare hook of the tools that take a quota, which dom0 takes in bytes."""
+    if args.get("quota") is None:      # omitted, or null for "unchanged" in an edit
+        return args
+    return dict(args, quota=_size_bytes(args["quota"], "argument 'quota'"))
 
 
 def _get_property(name: str, prop: str) -> dict:
@@ -800,11 +848,21 @@ def _qubes_events(args: dict) -> dict:
     Returns {"ok": true, "ai_managed_bytes_used": <int>,
     "ai_managed_bytes_cap": <int>, "ai_managed_bytes_headroom": <int>,
     "name_prefix": "<prefix new names must carry>"}. For the hub the figures
-    are all of AI space against the operator's pool cap. For a project's lead
-    they are its project's workers against the project's quota, and the reply
-    adds "project" (its label), "templates" (what it may spawn from),
-    "networks" (where its workers may be born; null is "none", the first entry
-    is the default) and "dump" (its dump sink, or null).
+    are all of AI space against the operator's pool cap, and the reply adds
+    "projects": one entry per slot in use, {slot, label, lead, templates,
+    networks, quota, used, has_dump}, starting with p00, the hub's own qubes,
+    which has no label, lead, templates, networks or quota. In networks null
+    is "none" and the first entry is the default; a recorded name that has
+    left AI space reads "<out-of-scope>"; used is the slot's disk, or null
+    when it cannot be read; has_dump says whether the slot has a dump
+    sink, whose name the hub is not told. "projects" is null when the
+    operator's project records cannot be read. Read it before proposing a
+    change to a project (qubes_propose_project_edit and the other proposal
+    tools). For a project's lead the figures are its project's workers
+    against the project's quota, and the reply adds "project" (its label),
+    "templates" (what it may spawn from), "networks" (where its workers may
+    be born; null is "none", the first entry is the default) and "dump" (its
+    dump sink, or null).
     "used" is provisioned size, not bytes written. Check the headroom before a
     create (qubes_spawn, qubes_clone, a disposable) and stop creating when it
     falls below the next allocation. The cap and the quota are the operator's
@@ -814,3 +872,264 @@ def _qubes_events(args: dict) -> dict:
     """, {})
 def _qubes_get_pool_stats(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.GetPoolStats", timeout=DOM0_TIMEOUT)
+
+
+# --------------------------------------------------------------------------
+# Proposals: the hub asks, and the operator accepts or rejects in dom0
+# --------------------------------------------------------------------------
+
+# Each tool sends its arguments as the caller gave them (a quota converted to
+# bytes), under the proposal's type. dom0 checks the shape with its own rules
+# and stores its own normal form, with every optional field filled in, so no
+# default is filled in here: there would be two places deciding what an
+# omitted field means.
+
+_PROPOSAL_TERMS = inspect.cleandoc("""
+    Nothing changes until the operator accepts the proposal in dom0, in the
+    qubes-mcp window or with its `qmcp proposal accept`. Only the hub can
+    propose; a project's lead is refused.
+    Submitting checks the proposal's shape and looks no qube up, so a name
+    that does not fit the fleet fails when the operator accepts, against the
+    fleet as it is then. At most 10 proposals are pending at a time, and each
+    expires after 7 days. If the operator accepts it but the change is
+    refused or fails, the proposal closes as "failed"; submit it again if it
+    is still wanted. Follow it with qubes_proposals.
+
+    Returns {"ok": true, "id": <int>, "sha256": "<fingerprint>", "state":
+    "pending", "expires": "<UTC time>"} or {"ok": false, "error": "<reason>"}.
+    """)
+
+
+def _proposal_doc(text: str) -> str:
+    """A proposal tool's description: its own part, then what every proposal shares."""
+    return inspect.cleandoc(text) + "\n\n" + _PROPOSAL_TERMS
+
+
+def _submit(kind: str, args: dict) -> dict:
+    return qrexec.call_qmcp("qmcp.SubmitProposal", dict(args, type=kind), timeout=DOM0_TIMEOUT)
+
+
+_TITLE = _prop("string", "What the proposal asks for, in 1-100 printable ASCII characters. "
+                         'The operator sees it labelled "written by AI".')
+_PROJECT = _prop("string", "The project's label (never its slot: by the time the operator "
+                           "accepts, a slot can hold another project).")
+_LEAD = _prop("object", 'Where the lead comes from: {"from": "template", "clone" or '
+                        '"promote", "qube": NAME}.',
+              properties={
+                  "from": _prop("string", "template: a fresh lead built on the TemplateVM "
+                                          "`qube`. clone: a copy of `qube`, one of the hub's "
+                                          "own managed AppVMs. promote: `qube` itself, one of "
+                                          "the hub's own AppVMs, becomes the lead.",
+                                enum=["template", "clone", "promote"]),
+                  "qube": _prop("string", "The TemplateVM, or the hub's own AppVM, the lead "
+                                          "comes from."),
+              }, required=["from", "qube"], additionalProperties=False)
+_LEAD_NAME = _prop(["string", "null"], "A fresh lead's name, inside the project's names; "
+                                       "omit it for <prefix><label>-lead.")
+_LEAD_NETVM = _prop(["string", "null"], "The lead's own network: a qube that provides network, "
+                                        'or "none". Omitted or null (the same thing here, '
+                                        "never \"none\"), a fresh lead has none and a promoted "
+                                        "one keeps its own.")
+_QUOTA_TEXT = ("the workers' disk quota: bytes, or a whole number and K, M, G or T, powers of "
+               '1024 (e.g. "40G").')
+_NETWORKS_TEXT = ('Worker networks: gateways in AI space, or "none" (or null, as '
+                  "qubes_get_pool_stats shows it) for no network.")
+_TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may spawn from."
+
+
+@_register("qubes_propose_project", _proposal_doc("""
+    Propose a new project, for the operator to accept or reject in dom0.
+
+    A project is a lead, the workers it creates and optionally a dump sink, in
+    the lowest free slot (p01-p15). Its qubes are named <prefix><label>-...,
+    e.g. "ai-osint-scraper" (qubes_get_pool_stats reports the prefix).
+
+    - label: 1-8 lowercase letters or digits, not one that reads as a slot
+      ("p03") or a keyword ("none", "hub").
+    - lead: {"from": ..., "qube": NAME}. "template": a fresh lead built on the
+      TemplateVM NAME. "clone": a copy of NAME, one of the hub's own managed
+      AppVMs (in p00 or in no slot). "promote": NAME itself, one of the hub's
+      own AppVMs, becomes the lead, keeping its files, template and network.
+    - lead_name: a fresh lead's name, inside <prefix><label>-; omit it for
+      <prefix><label>-lead. A promoted lead keeps its own name.
+    - lead_netvm: the lead's own network, a qube that provides network, or
+      "none". Omitted, a fresh lead has no network and a promoted one keeps
+      its own.
+    - templates: up to 15 templates or disposable templates in AI space that
+      the lead may spawn from. The lead's own template goes first when it is
+      in AI space; the list must not end up empty.
+    - networks: 1-8 worker networks, gateways in AI space or "none" for no
+      network; the first is the default for new workers.
+    - quota: the workers' disk, in bytes or as a size ("512M", "40G", "1T";
+      K, M, G and T are powers of 1024). The pool cap still applies.
+    - dump: true to also make the project's dump sink, <label>-dump.
+
+    It needs the operator's second tick, an extra confirmation, when the lead
+    is promoted, when lead_netvm or a worker network is one AI space does not
+    use today, or when the quota makes the projects' quotas add up to more
+    than the pool cap.
+    """), {
+        "title": _TITLE,
+        "label": _prop("string", "The new project's label: 1-8 lowercase letters or digits."),
+        "lead": _LEAD,
+        "lead_name": _LEAD_NAME,
+        "lead_netvm": _LEAD_NETVM,
+        "templates": _prop("array", _TEMPLATES_TEXT + " Omit for none beyond the lead's own.",
+                           items={"type": "string"}),
+        "networks": _prop("array", _NETWORKS_TEXT + " The first is the default.",
+                          items={"type": ["string", "null"]}),
+        "quota": _prop(["integer", "string"], "The project's quota: " + _QUOTA_TEXT),
+        "dump": _prop("boolean", "Also make the project's dump sink; omit for false."),
+    }, required=("title", "label", "lead", "networks", "quota"), prepare=_quota_in_bytes)
+def _qubes_propose_project(args: dict) -> dict:
+    return _submit("project-create", args)
+
+
+@_register("qubes_propose_project_edit", _proposal_doc("""
+    Propose a change to a project's templates, worker networks or quota.
+
+    The edit says what it adds, removes or sets, and is applied to the project
+    as it is when the operator accepts it, changing only the entries it
+    names: a change made since to anything else stands. Adding what is
+    already there, or removing what is not, changes nothing. Workers keep their networks: taking a network off the list moves
+    no qube off it. qubes_get_pool_stats shows every project as it is now.
+
+    - project: the project's label.
+    - add_templates, remove_templates: templates or disposable templates in AI
+      space that the lead may spawn from.
+    - add_networks, remove_networks: worker networks, gateways in AI space or
+      "none" for no network (null there means "none" too, as
+      qubes_get_pool_stats shows it).
+    - default_network: this network, already on the list or added here, goes
+      first, as the default for new workers.
+    - quota: the new disk quota, in bytes or as a size, as for
+      qubes_propose_project.
+
+    null in default_network or quota leaves it as it is, like leaving it out.
+    An entry cannot be both added and removed, and an edit must change
+    something. It needs the operator's second tick, an extra confirmation,
+    when it adds a network AI space does not use today, or sets a quota that
+    makes the projects' quotas add up to more than the pool cap.
+    """), {
+        "title": _TITLE,
+        "project": _PROJECT,
+        "add_templates": _prop("array", "Add these: " + _TEMPLATES_TEXT,
+                               items={"type": "string"}),
+        "remove_templates": _prop("array", "Remove these from the approved templates.",
+                                  items={"type": "string"}),
+        "add_networks": _prop("array", "Add these: " + _NETWORKS_TEXT,
+                              items={"type": ["string", "null"]}),
+        "remove_networks": _prop("array", 'Remove these from the worker networks ("none", or '
+                                          "null, is the no-network entry).",
+                                 items={"type": ["string", "null"]}),
+        "default_network": _prop(["string", "null"], "Put this worker network first, as the "
+                                                     "default; null or omitted leaves it."),
+        "quota": _prop(["integer", "string", "null"],
+                       "The new quota, " + _QUOTA_TEXT + " Null or omitted leaves it."),
+    }, required=("title", "project"), prepare=_quota_in_bytes)
+def _qubes_propose_project_edit(args: dict) -> dict:
+    return _submit("project-edit", args)
+
+
+@_register("qubes_propose_dump", _proposal_doc("""
+    Propose a dump sink for a project, or for the hub's own slot p00.
+
+    A dump sink is a fresh qube with no network, outside AI space, that the
+    slot's members (a project's workers, or the hub's own qubes in p00) copy
+    files into without the operator's dialog. Neither the hub nor any qube in
+    AI space can run a command in it or read from it, and nothing in it can
+    reach back into AI space. A slot has at most one.
+
+    - project: the project's label, or "p00" for the hub's own qubes.
+    - name: the sink's name, outside the reserved name prefix; omit it for
+      <label>-dump, or hub-dump for p00.
+    """), {
+        "title": _TITLE,
+        "project": _prop("string", 'The project: its label, or "p00" '
+                                   "for the hub's own qubes."),
+        "name": _prop(["string", "null"], "The sink's name, outside the reserved name prefix; "
+                                          "omit it for <label>-dump, or hub-dump for p00."),
+    }, required=("title", "project"))
+def _qubes_propose_dump(args: dict) -> dict:
+    return _submit("project-dump", args)
+
+
+@_register("qubes_propose_lead", _proposal_doc("""
+    Propose a new lead for a project, or removing its lead.
+
+    - To remove the lead: remove=true and no other lead field. The lead's qube
+      is removed with everything in it; the project keeps its workers, which
+      only the hub reaches until the project has a lead again.
+    - To give the project a new lead: lead, and optionally lead_name and
+      lead_netvm, as for qubes_propose_project, and keep_old, which has no
+      default: true keeps the old lead as a worker of the same project (it
+      must be on one of the project's worker networks, or on none), false
+      removes it with everything in it. A proposal without keep_old is
+      refused, even for a project that has no lead now, where it changes
+      nothing. A kept lead keeps its name, so when it is named
+      <prefix><label>-lead, give the new lead a lead_name.
+
+    It needs the operator's second tick, an extra confirmation, when it
+    removes a lead, promotes one of the hub's qubes into the lead, or gives
+    the lead a network AI space does not use today.
+    """), {
+        "title": _TITLE,
+        "project": _PROJECT,
+        "remove": _prop(["boolean", "null"], "true to remove the lead; then give no other "
+                                             "lead field."),
+        "lead": dict(_LEAD, type=["object", "null"]),
+        "lead_name": _LEAD_NAME,
+        "lead_netvm": _LEAD_NETVM,
+        "keep_old": _prop(["boolean", "null"], "Required with a new lead, no default: true keeps "
+                                               "the old lead as a worker of the project, false "
+                                               "removes it with everything in it."),
+    }, required=("title", "project"))
+def _qubes_propose_lead(args: dict) -> dict:
+    return _submit("project-lead", args)
+
+
+@_register("qubes_propose_project_delete", _proposal_doc("""
+    Propose deleting a project, with its lead and every worker.
+
+    Accepting it removes the project's lead and every worker with everything
+    in them, keeps its dump sink (outside AI space, no longer the project's)
+    and frees the slot. It always needs the operator's second tick, an extra
+    confirmation.
+    """), {
+        "title": _TITLE,
+        "project": _PROJECT,
+    }, required=("title", "project"))
+def _qubes_propose_project_delete(args: dict) -> dict:
+    return _submit("project-delete", args)
+
+
+@_register("qubes_proposals", """
+    List the hub's proposals and what became of them, or show one in full.
+
+    Returns {"ok": true, "proposals": [{id, state, type, title, submitted,
+    expires, sha256}, ...]}, newest first. With id, the reply is that one
+    entry's fields plus "proposal": the options as dom0 stored them, with
+    every optional field filled in, which is what the operator reads and
+    accepts.
+
+    state is one of:
+    - pending: waiting for the operator (an accept running now reads pending).
+    - accepted: the operator accepted it and the change was made.
+    - rejected: the operator turned it down; nothing changed.
+    - expired: 7 days passed without a decision; nothing changed.
+    - failed: the operator accepted it, but the change was refused or stopped
+      part of the way, so the fleet may show part of it. Submit it again if
+      it is still wanted.
+
+    The hub learns the state only, never a reason or the operator's report:
+    read the fleet (qubes_list, qubes_get_pool_stats) to see what changed.
+    Only the hub reads proposals; a project's lead is refused. An id that is
+    not one of the hub's proposals gives {"ok": false, "error": "no such
+    proposal"}.
+    """, {
+        "id": _prop(["integer", "null"], "A proposal's id, to show that one with its stored "
+                                         "options; omit it to list them all.", default=None),
+    })
+def _qubes_proposals(args: dict) -> dict:
+    payload = {} if args["id"] is None else {"id": args["id"]}
+    return qrexec.call_qmcp("qmcp.ProposalStatus", payload, timeout=DOM0_TIMEOUT)

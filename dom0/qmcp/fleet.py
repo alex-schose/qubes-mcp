@@ -16,13 +16,16 @@ from __future__ import annotations
 import os
 import stat
 
-from qmcp import audit, birth, budget, core, projects
+from qmcp import audit, birth, budget, core, projects, proposals
 
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_NAME = "30-mcp-control.policy"
 LIB_DIR = "/usr/local/lib/qmcp"
 RPC_DIR = "/etc/qubes-rpc"
 TIER_DEFAULT_PATH = "/etc/qmcp/tier-default"
+#: The group the qmcp services run in, as a non-root dom0 user. tmpfiles gives
+#: it every runtime file they share with root, and `check` holds those files to it.
+SERVICES_GROUP = "qubes"
 
 LEGACY_TIER_TAGS = birth.LEGACY_TIER_TAGS
 TOMBSTONE_PREFIX = "qmcp-tombstone_"
@@ -96,6 +99,15 @@ def _read_word(path: str) -> str:
         return ""
 
 
+def _services_gid():
+    """SERVICES_GROUP's gid, or None when this host has no such group."""
+    import grp
+    try:
+        return grp.getgrnam(SERVICES_GROUP).gr_gid
+    except KeyError:
+        return None
+
+
 def _safe(fn, default=None):
     try:
         return fn()
@@ -132,6 +144,8 @@ PRECEDENCE_CLAIMS = (
     ("a lead's exec into another project", "qmcp.RunInAIManaged", "lead", "other"),
     ("a lead's copy into another project", "qubes.Filecopy", "lead", "other"),
     ("a lead's event stream", "qmcp.AIManagedEvents", "lead", "dom0"),
+    ("a lead submitting a proposal", "qmcp.SubmitProposal", "lead", "dom0"),
+    ("the hub submitting a proposal", "qmcp.SubmitProposal", "hub", "dom0"),
     ("a worker reaching its lead", "qubes.Filecopy", "member", "lead"),
     ("a worker calling a qmcp service", "qmcp.ListAIManagedQubes", "member", "dom0"),
     ("a worker's copy into its dump sink", "qubes.Filecopy", "member", "sink"),
@@ -346,20 +360,80 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     add("fail" if missing else "pass", "services",
         f"not installed: {', '.join(missing)}" if missing else f"{len(SERVICES)} installed")
 
-    # 11. the runtime directory the caps rely on
+    # 11. the runtime directory the caps rely on, and every file the services
+    # share with root: each must be SERVICES_GROUP's and group-writable, or
+    # their writes fail without a symptom.
+    gid = _services_gid()
+    if gid is None:
+        add("fail", "services group", f"no group named {SERVICES_GROUP}: the services share "
+                                      f"their runtime files with root through it")
+
+    def shared(st) -> bool:
+        return st is not None and bool(st.st_mode & stat.S_IWGRP) and st.st_gid == gid
+
     calls = os.path.join(core.RUN_DIR, "calls")
+    run = _safe(lambda: os.stat(core.RUN_DIR))
     st = _safe(lambda: os.stat(calls))
+    lock = _safe(lambda: os.stat(budget.LOCK_PATH))
     if st is None:
         add("fail", "runtime dir", f"{calls} missing (systemd-tmpfiles --create)")
-    elif not (st.st_mode & stat.S_IWGRP):
-        add("fail", "runtime dir", f"{calls} is not group-writable")
+    elif not (shared(run) and run.st_mode & stat.S_ISGID):
+        # Where either side makes a lock again that went missing, so it must
+        # stay the services' to open, whoever made it.
+        add("fail", "runtime dir", f"{core.RUN_DIR} is not the services group's, group-writable "
+                                   f"and setgid (2770 root:{SERVICES_GROUP}; systemd-tmpfiles "
+                                   f"--create /etc/tmpfiles.d/qmcp.conf)")
+    elif not shared(st):
+        add("fail", "runtime dir", f"{calls} is not writable by the services group "
+                                   f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+    elif lock is not None and not shared(lock):
+        add("fail", "runtime dir", f"{budget.LOCK_PATH} is not writable by the services group: "
+                                   f"every create refuses (systemd-tmpfiles --create "
+                                   f"/etc/tmpfiles.d/qmcp.conf)")
     else:
-        lock = _safe(lambda: os.stat(budget.LOCK_PATH))
-        if lock is not None and not (lock.st_mode & stat.S_IWGRP):
-            add("fail", "runtime dir", f"{budget.LOCK_PATH} is not group-writable: every create "
-                                       f"refuses (systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+        add("pass", "runtime dir", calls)
+    # The services cannot create a file in /var/log: a missing log, like one
+    # of another group, stops their lines without a symptom.
+    log = _safe(lambda: os.stat(audit.LOG_PATH))
+    if not shared(log):
+        add("fail", "audit log", f"{audit.LOG_PATH} is "
+                                 f"{'missing' if log is None else 'not writable by the services group'}: "
+                                 f"their audit lines stop without a symptom "
+                                 f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+
+    # 11b. the proposal store: the services (a non-root dom0 user in `qubes`)
+    # write proposals into it, and the operator's accept and reject (root)
+    # write decisions the services must read back. Without the group's write
+    # bit no proposal can be stored; without setgid a root-written decision is
+    # root's group and unreadable to them.
+    st = _safe(lambda: os.stat(proposals.PROPOSALS_DIR))
+    lock = _safe(lambda: os.stat(proposals.LOCK_PATH))
+    if st is None:
+        add("fail", "proposal store", f"{proposals.PROPOSALS_DIR} missing "
+                                      f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+    elif not (shared(st) and st.st_mode & stat.S_ISGID):
+        add("fail", "proposal store", f"{proposals.PROPOSALS_DIR} is not the services group's, "
+                                      f"group-writable and setgid (2770 root:{SERVICES_GROUP}): "
+                                      f"the hub's proposals cannot be stored, or their decisions "
+                                      f"read back")
+    elif lock is not None and not shared(lock):
+        add("fail", "proposal store", f"{proposals.LOCK_PATH} is not writable by the services "
+                                      f"group: every proposal the hub submits is refused "
+                                      f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+    else:
+        try:
+            rows = proposals.listing()
+        except OSError as e:
+            add("error", "proposal store", f"cannot read {proposals.PROPOSALS_DIR} "
+                                           f"({e.strerror or type(e).__name__}); run as root")
         else:
-            add("pass", "runtime dir", calls)
+            pending = sum(1 for r in rows if r["state"] == "pending")
+            broken = [str(r["id"]) for r in rows if r["needs_closing"]]
+            add("warn" if broken else "pass", "proposal store",
+                f"proposal(s) {', '.join(broken)} with a file that does not read, or an accept "
+                f"that did not finish: read them with qmcp proposal show N, then close them "
+                f"with qmcp proposal reject N" if broken
+                else f"{pending} pending, {len(rows) - pending} decided or expired")
 
     # 12. operator files
     caps_ok = budget.read_cap() is not None and budget.read_private_cap() is not None
@@ -832,8 +906,12 @@ def _quota(value) -> int:
     if isinstance(value, int):
         if value <= 0:
             raise ProjectError("a size must be positive")
-        return value
-    return parse_size(value)
+        n = value
+    else:
+        n = parse_size(value)
+    if n > projects.MAX_QUOTA:
+        raise ProjectError("a quota is at most 1 EiB")
+    return n
 
 
 def parse_size(text) -> int:
@@ -871,10 +949,22 @@ def _project(records: dict, key: str):
     return p
 
 
+#: How deep this process holds both project locks: an accepted proposal takes
+#: them before it runs its command, which then takes them again.
+_HELD = [0]
+
+
 class _Exclusive:
-    """Both locks, for one project command (see above)."""
+    """Both locks, for one project command (see above). Re-entrant within the
+    process: a second flock on a new descriptor of the same file would wait
+    for the first, here, and fail when the records lock gives up (30 s)."""
 
     def __enter__(self):
+        if _HELD[0]:
+            _HELD[0] += 1
+            self.nested = True
+            return self
+        self.nested = False
         self.records_lock = projects.Locked()
         self.records_lock.__enter__()
         try:
@@ -882,18 +972,41 @@ class _Exclusive:
         except core.Refusal:
             self.records_lock.__exit__(None, None, None)
             raise ProjectError("a create is in progress; try again in a moment") from None
+        _HELD[0] = 1
         return self
 
     def __exit__(self, *exc):
-        os.close(self.fd)
-        self.records_lock.__exit__(*exc)
+        _HELD[0] -= 1
+        if not self.nested:
+            os.close(self.fd)
+            self.records_lock.__exit__(*exc)
         return False
 
 
-def _run(command, *args, **kwargs) -> list:
+def hold_project_locks():
+    """Both project locks, held across several commands (an accepted proposal
+    holds them from its second tick through its command)."""
+    return _Exclusive()
+
+
+class Report(list):
+    """A command's report: its lines, and the steps that did not complete.
+    Whether a command failed is read from `failed`, never from its text: a
+    line holds names, and a name may hold any word."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed: list = []
+
+    def fail(self, line: str) -> None:
+        self.append(line)
+        self.failed.append(line)
+
+
+def _run(command, *args, **kwargs) -> Report:
     """Run a project command under both locks. Its exception, if any, carries
     `report`: the steps that completed before it failed."""
-    report: list = []
+    report = Report()
     with _Exclusive():
         try:
             command(report, *args, **kwargs)
@@ -1093,17 +1206,20 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm):
     return name, True, set()
 
 
-def _undo_lead(app, lead: str, fresh: bool, slot: str, before=frozenset()) -> None:
+def _undo_lead(app, lead: str, fresh: bool, slot: str, before=frozenset()) -> str:
     """Undo `_make_lead`: remove a lead it made; give a promoted one back
     exactly the badges it had, removing first, so a failure never leaves a
-    qube with more authority than before."""
+    qube with more authority than before. '' when undone, else why not."""
     if fresh:
-        _remove_qube(app, lead)
-        return
+        return _remove_qube(app, lead)
     vm = _vm(app, lead)
     if vm is not None:
-        _set_tags(vm, remove={projects.LEAD, projects.lead_badge(slot)})
-        _set_tags(vm, add=set(before))
+        try:
+            _set_tags(vm, remove={projects.LEAD, projects.lead_badge(slot)})
+            _set_tags(vm, add=set(before))
+        except Exception as e:
+            return f"{lead}: badges {type(e).__name__}"
+    return ""
 
 
 def _recorded_lead(app, p):
@@ -1187,10 +1303,12 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         records[slot] = projects.Project(slot, label, lead, tpls, nets, quota, sink)
         projects.save(records)
     except Exception:
-        if sink:
-            _remove_qube(app, sink)
-        _undo_lead(app, lead, fresh, slot, before)
-        report.append(f"{slot}: undone")
+        left = [err for err in ((_remove_qube(app, sink) if sink else ""),
+                                _undo_lead(app, lead, fresh, slot, before)) if err]
+        if left:
+            report.fail(f"{slot}: NOT undone: {'; '.join(left)}")
+        else:
+            report.append(f"{slot}: undone")
         raise
     report.append(f"{slot}: project '{label}' recorded; workers are named {space}*")
 
@@ -1231,7 +1349,8 @@ def _remove_lead(report, app, key):
     report.append(f"{p.slot}: the record names no lead")
     if ours:
         err = _remove_qube(app, old)
-        report.append(f"{p.slot}: removed {old}" if not err else f"{p.slot}: NOT removed: {err}")
+        report.append(f"{p.slot}: removed {old}") if not err else \
+            report.fail(f"{p.slot}: NOT removed: {err}")
 
 
 def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
@@ -1268,7 +1387,8 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
             report.append(f"{p.slot}: {old} kept as a worker")
         elif ours:
             err = _remove_qube(app, old)
-            report.append(f"{p.slot}: removed {old}" if not err else f"{p.slot}: NOT removed: {err}")
+            report.append(f"{p.slot}: removed {old}") if not err else \
+                report.fail(f"{p.slot}: NOT removed: {err}")
     lead, fresh, before = _make_lead(app, p.slot, lead_source, lead_origin, name, lead_netvm)
     tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead))
     if tpl and tpl not in p.templates and (vm := _vm(app, tpl)) is not None \
@@ -1291,7 +1411,10 @@ def edit_project(app, key: str, templates=None, networks=None, quota=None) -> li
 
 def _edit_project(report, app, key, templates, networks, quota):
     records = _load_records()
-    p = _project(records, key)
+    _apply_edit(report, app, records, _project(records, key), templates, networks, quota)
+
+
+def _apply_edit(report, app, records, p, templates, networks, quota):
     if templates is not None:
         p.templates = tuple(_check_templates(app, templates))
     if networks is not None:
@@ -1301,6 +1424,50 @@ def _edit_project(report, app, key, templates, networks, quota):
     projects.save(records)
     report.append(f"{p.slot}: templates {list(p.templates)}, networks "
                   f"{[n or 'none' for n in p.networks]}, quota {p.quota}")
+
+
+def edited(p, add_templates=(), remove_templates=(), add_networks=(), remove_networks=(),
+           default_network=None, quota=None) -> tuple:
+    """A project's (templates, networks, quota) after an edit that says what it
+    adds, removes or sets: an accepted proposal's, applied to the record as it
+    is then, changing only the entries it names: a later change of the
+    operator's to anything else stands. Adding what is there or removing what
+    is not changes nothing. `none` is the no-network
+    entry; the default network, if given, moves to the front."""
+    nets = lambda names: [None if n in (None, "none") else n for n in names]  # noqa: E731
+    gone = set(remove_templates)
+    templates = [t for t in p.templates if t not in gone]
+    templates += [t for t in add_templates if t not in templates]
+    gone = set(nets(remove_networks))
+    networks = [n for n in p.networks if n not in gone]
+    networks += [n for n in nets(add_networks) if n not in networks]
+    if default_network is not None:
+        first = nets([default_network])[0]
+        if first not in networks:
+            raise ProjectError(f"the default network {default_network} is not on the list")
+        networks.remove(first)
+        networks.insert(0, first)
+    return templates, networks, p.quota if quota is None else quota
+
+
+def edit_project_changes(app, key: str, add_templates=(), remove_templates=(), add_networks=(),
+                         remove_networks=(), default_network=None, quota=None) -> list:
+    """An edit that says what it adds, removes or sets, computed from the record
+    under the lock and then checked exactly as `edit_project` checks."""
+    return _run(_edit_changes, app, key, add_templates, remove_templates, add_networks,
+                remove_networks, default_network, quota)
+
+
+def _edit_changes(report, app, key, add_templates, remove_templates, add_networks,
+                  remove_networks, default_network, quota):
+    records = _load_records()
+    p = _project(records, key)
+    templates, networks, new_quota = edited(p, add_templates, remove_templates, add_networks,
+                                            remove_networks, default_network, quota)
+    _apply_edit(report, app, records, p,
+                templates if tuple(templates) != p.templates else None,
+                networks if tuple(networks) != p.networks else None,
+                new_quota if new_quota != p.quota else None)
 
 
 def add_dump(app, key: str, name: str | None = None) -> list:
@@ -1372,6 +1539,22 @@ def _move(report, app, name, target, confirm):
                           f"can still detect it by name")
 
 
+def delete_plan(app, records: dict, key: str) -> tuple:
+    """What `qmcp project delete KEY --yes` would do, changing nothing: (it can
+    run, the plan in words). Reads the records and the qube list only, so it
+    needs no root, and the window and a proposal show it before anyone asks."""
+    p = projects.find(records, key)
+    if p is None and key in projects.PROJECT_SLOTS:
+        return True, (f"{key} has no record: this finishes a delete, removing the qubes still "
+                      f"wearing its member badge and stripping its badges everywhere")
+    if p is None or p.slot == projects.HUB_SLOT:
+        return False, f"no project '{key}'"
+    members = sorted(vm.name for vm in app.domains if core.is_member(vm, p.slot))
+    return True, (f"this removes {p.slot} '{p.label}': its lead {p.lead or '(none)'} and every "
+                  f"member qube ({', '.join(members) if members else 'none'}), and keeps its dump "
+                  f"sink {p.dump or '(none)'}")
+
+
 def delete_project(app, key: str) -> list:
     """Remove the lead and every member, keep the dump sink (minus its slot
     badge), strip every badge of the slot, and free it. Authority goes first:
@@ -1395,12 +1578,14 @@ def _delete_project(report, app, key):
         report.append(f"{p.slot}: record of '{p.label}' deleted")
         if ours:
             err = _remove_qube(app, p.lead)
-            report.append(f"{p.slot}: removed {p.lead}" if not err else f"{p.slot}: NOT removed: {err}")
+            report.append(f"{p.slot}: removed {p.lead}") if not err else \
+                report.fail(f"{p.slot}: NOT removed: {err}")
     # Only qubes really in the project are removed. A stray badge on a qube
     # outside AI space is stripped below, never the qube.
     for name in [vm.name for vm in app.domains if core.is_member(vm, p.slot)]:
         err = _remove_qube(app, name)
-        report.append(f"{p.slot}: removed {name}" if not err else f"{p.slot}: NOT removed: {err}")
+        report.append(f"{p.slot}: removed {name}") if not err else \
+            report.fail(f"{p.slot}: NOT removed: {err}")
     for name in _badges_of_slot(app, p.slot):
         vm = _vm(app, name)
         strip = {t for t in _tags(vm) if (q := projects.slot_badge_parts(t)) and q[1] == p.slot}
@@ -1411,10 +1596,12 @@ def _delete_project(report, app, key):
             report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}"
                           + (" (the dump sink, kept)" if name == p.dump else ""))
         except Exception as e:
-            report.append(f"{p.slot}: could NOT strip badges from {name} ({type(e).__name__})")
+            report.fail(f"{p.slot}: could NOT strip badges from {name} ({type(e).__name__})")
     left = _badges_of_slot(app, p.slot)
-    report.append(f"{p.slot}: free" if not left else
-                  f"{p.slot}: NOT reusable until these lose its badges: {', '.join(left)}")
+    if left:
+        report.fail(f"{p.slot}: NOT reusable until these lose its badges: {', '.join(left)}")
+    else:
+        report.append(f"{p.slot}: free")
 
 
 def project_rows(app, records: dict) -> list:

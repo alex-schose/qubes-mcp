@@ -266,6 +266,9 @@ def main() -> int:
     refused_raw("raw admin.vm.List from the lead", "@adminvm", "admin.vm.List")
     refused_raw("raw policy.Get from the lead", "@adminvm", "policy.Get")
     refused_raw("raw event stream from the lead", "@adminvm", "qmcp.AIManagedEvents", b'{"duration": 1}')
+    refused_raw("raw proposal from the lead", "@adminvm", "qmcp.SubmitProposal",
+                b'{"type":"project-delete","title":"x","project":"p01"}')
+    refused_raw("raw proposal states from the lead", "@adminvm", "qmcp.ProposalStatus", b"{}")
     refused_raw("raw tag.Set on its own worker", w1, "admin.vm.tag.Set+qmcp-lead")
     refused_raw("raw exec into the hub", args.hub, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
     refused_raw("raw exec into a guarded qube", args.guarded, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')

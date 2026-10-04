@@ -1,7 +1,9 @@
 """qmcp.audit — the hash-chained, AI-unreachable record of state changes.
 
 Every state-changing qmcp.* call appends one JSON line to
-/var/log/qmcp-audit.log. Each line carries `prev`, the sha256 of the line
+/var/log/qmcp-audit.log, and so does every command of the operator's that
+changes something (caller "operator": the command and the names it acts on),
+accepting and rejecting the hub's proposals included. Each line carries `prev`, the sha256 of the line
 before it, and `hash`, the sha256 of its own canonical form, so an edit, a
 deletion, a reorder or an insertion breaks the chain and `verify()` finds it.
 
@@ -17,15 +19,17 @@ Contracts:
 - THE CALLER SANITISES the summary: qube names, property and feature KEYS,
   actions. Never a property or feature value.
 
-Schema 2 (0.9.17) adds `caller` (the qrexec source) and `error_class` (the
-exception class behind a fixed-vocabulary error, so the operator can see what
-the caller was not told). Lines of schema 1 chain on unchanged. A write reads
+Schema 2 (0.9.17) adds `caller` (the qrexec source, or "operator" for the
+operator's own commands) and `error_class` (the exception class behind a
+fixed-vocabulary error, so the operator can see what the caller was not told). Lines of schema 1 chain on unchanged. A write reads
 only the end of the file, and `qmcp audit rotate` moves the log aside and
 starts a new one anchored on the old head.
 
-The wrappers run as a non-root dom0 user in the `qubes` group. The installer
-creates the log root:qubes 0660; this module never chmods it, because a
-non-owner fchmod is EPERM and would make every append fail.
+The wrappers run as a non-root dom0 user in the `qubes` group, and the
+operator's commands as root or as a member of `qubes`. The installer and tmpfiles create the log
+root:qubes 0660, and `qmcp check` fails when the services could not write it;
+this module never chmods it, because a non-owner fchmod is EPERM and would make
+every append fail.
 """
 from __future__ import annotations
 
@@ -86,6 +90,21 @@ def _tail_state(f) -> tuple[int, str]:
         return 0, GENESIS
 
 
+def _keep_for_the_services(fd: int) -> None:
+    """A log root has just created is root's group, and the services (the
+    `qubes` group) could no longer append to it, without a symptom. Give a new,
+    empty, root-owned log to `qubes`; never touch one that has lines."""
+    try:
+        st = os.fstat(fd)
+        if st.st_size == 0 and st.st_uid == 0:
+            import grp
+            gid = grp.getgrnam("qubes").gr_gid
+            if st.st_gid != gid:
+                os.fchown(fd, -1, gid)
+    except (KeyError, OSError):
+        pass
+
+
 def _locked_log(path: str):
     """The log opened for append and exclusively locked, as a binary file.
 
@@ -94,7 +113,15 @@ def _locked_log(path: str):
     to the renamed file would fork the chain.
     """
     for _ in range(5):
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o660)
+        # Root (the operator's commands) and the services both append here: a
+        # file whoever creates it must stay group-writable (tmpfiles declares it).
+        old = os.umask(0o007)
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o660)
+        finally:
+            os.umask(old)
+        if os.geteuid() == 0:
+            _keep_for_the_services(fd)
         f = os.fdopen(fd, "r+b")
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
@@ -151,7 +178,7 @@ def rotate(path: str | None = None) -> str:
         os.fchmod(nfd, st.st_mode & 0o7777)
         with os.fdopen(nfd, "r+b") as nf:
             record = {"v": SCHEMA, "ts": _utc_now_iso(), "service": ROTATE_SERVICE,
-                      "caller": None, "args": {"continues": os.path.basename(aside),
+                      "caller": "operator", "args": {"continues": os.path.basename(aside),
                                                "after_seq": seq},
                       "ok": True, "error": None, "seq": 1, "prev": head}
             record["hash"] = _body_hash(record)

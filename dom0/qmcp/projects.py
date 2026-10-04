@@ -58,6 +58,8 @@ _QUBE_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 
 MAX_TEMPLATES = 16
 MAX_NETWORKS = 8
+#: A quota past any disk (1 EiB): bigger numbers would only overflow arithmetic.
+MAX_QUOTA = 2 ** 60
 
 
 class ProjectsUnreadable(Exception):
@@ -173,8 +175,8 @@ def _validate_slot(slot: str, entry) -> Project:
             or len(set(networks)) != len(networks)):
         raise _bad(f"{slot}: networks must be 1-{MAX_NETWORKS} distinct qube names or null")
     quota = entry["quota"]
-    if isinstance(quota, bool) or not isinstance(quota, int) or quota <= 0:
-        raise _bad(f"{slot}: quota must be a positive integer number of bytes")
+    if isinstance(quota, bool) or not isinstance(quota, int) or not 0 < quota <= MAX_QUOTA:
+        raise _bad(f"{slot}: quota must be a positive integer number of bytes, at most 1 EiB")
     dump = entry["dump"]
     if dump is not None and not valid_qube_name(dump):
         raise _bad(f"{slot}: bad dump")

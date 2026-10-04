@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.19.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.20.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -34,7 +34,10 @@
 #                                    under Settings > Qubes Tools an X-XFCE-SettingsDialog
 #                                    entry whose file name contains "qubes"
 #   /etc/qubes/policy.d/30-mcp-control.policy   the rulebook, hub name rendered in
-#   /etc/tmpfiles.d/qmcp.conf        the runtime directory the caps use
+#   /etc/tmpfiles.d/qmcp.conf        the runtime directory the caps use, and the
+#                                    files root and the services share: the
+#                                    proposal store /var/lib/qmcp/proposals
+#                                    (root:qubes 2770), its lock, the audit log
 #   /etc/qmcp/{hub,pool-cap,private-cap,birth-egress}   only when absent
 #   /etc/qmcp/projects.json          the project records, empty, only when absent;
 #                                    `qmcp project` writes it (as root)
@@ -89,7 +92,8 @@ say() { echo "==> $*"; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash $0)"
 [ -e /etc/qubes-release ] && command -v qvm-ls >/dev/null || die "this is not dom0"
-for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py dom0/rpc/qmcp-service \
+for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py \
+         dom0/qmcp/proposals.py dom0/rpc/qmcp-service \
          dom0/bin/qmcp policy/30-mcp-control.policy deploy/qmcp-tmpfiles.conf pyproject.toml \
          dom0/qmcp/gui.py dom0/qmcp/guimodel.py dom0/bin/qmcp-gui deploy/qubes-mcp.desktop; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
@@ -99,7 +103,7 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/pyproject.toml")"
 # An empty or truncated pull passes "parses clean", so check for a known rule.
 grep -qE '^\*[[:space:]]+\*[[:space:]]+mcp-control[[:space:]]+@anyvm[[:space:]]+deny' \
     "$SRC/policy/30-mcp-control.policy" || die "the staged policy is not the qubes-mcp rulebook"
-PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel' \
+PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel, qmcp.proposals' \
     || die "the staged library does not import"
 
 # The hub: fixed at the first install. Read with the same function the services
@@ -264,9 +268,10 @@ while IFS= read -r svc; do
 done <<< "$SERVICES"
 say "installed $(echo "$SERVICES" | wc -l) services in $RPC"
 
-# --- runtime directory, operator files, audit log
+# --- runtime directory, proposal store, operator files, audit log
 install -m 0644 "$SRC/deploy/qmcp-tmpfiles.conf" /etc/tmpfiles.d/qmcp.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf
+say "runtime directory /run/qmcp and proposal store /var/lib/qmcp/proposals in place"
 install -d -m 0755 "$ETC_QMCP"
 write_if_absent() {   # file value
     if [ -e "$1" ]; then
