@@ -24,6 +24,7 @@ sys.path.insert(0, str(HERE))
 from qmcp import audit, budget, core, fleet, projects, services  # noqa: E402
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB, Base  # noqa: E402
+from qmcp import gateways  # noqa: E402
 
 LEAD = "ai-osint-lead"
 OTHER_LEAD = "ai-other-lead"
@@ -100,14 +101,16 @@ class Principal(ProjectBase):
         for caller in ("ai-osint-w1", "ai-hubq", "osint-dump", "ai-work"):
             self.assertEqual(self.lcall("qmcp.ListAIManagedQubes", lead=caller), core.NOT_AUTHORIZED, caller)
 
-    def test_unreadable_records_refuse_leads_and_hub_creates(self):
+    def test_unreadable_records_refuse_leads_but_not_the_hubs_creates(self):
+        # A lead is no principal without its record. The hub's creates no longer
+        # read the records: its names are ai-hub-..., and `hub` is never a
+        # project's label, so no project's space can hold one of them.
         pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
         self.assertEqual(self.lcall("qmcp.ListAIManagedQubes"), core.NOT_AUTHORIZED)
         self.assertTrue(self.call("qmcp.ListAIManagedQubes")["ok"])        # the hub still reads
         self.egress("ai-net-router")
-        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-new", "template": "ai-debian-13"})
-        self.assertEqual(r["error"], "project records unreadable")
-        self.assertNotIn("ai-new", self.app.domains)
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-new", "template": "ai-debian-13"})
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-new"})
 
     def test_record_validation(self):
         bad = [
@@ -215,7 +218,9 @@ class LeadReads(ProjectBase):
         self.assertEqual((r["project"], r["name_prefix"], r["dump"]), ("osint", "ai-osint-", "osint-dump"))
         self.assertEqual(r["networks"], ["ai-net-router", None])
         hub = self.call("qmcp.GetPoolStats")
-        self.assertEqual(hub["name_prefix"], "ai-")
+        self.assertEqual(hub["name_prefix"], "ai-hub-")          # the names its creates must carry
+        self.assertEqual(hub["reserved_prefix"], "ai-")          # what a project's names build on
+        self.assertNotIn("reserved_prefix", r)                    # a lead proposes nothing
         self.assertGreater(hub["ai_managed_bytes_used"], r["ai_managed_bytes_used"])
 
     def test_no_event_stream_for_leads(self):
@@ -355,33 +360,36 @@ class LeadCreates(ProjectBase):
 
 class HubWithProjects(ProjectBase):
     def test_the_hub_cannot_name_into_a_project(self):
+        # The hub names only inside ai-hub-, so no project's space is reachable,
+        # judged on the name alone.
         self.egress("ai-net-router")
-        for name in ("ai-osint-x", "ai-other-y"):
+        for name in ("ai-osint-x", "ai-other-y", "ai-osintx"):
             self.app.domains.lookups = 0
             r = self.call("qmcp.SpawnAIManagedQube", {"name": name, "template": "ai-debian-13"})
-            self.assertEqual(r["error"], "name is inside a project's name space")
+            self.assertIn("must start with 'ai-hub-'", r["error"])
             self.assertEqual(self.app.domains.lookups, 0)
             r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": name})
-            self.assertEqual(r["error"], "name is inside a project's name space")
-        self.assertTrue(self.call("qmcp.SpawnAIManagedQube", {"name": "ai-osintx", "template": "ai-debian-13"})["ok"])
+            self.assertIn("must start with 'ai-hub-'", r["error"])
+        self.assertTrue(self.call("qmcp.SpawnAIManagedQube",
+                                  {"name": "ai-hub-osintx", "template": "ai-debian-13"})["ok"])
 
     def test_what_the_hubs_creates_join(self):
         self.egress("ai-net-router")
-        self.call("qmcp.SpawnAIManagedQube", {"name": "ai-app", "template": "ai-debian-13"})
-        self.assertIn("qmcp-proj-p00", self.tags("ai-app"))
-        self.call("qmcp.SpawnAIManagedQube", {"name": "ai-mydvm", "template": "ai-debian-13",
+        self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-app", "template": "ai-debian-13"})
+        self.assertIn("qmcp-proj-p00", self.tags("ai-hub-app"))
+        self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-mydvm", "template": "ai-debian-13",
                                              "klass": "DispVMTemplate"})
-        self.assertFalse(projects.member_slots(self.tags("ai-mydvm")))
+        self.assertFalse(projects.member_slots(self.tags("ai-hub-mydvm")))
         r = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"})
-        self.assertFalse(projects.member_slots(self.tags(r["name"])))      # 121: no p00 for disposables
-        self.call("qmcp.CloneAIManagedQube", {"source": "ai-debian-13", "name": "ai-tpl2"})
-        self.assertFalse(projects.member_slots(self.tags("ai-tpl2")))
+        self.assertFalse(projects.member_slots(self.tags(r["name"])))      # no p00 for disposables
+        self.call("qmcp.CloneAIManagedQube", {"source": "ai-debian-13", "name": "ai-hub-tpl2"})
+        self.assertFalse(projects.member_slots(self.tags("ai-hub-tpl2")))
 
     def test_the_hub_clones_a_lead_into_no_slot_without_its_role(self):
         # Project content never joins p00's dialog-free copies by a clone.
-        r = self.call("qmcp.CloneAIManagedQube", {"source": LEAD, "name": "ai-lead-copy"})
+        r = self.call("qmcp.CloneAIManagedQube", {"source": LEAD, "name": "ai-hub-lead-copy"})
         self.assertTrue(r["ok"], r)
-        self.assertEqual(self.tags("ai-lead-copy"), {"ai-managed", f"qmcp-owner_{HUB}"})
+        self.assertEqual(self.tags("ai-hub-lead-copy"), {"ai-managed", f"qmcp-owner_{HUB}"})
 
     def test_the_hub_operates_projects_but_does_not_remove_a_lead(self):
         r = self.call("qmcp.LifecycleAIManaged", {"name": LEAD, "action": "remove"})
@@ -400,7 +408,8 @@ class Operator(ProjectBase):
     def test_create_from_a_template(self):
         report = fleet.create_project(self.app, "res", "template", "ai-debian-13",
                                       templates=["ai-dvm"], networks=["ai-net-router", "none"],
-                                      quota="40G", lead_netvm="ai-net-router", dump=True)
+                                      quota="40G", lead_netvm="ai-net-router", dump=True,
+                                      model="API.anthropic.com:443")
         self.assertTrue(report[-1].endswith("workers are named ai-res-*"), report)
         p = projects.find(self.records(), "res")
         self.assertEqual((p.slot, p.lead, p.templates, p.networks, p.quota, p.dump),
@@ -411,6 +420,12 @@ class Operator(ProjectBase):
         lead = self.app.domains["ai-res-lead"]
         self.assertEqual(lead.netvm.name, "ai-net-router")
         self.assertIsNone(lead.default_dispvm)
+        # Model endpoint only: written into the lead, and what qubesd read
+        # back is the record's accepted firewall.
+        rules = ["action=accept dsthost=api.anthropic.com proto=tcp dstports=443-443",
+                 "action=accept specialtarget=dns", "action=drop"]
+        self.assertEqual(lead.__dict__["_firewall"], rules)
+        self.assertEqual((p.model, list(p.lead_firewall)), ("api.anthropic.com:443", rules))
         self.assertEqual(self.tags("res-dump"), {"ai-dump", "qmcp-dump-p03"})
         self.assertIsNone(self.app.domains["res-dump"].netvm)
         # The new lead is a principal at once.
@@ -424,9 +439,18 @@ class Operator(ProjectBase):
         self.assertEqual(projects.find(self.records(), "safe").templates, ("ai-debian-13",))
 
     def test_create_by_promoting_or_cloning(self):
-        fleet.create_project(self.app, "prom", "promote", "ai-hubq", networks=["none"], quota=10 * GiB)
+        # A promoted lead keeps its network, so it needs its model endpoint.
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.create_project(self.app, "prom", "promote", "ai-hubq", networks=["none"],
+                                 quota=10 * GiB)
+        self.assertIn("model endpoint", str(cm.exception))
+        self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-proj-p00"})
+        fleet.create_project(self.app, "prom", "promote", "ai-hubq", networks=["none"], quota=10 * GiB,
+                             model="api.example.org:8443")
         self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-lead", "qmcp-lead-p03"})
         self.assertEqual(self.app.domains["ai-hubq"].netvm.name, "ai-net-router")   # kept
+        self.assertEqual(self.app.domains["ai-hubq"].__dict__["_firewall"][0],
+                         "action=accept dsthost=api.example.org proto=tcp dstports=8443-8443")
         self.assertEqual(projects.find(self.records(), "prom").templates, ("ai-debian-13",))
         fleet.create_project(self.app, "clo", "clone", "ai-work", networks=["none"], quota=10 * GiB,
                              lead_netvm="none")
@@ -445,7 +469,12 @@ class Operator(ProjectBase):
             (dict(label="ai", dump=True), "inside"),
             (dict(origin="ai-work"), "not a TemplateVM"),
             (dict(origin="debian-13"), "at least one approved template in AI space"),
-            (dict(networks=["ai-work"]), "not a gateway"),
+            (dict(networks=["ai-work"]), "not an enrolled gateway"),
+            (dict(networks=["ai-gw-unbadged"]), "not an enrolled gateway"),
+            (dict(lead_netvm="ai-net-router"), "needs its model endpoint"),
+            (dict(lead_netvm="ai-gw-unbadged", model="h.example:1"), "not an enrolled gateway"),
+            (dict(model="h.example:1"), "no network reaches no model endpoint"),
+            (dict(lead_netvm="ai-net-router", model="no-port"), "host:port"),
             (dict(templates=["ai-work"]), "not a template"),
             (dict(source="promote", origin=LEAD), "already leads"),
             (dict(source="promote", origin="ai-osint-w1"), "another project's member"),
@@ -608,7 +637,7 @@ class AuditFixes(ProjectBase):
         self.assertIn(f"qmcp-lead-{slot}", self.tags(lead))
         self.assertEqual(projects.find(self.records(), slot).lead, lead)
 
-    # F-001 / F-002: validate before taking anything away
+    # Validate before taking anything away
     def test_a_promote_with_a_bad_network_changes_nothing(self):
         before = self.tags("ai-hubq")
         with self.assertRaises(fleet.RoleError):
@@ -642,7 +671,7 @@ class AuditFixes(ProjectBase):
             if f.status == "fail"]
         self.assertIn("leads", fails)
 
-    # F-003: authority is current when the work is done
+    # Authority is current when the work is done
     def test_a_lead_revoked_while_its_request_arrives_is_refused(self):
         req = json.dumps({"name": "ai-osint-w1", "action": "remove"}).encode()
         out = io.StringIO()
@@ -681,13 +710,33 @@ class AuditFixes(ProjectBase):
             os.close(held)
         self.assertUntouched()
 
-    # F-004: a qube entering a slot meets the rules a new one meets
-    def test_keep_old_needs_its_network_on_the_list(self):
+    # A kept lead joins on a listed network, or on none
+    def test_a_kept_lead_off_the_list_loses_its_network(self):
         self.app.domains[OTHER_LEAD]._props["netvm"] = self.app.domains["ai-net-router"]
+        report = fleet.set_lead(self.app, "other", "template", "ai-debian-13", lead_netvm="none",
+                                keep_old=True, lead_name="ai-other-lead2")
+        self.assertIsNone(self.app.domains[OTHER_LEAD].netvm)
+        self.assertEqual(projects.member_slots(self.tags(OTHER_LEAD)), {"p02"})
+        self.assertEqual(projects.find(self.records(), "other").networks, (None,))
+        self.assertTrue(any("lost its network" in line for line in report), report)
+
+    def test_a_kept_lead_keeps_a_network_the_tick_adds(self):
+        self.app.domains[OTHER_LEAD]._props["netvm"] = self.app.domains["ai-net-router"]
+        fleet.set_lead(self.app, "other", "template", "ai-debian-13", lead_netvm="none",
+                       keep_old=True, lead_name="ai-other-lead2", add_old_network=True)
+        self.assertEqual(self.app.domains[OTHER_LEAD].netvm.name, "ai-net-router")
+        self.assertEqual(projects.find(self.records(), "other").networks, (None, "ai-net-router"))
+        # Without keep_old the tick means nothing, and is refused.
+        with self.assertRaises(fleet.RoleError):
+            fleet.set_lead(self.app, "other", "template", "ai-debian-13", lead_netvm="none",
+                           lead_name="ai-other-lead3", add_old_network=True)
+
+    def test_a_kept_lead_on_an_unenrolled_network_cannot_be_added(self):
+        self.app.domains[OTHER_LEAD]._props["netvm"] = self.app.domains["ai-gw-unbadged"]
         with self.assertRaises(fleet.RoleError) as cm:
             fleet.set_lead(self.app, "other", "template", "ai-debian-13", lead_netvm="none",
-                           keep_old=True, lead_name="ai-other-lead2")
-        self.assertIn("network", str(cm.exception))
+                           keep_old=True, lead_name="ai-other-lead2", add_old_network=True)
+        self.assertIn("not an enrolled gateway", str(cm.exception))
         self.assertUntouched(OTHER_LEAD, "p02")
 
     def test_moves_between_slots_need_confirmation(self):
@@ -704,12 +753,11 @@ class AuditFixes(ProjectBase):
     def test_the_hub_clones_project_content_into_no_slot(self):
         for source, want in (("ai-osint-w1", set()), (LEAD, set()), ("ai-hubq", {"p00"}),
                              ("ai-work2", {"p00"})):
-            name = f"ai-c-{source[-4:]}"
+            name = f"ai-hub-c-{source[-4:]}"
             r = self.call("qmcp.CloneAIManagedQube", {"source": source, "name": name})
             self.assertTrue(r["ok"], (source, r))
             self.assertEqual(projects.member_slots(self.tags(name)), want, source)
 
-    # F-006, F-007, F-008
     def test_a_failed_promote_restores_the_exact_badges(self):
         before = self.tags("ai-work")
         self.app.fail.add("tag.add:qmcp-dump-p03")
@@ -733,9 +781,8 @@ class AuditFixes(ProjectBase):
         self.write_records(doc)
         report = fleet.remove_lead(self.app, "osint")
         self.assertIn("ai-work2", self.app.domains)
-        self.assertTrue(any("left alone" in line for line in report), report)
+        self.assertTrue(any("not demoted or killed" in line for line in report), report)
 
-    # F-009
     def test_the_quota_is_checked_before_the_fleet_cap(self):
         (self.tmp / "pool-cap").write_text(str(1 * GiB))
         r = self.lcall("qmcp.SpawnAIManagedQube", {"name": "ai-osint-big", "template": "ai-debian-13",
@@ -753,10 +800,15 @@ class EditAndCli(ProjectBase):
     """`qmcp project edit`, the command line, and the warnings the other classes leave out."""
 
     def test_edit_replaces_lists_and_quota_and_moves_no_worker(self):
+        # A network a member still sits on stays on the list.
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.edit_project(self.app, "osint", networks=["none"])
+        self.assertIn("ai-osint-w1 on ai-net-router", str(cm.exception))
+        self.assertEqual(projects.find(self.records(), "osint").networks, ("ai-net-router", None))
+        self.app.domains["ai-osint-w1"].netvm = None
         fleet.edit_project(self.app, "osint", templates=["ai-debian-13"], networks=["none"], quota="30G")
         p = projects.find(self.records(), "osint")
         self.assertEqual((p.templates, p.networks, p.quota), (("ai-debian-13",), (None,), 30 * GiB))
-        self.assertEqual(self.app.domains["ai-osint-w1"].netvm.name, "ai-net-router")   # not moved
         for kwargs in ({"templates": ["ai-work"]}, {"networks": ["ai-work"]}, {"quota": "0"}):
             with self.assertRaises(fleet.RoleError, msg=kwargs):
                 fleet.edit_project(self.app, "osint", **kwargs)
@@ -797,7 +849,7 @@ class EditAndCli(ProjectBase):
     def findings(self):
         vms = list(self.app.domains)
         return {f.check: f for f in fleet.project_findings(vms, {v.name: v for v in vms},
-                                                            self.records(), "ai-")}
+                                                            self.records(), "ai-", gateways.load())}
 
     def test_warnings_on_lists_sinks_and_names(self):
         doc = json.loads(json.dumps(RECORDS))

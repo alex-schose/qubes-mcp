@@ -2,7 +2,7 @@
 
 A proposal is the options of one `qmcp project` command, never a plan or a list
 of commands: create a project, edit one, add a dump sink, change or remove a
-lead, delete a project. Only the hub submits them (`qmcp.SubmitProposal`) and
+lead, change a lead's firewall, delete a project. Only the hub submits them (`qmcp.SubmitProposal`) and
 polls them (`qmcp.ProposalStatus`); the operator accepts or rejects them in the
 window, which runs `qmcp proposal accept N --sha256 H` or `qmcp proposal reject
 N`, or with those commands in a dom0 terminal. Nothing changes until the
@@ -35,7 +35,10 @@ lead a network by itself.
   it is: removing a qube (deleting a project, removing a lead, or replacing one
   without keeping it), a network that neither the hub nor any non-gateway qube
   in AI space uses and no project lists, a promoted lead, a quota that would
-  make the projects' quotas add up to more than the pool cap. The window shows
+  make the projects' quotas add up to more than the pool cap, a new project's
+  model endpoint that no project uses, a lead change that gives the project a
+  different model endpoint, and every change to a lead's firewall, which the
+  window shows as the old and new rules. The window shows
   the reasons, and `accept` refuses without `--yes TICK`, the digest of the
   reasons shown, while there are any.
 - **The hub learns a state word only**: pending, accepted, rejected, expired or
@@ -67,7 +70,7 @@ import re
 import shlex
 import time
 
-from qmcp import audit, budget, core, projects
+from qmcp import audit, budget, core, firewall, projects
 
 PROPOSALS_DIR = "/var/lib/qmcp/proposals"
 LOCK_PATH = "/run/qmcp/proposals.lock"
@@ -91,7 +94,8 @@ REPORT_LINES = 200
 REPORT_WIDTH = 300
 NOTIFY_TIMEOUT_S = 5.0
 
-TYPES = ("project-create", "project-edit", "project-dump", "project-lead", "project-delete")
+TYPES = ("project-create", "project-edit", "project-dump", "project-lead", "project-firewall",
+         "project-delete")
 #: The states the hub may learn.
 STATES = ("pending", "accepted", "rejected", "expired", "failed")
 DECIDED = ("accepted", "rejected", "failed")
@@ -224,8 +228,13 @@ def _lead(value) -> dict:
     return {"from": value["from"], "qube": _qube(value["qube"], "lead.qube")}
 
 
-def _lead_netvm(value):
-    return None if value is None else _network(value, "lead_netvm")
+def _lead_netvm(value, lead: dict | None = None):
+    """A lead's network. A promoted lead keeps its own, since no network moves:
+    for one, only none (disconnect it) or nothing is taken."""
+    out = None if value is None else _network(value, "lead_netvm")
+    if lead is not None and lead["from"] == "promote" and out not in (None, NONE):
+        raise Invalid("lead_netvm: a promoted lead keeps its own network; give none or leave it out")
+    return out
 
 
 def _lead_name(value, lead: dict, prefix, space=None):
@@ -244,17 +253,64 @@ def _lead_name(value, lead: dict, prefix, space=None):
     return value
 
 
+def _model(value) -> str:
+    try:
+        return firewall.model_text(value)
+    except firewall.FirewallError as e:
+        raise Invalid(f"model: {e}") from None
+
+
+#: Per type, the fields that join the normal form only when given (see below).
+OPTIONAL = {"project-create": frozenset({"model"}),
+            "project-lead": frozenset({"model", "add_old_network"}),
+            "project-firewall": frozenset({"model", "rules"})}
+
+
+def _optional(out: dict, req: dict) -> dict:
+    """Fields added in 0.9.21 join the normal form only when given, so a
+    proposal stored by 0.9.20 still reads back as itself: its fingerprint, which
+    the operator may already have seen, does not change."""
+    if req.get("model") is not None:
+        out["model"] = _model(req["model"])
+    if req.get("add_old_network") is not None and _bool(req["add_old_network"], "add_old_network"):
+        out["add_old_network"] = True
+    return out
+
+
+def _default_sink(key: str) -> str:
+    """The sink's name when none is given, as the command names it."""
+    return "hub-dump" if key == projects.HUB_SLOT else f"{key}-dump"
+
+
+def _sink_refusal(key: str, prefix) -> str | None:
+    """Why the default sink name cannot be used, or None: it would start with
+    the reserved prefix (a label such as "ai" makes "ai-dump"), or it is no
+    qube name (a label starting with a digit makes "42-dump"). The command
+    refuses both at accept; refused here, the hub learns why instead of
+    "failed"."""
+    sink = _default_sink(key)
+    if not core.valid_qube_name(sink):
+        return f"the sink would be named {sink}, which is no qube name"
+    if prefix is not None and sink.startswith(prefix):
+        return f"the sink would be named {sink}, inside the reserved prefix {prefix}"
+    return None
+
+
 def _create(req: dict, prefix) -> dict:
     _fields(req, {"label", "lead", "networks", "quota"},
-            {"lead_netvm", "lead_name", "templates", "dump"})
+            {"lead_netvm", "lead_name", "templates", "dump", "model"})
     label = req["label"]
     why = projects.label_refusal(label)
     if why:
         raise Invalid(f"label: {why}")
+    dump = _bool(req.get("dump", False), "dump")
+    if dump and _sink_refusal(label, prefix):
+        raise Invalid(f"dump: {_sink_refusal(label, prefix)}: choose another label, or propose "
+                      f"the sink with a name once the project exists")
     lead = _lead(req["lead"])
     space = None if prefix is None else f"{prefix}{label}-"
     return {"label": label, "lead": lead,
-            "lead_netvm": _lead_netvm(req.get("lead_netvm")),
+            "lead_netvm": _lead_netvm(req.get("lead_netvm"), lead),
             "lead_name": _lead_name(req.get("lead_name"), lead, prefix, space),
             # The lead's own template joins the list at accept when it is in AI
             # space, as with the command, so one place is kept for it.
@@ -263,7 +319,7 @@ def _create(req: dict, prefix) -> dict:
             "networks": _list(req["networks"], "networks", 1, projects.MAX_NETWORKS,
                               _list_network),
             "quota": _quota(req["quota"]),
-            "dump": _bool(req.get("dump", False), "dump")}
+            "dump": dump} | _optional({}, req)
 
 
 def _edit(req: dict, prefix) -> dict:
@@ -300,20 +356,25 @@ def _edit(req: dict, prefix) -> dict:
 
 def _dump(req: dict, prefix) -> dict:
     _fields(req, {"project"}, {"name"})
+    key = _key(req["project"], hub=True)
     name = req.get("name")
     if name is not None:
         _qube(name, "name")
         if prefix is not None and name.startswith(prefix):
             raise Invalid(f"name: a dump sink is named outside {prefix}")
-    return {"project": _key(req["project"], hub=True), "name": name}
+    elif _sink_refusal(key, prefix):
+        raise Invalid(f"name: {_sink_refusal(key, prefix)}: give the sink a name")
+    return {"project": key, "name": name}
 
 
 def _lead_change(req: dict, prefix) -> dict:
-    _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old"})
+    _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old", "model",
+                               "add_old_network"})
     project = _key(req["project"])
     remove = req.get("remove")
     if remove is True:
-        if any(req.get(k) is not None for k in ("lead", "lead_netvm", "lead_name", "keep_old")):
+        if any(req.get(k) is not None for k in ("lead", "lead_netvm", "lead_name", "keep_old",
+                                                "model", "add_old_network")):
             raise Invalid("remove: takes no other lead field")
         return {"project": project, "remove": True, "lead": None, "lead_netvm": None,
                 "lead_name": None, "keep_old": None}
@@ -327,10 +388,33 @@ def _lead_change(req: dict, prefix) -> dict:
         raise Invalid("keep_old: say whether the old lead stays as a worker (true) or is "
                       "removed with everything in it (false)")
     lead = _lead(req["lead"])
-    return {"project": project, "remove": False, "lead": lead,
-            "lead_netvm": _lead_netvm(req.get("lead_netvm")),
-            "lead_name": _lead_name(req.get("lead_name"), lead, prefix),
-            "keep_old": _bool(req["keep_old"], "keep_old")}
+    out = {"project": project, "remove": False, "lead": lead,
+           "lead_netvm": _lead_netvm(req.get("lead_netvm"), lead),
+           "lead_name": _lead_name(req.get("lead_name"), lead, prefix),
+           "keep_old": _bool(req["keep_old"], "keep_old")}
+    _optional(out, req)
+    if out.get("add_old_network") and not out["keep_old"]:
+        raise Invalid("add_old_network: only with keep_old true")
+    return out
+
+
+def _lead_firewall(req: dict, prefix) -> dict:
+    """A new model endpoint (the firewall becomes that endpoint and DNS), or
+    exactly these rules. Either way the operator sees the old and new rules,
+    and accepting takes the second tick."""
+    _fields(req, {"project"}, {"model", "rules"})
+    out = {"project": _key(req["project"])}
+    if (req.get("model") is None) == (req.get("rules") is None):
+        raise Invalid("say one of model (host:port) or rules (a list of firewall rules)")
+    if req.get("model") is not None:
+        out["model"] = _model(req["model"])
+    else:
+        rules = req["rules"]
+        err = firewall.rules_refusal(rules)
+        if err:
+            raise Invalid(f"rules: {err}")
+        out["rules"] = list(rules)
+    return out
 
 
 def _delete(req: dict, prefix) -> dict:
@@ -339,7 +423,8 @@ def _delete(req: dict, prefix) -> dict:
 
 
 _NORMALISE = {"project-create": _create, "project-edit": _edit, "project-dump": _dump,
-              "project-lead": _lead_change, "project-delete": _delete}
+              "project-lead": _lead_change, "project-firewall": _lead_firewall,
+              "project-delete": _delete}
 
 
 def normalise(req, prefix: str | None = None) -> dict:
@@ -699,6 +784,8 @@ def command(p: dict) -> str | None:
         argv += ["--quota", f"{q // 1024 ** 3}G" if q % 1024 ** 3 == 0 else str(q)]
         if p["dump"]:
             argv.append("--dump")
+        if p.get("model") is not None:
+            argv += ["--model", p["model"]]
     elif t == "project-lead":
         argv = ["qmcp", "project", "lead", p["project"]]
         if p["remove"]:
@@ -711,6 +798,16 @@ def command(p: dict) -> str | None:
                 argv += ["--lead-name", p["lead_name"]]
             if p["keep_old"]:
                 argv.append("--keep-old")
+            if p.get("add_old_network"):
+                argv.append("--add-old-network")
+            if p.get("model") is not None:
+                argv += ["--model", p["model"]]
+    elif t == "project-firewall":
+        argv = ["qmcp", "project", "firewall", p["project"]]
+        if p.get("model") is not None:
+            argv += ["--model", p["model"]]
+        for rule in p.get("rules", ()):
+            argv += ["--rule", rule]
     elif t == "project-dump":
         argv = ["qmcp", "project", "dump", p["project"]]
         if p["name"] is not None:
@@ -721,10 +818,12 @@ def command(p: dict) -> str | None:
 
 
 def _netvm_name(vm):
+    """The network's name, None for none, `core.UNREADABLE` when it cannot be
+    read: no network's name, so it never makes a real one look used."""
     try:
-        ref = getattr(vm, "netvm", None)
+        ref = vm.netvm
     except Exception:
-        return None
+        return core.UNREADABLE
     return None if ref is None else str(getattr(ref, "name", ref))
 
 
@@ -732,14 +831,20 @@ def networks_in_use(app, records: dict) -> set:
     """The networks AI space reaches today: the hub's, every AI-space qube's
     that is not itself a gateway, and every project's worker networks. A
     gateway's own upstream is not counted: a qube placed on it directly would
-    skip the gateway, which is a new path."""
+    skip the gateway, which is a new path. A qube whose tags or network role
+    cannot be read proves no use: what it is on counts as new."""
     hub = core.read_hub()
     used = set()
     for vm in app.domains:
-        if vm.name == hub or (core.in_scope(vm) and not core.is_gateway(vm)):
-            name = _netvm_name(vm)
-            if name:
-                used.add(name)
+        if vm.name != hub:
+            try:
+                if not core.in_scope(vm) or core.is_gateway(vm):
+                    continue
+            except core.Unreadable:
+                continue
+        name = _netvm_name(vm)
+        if name:
+            used.add(name)
     for p in records.values():
         used.update(p.named_networks())
     return used
@@ -784,9 +889,23 @@ def second_tick(app, p: dict, records: dict) -> list:
             reasons.append(f"removes {which} lead {target.lead} with everything in it")
     if p.get("lead") and p["lead"]["from"] == "promote":
         keeps = "files, template and network" if p.get("lead_netvm") is None else \
-            f"files and template, and its network becomes {p['lead_netvm']}"
+            "files and template, and loses its network"
         reasons.append(f"promotes {p['lead']['qube']}, one of the hub's own qubes, into a lead: it "
                        f"keeps its {keeps}")
+    # A model endpoint decides who answers the lead's agent: a new one is
+    # never one click. "New" as for a network: one no project uses today.
+    if t == "project-create" and p.get("model") and \
+            p["model"] not in {r.model for r in records.values() if r.model}:
+        reasons.append(f"gives the lead a model endpoint no project uses today: {p['model']}, "
+                       f"the only place it may reach besides DNS")
+    if t == "project-lead" and not p["remove"] and p.get("model") and target is not None \
+            and p["model"] != target.model:
+        reasons.append(f"changes the project's model endpoint from {target.model or 'none'} to "
+                       f"{p['model']}: the new lead may reach that and DNS, nothing else")
+    if t == "project-firewall":
+        new = f"model {p['model']} only" if p.get("model") else f"{len(p['rules'])} rules"
+        reasons.append(f"changes the lead firewall of {p['project']} to {new}: compare the old and "
+                       f"new rules")
     asked = []
     if t == "project-create":
         asked = [p["lead_netvm"]] + p["networks"]
@@ -820,7 +939,7 @@ def _execute(app, p: dict) -> list:
     if t == "project-create":
         return fleet.create_project(app, p["label"], p["lead"]["from"], p["lead"]["qube"],
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
-                                    p["dump"], p["lead_name"])
+                                    p["dump"], p["lead_name"], p.get("model"))
     if t == "project-edit":
         return fleet.edit_project_changes(app, p["project"], p["add_templates"],
                                           p["remove_templates"], p["add_networks"],
@@ -831,7 +950,10 @@ def _execute(app, p: dict) -> list:
         if p["remove"]:
             return fleet.remove_lead(app, p["project"])
         return fleet.set_lead(app, p["project"], p["lead"]["from"], p["lead"]["qube"],
-                              p["lead_netvm"], p["keep_old"], p["lead_name"])
+                              p["lead_netvm"], p["keep_old"], p["lead_name"], p.get("model"),
+                              bool(p.get("add_old_network")))
+    if t == "project-firewall":
+        return fleet.set_lead_firewall(app, p["project"], p.get("model"), p.get("rules"))
     if t == "project-delete":
         return fleet.delete_project(app, p["project"])
     raise Refused(f"unknown type {t}")
@@ -882,6 +1004,13 @@ def show(app, pid: int, now: float | None = None, directory: str | None = None) 
                             "quota": quota}
         except fleet.ProjectError as err:
             doc["plan"] = f"this edit cannot apply to the record as it is now: {err}"
+    if p["type"] == "project-firewall" and target is not None and target.label:
+        view = fleet.lead_firewall_view(app, records, p["project"])
+        doc["before"] = {"model": view["model"], "accepted": view["accepted"], "live": view["live"],
+                         "read_error": view["read_error"]}
+        doc["after"] = {"model": p.get("model") or view["model"],
+                        "rules": firewall.endpoint_rules(p["model"]) if p.get("model")
+                        else list(p["rules"])}
     if p["type"] == "project-delete":
         # The command's own plan, which also covers finishing a half-done delete.
         doc["plan"] = fleet.delete_plan(app, records, p["project"])[1]

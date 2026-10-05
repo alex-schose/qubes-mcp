@@ -30,7 +30,7 @@ import fcntl
 import os
 import time
 
-from qmcp.core import UMBRELLA, Refusal, refuse
+from qmcp.core import UMBRELLA, Gone, Refusal, refuse, tags_of
 
 CAP_PATH = "/etc/qmcp/pool-cap"
 PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
@@ -86,14 +86,16 @@ def persistent_bytes(vm) -> int:
 
 def persistent_sum(app, badge: str | None = None) -> int:
     """Σ persistent_bytes over AI space, or over the qubes in AI space that
-    wear `badge` (a project's member badge). Raises if anything counted cannot
-    be read: an under-count would let a create through the cap. A qube whose
-    tags cannot be read is not in AI space and is skipped."""
+    wear `badge` (a project's member badge). Raises if anything it must count,
+    or any qube's tags, cannot be read: an under-count would let a create
+    through the cap, and a qube whose tags cannot be read may be in AI space.
+    A qube qubesd says is gone (removed since the list was read) is skipped:
+    it holds no disk."""
     total = 0
     for vm in app.domains:
         try:
-            tags = set(vm.tags)
-        except Exception:
+            tags = tags_of(vm)
+        except Gone:
             continue
         if UMBRELLA in tags and (badge is None or badge in tags):
             total += persistent_bytes(vm)

@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from qubes_mcp import tools  # noqa: E402
 
 RUN = "".join(random.choice(string.ascii_lowercase) for _ in range(4))
-PREFIX = f"ai-st{RUN}"
+PREFIX = f"ai-hub-st{RUN}"
 TEMPLATE = os.environ.get("QMCP_SEAT_TEMPLATE", "ai-debian-13")
 GUARDED_QUBE = os.environ.get("QMCP_SEAT_GUARDED", "ai-net-router")
 OUTSIDE_QUBE = os.environ.get("QMCP_SEAT_OUTSIDE", "sys-net")
@@ -69,6 +69,10 @@ def spawn(suffix, **kw):
     return name, r
 
 
+#: The gateways the operator enrolled, read from the hub's pool stats.
+ENROLLED: set = set()
+
+
 def main() -> int:
     keep = "--keep" in sys.argv
     t0 = time.monotonic()
@@ -85,6 +89,20 @@ def main() -> int:
     check("gateway is listed guarded", by.get(GUARDED_QUBE, {}).get("guarded") is True, str(by.get(GUARDED_QUBE)))
     check("hub and operator qubes are not listed",
           "mcp-control" not in by and OUTSIDE_QUBE not in by and "dom0" not in by)
+
+    # ---------------------------------------------------------------- the registry
+    stats = call("qubes_get_pool_stats")
+    gws = stats.get("gateways") if stats.get("ok") else None
+    if not check("the hub reads the gateway registry", isinstance(gws, list) and bool(gws),
+                 json.dumps(stats)[:300]):
+        return report(t0)
+    ENROLLED.update(g["name"] for g in gws)
+    r = call("qubes_spawn", name="ai-st-outside", template=TEMPLATE)
+    check("a name outside the hub's own space is refused", "ai-hub-" in str(r.get("error")),
+          json.dumps(r))
+    r = call("qubes_spawn", name=f"{PREFIX}-x", template=TEMPLATE, netvm=OUTSIDE_QUBE)
+    check("a network that is not enrolled is refused", "enrolled gateway" in str(r.get("error")),
+          json.dumps(r))
 
     # ---------------------------------------------------------------- reads / oracle
     a = call("qubes_props_get", name=OUTSIDE_QUBE, properties=["memory"])
@@ -104,7 +122,8 @@ def main() -> int:
     r = call("qubes_props_get", name=w, properties=["tags", "netvm", "default_dispvm", "template"])
     v = r.get("values", {})
     check("born managed, provenance hidden", v.get("tags") == ["ai-managed"], json.dumps(r))
-    check("born on an AI-space network", v.get("netvm") not in (None, "<out-of-scope>"), json.dumps(r))
+    check("born on an enrolled network", v.get("netvm") not in (None, "<out-of-scope>")
+          and v.get("netvm") in ENROLLED, json.dumps(r) + f" enrolled={sorted(ENROLLED)}")
     check("default_dispvm pinned to none", v.get("default_dispvm") is None, json.dumps(r))
     r = call("qubes_spawn", name=w, template=TEMPLATE)
     check("collision inside the prefix", "already exists" in str(r.get("error")), json.dumps(r))
@@ -203,7 +222,9 @@ def main() -> int:
           f"collision inside {statistics.median(t_col)*1000:.0f} ms", flush=True)
 
     r = call("qubes_get_pool_stats")
-    check("pool stats", r.get("ok") is True and r["ai_managed_bytes_cap"] > 0, json.dumps(r))
+    check("pool stats: the hub's own names and the reserved prefix",
+          r.get("ok") is True and r["ai_managed_bytes_cap"] > 0 and bool(r.get("reserved_prefix"))
+          and r.get("name_prefix") == f"{r['reserved_prefix']}hub-", json.dumps(r)[:300])
     return report(t0, keep)
 
 

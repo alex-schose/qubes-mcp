@@ -5,11 +5,12 @@ window. `tests/test_gui.py` proves the window's logic offline, against the real
 command; this list proves it on a real box, with real hands.
 
 Run it in dom0, as your own user. You need a TemplateVM in AI space
-(`<template>` below) and a gateway in AI space (`<gateway>`), and `qmcp check`
-GREEN. The names `t1`, `ai-t1h`, `ai-t1-lead`, `ai-t1-boss` and `t1-dump` must
-not exist yet. Answer by step number: "pass", or what you saw instead.
+(`<template>` below), an enrolled gateway (`<gateway>`: the Gateways tab lists
+the enrolled ones), and `qmcp check` GREEN. The names `t1`, `ai-t1h`,
+`ai-t1-lead`, `ai-t1-boss` and `t1-dump` must not exist yet. Answer by step
+number: "pass", or what you saw instead.
 
-Steps 18 to 21 play the hub's part as well, so they also need a terminal in
+Steps 18 to 21 and 29 play the hub's part as well, so they also need a terminal in
 the hub (the qube the Settings tab names under *Hub (fixed at install)*), from
 which they send the requests an agent would. The names `t2`, `t3` and
 `ai-t2-lead` must not exist yet. The projects' quotas (*Disk quota* in each
@@ -17,9 +18,20 @@ project's details) plus 4 GiB must stay within *Pool cap (all of AI space)* on
 the Settings tab: past it, the proposal in step 18 asks for a second tick that
 the step does not expect.
 
+Steps 23 to 29 cover the gateway registry and the leads' firewalls. They also
+need: a TemplateVM outside AI space for a router, `<router-template>`, whose
+`qvm-features <router-template> qubes-firewall` prints `1` (enrolling refuses a
+router for which that feature is not on: its own value, else its template's); Whonix's
+`sys-whonix`, whose `qvm-tags sys-whonix` lists `anon-gateway` (the tag
+`qmcp gateway list` reads to mark the gateway in step 25); and a model endpoint, `<model>`, in the form `host:port` with a host name
+(not an address, which qubesd states back as `dst4=`), such as
+`api.anthropic.com:443`. The names `sys-ai-t4`, `t4`, `t5`, `ai-t4-lead` and
+`ai-t5-lead` must not exist yet.
+
 Every form shows, under its fields, the exact command OK will run. Check it
 against the step each time; it is the window's promise that what you see is
-what runs.
+what runs. While OK is off, that line says why instead, in orange, under
+*OK is off:*.
 
 1. **Open it from the menu.** In the Qubes menu, open the settings page
    (the gear), then *Qubes Tools*: *qubes-mcp* is listed beside Qube Manager.
@@ -92,7 +104,8 @@ what runs.
     will go. OK. Expect: the project and its members are gone, and `t1-dump`
     is kept.
 16. **Settings.** The Settings tab shows the hub, the name prefix, the caps,
-    the disk AI space uses, and the version, with no way to edit them.
+    the disk AI space uses, the birth egress, the number of gateways enrolled,
+    and the version, with no way to edit them.
 17. **Busy.** Start any change, and while it runs, try another button.
     Expect: every action button is greyed out until the first one reports.
 18. **A proposal arrives.** In the hub, propose a project as an agent would,
@@ -182,6 +195,120 @@ what runs.
     closing* line; the Check tab's *proposal store* PASS; and
     `ls /var/lib/qmcp/proposals/` listing `NNNNNN.decision.unreadable` beside
     `NNNNNN.decision`: the damaged file is kept, never deleted.
-23. **Clean up.** `qvm-remove -f t1-dump ai-t1h`, the two qubes steps 1 to 17
-    leave behind; skip it if you ran only steps 18 to 22. Expect: `qmcp check` GREEN.
-    The decided proposals stay in the list: nothing removes them.
+23. **Enroll a gateway.** Open the Gateways tab. Expect `<gateway>` listed,
+    and when selected, *Problem* `none: AI space may use it`. Make a router of
+    your own, outside AI space:
+    `qvm-create --class AppVM --template <router-template> --label orange sys-ai-t4`,
+    then `qvm-prefs sys-ai-t4 provides_network True` and
+    `qvm-prefs sys-ai-t4 netvm sys-firewall`. Press Refresh, then *Enroll...*.
+    Expect *Qube* with nothing chosen and OK greyed out; its list holds the
+    qubes that provide network and are not enrolled, each marked *outside AI
+    space* or *in AI space*, and not `<gateway>`. Choose `sys-ai-t4`, leave
+    *Anonymising* unticked, type `t4 test` into *Label*. Expect the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp gateway enroll sys-ai-t4 --label 't4 test'`.
+    OK. Expect a report ending `sys-ai-t4: enrolled`, and the list gaining
+    `sys-ai-t4` with *Upstream* `sys-firewall`, *In use* `0 qube(s)` and no
+    *Notes*; the Settings tab's *Gateways enrolled* one more than before.
+24. **Offered in the project forms.** On the Qubes tab, *New project...*.
+    Expect *Worker networks* to list `none`, `<gateway>` and `sys-ai-t4`, and
+    any other enrolled gateway, and nothing else (no `sys-firewall`, unless you
+    enrolled it); *Lead network* the same after its first entry, *not set*.
+    Cancel. Then make `sys-ai-t4` stop qualifying, as a template change could:
+    `qvm-features sys-ai-t4 qubes-firewall ''`, and Refresh. On the Gateways
+    tab, expect its row's *Notes* to read `NOT USABLE: Qubes' qubes-firewall
+    feature is not on for it (the qube's own value, else its template's)`, and
+    the light `FAILED` (the Check tab's *gateway registry*). Back on the Qubes
+    tab, *New project...*: type `t9` into *Label*, tick `none` under *Worker
+    networks* and type `1G` into *Workers' disk quota*, so OK is on. `sys-ai-t4` is still
+    listed, marked NOT USABLE; tick it, and OK greys out, saying
+    `'sys-ai-t4' is enrolled but not usable:` and the same reason. Cancel.
+    `qvm-features --unset sys-ai-t4 qubes-firewall`, Refresh: the mark is
+    gone, and the light is `GREEN` again.
+25. **The Whonix mark.** `qvm-prefs sys-ai-t4 netvm sys-whonix`, then Refresh,
+    and the Gateways tab. Expect `sys-ai-t4`'s *Notes* to read
+    `its own firewall rules have no effect upstream`. Select it: the same text
+    in orange under its fields, and *Its upstream ignores its firewall rules*
+    starting `yes: its own firewall rules have no effect upstream`. Press
+    *Change...*: OK is greyed out, saying `nothing changed`. Set *Anonymising*
+    to *yes*; the command ends `--anonymising yes`. OK. Expect its row's
+    *Anonymising* `yes`. Then `qvm-prefs sys-ai-t4 netvm sys-firewall`,
+    Refresh: the mark is gone. *Change...*, *Anonymising* *no*, OK.
+26. **A project with a model.** *New project...*: label `t4`; the lead a fresh
+    qube from `<template>`; *Lead network* `sys-ai-t4`; worker network `none`;
+    quota `4G`. Expect OK greyed out, saying a lead with a network needs its
+    model endpoint, and the line *The lead's network* saying the lead will be
+    on `sys-ai-t4`. Type `<model>` into *Lead's model endpoint*: the command
+    now holds `--lead-netvm sys-ai-t4 --model <model>`. OK. Expect project `t4`
+    with its lead `ai-t4-lead`. Select `t4`. Expect *Lead's model endpoint*
+    `<model>`; *Lead firewall you accepted* three lines: the endpoint
+    (`action=accept dsthost=... proto=tcp dstports=...`, qubesd's own
+    spelling), `action=accept specialtarget=dns`
+    and `action=drop`; *Lead firewall* `read at` a time; *Rules it has now
+    (live)* the same three lines; *Live rules are the ones you accepted* `yes`.
+    *Set lead model...* and *Set lead rules...* are on, *Accept current
+    rules...* greyed out. Select `ai-t4-lead` in the tree: the same lead
+    firewall lines and buttons.
+27. **Set the rules; the check stays green.** Select `t4`, *Set lead
+    rules...*. Expect *Rules, one per line* to hold the three accepted rules,
+    and under it three columns: *Accepted now*, *Live now*, *After OK*. On a
+    new line above `action=drop` type
+    `action=accept proto=tcp dsthost=example.com dstports=443`: *After OK*
+    shows four lines. On a line of its own type `action=allow`: OK greys out,
+    saying a rule's action is accept or drop. Delete that line. OK. Expect a
+    report ending `ai-t4-lead's firewall set (4 rules)`; *Rules you accepted*
+    and *Rules it has now (live)* four lines each, *Live rules are the ones you
+    accepted* `yes`; the light still `GREEN`, and the Check tab's *lead
+    firewalls* PASS.
+28. **A lead with no rules accepted.** *New project...*: label `t5`, the lead
+    a fresh qube from `<template>`, *Lead network* `none`, worker network
+    `none`, quota `1G`. Type `<model>` into *Lead's model endpoint*: OK greys
+    out, saying a lead with no network reaches no model endpoint. Empty the
+    field, OK. Select `t5`: *Set lead model...* is greyed out, *Set lead
+    rules...* is on, and the details say *Set lead model* `off: ai-t5-lead has
+    no network, so it reaches no model endpoint; set its rules, or give the
+    project a new lead on a network`. Then, in dom0, give that lead a network
+    by hand, as an upgrade from 0.9.20 leaves a lead:
+    `qvm-prefs ai-t5-lead netvm sys-ai-t4`. Refresh. The *Set lead model* line
+    is gone, and the button is on.
+    Expect the Check tab to hold a WARN *lead firewalls not accepted* naming
+    `t5: ai-t5-lead`, and the light still `GREEN` (a warning is not a
+    failure). Select `t5`: *Rules you accepted* `none on record`, *Rules it
+    has now (live)* the qube's own rules (Qubes gives a new qube
+    `action=accept`), *Accept current rules...* on. Press it: the form shows
+    *Accepted now* `none on record` beside *Live now*, and the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp project firewall t5 --accept-current`.
+    OK. Expect *Live rules are the ones you accepted* `yes`, the WARN gone,
+    and *Accept current rules...* greyed out. Then *Set lead model...*: OK is
+    greyed out until you type `<model>`; *After OK* then shows the three
+    endpoint rules. OK. Expect *Lead's model endpoint* `<model>`, and the live
+    rules the three endpoint rules.
+29. **The hub proposes a lead's firewall.** In the hub:
+
+    ```sh
+    printf '%s' '{"type": "project-firewall", "title": "example.net for t4",
+      "project": "t4", "rules": ["action=accept proto=tcp dsthost=example.net dstports=443",
+      "action=accept specialtarget=dns", "action=drop"]}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Expect `"ok": true` and an id P. Refresh, select P on the Proposals tab.
+    Expect: *Type* `project-firewall`; *Lead firewall rules* the three lines
+    you sent; *Lead's model, now -> after* `<model> -> <model>`; *Lead
+    firewall now, as you accepted it* and *Lead firewall now, live* the four
+    rules of step 27; *Lead firewall after accepting* the three new ones; red
+    text saying accepting it needs the second tick because it changes the lead
+    firewall of t4 to 3 rules, to compare the old and new rules; the tick box
+    empty and *Accept...* greyed out. Tick it, *Accept...*: the command ends in
+    `--yes` and the *Second tick digest*. OK. Expect `proposal P: accepted`; on
+    the Qubes tab, `t4`'s *Rules you accepted* and *Rules it has now (live)*
+    the three new rules; the light `GREEN`.
+30. **Clean up.** On the Gateways tab select `sys-ai-t4`, *Remove...*: expect
+    OK greyed out, the form saying `'sys-ai-t4' is in use` by `ai-t4-lead` and
+    `ai-t5-lead`, and no red line (it removes no qube). Cancel. Delete `t4`
+    and `t5` (*Delete project...*, OK, each). Select `sys-ai-t4` again,
+    *Remove...*, OK: expect `sys-ai-t4: no longer enrolled`. Then
+    `qvm-remove -f sys-ai-t4` (`qvm-shutdown --wait sys-ai-t4` first if it
+    runs), and `qvm-remove -f t1-dump ai-t1h`, the two
+    qubes steps 1 to 17 leave behind; skip what a step you did not run never
+    made. Expect: `qmcp check` GREEN. The decided proposals stay in the list:
+    nothing removes them.

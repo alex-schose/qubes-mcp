@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import stat
 
-from qmcp import audit, birth, budget, core, projects, proposals
+from qmcp import audit, birth, budget, core, firewall, gateways, projects, proposals
 
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_NAME = "30-mcp-control.policy"
@@ -84,8 +84,8 @@ def _tags(vm) -> set:
     return core.tags_of(vm)
 
 
-def _owner(vm):
-    for t in _tags(vm):
+def _owner(tags):
+    for t in tags:
         if t.startswith(birth.OWNER_PREFIX):
             return t[len(birth.OWNER_PREFIX):]
     return None
@@ -138,6 +138,7 @@ PRECEDENCE_CLAIMS = (
     ("qmcp exec from AI space", "qmcp.RunInAIManaged", "ai", "peer"),
     ("a copy into a guarded qube", "qubes.Filecopy", "ai", "guarded"),
     ("hub exec into a guarded qube", "qmcp.RunInAIManaged", "hub", "guarded"),
+    ("the hub writing a lead's firewall", "admin.vm.firewall.Set", "hub", "lead"),
     ("the Admin API to dom0 from the hub", "admin.vm.List", "hub", "dom0"),
     ("hub exec outside AI space", "qmcp.RunInAIManaged", "hub", "outside"),
     ("a lead's exec into its own member", "qmcp.RunInAIManaged", "lead", "member"),
@@ -237,6 +238,36 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     except Exception as e:
         return [Finding("error", "fleet", f"cannot list qubes ({type(e).__name__})")]
     by_name = {vm.name: vm for vm in vms}
+    # Every qube's tags, read once: the items below that judge tags judge these
+    # reads. A qube whose tags cannot be read is reported here and skipped by
+    # those items, never judged as a qube with none. One qubesd says is gone
+    # (removed since the list was read) is skipped: it holds nothing.
+    tags_by, unread = {}, []
+    for vm in vms:
+        try:
+            tags_by[vm.name] = _tags(vm)
+        except core.Gone:
+            pass
+        except core.Unreadable:
+            unread.append(vm.name)
+    if unread:
+        add("error", "qube tags", f"cannot read the tags of: {', '.join(sorted(unread))}; the "
+                                  f"items that judge tags skip them")
+    vms = [vm for vm in vms if vm.name in tags_by]
+
+    def judged(item, offenders, cannot, fail_text, pass_text, level="fail"):
+        """An item's finding: its offenders, with what it could not read noted;
+        what it could not read alone is an error, never a pass."""
+        note = f"; cannot read {', '.join(sorted(cannot))}" if cannot else ""
+        if offenders:
+            add(level, item, fail_text + note)
+        elif cannot:
+            add("error", item, note[2:])
+        else:
+            add("pass", item, pass_text)
+
+    def T(vm) -> set:
+        return tags_by[vm.name]
 
     # 1. the hub
     hub = core.read_hub()
@@ -244,8 +275,10 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("fail", "hub", f"{core.HUB_PATH} missing or malformed")
     elif hub not in by_name:
         add("fail", "hub", f"hub '{hub}' does not exist")
+    elif hub not in tags_by:
+        add("error", "hub", f"cannot read the tags of the hub '{hub}'")
     else:
-        bad = {t for t in _tags(by_name[hub]) if birth.controlled(t)}
+        bad = {t for t in tags_by[hub] if birth.controlled(t)}
         if bad:
             add("fail", "hub", f"hub '{hub}' carries AI-space badges {sorted(bad)}; "
                                f"remove them with: qvm-tags {hub} del <tag>")
@@ -253,19 +286,68 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
             add("pass", "hub", f"hub is '{hub}', outside AI space")
 
     # 2. migration complete
-    tiered = sorted(vm.name for vm in vms if _tags(vm) & LEGACY_TIER_TAGS)
+    tiered = sorted(vm.name for vm in vms if T(vm) & LEGACY_TIER_TAGS)
     add("fail" if tiered else "pass", "tier tags",
         f"still tiered: {', '.join(tiered)} (run qmcp migrate)" if tiered else "none left")
 
     # 3. gateways are always guarded: the policy cannot see provides_network
-    loose = sorted(vm.name for vm in vms if core.in_scope(vm) and core.is_gateway(vm)
-                   and core.GUARDED not in _tags(vm))
-    add("fail" if loose else "pass", "gateways guarded",
-        f"gateway(s) without {core.GUARDED}: {', '.join(loose)} (qmcp guard <qube>)"
-        if loose else "every gateway in AI space is guarded")
+    loose, role_unread = [], []
+    for vm in vms:
+        if core.UMBRELLA not in T(vm) or core.GUARDED in T(vm):
+            continue
+        try:
+            if core.is_gateway(vm):
+                loose.append(vm.name)
+        except core.Unreadable:
+            role_unread.append(f"whether {vm.name} provides network")
+    judged("gateways guarded", loose, role_unread,
+           f"gateway(s) without {core.GUARDED}: {', '.join(sorted(loose))} (qmcp guard <qube>)",
+           "every gateway in AI space is guarded")
+
+    # 3b. the gateway registry: every entry still a gateway AI space may use,
+    # and every network an AI qube is on, enrolled. A qube's own firewall
+    # rules are carried out by the qube above it, so that qube must be one
+    # the operator chose.
+    try:
+        registry = gateways.load()
+    except gateways.GatewaysUnreadable as e:
+        registry = None
+        add("fail", "gateway registry", f"{gateways.GATEWAYS_PATH}: {e}; no network is usable")
+    if registry is not None:
+        bad, gw_unread = [], []
+        for name in sorted(registry):
+            if name in unread:
+                continue                    # its tags: the "qube tags" error names it
+            try:
+                why = _gateway_refusal(by_name, name, hub)
+            except core.Unreadable as e:
+                gw_unread.append(str(e).removeprefix("cannot read "))
+                continue
+            if why:
+                bad.append(f"{name} ({why})")
+        judged("gateway registry", bad, gw_unread, f"enrolled but not usable: {'; '.join(bad)}",
+               f"{len(registry)} gateway(s) enrolled" if registry
+               else "no gateway enrolled; AI qubes can have no network (qmcp gateway enroll QUBE)")
+        loose, net_unread = [], []
+        for vm in vms:
+            if core.UMBRELLA not in T(vm):
+                continue
+            try:
+                if core.is_gateway(vm):
+                    continue
+                net = _netvm(vm)
+            except (core.Unreadable, NetvmUnreadable):
+                net_unread.append(f"the network, or whether it provides network, of {vm.name}")
+                continue
+            if net is not None and net not in registry:
+                loose.append(f"{vm.name} on {net}")
+        judged("AI networks", loose, net_unread,
+               f"AI qubes on a network that is not enrolled: {', '.join(sorted(loose))} (enroll "
+               f"it with qmcp gateway enroll NAME, or clear the qube's network)",
+               "every AI qube's network (gateways aside) is an enrolled gateway, or none")
 
     # 4. the airlock: a drop box is never in AI space
-    hybrids = sorted(vm.name for vm in vms if {"ai-dump", core.UMBRELLA} <= _tags(vm))
+    hybrids = sorted(vm.name for vm in vms if {"ai-dump", core.UMBRELLA} <= T(vm))
     add("fail" if hybrids else "pass", "drop boxes",
         f"ai-dump qube(s) also ai-managed: {', '.join(hybrids)}" if hybrids
         else "no ai-dump qube is in AI space")
@@ -273,35 +355,48 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     # 5. stray badges outside AI space. Slot badges are judged by the project
     # checks below, which fail on a misplaced one; a dump sink's badge belongs
     # outside AI space.
-    stray = sorted(vm.name for vm in vms if not core.in_scope(vm)
+    stray = sorted(vm.name for vm in vms if core.UMBRELLA not in T(vm)
                    and any(t == core.GUARDED or t.startswith(birth.NAMESPACE)
-                           for t in _tags(vm) if not t.startswith(TOMBSTONE_PREFIX)
+                           for t in T(vm) if not t.startswith(TOMBSTONE_PREFIX)
                            and not projects.is_slot_tag(t)))
     add("warn" if stray else "pass", "stray badges",
         f"qmcp badges outside AI space: {', '.join(stray)}" if stray else "none")
 
     # 6. v0.9.16 tombstones still on disk
     tombs = sorted(vm.name for vm in vms
-                   if any(t.startswith(TOMBSTONE_PREFIX) for t in _tags(vm)))
+                   if any(t.startswith(TOMBSTONE_PREFIX) for t in T(vm)))
     add("warn" if tombs else "pass", "tombstones",
         f"v0.9.16 tombstones awaiting removal by hand: {', '.join(tombs)}" if tombs else "none")
 
     # 7. the name-namespace residual
     prefix = birth.read_name_prefix()
-    squat = sorted(vm.name for vm in vms if vm.name.startswith(prefix) and not core.in_scope(vm)
-                   and vm.name not in tombs)
+    squat = sorted(vm.name for vm in vms if vm.name.startswith(prefix)
+                   and core.UMBRELLA not in T(vm) and vm.name not in tombs)
     add("warn" if squat else "pass", "name namespace",
         f"outside AI space but inside '{prefix}': {', '.join(squat)} (their names are "
         f"detectable through create collisions)" if squat else f"'{prefix}' holds only AI space")
 
     # 8. no default disposable template outside AI space on a managed qube
-    dd = []
+    dd, dd_unread = [], []
     for vm in vms:
-        if core.state(vm) == "managed":
-            ref = _safe(lambda: getattr(vm, "default_dispvm", None))
-            name = None if ref is None else str(getattr(ref, "name", ref))
-            if name and not (name in by_name and core.in_scope(by_name[name])):
-                dd.append(vm.name)
+        # Managed qubes only. The role is read strictly here: `is_guarded` counts
+        # one it cannot read as guarded, which would skip the qube unreported.
+        if core.UMBRELLA not in T(vm) or core.GUARDED in T(vm):
+            continue
+        try:
+            if core.is_gateway(vm):
+                continue
+            ref = core.default_dispvm_of(vm)
+        except core.Unreadable as e:
+            dd_unread.append(str(e).removeprefix("cannot read "))
+            continue
+        name = None if ref is None else str(getattr(ref, "name", ref))
+        if name in unread:
+            continue                        # its tags: the "qube tags" error names it
+        if name and not (name in tags_by and core.UMBRELLA in tags_by[name]):
+            dd.append(vm.name)
+    if dd_unread:
+        add("error", "default_dispvm", f"cannot read {', '.join(sorted(dd_unread))}")
     add("warn" if dd else "pass", "default_dispvm",
         f"managed qube(s) pointing at a disposable template outside AI space: "
         f"{', '.join(sorted(dd))} (qmcp migrate --apply pins them)" if dd else "none")
@@ -441,10 +536,12 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         "pool-cap and private-cap readable" if caps_ok
         else f"{budget.CAP_PATH} or {budget.PRIVATE_CAP_PATH} missing or malformed")
     egress = _read_word(birth.BIRTH_EGRESS_PATH)
-    if egress and not (egress in by_name and core.in_scope(by_name[egress])):
-        add("warn", "birth egress", f"'{egress}' is not in AI space; template spawns will be refused")
+    if egress and not (registry and egress in registry):
+        add("warn", "birth egress", f"'{egress}' is not an enrolled gateway; the hub's template "
+                                    f"spawns will not use it")
     else:
-        add("pass", "birth egress", egress or "not set (template spawns need the hub's netvm in AI space)")
+        add("pass", "birth egress", egress or "not set (the hub's template spawns need the hub's "
+                                              "own network enrolled)")
 
     # 13. the audit chain
     ok, n, err = audit.verify()
@@ -469,7 +566,8 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     else:
         add("pass", "project records",
             f"{sum(1 for p in records.values() if p.label)} project(s) in {projects.PROJECTS_PATH}")
-    out.extend(project_findings(vms, by_name, records, prefix))
+    out.extend(project_findings(vms, by_name, records, prefix, registry, tags_by))
+    out.extend(lead_firewall_findings(app, by_name, records))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
     if cap is not None and quotas > cap:
@@ -479,35 +577,88 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     return out
 
 
-def _is_template(vm) -> bool:
-    return (_safe(lambda: vm.klass) == "TemplateVM"
-            or bool(_safe(lambda: getattr(vm, "template_for_dispvms", False), False)))
+#: A value that could not be read, as a listing shows it: never a qube name or a
+#: state, so nothing that compares it can take it for none or for a gateway's
+#: name. In the true-or-false fields (`gateway`, `dvmt`, `lead`, and a gateway
+#: row's `in_ai_space` and `upstream_ignores_firewall`) it is truthy: test those
+#: with `is True`.
+UNREADABLE = core.UNREADABLE
+
+
+def _shown(read):
+    """For display only: the value, or `UNREADABLE` when the read fails, never
+    a default. Every decision reads through the strict readers instead."""
+    try:
+        return read()
+    except Exception:
+        return UNREADABLE
 
 
 def _netvm_name(vm):
-    ref = _safe(lambda: getattr(vm, "netvm", None))
+    """For display: the network's name, None for none, `UNREADABLE` when it
+    cannot be read. Every decision reads it with `_netvm`, which raises."""
+    try:
+        return _netvm(vm)
+    except NetvmUnreadable:
+        return UNREADABLE
+
+
+class NetvmUnreadable(Exception):
+    pass
+
+
+def _netvm(vm):
+    """The qube's network, or None for none (dom0 and a RemoteVM have no
+    network). Raises NetvmUnreadable when it cannot be read: a failed read is
+    never "no network"."""
+    try:
+        if core.klass_of(vm) in core.NO_NETWORK_CLASSES:
+            return None
+        ref = vm.netvm      # never getattr with a default: qubesadmin's read errors are AttributeErrors
+    except Exception:
+        raise NetvmUnreadable(core.name_of(vm)) from None
     return None if ref is None else str(getattr(ref, "name", ref))
 
 
-def project_findings(vms, by_name: dict, records: dict, prefix: str) -> list:
+def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=None,
+                     tags_by=None) -> list:
     """The project invariants. The rulebook matches tags, not records, so a
     badge in the wrong place is a fail, not a warning: a slot badge outside AI
-    space or left over from a deleted project is a dialog-free path for a lead."""
+    space or left over from a deleted project is a dialog-free path for a lead.
+    `tags_by` is the check's one tag read per qube; a qube missing from it is
+    the check's "qube tags" error and judged by none of these."""
+    if tags_by is None:
+        tags_by = {}
+        for vm in vms:
+            try:
+                tags_by[vm.name] = _tags(vm)
+            except core.Unreadable:
+                pass        # gone, or the check's "qube tags" error names it
+    vms = [vm for vm in vms if vm.name in tags_by]
     out: list = []
     add = lambda *a: out.append(Finding(*a))  # noqa: E731
-    slots_on = {}
+    slots_on, unread = {}, []
     bad_outside, bad_shape, stale, templates_in, stray_leads = [], [], [], [], []
+
+    def role(vm):
+        """'template', 'gateway' or None; None too, noted, when it cannot be read."""
+        try:
+            return "template" if core.is_template(vm) else "gateway" if core.is_gateway(vm) else None
+        except core.Unreadable as e:
+            unread.append(str(e))
+            return None
+
     for vm in vms:
-        tags = _tags(vm)
+        tags = tags_by[vm.name]
         members, leads = projects.member_slots(tags), projects.lead_slots(tags)
         dumps = {p[1] for p in map(projects.slot_badge_parts, tags) if p and p[0] == "dump"}
         has_lead_tag = projects.LEAD in tags
         if not (members or leads or dumps or has_lead_tag):
             continue
         slots_on[vm.name] = (members, leads, dumps)
-        if not core.in_scope(vm) and (members or leads or has_lead_tag):
+        if core.UMBRELLA not in tags and (members or leads or has_lead_tag):
             bad_outside.append(vm.name)
-        if dumps and (core.in_scope(vm) or projects.DROP_BOX not in tags):
+        if dumps and (core.UMBRELLA in tags or projects.DROP_BOX not in tags):
             bad_outside.append(f"{vm.name} (a dump sink must be ai-dump and outside AI space)")
         if (len(members) + len(leads) > 1 or (members and has_lead_tag)
                 or bool(leads) != has_lead_tag or len(dumps) > 1 or (dumps and (members or leads))):
@@ -523,7 +674,7 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str) -> list:
             rec = records.get(next(iter(leads))) if len(leads) == 1 else None
             if rec is None or rec.lead != vm.name:
                 stray_leads.append(vm.name)
-        if (members or leads) and (_is_template(vm) or core.is_gateway(vm)):
+        if (members or leads) and role(vm):
             templates_in.append(vm.name)
     add("fail" if bad_outside else "pass", "slot badges in AI space",
         f"badges a lead could route to: {', '.join(sorted(bad_outside))}" if bad_outside
@@ -547,30 +698,44 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str) -> list:
                 leaderless.append(f"{p.label} ({p.slot})")
             else:
                 vm = by_name.get(p.lead)
-                if vm is None or not core.lead_badges_agree(_tags(vm), p.slot) or _is_template(vm) \
-                        or core.is_gateway(vm):
+                if vm is None:
+                    lead_bad.append(f"{p.label}: {p.lead}")
+                elif vm.name in tags_by and (not core.lead_badges_agree(tags_by[vm.name], p.slot)
+                                             or role(vm)):
                     lead_bad.append(f"{p.label}: {p.lead}")
             for t in p.templates:
                 vm = by_name.get(t)
-                if vm is None or not core.in_scope(vm) or not _is_template(vm):
+                if vm is None or (vm.name in tags_by and (core.UMBRELLA not in tags_by[vm.name]
+                                                          or role(vm) != "template")):
                     tpl_warn.append(f"{p.label}: {t}")
             for n in p.named_networks():
-                vm = by_name.get(n)
-                if vm is None or not core.in_scope(vm) or not core.is_gateway(vm):
-                    net_warn.append(f"{p.label}: {n}")
+                if not registry or n not in registry:
+                    net_warn.append(f"{p.label}: {n} is not an enrolled gateway")
             for vm in vms:
-                if core.is_member(vm, p.slot):
-                    net = _netvm_name(vm)
-                    if net is not None and net not in p.named_networks() \
-                            and _safe(lambda: vm.klass) != "DispVM":
+                if _member(tags_by[vm.name], p.slot):
+                    try:
+                        net = _netvm(vm)
+                        disposable = core.klass_of(vm) == "DispVM"
+                    except (NetvmUnreadable, core.Unreadable):
+                        unread.append(f"cannot read the network or class of {p.label}'s member "
+                                      f"{vm.name}")
+                        continue
+                    if net is not None and net not in p.named_networks() and not disposable:
                         net_warn.append(f"{p.label}: member {vm.name} is on {net}, not on the list")
         for name in names:
             vm = by_name.get(name)
-            if vm is None or core.in_scope(vm) or projects.dump_badge(p.slot) not in _tags(vm) \
-                    or projects.DROP_BOX not in _tags(vm):
+            if vm is not None and name not in tags_by:
+                continue                    # the check's "qube tags" error names it
+            if vm is None or core.UMBRELLA in tags_by[name] \
+                    or projects.dump_badge(p.slot) not in tags_by[name] \
+                    or projects.DROP_BOX not in tags_by[name]:
                 sink_bad.append(f"{p.slot}: {name}")
-            elif _netvm_name(vm) is not None:
-                sink_warn.append(f"{p.slot}: {name} has a network")
+            else:
+                try:
+                    if _netvm(vm) is not None:
+                        sink_warn.append(f"{p.slot}: {name} has a network")
+                except NetvmUnreadable:
+                    unread.append(f"cannot read the network of {p.slot}'s sink {name}")
         for name, (_, _, dumps) in slots_on.items():
             if p.slot in dumps and name not in names:
                 sink_bad.append(f"{p.slot}: {name} wears the dump badge but is not the record's sink")
@@ -589,10 +754,18 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str) -> list:
     if sink_warn:
         add("warn", "dump sink network", "; ".join(sink_warn))
 
-    unslotted = sorted(vm.name for vm in vms if core.state(vm) == "managed"
-                       and _safe(lambda: vm.klass) == "AppVM" and not _is_template(vm)
-                       and not (_tags(vm) & {projects.LEAD})
-                       and not projects.member_slots(_tags(vm)))
+    unslotted = []
+    for vm in vms:
+        tags = tags_by[vm.name]
+        if core.UMBRELLA not in tags or core.GUARDED in tags or projects.LEAD in tags \
+                or projects.member_slots(tags):
+            continue
+        try:
+            if core.klass_of(vm) == "AppVM" and not core.is_template(vm) \
+                    and not core.is_gateway(vm):
+                unslotted.append(vm.name)
+        except core.Unreadable as e:
+            unread.append(str(e))
     if unslotted:
         add("warn", "managed qubes in no slot",
             f"{', '.join(unslotted)} (hub-only, copies by dialog; qmcp project move QUBE p00)")
@@ -602,12 +775,239 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str) -> list:
             continue
         space = p.space(prefix)
         squat += [vm.name for vm in vms if vm.name.startswith(space)
-                  and not core.is_member(vm, p.slot) and vm.name != p.lead]
+                  and not _member(tags_by[vm.name], p.slot) and vm.name != p.lead]
     if squat:
         add("warn", "project name spaces",
             f"inside a project's names but not its own: {', '.join(sorted(squat))} "
             f"(that project's lead can detect them through a create collision)")
+    if unread:
+        add("error", "project checks", "; ".join(sorted(set(unread))))
     return out
+
+
+def _member(tags, slot: str) -> bool:
+    """`core.is_member` on tags already read."""
+    return core.UMBRELLA in tags and projects.member_badge(slot) in tags \
+        and projects.LEAD not in tags
+
+
+def lead_firewall_findings(app, by_name: dict, records: dict) -> list:
+    """A lead's firewall is the operator's: it must still be the rules the
+    operator accepted. A lead with no network needs none; a lead with one
+    and no accepted rules on record (upgraded from 0.9.20) is warned about
+    until the operator accepts its current rules or sets its model."""
+    drift, unaccepted, unread = [], [], []
+    for p in sorted(records.values(), key=lambda p: p.slot):
+        if p.slot == projects.HUB_SLOT or p.lead is None or p.lead not in by_name:
+            continue
+        try:
+            if _netvm(by_name[p.lead]) is None:
+                continue
+        except NetvmUnreadable:
+            unread.append(f"{p.lead} (network)")
+            continue
+        if p.lead_firewall is None:
+            unaccepted.append(f"{p.label}: {p.lead}")
+            continue
+        try:
+            live = firewall.read_rules(app, p.lead)
+        except Exception as e:
+            unread.append(f"{p.lead} ({type(e).__name__})")
+            continue
+        if tuple(live) != tuple(p.lead_firewall):
+            drift.append(f"{p.label}: {p.lead}")
+    out = []
+    if unread:
+        out.append(Finding("error", "lead firewalls", f"cannot read: {', '.join(unread)}"))
+    if drift:
+        out.append(Finding("fail", "lead firewalls",
+                           f"differ from the rules you accepted: {', '.join(drift)} "
+                           f"(qmcp project firewall NAME shows both)"))
+    elif not unread:
+        out.append(Finding("pass", "lead firewalls", "every lead firewall you accepted is still as "
+                                                     "you accepted it"))
+    if unaccepted:
+        out.append(Finding("warn", "lead firewalls not accepted",
+                           f"{', '.join(unaccepted)}: accept the current rules with qmcp project "
+                           f"firewall NAME --accept-current, or set the model with --model HOST:PORT"))
+    return out
+
+
+# ------------------------------------------------------------------ gateways
+
+def _template_chain(vm) -> list:
+    """The templates a qube's system comes from: its template, and that one's,
+    up to the TemplateVM (a disposable's template is a disposable template).
+    Raises `core.Unreadable`: a chain it cannot read is not a short one."""
+    chain, seen = [], set()
+    ref = core.template_of(vm)
+    while ref is not None and ref.name not in seen:
+        seen.add(ref.name)
+        chain.append(ref)
+        ref = core.template_of(ref)
+    return chain
+
+
+def gateway_refusal(by_name: dict, name: str, hub=None) -> str | None:
+    """None if `name` may be an enrolled gateway, else why not.
+
+    It provides network; it carries out its clients' firewall rules, by
+    Qubes' own marker, and is not a Whonix gateway (Whonix's `anon-gateway`
+    tag), which carries the marker and applies none of its clients' rules
+    (measured on Whonix 18); its system comes from no template the hub manages
+    (every template in its chain outside AI space or guarded), since a
+    template the hub edits could switch its firewall off; it is not the hub,
+    a drop box or a member or lead of a project; inside AI space it is guarded.
+    A read that fails refuses it, until it reads.
+    """
+    try:
+        return _gateway_refusal(by_name, name, hub)
+    except core.Unreadable as e:
+        return f"{e}, so it is refused until that reads"
+
+
+def _gateway_refusal(by_name: dict, name: str, hub) -> str | None:
+    vm = by_name.get(name)
+    if vm is None or core.klass_of(vm) == "AdminVM":
+        return "no such qube"
+    if not core.is_gateway(vm):
+        return "does not provide network"
+    if name == (core.read_hub() if hub is None else hub):
+        return "is the hub"
+    try:
+        tags = _tags(vm)
+    except core.Gone:
+        return "no such qube"
+    if projects.DROP_BOX in tags or projects.LEAD in tags or projects.member_slots(tags) \
+            or projects.lead_slots(tags):
+        return "is a drop box, a lead or a project's member"
+    if core.in_scope(vm) and core.GUARDED not in tags:
+        return f"is in AI space without {core.GUARDED} (qmcp guard {name})"
+    if gateways.WHONIX_GATEWAY_TAG in tags:
+        return ("is a Whonix gateway, which applies none of its clients' firewall rules "
+                "(measured): enroll a plain router in front of it instead")
+    try:
+        marker = vm.features.check_with_template(gateways.FIREWALL_FEATURE, None)
+    except Exception:
+        raise core.Unreadable(f"cannot read the {gateways.FIREWALL_FEATURE} feature of "
+                              f"{name}") from None
+    if marker in (None, "", "0", False, 0):
+        return (f"Qubes' {gateways.FIREWALL_FEATURE} feature is not on for it (the qube's own "
+                f"value, else its template's)")
+    for tpl in _template_chain(vm):
+        tpl_tags = _tags(tpl)
+        if core.UMBRELLA in tpl_tags and core.GUARDED not in tpl_tags:
+            return f"its template {tpl.name} is one the hub manages (guard it, or use another)"
+    return None
+
+
+def gateway_rows(app) -> list:
+    """The registry as the operator reads it: each entry, whether it is still
+    usable and why not, its upstream, and whether that upstream ignores its
+    firewall rules (a Whonix gateway hands its clients' traffic to Tor
+    locally; measured on Whonix 18). Also what uses it."""
+    registry = gateways.load()
+    by_name = {vm.name: vm for vm in app.domains}
+    records = _load_records()
+    # Each qube read once, for every entry: one in AI space, or whose tags
+    # cannot be read (it may be), with its network, UNREADABLE when not read.
+    # A qube qubesd says is gone is no user.
+    on = []
+    for v in by_name.values():
+        try:
+            if core.UMBRELLA not in core.tags_of(v):
+                continue
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            pass
+        on.append((v.name, _netvm_name(v)))
+    rows = []
+    for name in sorted(registry):
+        g, vm = registry[name], by_name.get(name)
+        upstream = None if vm is None else _netvm_name(vm)
+        up_vm = by_name.get(upstream) if upstream else None
+        # A qube whose tags or network cannot be read may be on it: counted.
+        users = sorted(n for n, net in on if net in (name, UNREADABLE))
+        rows.append({"name": name, "anonymising": g.anonymising, "label": g.label,
+                     "problem": gateway_refusal(by_name, name),
+                     "in_ai_space": vm is not None and _shown(lambda: core.in_scope(vm)),
+                     "upstream": upstream,
+                     "upstream_ignores_firewall": UNREADABLE if upstream == UNREADABLE else
+                     up_vm is not None and _shown(
+                         lambda: gateways.WHONIX_GATEWAY_TAG in _tags(up_vm)),
+                     "used_by": users,
+                     "projects": sorted(p.label for p in records.values()
+                                        if p.label and name in p.named_networks())})
+    return rows
+
+
+def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "") -> str:
+    err = gateways.label_refusal(label)
+    if err:
+        raise RoleError(err)
+    with _Exclusive():
+        registry = gateways.load()
+        if name in registry:
+            raise RoleError(f"'{name}' is enrolled already; change it with qmcp gateway set")
+        if len(registry) >= gateways.MAX_GATEWAYS:
+            raise RoleError(f"at most {gateways.MAX_GATEWAYS} gateways")
+        why = gateway_refusal({vm.name: vm for vm in app.domains}, name)
+        if why:
+            raise RoleError(f"'{name}' cannot be enrolled: {why}")
+        registry[name] = gateways.Gateway(name, bool(anonymising), label)
+        gateways.save(registry)
+    return f"{name}: enrolled{' (anonymising)' if anonymising else ''}"
+
+
+def set_gateway(app, name: str, anonymising=None, label=None) -> str:
+    if label is not None and gateways.label_refusal(label):
+        raise RoleError(gateways.label_refusal(label))
+    with _Exclusive():
+        registry = gateways.load()
+        g = registry.get(name)
+        if g is None:
+            raise RoleError(f"'{name}' is not enrolled")
+        if anonymising is not None:
+            g.anonymising = bool(anonymising)
+        if label is not None:
+            g.label = label
+        gateways.save(registry)
+    return f"{name}: {'anonymising' if g.anonymising else 'not anonymising'}, label '{g.label}'"
+
+
+def remove_gateway(app, name: str) -> str:
+    """Take a gateway out of the registry. Refused while a project lists it or
+    an AI qube sits on it: they would be left on a network AI may not use."""
+    with _Exclusive():
+        registry = gateways.load()
+        if name not in registry:
+            raise RoleError(f"'{name}' is not enrolled")
+        records = _load_records()
+        listing_projects = sorted(p.label for p in records.values()
+                                  if p.label and name in p.named_networks())
+        users = []
+        for vm in app.domains:
+            try:
+                if not core.in_scope(vm):
+                    continue
+            except core.Gone:
+                continue
+            except core.Unreadable:
+                users.append(f"{vm.name} (tags unreadable)")
+                continue
+            try:
+                if _netvm(vm) == name:
+                    users.append(vm.name)
+            except NetvmUnreadable:
+                users.append(f"{vm.name} (network unreadable)")
+        users.sort()
+        if listing_projects or users:
+            raise RoleError(f"'{name}' is in use: projects {listing_projects or '-'}, qubes "
+                            f"{users or '-'}; take it off their lists and clear their networks first")
+        del registry[name]
+        gateways.save(registry)
+    return f"{name}: no longer enrolled"
 
 
 # ------------------------------------------------------------------ migrate
@@ -669,16 +1069,26 @@ def plan_migration(app, choices: dict, exec_default: str | None = None,
     if tier_default == "unset":
         tier_default = read_tier_default()
     flipped = tier_default == "ro"
-    tiered = any(_tags(vm) & LEGACY_TIER_TAGS for vm in app.domains)
-    hub = core.read_hub()
     steps, problems = [], []
+    tags_by = {}
+    for vm in app.domains:
+        try:
+            tags_by[vm.name] = _tags(vm)
+        except core.Gone:
+            pass
+        except core.Unreadable as e:
+            problems.append(f"{vm.name}: {e}; run the plan again")
+    tiered = any(tags & LEGACY_TIER_TAGS for tags in tags_by.values())
+    hub = core.read_hub()
     listed = read_guarded_list()
     if listed is _UNREADABLE:
         problems.append(f"{GUARDED_LIST_PATH} exists but cannot be read; it may name qubes "
                         f"v0.9.16 always refused. Fix or remove it first")
         listed = set()
     for vm in app.domains:
-        tags = _tags(vm)
+        if vm.name not in tags_by:
+            continue
+        tags = tags_by[vm.name]
         tiers = tags & LEGACY_TIER_TAGS
         if vm.name == hub and (core.UMBRELLA in tags or tiers):
             problems.append(f"{vm.name}: the hub must not be in AI space; "
@@ -691,7 +1101,12 @@ def plan_migration(app, choices: dict, exec_default: str | None = None,
             if tiers:
                 problems.append(f"{vm.name}: tier tag without the umbrella ({', '.join(sorted(tiers))})")
             continue
-        if core.is_gateway(vm):
+        try:
+            gateway = core.is_gateway(vm)
+        except core.Unreadable as e:
+            problems.append(f"{vm.name}: {e}; run the plan again")
+            continue
+        if gateway:
             want, note = "guarded", "gateway"
         elif vm.name in listed:
             want, note = choices.get(vm.name) or "guarded", f"on {GUARDED_LIST_PATH}"
@@ -719,8 +1134,11 @@ def plan_migration(app, choices: dict, exec_default: str | None = None,
         add -= tags
         pin = False
         if want == "managed":
-            ref = _safe(lambda: getattr(vm, "default_dispvm", None))
-            pin = ref is not None
+            try:
+                pin = core.default_dispvm_of(vm) is not None
+            except core.Unreadable as e:
+                problems.append(f"{vm.name}: {e}; run the plan again")
+                continue
         if remove or add or pin:
             steps.append(Step(vm.name, remove, add, pin, note))
     return steps, problems
@@ -766,31 +1184,94 @@ class RoleError(Exception):
     pass
 
 
+def _read_tags(vm) -> set:
+    """`_tags` for a role action: a read that fails stops it, in words."""
+    try:
+        return _tags(vm)
+    except core.Unreadable as e:
+        raise RoleError(f"{e}; try again") from None
+
+
 def _target(app, name):
     if not core.valid_qube_name(name) or name not in app.domains:
         raise RoleError(f"no qube named '{name}'")
     if name == core.read_hub():
         raise RoleError(f"'{name}' is the hub; the hub is never in AI space")
     vm = app.domains[name]
-    if "ai-dump" in _tags(vm):
+    if "ai-dump" in _read_tags(vm):
         raise RoleError(f"'{name}' is a drop box (ai-dump); a drop box is never in AI space")
     return vm
 
 
+def _is_gateway(vm) -> bool:
+    try:
+        return core.is_gateway(vm)
+    except core.Unreadable as e:
+        raise RoleError(f"{e}; try again") from None
+
+
+def _pin_dispvm(vm, name) -> bool:
+    """No default disposable template, set explicitly and read back: from AI
+    space it could start a disposable outside it, and one that follows Qubes'
+    global default would move with it. True when it changed the qube."""
+    try:
+        if core.default_dispvm_of(vm) is None and not vm.property_is_default("default_dispvm"):
+            return False
+        vm.default_dispvm = None
+        if core.default_dispvm_of(vm) is not None or vm.property_is_default("default_dispvm"):
+            raise RoleError(f"'{name}''s default disposable template did not read back as none")
+        return True
+    except core.Unreadable as e:
+        raise RoleError(f"{e}; try again") from None
+    except RoleError:
+        raise
+    except Exception as e:
+        raise RoleError(f"'{name}''s default disposable template could not be pinned "
+                        f"({type(e).__name__})") from None
+
+
+def _network_enrolled(vm, name) -> None:
+    """A qube joining AI space that is not itself a gateway must be on an
+    enrolled gateway, or on none: `qmcp check` fails on any other, so the role
+    action refuses first."""
+    try:
+        net = _netvm(vm)
+    except NetvmUnreadable:
+        raise RoleError(f"'{name}''s network cannot be read; try again") from None
+    if net is not None and not _is_gateway(vm):
+        try:
+            enrolled = net in gateways.load()
+        except gateways.GatewaysUnreadable:
+            enrolled = False
+        if not enrolled:
+            raise RoleError(f"'{name}' is on {net}, which is not an enrolled gateway: enroll it "
+                            f"(qmcp gateway enroll {net}) or clear the qube's network first")
+
+
 def manage(app, name) -> str:
     vm = _target(app, name)
-    if core.is_gateway(vm):
+    if _is_gateway(vm):
         raise RoleError(f"'{name}' provides network; gateways are always guarded (qmcp guard)")
-    vm.tags.add(core.UMBRELLA)
-    for t in sorted((_tags(vm) & LEGACY_TIER_TAGS) | ({core.GUARDED} & _tags(vm))):
+    _network_enrolled(vm, name)
+    pinned = _pin_dispvm(vm, name)          # before it joins AI space
+    try:
+        vm.tags.add(core.UMBRELLA)
+    except Exception as e:
+        raise RoleError(f"'{name}' could not be added to AI space ({type(e).__name__})"
+                        + ("; its default disposable template was cleared" if pinned else "")) from None
+    try:
+        tags = _tags(vm)
+    except core.Unreadable as e:
+        raise RoleError(f"'{name}' is in AI space now"
+                        + ("; its default disposable template was cleared" if pinned else "")
+                        + f", but {e}; run qmcp manage {name} again") from None
+    for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
         vm.tags.discard(t)
-    if _safe(lambda: getattr(vm, "default_dispvm", None)) is not None:
-        vm.default_dispvm = None
     return f"{name}: managed"
 
 
 def _not_in_a_slot(vm, name, action: str) -> None:
-    tags = _tags(vm)
+    tags = _read_tags(vm)
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise RoleError(f"'{name}' is a lead; use qmcp project lead <project> --remove first")
     if projects.member_slots(tags) and action != "revoke":
@@ -800,9 +1281,14 @@ def _not_in_a_slot(vm, name, action: str) -> None:
 def guard(app, name) -> str:
     vm = _target(app, name)
     _not_in_a_slot(vm, name, "guard")
+    _network_enrolled(vm, name)
     vm.tags.add(core.GUARDED)
     vm.tags.add(core.UMBRELLA)
-    for t in sorted(_tags(vm) & LEGACY_TIER_TAGS):
+    try:
+        tags = _tags(vm)
+    except core.Unreadable as e:
+        raise RoleError(f"'{name}' is guarded now, but {e}; run qmcp guard {name} again") from None
+    for t in sorted(tags & LEGACY_TIER_TAGS):
         vm.tags.discard(t)
     return f"{name}: guarded"
 
@@ -812,45 +1298,67 @@ def revoke(app, name, shutdown: bool = True) -> str:
     Restrictions such as an egress lock go too: revoke is yours."""
     vm = _target(app, name)
     _not_in_a_slot(vm, name, "revoke")
-    for t in sorted((t for t in _tags(vm) if birth.controlled(t)), key=_removal_order):
+    for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
-    if _safe(lambda: getattr(vm, "default_dispvm", None)) is not None:
-        vm.default_dispvm = None
+    try:
+        left = sorted(t for t in _tags(vm) if birth.controlled(t))
+    except core.Unreadable as e:
+        raise RoleError(f"'{name}''s badges were taken off, but {e}; run qmcp revoke {name} "
+                        f"again") from None
+    if left:
+        raise RoleError(f"'{name}' still wears {', '.join(left)}; run qmcp revoke {name} again")
+    try:
+        _pin_dispvm(vm, name)
+    except RoleError as e:
+        raise RoleError(f"'{name}' is out of AI space, but {e}") from None
     msg = f"{name}: revoked"
-    if shutdown and _safe(vm.is_running, False):
-        try:
-            vm.shutdown()
-            msg += ", shutdown requested"
-        except Exception as e:
-            msg += f", shutdown failed ({type(e).__name__}); kill it with qvm-kill {name}"
+    if shutdown:
+        power = _safe(vm.get_power_state, "unknown")
+        if power in ("NA", "unknown"):
+            msg += f", power state unreadable, so not shut down (qvm-shutdown {name})"
+        elif power != "Halted":
+            try:
+                vm.shutdown()
+                msg += ", shutdown requested"
+            except Exception as e:
+                msg += f", shutdown failed ({type(e).__name__}); kill it with qvm-kill {name}"
     return msg
 
 
 def listing(app, everything: bool = False) -> list:
     """One row per qube in AI space. `everything` adds every other qube but
     dom0, with state None: the operator's window offers them when a qube joins
-    AI space, and as a lead's template or network."""
+    AI space, as a lead's template, and as a gateway to enroll."""
     rows = []
     for vm in app.domains:
-        st = core.state(vm)
-        klass = _safe(lambda: vm.klass)
-        if st is None and (not everything or klass == "AdminVM"):
+        klass = _shown(lambda: core.klass_of(vm))
+        if klass == "AdminVM":
             continue
-        tpl = _safe(lambda: getattr(vm, "template", None))
-        net = _safe(lambda: getattr(vm, "netvm", None))
-        tags = _tags(vm)
-        slots = projects.member_slots(tags) | projects.lead_slots(tags)
+        try:
+            tags = _tags(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            tags = None             # listed as UNREADABLE: it may be in AI space
+        st = UNREADABLE if tags is None else None if core.UMBRELLA not in tags else \
+            "guarded" if core.is_guarded(vm, tags) else "managed"
+        if st is None and not everything:
+            continue
+        tpl = _shown(lambda: core.template_of(vm))
+        slots = set() if tags is None else projects.member_slots(tags) | projects.lead_slots(tags)
         rows.append({
             "name": vm.name, "state": st, "klass": klass,
-            "template": None if tpl is None else str(getattr(tpl, "name", tpl)),
-            "netvm": None if net is None else str(getattr(net, "name", net)),
+            "template": tpl if tpl in (None, UNREADABLE) else str(getattr(tpl, "name", tpl)),
+            "netvm": _netvm_name(vm),
             "power": _safe(vm.get_power_state, "unknown"),
-            "slot": ",".join(sorted(slots)) or None,
-            "lead": projects.LEAD in tags,
-            "owner": _owner(vm),
-            "gateway": core.is_gateway(vm),
-            "dvmt": bool(_safe(lambda: getattr(vm, "template_for_dispvms", False), False)),
-            "badges": sorted(t for t in tags if birth.controlled(t) or t == projects.DROP_BOX),
+            # What the tags say is not known when they cannot be read: never empty.
+            "slot": UNREADABLE if tags is None else ",".join(sorted(slots)) or None,
+            "lead": UNREADABLE if tags is None else projects.LEAD in tags,
+            "owner": UNREADABLE if tags is None else _owner(tags),
+            "gateway": _shown(lambda: core.is_gateway(vm)),
+            "dvmt": _shown(lambda: core.is_dvmt(vm)),
+            "badges": None if tags is None else
+            sorted(t for t in tags if birth.controlled(t) or t == projects.DROP_BOX),
         })
     return rows
 
@@ -872,6 +1380,7 @@ def settings(app) -> dict:
         "private_cap": budget.read_private_cap(),
         "ai_space_bytes": used,
         "birth_egress": _read_word(birth.BIRTH_EGRESS_PATH) or None,
+        "gateways_enrolled": _safe(lambda: len(gateways.load())),
     }
 
 
@@ -927,12 +1436,14 @@ def parse_size(text) -> int:
 
 
 def _vm(app, name):
+    """The qube called `name`, or None when there is none. A lookup that fails
+    raises `core.Unreadable`: it is no proof that the qube is gone."""
     if not core.valid_qube_name(name):
         return None
     try:
         return app.domains[name] if name in app.domains else None
     except Exception:
-        return None
+        raise core.Unreadable(f"cannot look up {name}") from None
 
 
 def _load_records() -> dict:
@@ -1010,6 +1521,14 @@ def _run(command, *args, **kwargs) -> Report:
     with _Exclusive():
         try:
             command(report, *args, **kwargs)
+        except core.Unreadable as e:
+            # A read that failed stops the command where it was, in words. The
+            # report holds the steps that completed; a write after the last of
+            # them may have landed too, so the message never says that nothing
+            # changed.
+            err = ProjectError(f"{e}; stopped there (qmcp check shows what is left)")
+            err.report = list(report)
+            raise err from None
         except Exception as e:
             e.report = list(report)
             raise
@@ -1017,7 +1536,7 @@ def _run(command, *args, **kwargs) -> Report:
 
 
 def _template_name(vm):
-    ref = _safe(lambda: getattr(vm, "template", None))
+    ref = core.template_of(vm)
     return None if ref is None else str(getattr(ref, "name", ref))
 
 
@@ -1025,7 +1544,7 @@ def _check_templates(app, names) -> list:
     out = []
     for name in names:
         vm = _vm(app, name)
-        if vm is None or not core.in_scope(vm) or not _is_template(vm):
+        if vm is None or not core.in_scope(vm) or not core.is_template(vm):
             raise ProjectError(f"'{name}' is not a template or disposable template in AI space")
         if name not in out:
             out.append(name)
@@ -1034,14 +1553,33 @@ def _check_templates(app, names) -> list:
     return out
 
 
+def _registry() -> dict:
+    try:
+        return gateways.load()
+    except gateways.GatewaysUnreadable as e:
+        raise ProjectError(f"{gateways.GATEWAYS_PATH} is unreadable ({e}); fix it before "
+                           f"changing networks") from None
+
+
+def _usable_gateway(app, registry: dict, net: str) -> None:
+    """An enrolled gateway that still qualifies. One that stopped (`qmcp check`
+    fails on it) is refused here, as a project's network or a lead's, until it
+    is fixed or removed; the services still place new qubes on it while it
+    stays enrolled."""
+    if net not in registry:
+        raise ProjectError(f"'{net}' is not an enrolled gateway (qmcp gateway enroll {net})")
+    why = gateway_refusal({vm.name: vm for vm in app.domains}, net)
+    if why:
+        raise ProjectError(f"'{net}' is enrolled but not usable: {why}")
+
+
 def _check_networks(app, names) -> list:
+    registry = _registry()
     out = []
     for name in names:
         net = None if name in (None, "none") else name
         if net is not None:
-            vm = _vm(app, net)
-            if vm is None or not core.in_scope(vm) or not core.is_gateway(vm):
-                raise ProjectError(f"'{net}' is not a gateway in AI space")
+            _usable_gateway(app, registry, net)
         if net in out:
             raise ProjectError(f"network '{name}' is listed twice")
         out.append(net)
@@ -1053,10 +1591,47 @@ def _check_networks(app, names) -> list:
 def _check_lead_netvm(app, name):
     if name in (None, "none"):
         return None
-    vm = _vm(app, name)
-    if vm is None or not core.is_gateway(vm):
-        raise ProjectError(f"'{name}' is not a qube that provides network")
+    _usable_gateway(app, _registry(), name)
     return name
+
+
+def _lead_network(app, source: str, origin: str, lead_netvm):
+    """The network a new lead will have: the one given, or for a promoted
+    lead its own. Either way it must be enrolled, or none."""
+    if source == "promote":
+        vm = _vm(app, origin)
+        try:
+            current = None if vm is None else _netvm(vm)
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of '{origin}' cannot be read") from None
+        if lead_netvm not in (None, "none", current):
+            raise ProjectError("a promoted lead keeps its own network, since no network moves: "
+                               "give it none (--lead-netvm none), or make a fresh lead")
+        if lead_netvm == "none":
+            return None
+        return None if current is None else _check_lead_netvm(app, current)
+    return _check_lead_netvm(app, lead_netvm)
+
+
+def _lead_rules(app, source: str, origin: str, lead_netvm, model):
+    """(canonical model or None, the rules dom0 writes into the new lead or None).
+    A lead with a network gets "model endpoint only", so it needs a model; a
+    promoted lead keeps its own network unless given none, and that network
+    must be enrolled. A lead with no network needs no firewall."""
+    net = _lead_network(app, source, origin, lead_netvm)
+    if model is None:
+        if net is not None:
+            raise ProjectError("a lead with a network needs its model endpoint (--model HOST:PORT): "
+                               "dom0 writes its firewall to allow that endpoint and DNS, "
+                               "nothing else")
+        return None, None
+    try:
+        model = firewall.model_text(model)
+    except firewall.FirewallError as e:
+        raise ProjectError(str(e)) from None
+    if net is None:
+        raise ProjectError("a lead with no network reaches no model endpoint; drop --model")
+    return model, firewall.endpoint_rules(model)
 
 
 def _hubs_own_appvm(app, name, what: str):
@@ -1064,10 +1639,10 @@ def _hubs_own_appvm(app, name, what: str):
     qube to promote. Never a template, gateway, guarded qube, lead, drop box
     or another project's member."""
     vm = _vm(app, name)
-    if vm is None or not core.in_scope(vm):
+    tags = set() if vm is None else _tags(vm)
+    if core.UMBRELLA not in tags:
         raise ProjectError(f"no qube '{name}' in AI space")
-    tags = _tags(vm)
-    if _safe(lambda: vm.klass) != "AppVM" or _is_template(vm) or core.is_gateway(vm):
+    if core.klass_of(vm) != "AppVM" or core.is_template(vm) or core.is_gateway(vm):
         raise ProjectError(f"{what} must be an AppVM, not a template or gateway")
     if core.GUARDED in tags or projects.DROP_BOX in tags:
         raise ProjectError(f"'{name}' is guarded or a drop box")
@@ -1083,19 +1658,26 @@ def _lead_template(app, name):
     stronger choice, since the hub cannot edit it; it then stays off the
     project's approved list, which holds only AI space."""
     vm = _vm(app, name)
-    if vm is None or _safe(lambda: vm.klass) != "TemplateVM":
+    if vm is None or core.klass_of(vm) != "TemplateVM":
         raise ProjectError(f"'{name}' is not a TemplateVM")
     return vm
 
 
-def _badges_of_slot(app, slot: str) -> list:
-    """Every qube still wearing a badge of `slot`."""
-    out = []
+def _badges_of_slot(app, slot: str) -> tuple:
+    """(every qube still wearing a badge of `slot`, every qube whose tags
+    cannot be read): either keeps the slot from being reused."""
+    out, unread = [], []
     for vm in app.domains:
-        tags = _tags(vm)
+        try:
+            tags = _tags(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            unread.append(vm.name)
+            continue
         if any((p := projects.slot_badge_parts(t)) and p[1] == slot for t in tags):
             out.append(vm.name)
-    return out
+    return out, unread
 
 
 def _removal_order(tag: str) -> tuple:
@@ -1121,17 +1703,30 @@ def _set_tags(vm, add=(), remove=()):
         raise RuntimeError("tags did not read back as set")
 
 
+def _not_removed(report, slot: str, name: str, err: str) -> None:
+    report.fail(f"{slot}: NOT removed: {err}; if it still runs, kill it by hand (qvm-kill {name})")
+
+
 def _remove_qube(app, name) -> str:
     """Kill and remove a qube; '' when it is gone, else why not."""
     import time
-    vm = _vm(app, name)
+    try:
+        vm = _vm(app, name)
+    except core.Unreadable:
+        return f"{name}: cannot be looked up"
     if vm is None:
         return ""
     try:
-        if _safe(vm.is_running, False):
-            vm.kill()
+        if _safe(vm.get_power_state, "unknown") != "Halted":
+            try:
+                vm.kill()
+            except Exception:
+                pass                # not running after all; the remove below decides
         deadline = time.monotonic() + HALT_WAIT_S
-        while _safe(vm.get_power_state, "Halted") not in ("Halted", None) and time.monotonic() < deadline:
+        # "NA": qubesadmin's answer for a qube it cannot read, one qubesd removed
+        # when it was killed included; the remove below decides, as for any.
+        while _safe(vm.get_power_state, "Halted") not in ("Halted", "NA", None) \
+                and time.monotonic() < deadline:
             time.sleep(0.5)
         if name in app.domains:
             del app.domains[name]
@@ -1139,11 +1734,14 @@ def _remove_qube(app, name) -> str:
         pass
     except Exception as e:
         return f"{name}: {type(e).__name__}"
-    return "" if _vm(app, name) is None else f"{name}: still present"
+    try:
+        return "" if _vm(app, name) is None else f"{name}: still present"
+    except core.Unreadable:
+        return f"{name}: cannot be looked up, so not known to be removed"
 
 
 def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
-               freed: str | None = None) -> str:
+               freed: str | None = None, model=None) -> str:
     """Everything about a new lead that can be checked without changing
     anything; returns the name it will have. `freed` is a name that will be
     free by the time the lead is made (an old lead that is removed first)."""
@@ -1153,7 +1751,7 @@ def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
         _hubs_own_appvm(app, origin, "the lead")
     else:
         raise ProjectError(f"unknown lead source '{source}'")
-    _check_lead_netvm(app, lead_netvm)
+    _lead_rules(app, source, origin, lead_netvm, model)
     if source == "promote":
         return origin
     name = name or f"{space}lead"
@@ -1164,106 +1762,192 @@ def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
     return name
 
 
-def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm):
+#: `_undo_lead`'s default: the promoted qube's network was left as it was.
+_UNCHANGED = object()
+
+
+def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, model=None):
     """Make `name` the lead of `slot`, as planned by `_plan_lead`. Returns
-    (name, created, badges the qube had) so a later failure can undo exactly.
-    A fresh lead is born on `lead_netvm`; a promoted one keeps its network
-    unless `lead_netvm` is given. On failure nothing it made or badged remains."""
+    (name, created, badges the qube had, accepted rules, rules it had, network
+    it had) so a later failure can undo exactly. A fresh lead is born on
+    `lead_netvm`; a promoted one keeps its network unless given none. A lead
+    with a network gets "model endpoint only", written once it wears
+    `qmcp-lead`, which already bars the hub's firewall writes, and before its
+    slot's lead badge, which the rulebook routes on; its network is set or
+    cleared before that badge too. So a lead never holds the slot's badge with
+    a wider firewall or the network it is leaving. On failure it undoes what it
+    did (`_undo_lead`: a fresh lead is removed; a promoted one gets back its
+    badges, then its rules, then its network), stops at the first step it
+    cannot undo, and names it."""
     want = {core.UMBRELLA, projects.LEAD, projects.lead_badge(slot)}
+    _, rules = _lead_rules(app, source, origin, lead_netvm, model)
     if source == "promote":
         vm = _hubs_own_appvm(app, origin, "a promoted lead")
-        netvm = _check_lead_netvm(app, lead_netvm)
+        netvm = _lead_network(app, source, origin, lead_netvm)
         before = {projects.member_badge(s) for s in projects.member_slots(_tags(vm))}
+        old_rules = firewall.read_rules(app, origin) if rules else None
         try:
-            # Out of its slot first, then the lead badges: never both at once.
+            old_net = _netvm(vm) if lead_netvm == "none" else _UNCHANGED
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of '{origin}' cannot be read") from None
+        stored = None
+        try:
+            # `qmcp-lead` first: it grants nothing alone (the services refuse a
+            # lead without its record, and the slot lines need the slot's
+            # badge), and the rulebook denies the hub any firewall write to a
+            # qube wearing it (A1b). A hub write admitted just before is
+            # overwritten if it lands first, fails the read-back below if it
+            # lands between the write and the read-back, and shows in
+            # `qmcp check` if it lands later.
+            _set_tags(vm, add={projects.LEAD})
+            if rules:
+                stored = firewall.write_rules(app, origin, rules)
+            if lead_netvm == "none":
+                vm.netvm = None
+            if _netvm(vm) != netvm:
+                raise RuntimeError("the lead's network did not read back")
+            # Out of its slot, then the slot's lead badge: never both at once.
             _set_tags(vm, remove=before)
             _set_tags(vm, add=want)
-            if lead_netvm is not None:
-                vm.netvm = netvm
-        except Exception:
-            _undo_lead(app, origin, False, slot, before)
+        except Exception as e:
+            err = _undo_lead(app, origin, False, slot, before, old_rules, old_net)
+            if err:
+                raise ProjectError(f"making the lead failed ({type(e).__name__}) and undoing it "
+                                   f"did not finish: {err}") from e
             raise
-        return origin, False, before
+        return origin, False, before, stored, old_rules, old_net
     netvm = _check_lead_netvm(app, lead_netvm)
     if source == "template":
         _lead_template(app, origin)
         vm = app.add_new_vm("AppVM", name, LEAD_LABEL, template=origin)
     else:
         vm = app.clone_vm(_hubs_own_appvm(app, origin, "a lead's clone source"), name)
+    stored = None
     try:
         birth.stamp(birth.TagIO.for_vm(vm), _tags(vm), "dom0", None)
-        _set_tags(vm, add=want)
+        # `qmcp-lead` before the rules (see promote above), the slot's badge last.
+        _set_tags(vm, add={projects.LEAD})
+        if rules:
+            stored = firewall.write_rules(app, name, rules)
         vm.netvm = netvm
         vm.default_dispvm = None
-        if _netvm_name(vm) != netvm or _safe(lambda: getattr(vm, "default_dispvm", None)) is not None:
+        if _netvm(vm) != netvm or core.default_dispvm_of(vm) is not None:
             raise RuntimeError("the lead's network did not read back")
+        _set_tags(vm, add=want)
     except Exception as e:
         err = _remove_qube(app, name)
         if err:
             raise ProjectError(f"making the lead failed ({type(e).__name__}) and the new qube "
                                f"could not be removed: {err}") from e
         raise
-    return name, True, set()
+    return name, True, set(), stored, None, _UNCHANGED
 
 
-def _undo_lead(app, lead: str, fresh: bool, slot: str, before=frozenset()) -> str:
+def _undo_lead(app, lead: str, fresh: bool, slot: str, before=frozenset(),
+               old_rules=None, old_net=_UNCHANGED) -> str:
     """Undo `_make_lead`: remove a lead it made; give a promoted one back
     exactly the badges it had, removing first, so a failure never leaves a
-    qube with more authority than before. '' when undone, else why not."""
+    qube with more authority than before, then its old firewall, then the
+    network it had if it was cleared. '' when undone, else why not."""
     if fresh:
         return _remove_qube(app, lead)
-    vm = _vm(app, lead)
+    try:
+        vm = _vm(app, lead)
+    except core.Unreadable:
+        return f"{lead}: cannot be looked up"
     if vm is not None:
         try:
             _set_tags(vm, remove={projects.LEAD, projects.lead_badge(slot)})
             _set_tags(vm, add=set(before))
         except Exception as e:
             return f"{lead}: badges {type(e).__name__}"
+        if old_rules is not None:
+            try:
+                firewall.restore_rules(app, lead, old_rules)
+            except Exception as e:
+                return f"{lead}: firewall {type(e).__name__}"
+        if old_net is not _UNCHANGED:
+            try:
+                vm.netvm = old_net
+                if _netvm(vm) != old_net:
+                    raise RuntimeError("did not read back")
+            except Exception as e:
+                return f"{lead}: network {type(e).__name__}"
     return ""
 
 
 def _recorded_lead(app, p):
     """The project's recorded lead, only while it wears the slot's lead badge.
     A recorded name whose qube was removed by hand may since name another qube,
-    which must be left alone."""
+    which must be left alone. A lookup or tag read that fails raises: a lead it
+    cannot read is never taken for one that does not wear the badge."""
     vm = _vm(app, p.lead) if p.lead else None
     if vm is None or projects.lead_badge(p.slot) not in _tags(vm):
         return None
     return vm
 
 
-def _demote_lead(app, p, report: list) -> bool:
+def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
     """Take the lead's authority first: its badges, which the rulebook routes on
-    and the services require. Then a kill, so it starts no new call. A call it
-    already started may still finish: a create re-checks its caller under the
-    create lock, which this command holds; a lifecycle, property or feature
-    change already past its check completes."""
-    vm = _recorded_lead(app, p)
+    and the services require. Then a kill. A call it already started may still
+    finish: a create re-checks its caller under the create lock, which this
+    command holds; a lifecycle, property or feature change already past its
+    check completes. A recorded name whose qube does not wear the slot's lead
+    badge is left alone and reported as a failure: what that qube is, the
+    operator decides. A recorded name with no qube is noted. True when it
+    demoted the recorded lead. `removing`: the caller removes the qube once the
+    record is saved, and that removal's result says whether it is gone."""
+    vm = _vm(app, p.lead) if p.lead else None
     if vm is None:
         if p.lead:
-            report.append(f"{p.slot}: {p.lead} does not wear {p.slot}'s lead badge; left alone")
+            report.append(f"{p.slot}: no qube is named {p.lead} now")
         return False
-    _set_tags(vm, remove={projects.LEAD, projects.lead_badge(p.slot)})
-    report.append(f"{p.slot}: {p.lead} is no longer the lead")
-    if _safe(vm.is_running, False):
+    if projects.lead_badge(p.slot) not in _tags(vm):
+        if removing:
+            report.fail(f"{p.slot}: {p.lead} does not wear {p.slot}'s lead badge, so it was not "
+                        f"demoted or killed; if it is the old lead and still there after this "
+                        f"command, remove it by hand")
+        else:
+            report.fail(f"{p.slot}: {p.lead} does not wear {p.slot}'s lead badge, so it was not "
+                        f"demoted, killed or kept as a worker; if it is the old lead, take its "
+                        f"lead badges off by hand and move it in (qmcp project move {p.lead} "
+                        f"{p.label})")
+        return False
+    try:
+        _set_tags(vm, remove={projects.LEAD, projects.lead_badge(p.slot)})
+        report.append(f"{p.slot}: {p.lead} is no longer the lead")
+    except core.Unreadable as e:
+        # The removes went through; only their read-back failed. The kill and
+        # the record must not wait on a read: a lead left running unrecorded
+        # would keep its network and lose A1b's guard on its firewall.
+        report.fail(f"{p.slot}: {p.lead}'s lead badges were taken off, but {e}; qmcp check "
+                    f"shows whether any is left")
+    power = _safe(vm.get_power_state, "unknown")
+    if power != "Halted":
         try:
             vm.kill()
         except Exception as e:
-            report.append(f"{p.slot}: kill of {p.lead} failed ({type(e).__name__})")
+            if removing:
+                report.append(f"{p.slot}: kill of {p.lead} failed ({type(e).__name__}); its "
+                              f"removal, once the record is saved, tries again")
+            elif (after := _safe(vm.get_power_state, "unknown")) != "Halted":
+                report.fail(f"{p.slot}: kill of {p.lead} failed ({type(e).__name__}, power "
+                            f"state {after}): it no longer acts as the lead, but it may still "
+                            f"be running; if it is, kill it by hand (qvm-kill {p.lead})")
     return True
 
 
 def create_project(app, label: str, lead_source: str, lead_origin: str, templates=(),
                    networks=(), quota=None, lead_netvm=None, dump: bool = False,
-                   lead_name: str | None = None) -> list:
+                   lead_name: str | None = None, model: str | None = None) -> list:
     """Make a project; returns the report lines. The record is written last, so
     the lead is no principal until everything else is in place."""
     return _run(_create_project, app, label, lead_source, lead_origin, templates, networks,
-                quota, lead_netvm, dump, lead_name)
+                quota, lead_netvm, dump, lead_name, model)
 
 
 def _create_project(report, app, label, lead_source, lead_origin, templates, networks, quota,
-                    lead_netvm, dump, lead_name):
+                    lead_netvm, dump, lead_name, model=None):
     err = projects.label_refusal(label)
     if err:
         raise ProjectError(err)
@@ -1277,34 +1961,44 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
     if not free:
         raise ProjectError("all 15 project slots are in use")
     slot = free[0]
-    leftover = _badges_of_slot(app, slot)
+    leftover, unread = _badges_of_slot(app, slot)
     if leftover:
         raise ProjectError(f"slot {slot} still has badges on {', '.join(leftover)}; "
                            f"finish with: qmcp project delete {slot} --yes")
+    if unread:
+        raise ProjectError(f"cannot read the tags of {', '.join(unread)}, so slot {slot} is not "
+                           f"known to be free; try again")
     squatters = [vm.name for vm in app.domains if vm.name.startswith(space)]
     if squatters:
         raise ProjectError(f"qubes already sit in '{space}': {', '.join(squatters)}")
     sink = f"{label}-dump" if dump else None
-    if sink and (sink.startswith(prefix) or _vm(app, sink) is not None):
-        raise ProjectError(f"the dump sink '{sink}' would be inside '{prefix}' or exists")
-    name = _plan_lead(app, space, lead_source, lead_origin, lead_netvm, lead_name)
+    if sink and (sink.startswith(prefix) or not core.valid_qube_name(sink)
+                 or _vm(app, sink) is not None):
+        raise ProjectError(f"the dump sink '{sink}' would be inside '{prefix}', is no qube name, "
+                           f"or exists")
+    name = _plan_lead(app, space, lead_source, lead_origin, lead_netvm, lead_name, model=model)
+    model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
     lead_tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead_origin))
     tpls = list(templates)
     if lead_tpl and (vm := _vm(app, lead_tpl)) is not None and core.in_scope(vm):
         tpls.insert(0, lead_tpl)
     tpls = _check_templates(app, tpls)
     nets = _check_networks(app, networks)
-    lead, fresh, before = _make_lead(app, slot, lead_source, lead_origin, name, lead_netvm)
-    report.append(f"{slot}: lead {lead} ({'created' if fresh else 'promoted'})")
+    lead, fresh, before, stored, old_rules, old_net = _make_lead(app, slot, lead_source,
+                                                                 lead_origin, name, lead_netvm,
+                                                                 model)
+    report.append(f"{slot}: lead {lead} ({'created' if fresh else 'promoted'})"
+                  + (f", firewall: {model} and DNS only" if stored else ""))
     try:
         if sink:
             _make_sink(app, slot, sink)
             report.append(f"{slot}: dump sink {sink} created (no network)")
-        records[slot] = projects.Project(slot, label, lead, tpls, nets, quota, sink)
+        records[slot] = projects.Project(slot, label, lead, tpls, nets, quota, sink, model, stored)
         projects.save(records)
     except Exception:
         left = [err for err in ((_remove_qube(app, sink) if sink else ""),
-                                _undo_lead(app, lead, fresh, slot, before)) if err]
+                                _undo_lead(app, lead, fresh, slot, before, old_rules,
+                                           old_net)) if err]
         if left:
             report.fail(f"{slot}: NOT undone: {'; '.join(left)}")
         else:
@@ -1317,7 +2011,10 @@ def _make_sink(app, slot: str, name: str):
     """A fresh drop box: ai-dump + the slot's dump badge, no network, outside AI space."""
     if _vm(app, name) is not None:
         raise ProjectError(f"'{name}' exists; a dump sink is always a fresh qube")
-    tpl = _safe(lambda: getattr(app, "default_template", None))
+    try:
+        tpl = app.default_template
+    except Exception:
+        raise ProjectError("cannot read Qubes' default template for the dump sink") from None
     if tpl is None:
         raise ProjectError("Qubes has no default template for the dump sink")
     vm = app.add_new_vm("AppVM", name, SINK_LABEL, template=tpl)
@@ -1325,10 +2022,13 @@ def _make_sink(app, slot: str, name: str):
         _set_tags(vm, add={projects.DROP_BOX, projects.dump_badge(slot)})
         vm.netvm = None
         vm.default_dispvm = None
-        if _netvm_name(vm) is not None:
+        if _netvm(vm) is not None:
             raise RuntimeError("the sink's network did not read back as none")
-    except Exception:
-        _remove_qube(app, name)
+    except Exception as e:
+        err = _remove_qube(app, name)
+        if err:
+            raise ProjectError(f"the dump sink {name} failed ({type(e).__name__}) and could not be "
+                               f"removed: {err}") from e
         raise
     return name
 
@@ -1343,64 +2043,115 @@ def _remove_lead(report, app, key):
     p = _project(records, key)
     if p.lead is None:
         raise ProjectError(f"project '{p.label}' has no lead")
-    ours = _demote_lead(app, p, report)
-    old, p.lead = p.lead, None
+    ours = _demote_lead(app, p, report, removing=True)
+    # The accepted rules were the removed lead's; the model stays for the next one.
+    old, p.lead, p.lead_firewall = p.lead, None, None
     projects.save(records)
     report.append(f"{p.slot}: the record names no lead")
     if ours:
         err = _remove_qube(app, old)
         report.append(f"{p.slot}: removed {old}") if not err else \
-            report.fail(f"{p.slot}: NOT removed: {err}")
+            _not_removed(report, p.slot, old, err)
 
 
 def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
-             keep_old: bool = False, lead_name: str | None = None) -> list:
+             keep_old: bool = False, lead_name: str | None = None, model: str | None = None,
+             add_old_network: bool = False) -> list:
     """Give a project a new lead. Everything about the new lead is checked
     before the old one is touched. The old one is removed, or kept as a worker
-    of the same project (on one of its worker networks), never as one of the
-    hub's qubes."""
-    return _run(_set_lead, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name)
+    of the same project, never as one of the hub's qubes. A kept lead keeps
+    its network when the project lists it; otherwise `add_old_network` adds
+    it to the list, and without that the old lead loses its network. The new
+    lead gets `model`; one with a network and no `model` takes the project's,
+    and one with no network leaves the project with none."""
+    return _run(_set_lead, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
+                model, add_old_network)
 
 
-def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name):
+def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
+              model=None, add_old_network=False):
     prefix = birth.read_name_prefix()
     records = _load_records()
     p = _project(records, key)
     old_vm = _recorded_lead(app, p)
+    old_net, disconnect = None, False
+    if add_old_network and not keep_old:
+        raise ProjectError("--add-old-network goes with --keep-old")
     if keep_old and old_vm is not None:
-        net = _netvm_name(old_vm)
-        if net is not None and net not in p.named_networks():
-            raise ProjectError(f"the old lead is on {net}, which is not one of the project's worker "
-                               f"networks; drop --keep-old or add the network")
+        try:
+            old_net = _netvm(old_vm)
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of the old lead {p.lead} cannot be read") from None
+        if old_net is not None and old_net not in p.named_networks():
+            if add_old_network:
+                if len(p.networks) >= projects.MAX_NETWORKS:
+                    raise ProjectError(f"the project lists {projects.MAX_NETWORKS} networks already; "
+                                       f"take one off before adding the old lead's")
+                p.networks = tuple(_check_networks(app, p.networks + (old_net,)))
+            else:
+                disconnect = True
+    if model is None and _lead_network(app, lead_source, lead_origin, lead_netvm) is not None:
+        model = p.model         # the project's model carries over to a new lead with a network
     freed = None if (keep_old or old_vm is None) else p.lead
     if (keep_old and old_vm is not None and lead_source != "promote"
             and (lead_name or f"{p.space(prefix)}lead") == p.lead):
         raise ProjectError(f"the old lead keeps the name {p.lead}; pass --lead-name for the new one")
-    name = _plan_lead(app, p.space(prefix), lead_source, lead_origin, lead_netvm, lead_name, freed)
+    name = _plan_lead(app, p.space(prefix), lead_source, lead_origin, lead_netvm, lead_name, freed,
+                      model=model)
+    model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
+    try:
+        projects.parse(projects.dump_json(records))     # the record as it will be saved
+    except projects.ProjectsUnreadable as e:
+        raise ProjectError(f"the project's record would not be valid: {e}") from None
     old = p.lead
     if old is not None:
-        ours = _demote_lead(app, p, report)
-        p.lead = None
+        ours = _demote_lead(app, p, report, removing=not keep_old)
+        # The accepted rules were that lead's; the model stays for the next one.
+        p.lead, p.lead_firewall = None, None
         projects.save(records)
+        report.append(f"{p.slot}: the record names no lead now")
         if ours and keep_old:
-            _set_tags(_vm(app, old), add={projects.member_badge(p.slot)})
-            report.append(f"{p.slot}: {old} kept as a worker")
+            old_vm = _vm(app, old)
+            if disconnect:
+                # Off the network before it joins: never a moment as a worker
+                # on a network its project does not list.
+                old_vm.netvm = None
+                report.append(f"{p.slot}: {old} lost its network ({old_net} is not on the list)")
+            elif add_old_network and old_net is not None:
+                report.append(f"{p.slot}: {old_net} added to the worker networks")
+            try:
+                _set_tags(old_vm, add={projects.member_badge(p.slot)})
+                report.append(f"{p.slot}: {old} kept as a worker")
+            except core.Unreadable as e:
+                report.fail(f"{p.slot}: {old} was kept as a worker, but {e}")
         elif ours:
             err = _remove_qube(app, old)
             report.append(f"{p.slot}: removed {old}") if not err else \
-                report.fail(f"{p.slot}: NOT removed: {err}")
-    lead, fresh, before = _make_lead(app, p.slot, lead_source, lead_origin, name, lead_netvm)
-    tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead))
-    if tpl and tpl not in p.templates and (vm := _vm(app, tpl)) is not None \
-            and core.in_scope(vm) and _is_template(vm):
-        p.templates = p.templates + (tpl,)
-    p.lead = lead
+                _not_removed(report, p.slot, old, err)
+    lead, fresh, before, stored, old_rules, old_net = _make_lead(app, p.slot, lead_source,
+                                                                 lead_origin, name, lead_netvm,
+                                                                 model)
+    try:
+        tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead))
+        if tpl and tpl not in p.templates and (vm := _vm(app, tpl)) is not None \
+                and core.in_scope(vm) and core.is_template(vm):
+            p.templates = p.templates + (tpl,)
+    except core.Unreadable as e:
+        # The new lead is made: a read here must not leave it unrecorded. Its
+        # template stays off the list, one fewer, never one more.
+        report.append(f"{p.slot}: {e}, so the lead's template was not added to the approved list")
+    p.lead, p.model, p.lead_firewall = lead, model, stored
     try:
         projects.save(records)
-    except Exception:
-        _undo_lead(app, lead, fresh, p.slot, before)
+    except Exception as e:
+        err = _undo_lead(app, lead, fresh, p.slot, before, old_rules, old_net)
+        if err:
+            report.fail(f"{p.slot}: the new lead NOT undone: {err}")
+            raise ProjectError(f"saving the record failed ({type(e).__name__}) and undoing the "
+                               f"new lead did not finish: {err}") from e
         raise
-    report.append(f"{p.slot}: lead {lead} ({'created' if fresh else 'promoted'})")
+    report.append(f"{p.slot}: lead {lead} ({'created' if fresh else 'promoted'})"
+                  + (f", firewall: {model} and DNS only" if stored else ""))
 
 
 def edit_project(app, key: str, templates=None, networks=None, quota=None) -> list:
@@ -1414,11 +2165,40 @@ def _edit_project(report, app, key, templates, networks, quota):
     _apply_edit(report, app, records, _project(records, key), templates, networks, quota)
 
 
+def _networks_in_use(app, p, gone) -> list:
+    """The members of `p` sitting on one of the networks in `gone`; a member
+    whose network cannot be read counts as one, and so does a qube whose tags
+    cannot be read."""
+    out = []
+    for vm in app.domains:
+        try:
+            if not core.is_member(vm, p.slot):
+                continue
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            out.append(f"{vm.name} (tags unreadable)")
+            continue
+        try:
+            net = _netvm(vm)
+        except NetvmUnreadable:
+            out.append(f"{vm.name} (network unreadable)")
+            continue
+        if net is not None and net in gone:
+            out.append(f"{vm.name} on {net}")
+    return sorted(out)
+
+
 def _apply_edit(report, app, records, p, templates, networks, quota):
     if templates is not None:
         p.templates = tuple(_check_templates(app, templates))
     if networks is not None:
-        p.networks = tuple(_check_networks(app, networks))
+        new = tuple(_check_networks(app, networks))
+        in_use = _networks_in_use(app, p, set(p.named_networks()) - set(new))
+        if in_use:
+            raise ProjectError(f"still in use: {', '.join(in_use)}; remove those workers, or "
+                               f"clear their networks, before taking the network off the list")
+        p.networks = new
     if quota is not None:
         p.quota = _quota(quota)
     projects.save(records)
@@ -1470,6 +2250,92 @@ def _edit_changes(report, app, key, add_templates, remove_templates, add_network
                 new_quota if new_quota != p.quota else None)
 
 
+def lead_firewall_view(app, records: dict, key: str) -> dict:
+    """A project's lead firewall as the operator reads it: the model, the rules
+    the operator accepted, and the lead's live rules (None when they cannot be
+    read, never an empty list). Reads only; needs no root."""
+    p = _project(records, key)
+    live, error = None, None
+    if p.lead is not None and _vm(app, p.lead) is not None:
+        try:
+            live = firewall.read_rules(app, p.lead)
+        except Exception as e:
+            error = type(e).__name__
+    accepted = None if p.lead_firewall is None else list(p.lead_firewall)
+    return {"project": p.label, "slot": p.slot, "lead": p.lead, "model": p.model,
+            "accepted": accepted, "live": live, "read_error": error,
+            "same": live is not None and accepted is not None and live == accepted}
+
+
+def set_lead_firewall(app, key: str, model: str | None = None, rules=None,
+                      accept_current: bool = False) -> list:
+    """Change a lead's firewall, or accept the rules it has. With `model`, the
+    lead's model endpoint changes and its firewall becomes "model endpoint
+    only" (for a lead with a network); with `rules`, its firewall becomes
+    exactly those rules; with `accept_current`, its live rules become the
+    accepted ones and nothing on the qube changes, if they are in qmcp's rule
+    format (no comment or expire, at most 32). The record keeps what qubesd
+    reads back; a write that does not read back is undone."""
+    return _run(_set_lead_firewall, app, key, model, rules, accept_current)
+
+
+def _set_lead_firewall(report, app, key, model, rules, accept_current):
+    if sum(x is not None and x is not False for x in (model, rules, accept_current or None)) != 1:
+        raise ProjectError("say one of --model HOST:PORT, --rule RULE (repeatable) or --accept-current")
+    records = _load_records()
+    p = _project(records, key)
+    vm = _recorded_lead(app, p)
+    if vm is None:
+        raise ProjectError(f"project '{p.label}' has no lead wearing its lead badge")
+    if accept_current:
+        try:
+            stored = firewall.read_rules(app, p.lead)
+        except UnicodeDecodeError:
+            stored = None
+        if stored is None or firewall.rules_refusal(stored):
+            # A 0.9.20 hub could write any rule qubesd takes, a comment or an
+            # expiry included; the record keeps only qmcp's own rule format.
+            raise ProjectError(f"{p.lead}'s live rules are not in the form qmcp records ("
+                               f"{'not ASCII' if stored is None else firewall.rules_refusal(stored)}): "
+                               f"set them with --rule or --model instead")
+        p.lead_firewall = tuple(stored)
+        projects.save(records)
+        report.append(f"{p.slot}: {p.lead}'s current firewall ({len(stored)} rules) accepted")
+        return
+    if model is not None:
+        try:
+            model = firewall.model_text(model)
+        except firewall.FirewallError as e:
+            raise ProjectError(str(e)) from None
+        try:
+            if _netvm(vm) is None:
+                raise ProjectError(f"{p.lead} has no network, so it reaches no model endpoint; "
+                                   f"set its rules, or give the project a new lead on a network")
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of {p.lead} cannot be read") from None
+        rules = firewall.endpoint_rules(model)
+    err = firewall.rules_refusal(list(rules))
+    if err:
+        raise ProjectError(err)
+    before = firewall.read_rules(app, p.lead)
+    try:
+        stored = firewall.write_rules(app, p.lead, list(rules))
+    except Exception as e:
+        # Never leave rules live that the record does not hold: put back what was.
+        try:
+            firewall.restore_rules(app, p.lead, before)
+            undone = "its rules were put back as they were"
+        except Exception as e2:
+            undone = f"its old rules could NOT be put back ({type(e2).__name__})"
+        raise ProjectError(f"{p.lead}'s firewall was not set ({type(e).__name__}): {undone}") from e
+    if model is not None:
+        p.model = model
+    p.lead_firewall = tuple(stored)
+    projects.save(records)
+    report.append(f"{p.slot}: {p.lead}'s firewall set ({len(stored)} rules)"
+                  + (f", model {model}" if model else ""))
+
+
 def add_dump(app, key: str, name: str | None = None) -> list:
     """Give a project, or p00, its dump sink: a fresh offline drop box."""
     return _run(_add_dump, app, key, name)
@@ -1505,10 +2371,10 @@ def move(app, name: str, target: str, confirm: bool = False) -> list:
 def _move(report, app, name, target, confirm):
     records = _load_records()
     vm = _vm(app, name)
-    if vm is None or not core.in_scope(vm):
+    tags = set() if vm is None else _tags(vm)
+    if core.UMBRELLA not in tags:
         raise ProjectError(f"no qube '{name}' in AI space")
-    tags = _tags(vm)
-    if _safe(lambda: vm.klass) != "AppVM" or _is_template(vm) or core.is_gateway(vm) \
+    if core.klass_of(vm) != "AppVM" or core.is_template(vm) or core.is_gateway(vm) \
             or core.GUARDED in tags:
         raise ProjectError(f"'{name}' is not a managed AppVM; templates and gateways join no slot")
     if projects.LEAD in tags or projects.lead_slots(tags):
@@ -1520,7 +2386,10 @@ def _move(report, app, name, target, confirm):
     else:
         p = _project(records, target)
         slot = p.slot
-        net = _netvm_name(vm)
+        try:
+            net = _netvm(vm)
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of '{name}' cannot be read") from None
         if net is not None and net not in p.named_networks():
             raise ProjectError(f"'{name}' is on {net}, which is not one of {p.label}'s worker networks")
     current = projects.member_slots(tags)
@@ -1528,9 +2397,20 @@ def _move(report, app, name, target, confirm):
         raise ProjectError(f"'{name}' is in {', '.join(sorted(current))}: moving it carries that "
                            f"slot's content into {slot}; re-run with --yes")
     # Remove before add: a moment in no slot is less authority, never more.
-    _set_tags(vm, remove={projects.member_badge(s) for s in current})
+    if current:
+        try:
+            _set_tags(vm, remove={projects.member_badge(s) for s in current})
+        except core.Unreadable as e:
+            report.fail(f"{name}: taken out of {', '.join(sorted(current))}, but {e}; it was "
+                        f"moved into nothing (qmcp check shows what is left)")
+            return
+        report.append(f"{name}: out of {', '.join(sorted(current))}")
     if slot is not None:
-        _set_tags(vm, add={projects.member_badge(slot)})
+        try:
+            _set_tags(vm, add={projects.member_badge(slot)})
+        except core.Unreadable as e:
+            report.fail(f"{name}: put in {slot}, but {e} (qmcp check shows what is left)")
+            return
     report.append(f"{name}: {'no slot' if slot is None else slot}")
     prefix = birth.read_name_prefix()
     for p in records.values():
@@ -1549,10 +2429,19 @@ def delete_plan(app, records: dict, key: str) -> tuple:
                       f"wearing its member badge and stripping its badges everywhere")
     if p is None or p.slot == projects.HUB_SLOT:
         return False, f"no project '{key}'"
-    members = sorted(vm.name for vm in app.domains if core.is_member(vm, p.slot))
+    members, unread = [], []
+    for vm in app.domains:
+        try:
+            if core.is_member(vm, p.slot):
+                members.append(vm.name)
+        except core.Gone:
+            pass
+        except core.Unreadable:
+            unread.append(vm.name)
+    note = f"; the tags of {', '.join(sorted(unread))} cannot be read now" if unread else ""
     return True, (f"this removes {p.slot} '{p.label}': its lead {p.lead or '(none)'} and every "
-                  f"member qube ({', '.join(members) if members else 'none'}), and keeps its dump "
-                  f"sink {p.dump or '(none)'}")
+                  f"member qube ({', '.join(sorted(members)) if members else 'none'}), and keeps "
+                  f"its dump sink {p.dump or '(none)'}{note}")
 
 
 def delete_project(app, key: str) -> list:
@@ -1572,34 +2461,58 @@ def _delete_project(report, app, key):
     elif p is None or p.slot == projects.HUB_SLOT:
         raise ProjectError(f"no project '{key}'")
     else:
-        ours = _demote_lead(app, p, report)
+        ours = _demote_lead(app, p, report, removing=True)
         del records[p.slot]
         projects.save(records)
         report.append(f"{p.slot}: record of '{p.label}' deleted")
         if ours:
             err = _remove_qube(app, p.lead)
             report.append(f"{p.slot}: removed {p.lead}") if not err else \
-                report.fail(f"{p.slot}: NOT removed: {err}")
+                _not_removed(report, p.slot, p.lead, err)
     # Only qubes really in the project are removed. A stray badge on a qube
-    # outside AI space is stripped below, never the qube.
-    for name in [vm.name for vm in app.domains if core.is_member(vm, p.slot)]:
+    # outside AI space is stripped below, never the qube. A qube whose tags
+    # cannot be read is neither removed nor stripped: the delete reports it,
+    # and the slot stays in use until a run reads it.
+    members = []
+    for vm in app.domains:
+        try:
+            if core.is_member(vm, p.slot):
+                members.append(vm.name)
+        except core.Unreadable:
+            pass                    # read again below: removed if a member, else reported
+    for name in members:
         err = _remove_qube(app, name)
         report.append(f"{p.slot}: removed {name}") if not err else \
-            report.fail(f"{p.slot}: NOT removed: {err}")
-    for name in _badges_of_slot(app, p.slot):
-        vm = _vm(app, name)
-        strip = {t for t in _tags(vm) if (q := projects.slot_badge_parts(t)) and q[1] == p.slot}
-        if projects.LEAD in _tags(vm) and projects.lead_badge(p.slot) in strip:
-            strip.add(projects.LEAD)
+            _not_removed(report, p.slot, name, err)
+    holders, _ = _badges_of_slot(app, p.slot)
+    for name in holders:
         try:
-            _set_tags(vm, remove=strip)
+            vm = _vm(app, name)
+            tags = set() if vm is None else _tags(vm)
+            if _member(tags, p.slot):
+                # A member the first pass could not read: removed like the rest.
+                err = _remove_qube(app, name)
+                report.append(f"{p.slot}: removed {name}") if not err else \
+                    _not_removed(report, p.slot, name, err)
+                continue
+            strip = {t for t in tags if (q := projects.slot_badge_parts(t)) and q[1] == p.slot}
+            if projects.LEAD in tags and projects.lead_badge(p.slot) in strip:
+                strip.add(projects.LEAD)
+            if vm is not None:
+                try:
+                    _set_tags(vm, remove=strip)
+                except core.Unreadable as e:
+                    report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}, "
+                                  f"but {e}; read again below")
+                    continue
             report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}"
                           + (" (the dump sink, kept)" if name == p.dump else ""))
         except Exception as e:
             report.fail(f"{p.slot}: could NOT strip badges from {name} ({type(e).__name__})")
-    left = _badges_of_slot(app, p.slot)
-    if left:
-        report.fail(f"{p.slot}: NOT reusable until these lose its badges: {', '.join(left)}")
+    left, unread = _badges_of_slot(app, p.slot)
+    if left or unread:
+        report.fail(f"{p.slot}: NOT reusable until these lose its badges: "
+                    f"{', '.join(left + [f'{n} (tags unreadable)' for n in unread])}")
     else:
         report.append(f"{p.slot}: free")
 
@@ -1611,12 +2524,21 @@ def project_rows(app, records: dict) -> list:
         if p is None:
             continue
         badge = projects.member_badge(slot)
-        members = [vm.name for vm in app.domains if core.is_member(vm, slot)]
+        members = 0
+        for vm in app.domains:
+            try:
+                members += core.is_member(vm, slot)
+            except core.Gone:
+                pass
+            except core.Unreadable:
+                members = None      # not known, never a count that skipped a qube
+                break
         try:
             used = budget.persistent_sum(app, badge)
         except Exception:
             used = None
-        rows.append({"slot": slot, "label": p.label, "lead": p.lead, "members": len(members),
+        rows.append({"slot": slot, "label": p.label, "lead": p.lead, "members": members,
                      "used": used, "quota": p.quota, "templates": list(p.templates),
-                     "networks": list(p.networks), "dump": p.dump})
+                     "networks": list(p.networks), "dump": p.dump, "model": p.model,
+                     "lead_firewall": None if p.lead_firewall is None else list(p.lead_firewall)})
     return rows

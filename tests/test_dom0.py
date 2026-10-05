@@ -21,7 +21,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, birth, budget, core, fleet, projects, proposals, services  # noqa: E402
+from qmcp import audit, birth, budget, core, fleet, gateways, projects, proposals, services  # noqa: E402
 import fakequbes  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
@@ -48,6 +48,7 @@ class Base(unittest.TestCase):
             (fleet, "GUARDED_LIST_PATH", self.tmp / "guarded"),
             (services, "DISPOSE_WAIT_S", 0.01),
             (projects, "PROJECTS_PATH", self.tmp / "projects.json"),
+            (gateways, "GATEWAYS_PATH", self.tmp / "gateways.json"),
             (projects, "LOCK_PATH", self.tmp / "run" / "projects.lock"),
             (proposals, "PROPOSALS_DIR", self.tmp / "proposals"),
             (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
@@ -71,6 +72,9 @@ class Base(unittest.TestCase):
         (self.tmp / "pool-cap").write_text(str(1000 * GiB) + "\n")
         (self.tmp / "private-cap").write_text(str(20 * GiB) + "\n")
         self.app = standard_fleet()
+        # As after the operator enrolled the fleet's AI router: the registry
+        # starts empty on install, and the fixtures assume a working fleet.
+        self.enroll("ai-net-router")
 
     def _restore(self):
         for mod, attr, value in reversed(self._saved):
@@ -89,6 +93,11 @@ class Base(unittest.TestCase):
     def audit_lines(self):
         p = pathlib.Path(audit.LOG_PATH)
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def enroll(self, name, anonymising=False, label=""):
+        registry = gateways.load()
+        registry[name] = gateways.Gateway(name, anonymising, label)
+        gateways.save(registry)
 
     def egress(self, name):
         pathlib.Path(birth.BIRTH_EGRESS_PATH).write_text(name + "\n")
@@ -148,7 +157,10 @@ class Funnel(Base):
         line = self.audit_lines()[-1]
         self.assertEqual((line["caller"], line["service"], line["v"]), (HUB, "qmcp.SetPropertyAIManaged", 2))
         self.assertEqual(line["args"], {"name": "ai-work", "property": "memory"})
-        self.assertNotIn("777", json.dumps(line))
+        # Not in any field but the chain's own: the line's hash holds "777" by
+        # chance about once in seventy runs.
+        self.assertNotIn("777", json.dumps({k: v for k, v in line.items()
+                                            if k not in ("hash", "prev", "ts")}))
         ok, n, err = audit.verify()
         self.assertTrue(ok, err)
 
@@ -302,7 +314,7 @@ class Writes(Base):
 
 class Creates(Base):
     def spawn(self, **req):
-        req.setdefault("name", "ai-new")
+        req.setdefault("name", "ai-hub-new")
         req.setdefault("template", "ai-debian-13")
         return self.call("qmcp.SpawnAIManagedQube", req)
 
@@ -318,10 +330,10 @@ class Creates(Base):
     def test_spawn_birth(self):
         self.egress("ai-net-router")
         r = self.spawn()
-        self.assertEqual(r, {"ok": True, "name": "ai-new"})
-        vm = self.app.domains["ai-new"]
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-new"})
+        vm = self.app.domains["ai-hub-new"]
         # The hub's AppVMs join p00, its own slot.
-        self.assertEqual(self.tags("ai-new"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00"})
+        self.assertEqual(self.tags("ai-hub-new"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00"})
         self.assertEqual(vm.netvm.name, "ai-net-router")
         self.assertIsNone(vm.default_dispvm)     # the add_new_vm default was default-dvm
         # Pinned, not following a default: a qube left on the global default
@@ -334,52 +346,69 @@ class Creates(Base):
         # Row 4: nothing resolves -> refused, nothing created.
         r = self.spawn()
         self.assertEqual(r["error"], "birth egress could not be resolved")
-        self.assertNotIn("ai-new", self.app.domains)
+        self.assertNotIn("ai-hub-new", self.app.domains)
         # Row 2: the hub's own netvm, when it is in AI space.
         self.app.domains["mcp-control"]._props["netvm"] = self.app.domains["ai-net-router"]
         self.assertTrue(self.spawn()["ok"])
-        self.assertEqual(self.app.domains["ai-new"].netvm.name, "ai-net-router")
+        self.assertEqual(self.app.domains["ai-hub-new"].netvm.name, "ai-net-router")
 
     def test_explicit_netvm(self):
         self.egress("ai-net-router")
-        self.assertEqual(self.spawn(name="ai-n1", netvm=None)["ok"], True)
-        self.assertIsNone(self.app.domains["ai-n1"].netvm)
-        self.assertTrue(self.spawn(name="ai-n2", netvm="ai-net-router")["ok"])
-        self.assertEqual(self.spawn(name="ai-n3", netvm="ai-gw-unbadged")["error"],
+        self.assertEqual(self.spawn(name="ai-hub-n1", netvm=None)["ok"], True)
+        self.assertIsNone(self.app.domains["ai-hub-n1"].netvm)
+        self.assertTrue(self.spawn(name="ai-hub-n2", netvm="ai-net-router")["ok"])
+        # A gateway that is not enrolled is refused, inside AI space or not,
+        # judged from the registry alone, before any lookup.
+        lookups = self.app.domains.lookups
+        self.assertEqual(self.spawn(name="ai-hub-n3", netvm="ai-gw-unbadged")["error"],
+                         "netvm must be an enrolled gateway")
+        r = self.spawn(name="ai-hub-n4", netvm="sys-firewall")
+        self.assertEqual(r["error"], "netvm must be an enrolled gateway")
+        # An enrolled one must still be the answer the birth chain gives (here
+        # the configured birth egress: the hub's own network is not enrolled).
+        self.enroll("ai-gw-unbadged")
+        self.assertEqual(self.spawn(name="ai-hub-n5", netvm="ai-gw-unbadged")["error"],
                          "netvm must match the inherited birth egress")
-        r = self.spawn(name="ai-n4", netvm="sys-firewall")
-        self.assertEqual(r["error"], "netvm must reference an ai-managed qube")
+        self.assertNotIn("ai-hub-n3", self.app.domains)
+        # Once the hub's own network is enrolled, it is the chain's answer.
+        self.enroll("sys-firewall")
+        self.assertTrue(self.spawn(name="ai-hub-n6", netvm="sys-firewall")["ok"])
+        self.assertEqual(self.spawn(name="ai-hub-n7", netvm="ai-net-router")["error"],
+                         "netvm must match the inherited birth egress")
+        self.assertGreater(self.app.domains.lookups, lookups)    # the spawns themselves look up
 
     def test_template_references(self):
         self.egress("ai-net-router")
         r = self.spawn(template="debian-13")
         self.assertEqual(r["error"], "template must reference an ai-managed qube")
-        self.assertTrue(self.spawn(name="ai-from-guarded", template="ai-tpl-g")["ok"])
-        self.assertNotIn("qmcp-guarded", self.tags("ai-from-guarded"))
-        self.assertIn("must be a TemplateVM", self.spawn(name="ai-x", template="ai-work")["error"])
+        self.assertTrue(self.spawn(name="ai-hub-from-guarded", template="ai-tpl-g")["ok"])
+        self.assertNotIn("qmcp-guarded", self.tags("ai-hub-from-guarded"))
+        self.assertIn("must be a TemplateVM", self.spawn(name="ai-hub-x", template="ai-work")["error"])
 
     def test_dispvm_template_and_dispvm(self):
         self.egress("ai-net-router")
-        r = self.spawn(name="ai-mydvm", klass="DispVMTemplate")
+        r = self.spawn(name="ai-hub-mydvm", klass="DispVMTemplate")
         self.assertTrue(r["ok"], r)
-        vm = self.app.domains["ai-mydvm"]
+        vm = self.app.domains["ai-hub-mydvm"]
         self.assertEqual((vm.klass, vm.template_for_dispvms), ("AppVM", True))
-        self.assertEqual(self.tags("ai-mydvm"), {"ai-managed", "qmcp-owner_mcp-control"})
+        self.assertEqual(self.tags("ai-hub-mydvm"), {"ai-managed", "qmcp-owner_mcp-control"})
         # A named disposable off a guarded DVMT: the DVMT answers for its network (offline).
-        r = self.spawn(name="ai-d1", klass="DispVM", template="ai-dvm-g")
+        r = self.spawn(name="ai-hub-d1", klass="DispVM", template="ai-dvm-g")
         self.assertTrue(r["ok"], r)
-        self.assertIsNone(self.app.domains["ai-d1"].netvm)
-        self.assertIn("disposable template", self.spawn(name="ai-d2", klass="DispVM",
+        self.assertIsNone(self.app.domains["ai-hub-d1"].netvm)
+        self.assertIn("disposable template", self.spawn(name="ai-hub-d2", klass="DispVM",
                                                          template="ai-debian-13")["error"])
 
     def test_restrictions_are_inherited(self):
+        # Whonix's marker is carried to a child; v0.9.16's egress lock is no
+        # longer read by anything (no network moves), so a create strips it.
         self.egress("ai-net-router")
         tpl = self.app.domains["ai-debian-13"]
         tpl.tags.add("anon-vm")
         tpl.tags.add("qmcp-egress-locked_ai-net-router")
         self.assertTrue(self.spawn()["ok"])
-        self.assertEqual(self.tags("ai-new"), {"ai-managed", "qmcp-owner_mcp-control", "anon-vm",
-                                               "qmcp-egress-locked_ai-net-router", "qmcp-proj-p00"})
+        self.assertEqual(self.tags("ai-hub-new"), {"ai-managed", "qmcp-owner_mcp-control", "anon-vm",
+                                                   "qmcp-proj-p00"})
 
     def test_private_size(self):
         self.egress("ai-net-router")
@@ -387,20 +416,32 @@ class Creates(Base):
             self.assertIn("private_size", self.spawn(private_size=bad)["error"], bad)
         self.assertEqual(self.spawn(private_size=21 * GiB)["error"], budget.ERR_PRIVATE_TOO_LARGE)
         self.assertTrue(self.spawn(private_size=8 * GiB)["ok"])
-        self.assertEqual(self.app.domains["ai-new"].volumes["private"].size, 8 * GiB)
+        self.assertEqual(self.app.domains["ai-hub-new"].volumes["private"].size, 8 * GiB)
         self.app.fail.add("resize")
-        r = self.spawn(name="ai-big", private_size=8 * GiB)
-        self.assertEqual(r, {"ok": True, "name": "ai-big", "warning": "private_resize_failed"})
+        r = self.spawn(name="ai-hub-big", private_size=8 * GiB)
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-big", "warning": "private_resize_failed"})
 
     def test_pool_cap(self):
         self.egress("ai-net-router")
         (self.tmp / "pool-cap").write_text(str(10 * GiB))
         self.assertEqual(self.spawn()["error"], budget.ERR_CAP_EXCEEDED)
-        self.assertNotIn("ai-new", self.app.domains)
+        self.assertNotIn("ai-hub-new", self.app.domains)
 
     def test_collision_inside_namespace(self):
         self.egress("ai-net-router")
-        self.assertEqual(self.spawn(name="ai-work")["error"], "qube 'ai-work' already exists")
+        self.app.vm("ai-hub-taken", tags={"ai-managed"})
+        self.assertEqual(self.spawn(name="ai-hub-taken")["error"], "qube 'ai-hub-taken' already exists")
+
+    def test_the_hub_names_only_inside_its_own_space(self):
+        # A name says who owns a qube: the hub's are ai-hub-..., judged on
+        # the name alone, before anything is looked up.
+        self.egress("ai-net-router")
+        lookups = self.app.domains.lookups
+        for name in ("ai-work", "ai-new", "ai-hubx-new", "ai-hub-"):
+            r = self.spawn(name=name)
+            self.assertFalse(r["ok"], name)
+            self.assertIn("ai-hub-", r["error"], name)
+        self.assertEqual(self.app.domains.lookups, lookups)
 
     def test_rollback_is_reported_truthfully(self):
         # "rolled back" only when the qube is really gone.
@@ -408,15 +449,15 @@ class Creates(Base):
         self.app.fail.add("tag.add")
         r = self.spawn()
         self.assertEqual(r["error"], "birth stamp failed (rolled back)")
-        self.assertNotIn("ai-new", self.app.domains)
+        self.assertNotIn("ai-hub-new", self.app.domains)
         self.app.fail.add("remove")
-        r = self.spawn(name="ai-stuck")
+        r = self.spawn(name="ai-hub-stuck")
         self.assertEqual(r["error"], "birth stamp failed and rollback failed: "
-                                     "qube 'ai-stuck' needs manual cleanup in dom0")
-        self.assertIn("ai-stuck", self.app.domains)
+                                     "qube 'ai-hub-stuck' needs manual cleanup in dom0")
+        self.assertIn("ai-hub-stuck", self.app.domains)
         self.app.fail.clear()
         self.app.fail.add("set.netvm")
-        self.assertEqual(self.spawn(name="ai-n")["error"], "netvm assignment failed (rolled back)")
+        self.assertEqual(self.spawn(name="ai-hub-n")["error"], "netvm assignment failed (rolled back)")
 
     def test_no_exception_text_reaches_the_caller(self):
         # Inject a failure carrying SECRET into every step there is.
@@ -429,8 +470,8 @@ class Creates(Base):
         for step in steps:
             self.app.fail = {step}
             replies += [
-                self.spawn(name="ai-s1", private_size=4 * GiB, klass="DispVMTemplate"),
-                self.call("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": "ai-c1"}),
+                self.spawn(name="ai-hub-s1", private_size=4 * GiB, klass="DispVMTemplate"),
+                self.call("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": "ai-hub-c1"}),
                 self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"}),
                 self.call("qmcp.SetFeatureAIManaged", {"name": "ai-work2", "feature": "service.x", "value": 1}),
                 self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "memory", "value": 9}),
@@ -452,7 +493,7 @@ class Creates(Base):
         self.assertIn("qmcp-owner_mcp-control", copy.tags)
         self.assertIn("operator-note", copy.tags)
 
-    def clone(self, source="ai-work", name="ai-clone"):
+    def clone(self, source="ai-work", name="ai-hub-clone"):
         return self.call("qmcp.CloneAIManagedQube", {"source": source, "name": name})
 
     def test_clone_strips_and_restamps(self):
@@ -462,10 +503,10 @@ class Creates(Base):
             src.tags.add(t)
         src.tags.discard("qmcp-owner_mcp-control")
         r = self.clone()
-        self.assertEqual(r, {"ok": True, "name": "ai-clone"})
-        self.assertEqual(self.tags("ai-clone"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00",
-                                                 "qmcp-egress-locked_ai-net-router", "operator-note"})
-        vm = self.app.domains["ai-clone"]
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-clone"})
+        self.assertEqual(self.tags("ai-hub-clone"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00",
+                                                     "operator-note"})
+        vm = self.app.domains["ai-hub-clone"]
         self.assertEqual(vm.netvm.name, "ai-net-router")   # the source answers for itself
         self.assertIsNone(vm.default_dispvm)
 
@@ -477,9 +518,9 @@ class Creates(Base):
 
     def test_clone_a_managed_template(self):
         # The hub builds templates; a cloned template stays off the network.
-        r = self.clone(source="ai-debian-13", name="ai-tpl-dev")
+        r = self.clone(source="ai-debian-13", name="ai-hub-tpl-dev")
         self.assertTrue(r["ok"], r)
-        vm = self.app.domains["ai-tpl-dev"]
+        vm = self.app.domains["ai-hub-tpl-dev"]
         self.assertEqual(vm.klass, "TemplateVM")
         self.assertIsNone(vm.netvm)
         self.assertEqual(core.state(vm), "managed")
@@ -717,6 +758,7 @@ class Fleet(Base):
             fleet.manage(self.app, "mcp-control")        # the hub is never in AI space
         with self.assertRaises(fleet.RoleError):
             fleet.guard(self.app, "ai-sink")             # a drop box is never in AI space
+        self.app.domains["personal"].netvm = self.app.domains["ai-net-router"]   # enrolled
         fleet.guard(self.app, "personal")
         self.assertEqual(core.state(self.app.domains["personal"]), "guarded")
         fleet.manage(self.app, "personal")
@@ -737,7 +779,7 @@ class AuditFindings(Base):
     code as it stood before the fix."""
 
     def spawn(self, **req):
-        req.setdefault("name", "ai-new")
+        req.setdefault("name", "ai-hub-new")
         req.setdefault("template", "ai-debian-13")
         return self.call("qmcp.SpawnAIManagedQube", req)
 
@@ -754,9 +796,9 @@ class AuditFindings(Base):
             ("qmcp.SetPropertyAIManaged", lambda n: {"name": n, "property": "memory", "value": 5}),
             ("qmcp.SetFeatureAIManaged", lambda n: {"name": n, "feature": "service.x", "value": 1}),
             ("qmcp.LifecycleAIManaged", lambda n: {"name": n, "action": "start"}),
-            ("qmcp.CloneAIManagedQube", lambda n: {"source": n, "name": "ai-oracle"}),
+            ("qmcp.CloneAIManagedQube", lambda n: {"source": n, "name": "ai-hub-oracle"}),
             ("qmcp.SpawnDisposableAIManaged", lambda n: {"template": n}),
-            ("qmcp.SpawnAIManagedQube", lambda n: {"name": "ai-oracle", "template": n}),
+            ("qmcp.SpawnAIManagedQube", lambda n: {"name": "ai-hub-oracle", "template": n}),
             ("qmcp.AIManagedEvents", lambda n: {"duration": 1, "qube": n}),
         ]
         for svc, make in cases:
@@ -768,9 +810,9 @@ class AuditFindings(Base):
 
     def test_explicit_netvm_is_checked_by_name(self):
         self.egress("ai-net-router")
-        a = self.trace("qmcp.SpawnAIManagedQube", {"name": "ai-x1", "template": "ai-debian-13",
+        a = self.trace("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x1", "template": "ai-debian-13",
                                                    "netvm": "no-such-qube"})
-        b = self.trace("qmcp.SpawnAIManagedQube", {"name": "ai-x1", "template": "ai-debian-13",
+        b = self.trace("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x1", "template": "ai-debian-13",
                                                    "netvm": "sys-firewall"})
         self.assertEqual(a[0], b[0])
         self.assertEqual(a[1].count("admin.vm.tag.Get"), b[1].count("admin.vm.tag.Get"))
@@ -781,15 +823,15 @@ class AuditFindings(Base):
         real = budget.acquire_create_lock
 
         def slow_lock(*a, **kw):
-            self.app.vm("ai-new", tags={"operator-made"})    # someone else, meanwhile
+            self.app.vm("ai-hub-new", tags={"operator-made"})    # someone else, meanwhile
             return real(*a, **kw)
         budget.acquire_create_lock = slow_lock
         try:
             r = self.spawn()
         finally:
             budget.acquire_create_lock = real
-        self.assertEqual(r["error"], "qube 'ai-new' already exists")
-        self.assertIn("operator-made", self.tags("ai-new"))
+        self.assertEqual(r["error"], "qube 'ai-hub-new' already exists")
+        self.assertIn("operator-made", self.tags("ai-hub-new"))
 
     def test_a_failed_create_never_removes_someone_elses_qube(self):
         # a create call that raised is never "rolled back" by name.
@@ -800,15 +842,15 @@ class AuditFindings(Base):
             raise fakequbes.Injected(f"exists {SECRET}")
         self.app.add_new_vm = racing_add
         r = self.spawn()
-        self.assertEqual(r["error"], "create failed; a qube named 'ai-new' exists and was left alone")
-        self.assertIn("operator-made", self.tags("ai-new"))
+        self.assertEqual(r["error"], "create failed; a qube named 'ai-hub-new' exists and was left alone")
+        self.assertIn("operator-made", self.tags("ai-hub-new"))
 
     def test_a_template_netvm_never_decides(self):
         # a TemplateVM base does not answer for a child's network.
         self.egress("ai-net-router")
         self.app.domains["ai-debian-13"]._props["netvm"] = self.app.domains["ai-gw-unbadged"]
         self.assertTrue(self.spawn()["ok"])
-        self.assertEqual(self.app.domains["ai-new"].netvm.name, "ai-net-router")
+        self.assertEqual(self.app.domains["ai-hub-new"].netvm.name, "ai-net-router")
 
     def test_nothing_is_spawned_from_a_gateway(self):
         # the child would provide network with its guard stripped.
@@ -817,10 +859,10 @@ class AuditFindings(Base):
                     netvm=router, tags={"ai-managed", "qmcp-guarded"})
         r = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-gw-dvm"})
         self.assertEqual(r["error"], "a disposable template that provides network cannot be spawned from")
-        r = self.spawn(name="ai-gwd", klass="DispVM", template="ai-gw-dvm")
+        r = self.spawn(name="ai-hub-gwd", klass="DispVM", template="ai-gw-dvm")
         self.assertEqual(r["error"], "a template that provides network cannot be spawned from")
         self.assertEqual(self.app.domains._hidden, {})
-        self.assertNotIn("ai-gwd", self.app.domains)
+        self.assertNotIn("ai-hub-gwd", self.app.domains)
 
     def test_a_child_that_provides_network_is_rolled_back(self):
         # Second line of defence: if the pre-check is ever bypassed.
@@ -860,7 +902,7 @@ class AuditFindings(Base):
             def __getitem__(self, key):
                 raise fakequbes.Injected(f"volume read failed: {SECRET}")
         self.app.domains["ai-work2"].__dict__["volumes"] = Broken()
-        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": "ai-copy"})
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": "ai-hub-copy"})
         self.assertEqual(r["error"], budget.ERR_STATS_UNAVAILABLE)
         self.assertEqual(self.audit_lines()[-1].get("error_class"), "Injected")
 
@@ -879,13 +921,34 @@ class AuditFindings(Base):
         self.egress("ai-net-router")
         self.app.default_netvm = self.app.domains["ai-net-router"]
         self.assertTrue(self.spawn()["ok"])
-        self.assertFalse(self.app.domains["ai-new"].property_is_default("netvm"))
+        self.assertFalse(self.app.domains["ai-hub-new"].property_is_default("netvm"))
 
     def test_netvm_addresses_follow_the_netvm(self):
         r = self.call("qmcp.GetPropertyAIManaged", {"name": "ai-net-router", "property": "visible_gateway"})
         self.assertEqual(r["value"], "<out-of-scope>")
         r = self.call("qmcp.GetPropertyAIManaged", {"name": "ai-work", "property": "visible_gateway"})
         self.assertEqual(r["value"], "10.137.0.5")
+        # Whose addresses they are must be read: a network that cannot be read
+        # is refused, never taken for none and the addresses shown.
+        self.app.fail.add("get.netvm:ai-net-router")
+        r = self.call("qmcp.GetPropertyAIManaged", {"name": "ai-net-router", "property": "visible_gateway"})
+        self.assertFalse(r["ok"], r)
+        self.assertNotIn("10.137", json.dumps(r))
+
+    def test_a_network_that_does_not_read_back_rolls_the_create_back(self):
+        self.egress("ai-net-router")
+        real = self.app.add_new_vm
+
+        def add(*a, **kw):
+            vm = real(*a, **kw)
+            self.app.fail.add(f"get.netvm:{vm.name}")        # its read-back fails
+            return vm
+        self.app.add_new_vm = add
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-nr", "template": "ai-debian-13",
+                                                  "netvm": None})
+        self.assertFalse(r["ok"], r)
+        self.app.fail.clear()
+        self.assertNotIn("ai-hub-nr", {v.name for v in self.app.domains})
 
     def test_audit_rotation_keeps_the_chain(self):
         for i in range(3):

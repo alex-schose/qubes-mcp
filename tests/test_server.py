@@ -47,7 +47,8 @@ EXPECTED_TOOLS = [
     "qubes_firewall_get", "qubes_firewall_set", "qubes_clone", "qubes_spawn_disposable",
     "qubes_run_disposable", "qubes_feature_set", "qubes_events", "qubes_get_pool_stats",
     "qubes_propose_project", "qubes_propose_project_edit", "qubes_propose_dump",
-    "qubes_propose_lead", "qubes_propose_project_delete", "qubes_proposals",
+    "qubes_propose_lead", "qubes_propose_lead_firewall", "qubes_propose_project_delete",
+    "qubes_proposals",
 ]
 # Each proposal tool and the dom0 proposal type it submits.
 PROPOSAL_TYPES = {
@@ -55,6 +56,7 @@ PROPOSAL_TYPES = {
     "qubes_propose_project_edit": "project-edit",
     "qubes_propose_dump": "project-dump",
     "qubes_propose_lead": "project-lead",
+    "qubes_propose_lead_firewall": "project-firewall",
     "qubes_propose_project_delete": "project-delete",
 }
 SUBMIT = "qmcp.SubmitProposal"
@@ -67,6 +69,8 @@ MINIMAL_PROPOSALS = {
     "qubes_propose_project_edit": {"title": "More disk", "project": "osint", "quota": 1},
     "qubes_propose_dump": {"title": "A sink", "project": "osint"},
     "qubes_propose_lead": {"title": "No lead", "project": "osint", "remove": True},
+    "qubes_propose_lead_firewall": {"title": "New model", "project": "osint",
+                                    "model": "api.anthropic.com:443"},
     "qubes_propose_project_delete": {"title": "Done", "project": "osint"},
 }
 REMOVED_TOOLS = ["qubes_device_list", "qubes_device_attach", "qubes_device_detach",
@@ -1256,6 +1260,9 @@ PAYLOAD_CASES = [
             "title": "Promote", "label": "web2", "lead": {"from": "promote", "qube": "ai-agent"},
             "lead_name": None, "lead_netvm": None, "templates": [], "networks": ["ai-gw"],
             "quota": 40 * GiB, "dump": False}),
+        ("qubes_propose_project", "project-create", {
+            "title": "With a model", "label": "res", "lead": {"from": "template", "qube": "deb"},
+            "lead_netvm": "ai-gw", "networks": ["ai-gw"], "quota": 1, "model": "api.anthropic.com:443"}),
         ("qubes_propose_project_edit", "project-edit", MINIMAL_PROPOSALS["qubes_propose_project_edit"]),
         ("qubes_propose_project_edit", "project-edit", {
             "title": "Tor first", "project": "osint", "add_templates": ["ai-deb"],
@@ -1279,6 +1286,17 @@ PAYLOAD_CASES = [
             "title": "Keep the old lead", "project": "osint", "remove": False,
             "lead": {"from": "clone", "qube": "ai-agent"}, "lead_name": "ai-osint-lead2",
             "lead_netvm": "ai-gw", "keep_old": True}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "A new network", "project": "osint",
+            "lead": {"from": "template", "qube": "deb"}, "lead_netvm": "ai-tor", "keep_old": True,
+            "add_old_network": True, "model": "api.anthropic.com:443"}),
+        ("qubes_propose_lead_firewall", "project-firewall",
+         MINIMAL_PROPOSALS["qubes_propose_lead_firewall"]),
+        ("qubes_propose_lead_firewall", "project-firewall", {
+            "title": "Also the docs site", "project": "osint",
+            "rules": ["action=accept proto=tcp dsthost=api.anthropic.com dstports=443",
+                      "action=accept proto=tcp dsthost=docs.anthropic.com dstports=443",
+                      "action=accept specialtarget=dns", "action=drop"]}),
         ("qubes_propose_project_delete", "project-delete",
          MINIMAL_PROPOSALS["qubes_propose_project_delete"]),
      )
@@ -1528,7 +1546,15 @@ class ProposalContractTests(unittest.TestCase):
             with self.subTest(tool=tool, arguments=arguments):
                 self.assertEqual(payload["type"], PROPOSAL_TYPES[tool])
                 normal = self.proposals.normalise(payload, "ai-")
-                self.assertEqual({key: normal[key] for key in payload}, payload)
+                optional = self.proposals.OPTIONAL.get(payload["type"], frozenset())
+                for key, value in payload.items():
+                    if key in normal:
+                        self.assertEqual(normal[key], value, key)
+                    else:
+                        # A field added in 0.9.21 is stored only when given:
+                        # null (or a false tick) is "not given".
+                        self.assertIn(key, optional)
+                        self.assertIn(value, (None, False), key)
                 seen.add(tool)
         self.assertEqual(seen, set(PROPOSAL_TYPES))
 
@@ -1536,13 +1562,20 @@ class ProposalContractTests(unittest.TestCase):
         # A proposal's normal form names every field its type stores, which is
         # every field it accepts, unless dom0 took a field and dropped it: a
         # dom0 bug this cannot see.
+        stored = {}
         for tool, arguments, payload in self.submitted():
             with self.subTest(tool=tool):
                 normal = self.proposals.normalise(payload, "ai-")
                 schema = tools.TOOLS[tool].input_schema["properties"]
-                self.assertEqual(set(schema) | {"type"}, set(normal))
+                optional = self.proposals.OPTIONAL.get(payload["type"], frozenset())
+                self.assertTrue(set(schema) | {"type"} >= set(normal) >= (set(schema) | {"type"}) - optional,
+                                (set(schema), set(normal)))
+                stored.setdefault(tool, set()).update(normal)
                 with self.assertRaises(self.proposals.Invalid):
                     self.proposals.normalise({**payload, "extra": 1}, "ai-")
+        # Across its cases, every field a tool takes reaches dom0's normal form.
+        for tool, keys in stored.items():
+            self.assertEqual(keys, set(tools.TOOLS[tool].input_schema["properties"]) | {"type"}, tool)
 
     def test_the_lead_source_is_dom0_s(self):
         for name in ("qubes_propose_project", "qubes_propose_lead"):

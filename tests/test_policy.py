@@ -223,6 +223,17 @@ def _cases() -> list[Case]:
         add("ai exec guarded", "qmcp.RunInAIManaged", "ai-work", tgt, "deny", "deny")
         add("ai open-in guarded", "qubes.OpenInVM", "ai-work", tgt, "deny", "deny")
         add("ai open-url guarded", "qubes.OpenURL", "ai-work", tgt, "deny", "deny")
+    # --- a lead's firewall is the operator's: the hub reads it and never writes it
+    for tgt in ("lead-p01", "lead-p15"):
+        add("hub fw-set lead", "admin.vm.firewall.Set", HUB, tgt, "deny", "deny")
+        add("hub fw-reload lead", "admin.vm.firewall.Reload", HUB, tgt, "deny", "deny")
+        add("hub fw-get lead", "admin.vm.firewall.Get", HUB, tgt, "allow target=@adminvm",
+            "allow target=@adminvm")
+        add("hub exec lead", "qmcp.RunInAIManaged", HUB, tgt, "allow user=root", "allow user=root")
+    # ... and a lead cannot write its own, nor another lead's (it is no member)
+    for svc in ("admin.vm.firewall.Set", "admin.vm.firewall.Reload"):
+        add("lead fw-write itself", svc, "lead-p01", "lead-p01", "deny", "deny")
+        add("lead fw-write another lead", svc, "lead-p01", "lead-p02", "deny", "deny")
     # --- the hub never reaches outside AI space, nor itself
     for tgt in ("personal", "sys-net", "debian-13", HUB):
         add("hub exec outside", "qmcp.RunInAIManaged", HUB, tgt, "deny", "deny")

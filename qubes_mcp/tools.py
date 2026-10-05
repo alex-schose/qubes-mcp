@@ -322,12 +322,16 @@ def _run_payload(args: dict) -> dict:
     List the qubes in the caller's scope.
 
     The hub's scope is all of AI space. A project's lead sees its project's
-    workers, the templates its project may spawn from, and its project's worker
-    networks.
+    workers, the templates its project may spawn from, and those of its
+    project's worker networks that are in AI space (qubes_get_pool_stats
+    names them all).
 
     Each entry is {name, klass, label, template, power_state, guarded, slot,
     lead}. `slot` is the project slot a qube belongs to (p00 is the hub's own
     qubes, p01-p15 are projects), or null; `lead` is true for a project's lead.
+    A qube whose tags or class dom0 cannot read at that moment is left out; a
+    label or template it cannot read is "<unreadable>", and a power state it
+    cannot read "NA" or "unknown".
 
     A qube in scope is in one of two states:
     - managed (guarded: false): the caller may operate it: start and shut it
@@ -335,8 +339,8 @@ def _run_payload(args: dict) -> dict:
       remove it. For the hub this includes the templates and disposable
       templates it manages, and the leads (which only the operator removes).
       A lead may operate only the entries in its own slot (`slot` set); its
-      approved templates and networks are listed so it can spawn from and
-      onto them.
+      approved templates, and its networks that are in AI space, are listed
+      so it can spawn from and onto them.
     - guarded (guarded: true): reference only. It is listed, can be read, and
       can be spawned from (as a template or a disposable template), but is
       never operated.
@@ -354,10 +358,10 @@ def _qubes_list(args: dict) -> dict:
 @_register("qubes_spawn", """
     Create a new qube. It is born managed.
 
-    - name: must start with the caller's name prefix (qubes_get_pool_stats
-      reports it): for the hub, the operator's reserved prefix (default
-      "ai-") but outside every project's names; for a lead, its project's
-      prefix (e.g. "ai-osint-"). Any other name is refused.
+    - name: must start with the caller's own names: for the hub, the
+      operator's reserved prefix followed by "hub-" (by default "ai-hub-",
+      e.g. "ai-hub-browser"); for a lead, its project's (e.g. "ai-osint-").
+      qubes_get_pool_stats reports the prefix. Any other name is refused.
     - klass: "AppVM" (the default) or "DispVMTemplate", both built on a
       TemplateVM; or "DispVM", built on a disposable template (a qube with
       template_for_dispvms=True). A lead cannot create a DispVMTemplate.
@@ -365,15 +369,19 @@ def _qubes_list(args: dict) -> dict:
       its project's approved templates. One that is out of scope or does not
       exist is refused with "template must reference an ai-managed qube",
       which never says which of the two it is.
-    - netvm: omit it and the network is inherited. For the hub: the source's
-      netvm (for a DispVM, its disposable template's), else the hub's own
-      netvm if that is an AI qube, else the operator's configured default; if
-      none applies the create is refused, and a name must equal the inherited
-      value. For a lead: its project's default worker network, or another one
+    - netvm: omit it and the network is inherited. Every network must be a
+      gateway the operator enrolled (qubes_get_pool_stats lists them for the
+      hub). For the hub: a DispVM takes its disposable template's network,
+      which must be enrolled (or none), else the create is refused; an AppVM
+      or a disposable template takes the hub's own network if it is enrolled,
+      else the operator's configured default if that is enrolled, else the
+      create is refused. A name must equal the inherited value. For a lead: its project's default worker network, or another one
       on the project's list; a DispVM keeps its disposable template's, which
       must be on the list. A lead's own network is never used. Pass null for
-      no network, which is always allowed. After birth a qube's network can
-      only be cleared (netvm null), never moved to another one.
+      no network. That is always allowed, except that a lead's DispVM still
+      needs its disposable template on a listed network, or on none. After
+      birth a qube's network can only be cleared (netvm null), never moved to
+      another one.
     - private_size: optional, in bytes. Grows the persistent private volume
       beyond the Qubes default. It counts against the caller's disk budget
       (see qubes_get_pool_stats), and a size above the operator's per-qube
@@ -384,7 +392,8 @@ def _qubes_list(args: dict) -> dict:
     Returns {"ok": true, "name": "<name>"}, with a "warning" if a secondary step
     failed, or {"ok": false, "error": "<reason>"}.
     """, {
-        "name": _prop("string", "Name of the new qube; must carry the caller's prefix."),
+        "name": _prop("string", "Name of the new qube, inside the caller's own names "
+                                "(the hub's: ai-hub-...)."),
         "template": _prop("string", "Template (or, for a DispVM, disposable template) "
                                     "to build on; managed or guarded."),
         "klass": _prop("string", "Kind of qube to create.",
@@ -609,6 +618,10 @@ def _qubes_firewall_get(args: dict) -> dict:
 @_register("qubes_firewall_set", """
     Replace the firewall rules of a managed qube.
 
+    A project's lead is the exception: its firewall is the operator's, dom0
+    writes it, and the hub's write is refused.
+    Ask for a change with qubes_propose_lead_firewall.
+
     `rules` is the whole new ruleset: rule lines in the Qubes Admin API
     grammar, separated by newlines. With reload (the default) the rules are
     also applied at once in the qube's netvm; pass reload=false when that netvm
@@ -651,8 +664,8 @@ def _qubes_firewall_set(args: dict) -> dict:
     guarded source is refused, and one that is out of scope or does not exist
     is reported as "not found". The new name must start with the caller's
     prefix, as for qubes_spawn. The clone copies the source's settings and
-    keeps the source's network, "none" included; a source on a network outside
-    the caller's scope (for a lead, off its project's list) is refused. A
+    keeps the source's network, "none" included; a source whose network is not
+    an enrolled gateway (for a lead, one of its project's networks) is refused. A
     cloned template stays off the network.
 
     dom0 runs one create at a time, so this call may wait for others to finish.
@@ -660,7 +673,8 @@ def _qubes_firewall_set(args: dict) -> dict:
     Returns {"ok": true, "name": "<new name>"} or {"ok": false, "error": "<reason>"}.
     """, {
         "source": _prop("string", "Managed qube to clone."),
-        "name": _prop("string", "Name of the clone; must carry the caller's prefix."),
+        "name": _prop("string", "Name of the clone, inside the caller's own names "
+                                "(the hub's: ai-hub-...)."),
     }, required=("source", "name"))
 def _qubes_clone(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.CloneAIManagedQube",
@@ -673,9 +687,10 @@ def _qubes_clone(args: dict) -> dict:
 
     `template` is a managed or guarded disposable template (a qube with
     template_for_dispvms=True); one that is out of scope or does not exist is
-    refused with "template must reference an ai-managed qube". A lead may use
-    only its project's approved disposable templates, and only one whose
-    network is on its project's list (or none). The disposable is born
+    refused with "template must reference an ai-managed qube". The hub's
+    disposable template must be on an enrolled gateway, or on none. A lead
+    may use only its project's approved disposable templates, and only one
+    whose network is on its project's list (or none). The disposable is born
     managed (a lead's joins its project), gets an auto-assigned name, keeps
     its template's network ("none" included), and is removed by dom0 once it
     halts. Start it with
@@ -793,7 +808,9 @@ def _qubes_run_disposable(args: dict) -> dict:
     this sets a feature, it never removes one. A guarded qube is refused; one
     that is out of scope or does not exist is reported as "not found".
 
-    Returns {"ok": true, "feature": "<key>", "value": "<value read back>"} or
+    Returns {"ok": true, "feature": "<key>", "value": "<value read back>"},
+    with "<unreadable>" when it was set but could not be read back and null
+    when the qube or the feature was gone by then, or
     {"ok": false, "error": "<reason>"}.
     """, {
         "name": _prop("string", "The qube to change."),
@@ -849,14 +866,19 @@ def _qubes_events(args: dict) -> dict:
     "ai_managed_bytes_cap": <int>, "ai_managed_bytes_headroom": <int>,
     "name_prefix": "<prefix new names must carry>"}. For the hub the figures
     are all of AI space against the operator's pool cap, and the reply adds
+    "reserved_prefix", the prefix reserved for the names AI creates, which
+    a project's names build on (<reserved_prefix><label>-...), and
     "projects": one entry per slot in use, {slot, label, lead, templates,
     networks, quota, used, has_dump}, starting with p00, the hub's own qubes,
     which has no label, lead, templates, networks or quota. In networks null
     is "none" and the first entry is the default; a recorded name that has
-    left AI space reads "<out-of-scope>"; used is the slot's disk, or null
+    left AI space reads "<out-of-scope>", unless it is an enrolled gateway; used is the slot's disk, or null
     when it cannot be read; has_dump says whether the slot has a dump
     sink, whose name the hub is not told. "projects" is null when the
-    operator's project records cannot be read. Read it before proposing a
+    operator's project records cannot be read. For the hub the reply also
+    adds "gateways": the networks the operator enrolled, the only ones a
+    qube in AI space may be given, [{name, anonymising, label}, ...] (null
+    when the registry cannot be read). Name them in a proposal. Read it before proposing a
     change to a project (qubes_propose_project_edit and the other proposal
     tools). For a project's lead the figures are its project's workers
     against the project's quota, and the reply adds "project" (its label),
@@ -880,9 +902,9 @@ def _qubes_get_pool_stats(args: dict) -> dict:
 
 # Each tool sends its arguments as the caller gave them (a quota converted to
 # bytes), under the proposal's type. dom0 checks the shape with its own rules
-# and stores its own normal form, with every optional field filled in, so no
-# default is filled in here: there would be two places deciding what an
-# omitted field means.
+# and stores its own normal form, which fills in the optional fields it has
+# defaults for, so no default is filled in here: there would be two places
+# deciding what an omitted field means.
 
 _PROPOSAL_TERMS = inspect.cleandoc("""
     Nothing changes until the operator accepts the proposal in dom0, in the
@@ -925,15 +947,19 @@ _LEAD = _prop("object", 'Where the lead comes from: {"from": "template", "clone"
                                           "comes from."),
               }, required=["from", "qube"], additionalProperties=False)
 _LEAD_NAME = _prop(["string", "null"], "A fresh lead's name, inside the project's names; "
-                                       "omit it for <prefix><label>-lead.")
-_LEAD_NETVM = _prop(["string", "null"], "The lead's own network: a qube that provides network, "
-                                        'or "none". Omitted or null (the same thing here, '
-                                        "never \"none\"), a fresh lead has none and a promoted "
-                                        "one keeps its own.")
+                                       "omit it for <reserved_prefix><label>-lead.")
+_LEAD_NETVM = _prop(["string", "null"], "The lead's own network: an enrolled gateway "
+                                        "(qubes_get_pool_stats lists them), or \"none\". "
+                                        "Omitted or null (the same thing here, never \"none\"), "
+                                        "a fresh lead has none and a promoted one keeps its own.")
+_MODEL = _prop(["string", "null"], "The lead's model endpoint, host:port, e.g. "
+                                   '"api.anthropic.com:443". Needed when the lead has a network, '
+                                   "unless the project already has one: dom0 writes the lead's "
+                                   "firewall to allow that endpoint, DNS and nothing else.")
 _QUOTA_TEXT = ("the workers' disk quota: bytes, or a whole number and K, M, G or T, powers of "
                '1024 (e.g. "40G").')
-_NETWORKS_TEXT = ('Worker networks: gateways in AI space, or "none" (or null, as '
-                  "qubes_get_pool_stats shows it) for no network.")
+_NETWORKS_TEXT = ('Worker networks: enrolled gateways (qubes_get_pool_stats lists them), or '
+                  '"none" (or null, as qubes_get_pool_stats shows it) for no network.')
 _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may spawn from."
 
 
@@ -941,8 +967,10 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
     Propose a new project, for the operator to accept or reject in dom0.
 
     A project is a lead, the workers it creates and optionally a dump sink, in
-    the lowest free slot (p01-p15). Its qubes are named <prefix><label>-...,
-    e.g. "ai-osint-scraper" (qubes_get_pool_stats reports the prefix).
+    the lowest free slot (p01-p15). A fresh lead and the qubes it creates
+    are named <reserved_prefix><label>-..., e.g. "ai-osint-scraper"
+    (qubes_get_pool_stats reports reserved_prefix); Qubes names
+    disposables, and a promoted lead keeps its own name.
 
     - label: 1-8 lowercase letters or digits, not one that reads as a slot
       ("p03") or a keyword ("none", "hub").
@@ -950,30 +978,39 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
       TemplateVM NAME. "clone": a copy of NAME, one of the hub's own managed
       AppVMs (in p00 or in no slot). "promote": NAME itself, one of the hub's
       own AppVMs, becomes the lead, keeping its files, template and network.
-    - lead_name: a fresh lead's name, inside <prefix><label>-; omit it for
-      <prefix><label>-lead. A promoted lead keeps its own name.
-    - lead_netvm: the lead's own network, a qube that provides network, or
-      "none". Omitted, a fresh lead has no network and a promoted one keeps
-      its own.
+    - lead_name: a fresh lead's name, inside <reserved_prefix><label>-; omit
+      it for <reserved_prefix><label>-lead. A promoted lead keeps its own name.
+    - lead_netvm: the lead's own network, an enrolled gateway, or "none".
+      Omitted, a fresh lead has no network and a promoted one keeps its own;
+      a promoted lead takes only "none", since no network moves.
+      A lead's network is never moved, only cleared; for another, give the
+      project a new lead (qubes_propose_lead).
+    - model: the lead's model endpoint, host:port. Needed when the lead has a
+      network: dom0 writes the lead's firewall to allow that endpoint, DNS
+      and nothing else. Change it later with qubes_propose_lead_firewall.
     - templates: up to 15 templates or disposable templates in AI space that
       the lead may spawn from. The lead's own template goes first when it is
       in AI space; the list must not end up empty.
-    - networks: 1-8 worker networks, gateways in AI space or "none" for no
+    - networks: 1-8 worker networks, enrolled gateways or "none" for no
       network; the first is the default for new workers.
     - quota: the workers' disk, in bytes or as a size ("512M", "40G", "1T";
       K, M, G and T are powers of 1024). The pool cap still applies.
-    - dump: true to also make the project's dump sink, <label>-dump.
+    - dump: true to also make the project's dump sink, <label>-dump. Refused
+      when that name would start with reserved_prefix (a label such as "ai")
+      or would be no qube name (a label starting with a digit): then propose
+      the sink with a name once the project exists.
 
     It needs the operator's second tick, an extra confirmation, when the lead
     is promoted, when lead_netvm or a worker network is one AI space does not
-    use today, or when the quota makes the projects' quotas add up to more
-    than the pool cap.
+    use today, when the model is one no project uses today, or when the quota
+    makes the projects' quotas add up to more than the pool cap.
     """), {
         "title": _TITLE,
         "label": _prop("string", "The new project's label: 1-8 lowercase letters or digits."),
         "lead": _LEAD,
         "lead_name": _LEAD_NAME,
         "lead_netvm": _LEAD_NETVM,
+        "model": _MODEL,
         "templates": _prop("array", _TEMPLATES_TEXT + " Omit for none beyond the lead's own.",
                            items={"type": "string"}),
         "networks": _prop("array", _NETWORKS_TEXT + " The first is the default.",
@@ -991,13 +1028,15 @@ def _qubes_propose_project(args: dict) -> dict:
     The edit says what it adds, removes or sets, and is applied to the project
     as it is when the operator accepts it, changing only the entries it
     names: a change made since to anything else stands. Adding what is
-    already there, or removing what is not, changes nothing. Workers keep their networks: taking a network off the list moves
-    no qube off it. qubes_get_pool_stats shows every project as it is now.
+    already there, or removing what is not, changes nothing. Workers keep
+    their networks, so a network a worker still sits on cannot be taken off
+    the list: the accept fails until no worker uses it. qubes_get_pool_stats
+    shows every project as it is now.
 
     - project: the project's label.
     - add_templates, remove_templates: templates or disposable templates in AI
       space that the lead may spawn from.
-    - add_networks, remove_networks: worker networks, gateways in AI space or
+    - add_networks, remove_networks: worker networks, enrolled gateways or
       "none" for no network (null there means "none" too, as
       qubes_get_pool_stats shows it).
     - default_network: this network, already on the list or added here, goes
@@ -1041,14 +1080,18 @@ def _qubes_propose_project_edit(args: dict) -> dict:
     reach back into AI space. A slot has at most one.
 
     - project: the project's label, or "p00" for the hub's own qubes.
-    - name: the sink's name, outside the reserved name prefix; omit it for
-      <label>-dump, or hub-dump for p00.
+    - name: the sink's name, not starting with reserved_prefix; omit it for
+      <label>-dump, or hub-dump for p00 (refused when that would start with
+      reserved_prefix, as for a label such as "ai", or be no qube name, as for
+      a label starting with a digit: then give a name).
     """), {
         "title": _TITLE,
         "project": _prop("string", 'The project: its label, or "p00" '
                                    "for the hub's own qubes."),
-        "name": _prop(["string", "null"], "The sink's name, outside the reserved name prefix; "
-                                          "omit it for <label>-dump, or hub-dump for p00."),
+        "name": _prop(["string", "null"], "The sink's name, not starting with reserved_prefix; "
+                                          "omit it for <label>-dump, or hub-dump for p00, "
+                                          "unless that starts with reserved_prefix or is "
+                                          "no qube name."),
     }, required=("title", "project"))
 def _qubes_propose_dump(args: dict) -> dict:
     return _submit("project-dump", args)
@@ -1060,18 +1103,24 @@ def _qubes_propose_dump(args: dict) -> dict:
     - To remove the lead: remove=true and no other lead field. The lead's qube
       is removed with everything in it; the project keeps its workers, which
       only the hub reaches until the project has a lead again.
-    - To give the project a new lead: lead, and optionally lead_name and
-      lead_netvm, as for qubes_propose_project, and keep_old, which has no
-      default: true keeps the old lead as a worker of the same project (it
-      must be on one of the project's worker networks, or on none), false
-      removes it with everything in it. A proposal without keep_old is
-      refused, even for a project that has no lead now, where it changes
-      nothing. A kept lead keeps its name, so when it is named
-      <prefix><label>-lead, give the new lead a lead_name.
+    - To give the project a new lead: lead, and optionally lead_name,
+      lead_netvm and model, as for qubes_propose_project (without model, a
+      new lead with a network takes the project's), and keep_old, which has no
+      default: true keeps the old lead as a worker of the same project, false
+      removes it with everything in it. A kept lead keeps its network when the
+      project lists it; otherwise add_old_network=true adds that network to
+      the worker networks, and without it the kept lead loses its network. A
+      proposal without keep_old is refused, even for a project that has no
+      lead now, where it changes nothing. A kept lead keeps its name, so when
+      it is named <reserved_prefix><label>-lead, give a fresh new lead a
+      lead_name (a promoted one keeps its own name). This is
+      also how a project's lead moves to another network: a new lead on it,
+      which can take what it needs from the old one, kept as a worker.
 
     It needs the operator's second tick, an extra confirmation, when it
-    removes a lead, promotes one of the hub's qubes into the lead, or gives
-    the lead a network AI space does not use today.
+    removes a lead, promotes one of the hub's qubes into the lead, gives the
+    lead a network AI space does not use today, or gives the project a
+    different model endpoint.
     """), {
         "title": _TITLE,
         "project": _PROJECT,
@@ -1083,9 +1132,44 @@ def _qubes_propose_dump(args: dict) -> dict:
         "keep_old": _prop(["boolean", "null"], "Required with a new lead, no default: true keeps "
                                                "the old lead as a worker of the project, false "
                                                "removes it with everything in it."),
+        "model": _MODEL,
+        "add_old_network": _prop(["boolean", "null"], "With keep_old true: add the old lead's "
+                                                      "network to the worker networks, so it keeps "
+                                                      "it. Omitted, a kept lead on a network the "
+                                                      "project does not list loses its network."),
     }, required=("title", "project"))
 def _qubes_propose_lead(args: dict) -> dict:
     return _submit("project-lead", args)
+
+
+@_register("qubes_propose_lead_firewall", _proposal_doc("""
+    Propose a change to a project's lead firewall.
+
+    A lead's firewall is the operator's: dom0 writes it, for a lead with a
+    network when the lead is made (its model endpoint, DNS and nothing else),
+    and the hub's own writes to it are refused. Give one of:
+    - model: a new model endpoint, host:port; the firewall becomes that
+      endpoint, DNS and nothing else.
+    - rules: exactly these rules, in the Qubes Admin API grammar, one rule per
+      entry, e.g. "action=accept proto=tcp dsthost=api.example.com
+      dstports=443" (up to 32; keys action, proto, dsthost, dst4, dst6,
+      dstname, dstports, specialtarget and icmptype; the last is usually
+      "action=drop").
+
+    qubes_firewall_get reads the lead's rules as they are. Every change to a
+    lead's firewall needs the operator's second tick: the window shows the
+    old and new rules.
+    """), {
+        "title": _TITLE,
+        "project": _PROJECT,
+        "model": _prop(["string", "null"], "A new model endpoint, host:port; the firewall becomes "
+                                           "that endpoint, DNS and nothing else. Give this or "
+                                           "rules."),
+        "rules": _prop(["array", "null"], "Exactly these rules, one per entry. Give this or model.",
+                       items={"type": "string"}),
+    }, required=("title", "project"))
+def _qubes_propose_lead_firewall(args: dict) -> dict:
+    return _submit("project-firewall", args)
 
 
 @_register("qubes_propose_project_delete", _proposal_doc("""
@@ -1108,9 +1192,11 @@ def _qubes_propose_project_delete(args: dict) -> dict:
 
     Returns {"ok": true, "proposals": [{id, state, type, title, submitted,
     expires, sha256}, ...]}, newest first. With id, the reply is that one
-    entry's fields plus "proposal": the options as dom0 stored them, with
-    every optional field filled in, which is what the operator reads and
-    accepts.
+    entry's fields plus "proposal": the options as dom0 stored them, which
+    is what the operator reads and accepts. dom0 fills in every optional
+    field but model, which appears only when given, and add_old_network,
+    which appears only when true; a firewall proposal holds whichever of
+    model and rules it was given.
 
     state is one of:
     - pending: waiting for the operator (an accept running now reads pending).

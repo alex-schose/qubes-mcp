@@ -10,15 +10,17 @@ in two places, and the two must agree:
     qmcp-dump-pNN               the slot's dump sink (with ai-dump; never in AI space)
 - the RECORD in /etc/qmcp/projects.json, which holds what a tag cannot: the
   label (and with it the project's name space), the lead's name, the approved
-  templates, the worker networks, the disk quota and the dump sink's name.
+  templates, the worker networks, the disk quota, the dump sink's name, and,
+  once set, the lead's model endpoint (`model`) and the firewall the operator
+  accepted for the lead (`lead_firewall`). Those two keys are written only when
+  set, so a record without them stays in the format of 0.9.18 to 0.9.20.
 
 The record file is root-owned. The operator's `qmcp project` commands write
 it, under a lock and by atomic rename (the installer writes it empty); the
 services only read it. Every
 reader fails closed: a file that exists but cannot be read or validated means
-that no lead is recognised and that no create can show its name lies outside
-every project's space, so those are refused. An absent file means no project
-has been created yet.
+that no lead is recognised, so every lead's call is refused (the hub's creates
+do not read it). An absent file means no project has been created yet.
 
 A project's name space is the hub's name prefix, its label and a dash
 (`ai-osint-`). A label is 1 to 8 lowercase letters or digits. With no dash
@@ -34,6 +36,8 @@ import json
 import os
 import re
 import tempfile
+
+from qmcp import firewall
 
 SLOTS = tuple(f"p{n:02d}" for n in range(16))
 HUB_SLOT = "p00"
@@ -53,7 +57,9 @@ _SLOT_BADGE_RE = re.compile(r"\Aqmcp-(proj|lead|dump)-(p[0-9]{2})\Z")
 LABEL_RE = re.compile(r"\A[a-z0-9]{1,8}\Z")
 #: Labels a command could not tell from a slot or a keyword.
 _RESERVED_LABEL_RE = re.compile(r"\Ap[0-9]{2}\Z")
-RESERVED_LABELS = frozenset({"none", "hub"})
+#: The hub creates qubes only as `<prefix>hub-…`, so `hub` is never a project's label.
+HUB_LABEL = "hub"
+RESERVED_LABELS = frozenset({"none", HUB_LABEL})
 _QUBE_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 
 MAX_TEMPLATES = 16
@@ -114,14 +120,17 @@ def valid_qube_name(name) -> bool:
 class Project:
     """One slot's record. p00 carries only `dump`."""
 
-    __slots__ = ("slot", "label", "lead", "templates", "networks", "quota", "dump")
+    __slots__ = ("slot", "label", "lead", "templates", "networks", "quota", "dump",
+                 "model", "lead_firewall")
 
     def __init__(self, slot, label=None, lead=None, templates=(), networks=(), quota=None,
-                 dump=None):
+                 dump=None, model=None, lead_firewall=None):
         self.slot, self.label, self.lead = slot, label, lead
         self.templates = tuple(templates)
         self.networks = tuple(networks)
         self.quota, self.dump = quota, dump
+        self.model = model
+        self.lead_firewall = None if lead_firewall is None else tuple(lead_firewall)
 
     def space(self, prefix: str) -> str:
         """The project's name space, e.g. `ai-osint-`."""
@@ -133,8 +142,13 @@ class Project:
     def to_json(self) -> dict:
         if self.slot == HUB_SLOT:
             return {"dump": self.dump}
-        return {"label": self.label, "lead": self.lead, "templates": list(self.templates),
-                "networks": list(self.networks), "quota": self.quota, "dump": self.dump}
+        out = {"label": self.label, "lead": self.lead, "templates": list(self.templates),
+               "networks": list(self.networks), "quota": self.quota, "dump": self.dump}
+        if self.model is not None:
+            out["model"] = self.model
+        if self.lead_firewall is not None:
+            out["lead_firewall"] = list(self.lead_firewall)
+        return out
 
     def __repr__(self):
         return f"<Project {self.slot} {self.label or 'hub'}>"
@@ -156,8 +170,9 @@ def _validate_slot(slot: str, entry) -> Project:
             raise _bad(f"{slot}: bad dump")
         return Project(slot, dump=dump)
     want = {"label", "lead", "templates", "networks", "quota", "dump"}
-    if set(entry) != want:
-        raise _bad(f"{slot}: keys must be exactly {sorted(want)}")
+    optional = {"model", "lead_firewall"}
+    if not want <= set(entry) <= want | optional:
+        raise _bad(f"{slot}: keys must be {sorted(want)}, and optionally {sorted(optional)}")
     label = entry["label"]
     if label_refusal(label):
         raise _bad(f"{slot}: bad label")
@@ -180,7 +195,17 @@ def _validate_slot(slot: str, entry) -> Project:
     dump = entry["dump"]
     if dump is not None and not valid_qube_name(dump):
         raise _bad(f"{slot}: bad dump")
-    return Project(slot, label, lead, templates, networks, quota, dump)
+    model = entry.get("model")
+    if model is not None:
+        try:
+            if firewall.model_text(model) != model:
+                raise firewall.FirewallError("not canonical")
+        except firewall.FirewallError:
+            raise _bad(f"{slot}: model must be host:port") from None
+    lead_firewall = entry.get("lead_firewall")
+    if lead_firewall is not None and firewall.rules_refusal(lead_firewall):
+        raise _bad(f"{slot}: lead_firewall must be 1-{firewall.MAX_RULES} firewall rules")
+    return Project(slot, label, lead, templates, networks, quota, dump, model, lead_firewall)
 
 
 def parse(text: str) -> dict:
@@ -240,14 +265,6 @@ def find(projects: dict, key: str):
     if key in projects:
         return projects[key]
     return by_label(projects, key)
-
-
-def spaces(projects: dict, prefix: str) -> list:
-    return [p.space(prefix) for p in projects.values() if p.label]
-
-
-def in_a_project_space(name: str, projects: dict, prefix: str) -> bool:
-    return any(name.startswith(s) for s in spaces(projects, prefix))
 
 
 def free_slots(projects: dict) -> list:

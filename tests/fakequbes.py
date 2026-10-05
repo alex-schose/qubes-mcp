@@ -12,28 +12,73 @@ self-escalation bug green through a whole stage. So:
 - `add_new_vm` puts the new qube on the system default netvm and default
   disposable template, as qvm-create does;
 - tag names are validated as qubesd validates them (no `:` or `.`);
-- removing a running qube fails, as qubesd refuses it.
+- removing a running qube fails, as qubesd refuses it;
+- features answer `check_with_template` through the template chain, as
+  qubesadmin does (a template's `qubes-firewall` reaches the qubes built on it);
+- a qube's firewall is a list of rule lines behind `admin.vm.firewall.Get` and
+  `Set`; a new qube's is `action=accept`, and qubesd's own spelling is modelled
+  where qmcp reads it back (`dstports=443` reads back as `dstports=443-443`);
+- `vm.tags` is no set: iterating it is `admin.vm.tag.List` and `in` is
+  `admin.vm.tag.Get`, each a read that can fail, as in qubesadmin;
+- the network and disposable properties follow Qubes 4.3's classes: dom0 and
+  a RemoteVM have no network properties, a RemoteVM no `default_dispvm`, and
+  only an AppVM or a StandaloneVM has `template_for_dispvms` (measured on the
+  dev box for dom0, a TemplateVM and an AppVM; the rest read from Qubes'
+  source). A missing one raises AttributeError, as qubesadmin's
+  QubesNoSuchPropertyError does. `template` is there only for an AppVM and a
+  DispVM; the other properties modelled here are not trimmed per class;
+- a removed qube's tag read raises a KeyError, as qubesadmin's
+  QubesVMNotFoundError does; its property reads fail with the property-access
+  error, and its power state reads `NA`, as qubesadmin's do; its class, which
+  qubesadmin caches from the domain list, still reads;
 
-Failures are injected by name through `app.fail`; each injected exception's
+Failures are injected by name through `app.fail`, every read under that key,
+or `app.fail_reads(key, "ok fail")`, some reads in order. A tag read's keys are
+`tag.List`, `tag.Get` and either with `:<qube>`; `lookup:<qube>` fails `name in
+app.domains`. Each injected exception's
 message carries SECRET, so a test can assert no raw exception text ever reaches
 a reply.
 """
 from __future__ import annotations
 
+import collections
 import re
 
 GiB = 1024 ** 3
 SECRET = "SECRET-qubes_dom0/vm-pool-private-lvm"
 
 _TAG_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+#: A name qubesd accepts for a new qube (its validate_name): a letter first.
+_NAME_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 # Properties each class has, as `property_list()` reports them.
 _BASE_PROPS = ["label", "netvm", "provides_network", "default_dispvm", "memory",
                "maxmem", "vcpus", "kernel", "autostart", "template_for_dispvms",
                "name", "virt_mode", "management_dispvm", "guivm", "audiovm"]
+#: What a class lacks in Qubes 4.3: dom0 has no network, and only an AppVM or a
+#: StandaloneVM can be a disposable template. (`template` is added only for the
+#: classes that have one.)
+_CLASS_LACKS = {
+    "AdminVM": {"netvm", "provides_network", "template_for_dispvms", "visible_gateway", "dns"},
+    "RemoteVM": {"netvm", "provides_network", "template_for_dispvms", "default_dispvm",
+                 "visible_gateway", "dns"},
+    "TemplateVM": {"template_for_dispvms"},
+    "DispVM": {"template_for_dispvms"},
+}
 
 
 class Injected(Exception):
     pass
+
+
+class InjectedNotFound(Injected, KeyError):
+    """A read of a qube qubesd no longer has, as qubesadmin raises it: its
+    QubesVMNotFoundError is a KeyError."""
+
+
+class InjectedPropertyAccess(Injected, AttributeError):
+    """A property read that fails, as qubesadmin raises it: its
+    QubesPropertyAccessError is an AttributeError too, so `getattr` with a
+    default swallows it."""
 
 
 class FakeLabel:
@@ -51,21 +96,52 @@ class FakeVolume:
             self.size = size
 
 
-class FakeTags(set):
+class FakeTags:
+    """vm.tags as qubesadmin has it: iterating is `admin.vm.tag.List` and `in`
+    is `admin.vm.tag.Get`, each a qubesd call that can fail. Not a set subclass,
+    so `set(vm.tags)` iterates, as it must against qubesd (CPython copies a set
+    subclass without calling its `__iter__`)."""
+
     def __init__(self, vm, tags=()):
-        super().__init__(tags)
-        self._vm = vm
+        self._vm, self._tags = vm, set(tags)
+
+    def _read(self, method):
+        app, name = self._vm.app, self._vm.__dict__["name"]
+        if app.domains._any(name) is not self._vm:
+            raise InjectedNotFound(f"QubesVMNotFoundError {name}")
+        app._maybe_fail(method)
+        app._maybe_fail(f"{method}:{name}")
+
+    def raw(self) -> set:
+        """The tags as they are, for the fake itself and a test's assertions:
+        no qubesd read, so nothing injected fails it."""
+        return set(self._tags)
+
+    def __iter__(self):
+        self._read("tag.List")
+        return iter(sorted(self._tags))
+
+    def __contains__(self, tag):
+        self._read("tag.Get")
+        return tag in self._tags
 
     def add(self, tag):
         self._vm.app._maybe_fail(f"tag.add:{tag}")
         self._vm.app._maybe_fail("tag.add")
         if not _TAG_RE.match(tag):
             raise ValueError("disallowed characters")
-        super().add(tag)
+        self._tags.add(tag)
 
     def discard(self, tag):
         self._vm.app._maybe_fail(f"tag.discard:{tag}")
-        super().discard(tag)
+        self._tags.discard(tag)
+
+    def update(self, tags):
+        for tag in tags:
+            self.add(tag)
+
+    def clear(self):
+        self._tags.clear()
 
 
 class FakeFeatures(dict):
@@ -76,6 +152,42 @@ class FakeFeatures(dict):
     def __setitem__(self, key, value):
         self._vm.app._maybe_fail("feature.set")
         super().__setitem__(key, value)
+
+    def check_with_template(self, key, default=None):
+        self._vm.app._maybe_fail("feature.check")
+        vm = self._vm
+        for _ in range(8):
+            if key in vm.features:
+                return dict.__getitem__(vm.features, key)
+            vm = vm._props.get("template")
+            if vm is None:
+                break
+        return default
+
+
+#: qubesd's own order for a rule's options, as Qubes 4.3.1 states them back
+#: (measured 2026-10-04): the action, the destination, proto, ports, ICMP type.
+_QUBESD_ORDER = ("action", "dsthost", "dst4", "dst6", "proto", "dstports", "icmptype",
+                 "specialtarget", "expire")
+_IPV4 = re.compile(r"\A[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?\Z")
+
+
+def _qubesd_rule(line: str) -> str:
+    """A rule as qubesd states it back (measured on Qubes 4.3.1): in qubesd's
+    own order, whatever order it was written in; a single port as a range; an
+    IPv4 `dsthost` as `dst4` with its prefix length. A comment, which may hold
+    spaces, comes last and is kept as it is."""
+    line, sep, comment = line.partition("comment=")
+    opts = {}
+    for option in line.strip().split(" "):
+        key, _, value = option.partition("=")
+        if key == "dstports" and "-" not in value:
+            value = f"{value}-{value}"
+        if key == "dsthost" and _IPV4.match(value):
+            key, value = "dst4", value if "/" in value else f"{value}/32"
+        opts[key] = value
+    order = [k for k in _QUBESD_ORDER if k in opts] + [k for k in opts if k not in _QUBESD_ORDER]
+    return " ".join(f"{k}={opts[k]}" for k in order) + (f" comment={comment}" if sep else "")
 
 
 class FakeVM:
@@ -94,6 +206,7 @@ class FakeVM:
                         "root": FakeVolume(self, "root", root)}
         d["_power"] = power
         d["auto_cleanup"] = auto_cleanup
+        d["_firewall"] = ["action=accept"]
         props = {"label": FakeLabel(label), "netvm": netvm,
                  "provides_network": provides_network,
                  "default_dispvm": default_dispvm, "memory": memory,
@@ -104,6 +217,8 @@ class FakeVM:
                  "visible_gateway": "10.137.0.5", "dns": "10.139.1.1"}
         if klass in ("AppVM", "DispVM"):
             props["template"] = template
+        for p in _CLASS_LACKS.get(klass, ()):
+            props.pop(p, None)
         d["_props"] = props
         # Properties still following a default, as qubesd tracks them: a
         # qube created without an explicit netvm or default_dispvm follows the
@@ -115,11 +230,18 @@ class FakeVM:
         return item in self.__dict__["_defaults"]
     def property_list(self):
         self.app._maybe_fail("property_list")
-        return sorted(set(_BASE_PROPS + list(self._props)))
+        return sorted((set(_BASE_PROPS) | set(self._props)) - _CLASS_LACKS.get(self.klass, set()))
 
     def __getattr__(self, item):
         props = self.__dict__.get("_props", {})
         if item in props:
+            app = self.__dict__["app"]
+            if app.domains._any(self.__dict__["name"]) is not self:
+                # Removed: qubesadmin turns qubesd's not-found into its
+                # property-access error, as for any failed read.
+                raise InjectedPropertyAccess(f"get.{item}: {self.__dict__['name']} is gone")
+            app._maybe_fail(f"get.{item}")
+            app._maybe_fail(f"get.{item}:{self.__dict__['name']}")
             return props[item]
         raise AttributeError(item)
 
@@ -136,6 +258,9 @@ class FakeVM:
 
     # -- lifecycle
     def get_power_state(self):
+        # qubesadmin answers "NA", never an exception, for a qube it cannot read.
+        if self.app.domains._any(self.__dict__["name"]) is not self:
+            return "NA"
         return self._power
 
     def is_running(self):
@@ -190,7 +315,9 @@ class FakeDomains:
 
     def __contains__(self, name):
         self.lookups += 1
-        return getattr(name, "name", name) in self._vms
+        key = getattr(name, "name", name)
+        self.app._maybe_fail(f"lookup:{key}")      # the domain list could not be read
+        return key in self._vms
 
     def __getitem__(self, name):
         self.lookups += 1
@@ -212,14 +339,32 @@ class FakeApp:
     def __init__(self):
         self.domains = FakeDomains(self)
         self.fail: set = set()
+        self.fail_plan: dict = {}
+        #: Every key `_maybe_fail` was asked about, counted: a test that fails a
+        #: key no call reads proves nothing, and can check that it was read.
+        self.reads = collections.Counter()
+        #: The failures it raised, by key: a position past the reads a call makes
+        #: injects nothing, and a test that needs a failure can check one fired.
+        self.failed = collections.Counter()
         self.default_netvm = None
         self.default_dispvm = None
         self.default_template = None
         self._disp_counter = 1000
         self.calls: list = []
 
+    def fail_reads(self, key, pattern: str):
+        """Fail some of the reads under `key`, in order: "ok fail" lets the
+        first through and fails the second; reads after the pattern succeed."""
+        self.fail_plan[key] = collections.deque(w == "fail" for w in pattern.split())
+
     def _maybe_fail(self, key):
-        if key in self.fail:
+        self.reads[key] += 1
+        plan = self.fail_plan.get(key)
+        planned = plan.popleft() if plan else False
+        if key in self.fail or planned:
+            self.failed[key] += 1
+            if key.startswith("get."):
+                raise InjectedPropertyAccess(f"{key} failed: {SECRET}")
             raise Injected(f"{key} failed: {SECRET}")
 
     def vm(self, name, **kw):
@@ -228,6 +373,8 @@ class FakeApp:
     # -- creates
     def add_new_vm(self, klass, name, label, template=None):
         self._maybe_fail("add_new_vm")
+        if not _NAME_RE.match(name):
+            raise Injected("QubesValueError: invalid name")
         if name in self.domains._vms:
             raise Injected("QubesValueError: exists")
         tpl = self.domains[template] if isinstance(template, str) else template
@@ -236,7 +383,7 @@ class FakeApp:
             # cloneable properties (provides_network included), and takes its
             # network from it.
             return self.domains._add(FakeVM(
-                self, name, klass="DispVM", template=tpl, label=label, tags=set(tpl.tags),
+                self, name, klass="DispVM", template=tpl, label=label, tags=tpl.tags.raw(),
                 features=dict(tpl.features), netvm=tpl._props["netvm"],
                 provides_network=tpl._props["provides_network"],
                 default_dispvm=tpl._props["default_dispvm"],
@@ -252,10 +399,12 @@ class FakeApp:
                     tags=[t for t in src.tags if not t.startswith("created-by-")],
                     template=p.get("template"), netvm=p["netvm"],
                     provides_network=p["provides_network"],
-                    template_for_dispvms=p["template_for_dispvms"],
+                    template_for_dispvms=p.get("template_for_dispvms", False),
                     default_dispvm=p["default_dispvm"], label=p["label"].name,
                     private=src.volumes["private"].size, root=src.volumes["root"].size,
                     features=dict(src.features))
+        # qubesadmin's clone_vm copies the firewall too.
+        vm.__dict__["_firewall"] = list(src.__dict__["_firewall"])
         return self.domains._add(vm)
 
     # -- the raw admin calls the disposable path uses
@@ -266,7 +415,7 @@ class FakeApp:
             dvmt = self.domains._vms[dest]
             self._disp_counter += 1
             name = f"disp{self._disp_counter}"
-            vm = FakeVM(self, name, klass="DispVM", tags=set(dvmt.tags), template=dvmt,
+            vm = FakeVM(self, name, klass="DispVM", tags=dvmt.tags.raw(), template=dvmt,
                         netvm=dvmt._props["netvm"],
                         provides_network=dvmt._props["provides_network"],
                         features=dict(dvmt.features),
@@ -300,6 +449,12 @@ class FakeApp:
             vm._props[arg] = None if text == "" else self.domains._any(text)
             vm.__dict__["_defaults"].discard(arg)
             return b""
+        if method == "admin.vm.firewall.Get":
+            return "".join(f"{r}\n" for r in vm.__dict__["_firewall"]).encode()
+        if method == "admin.vm.firewall.Set":
+            lines = [l for l in (payload or b"").decode("ascii").splitlines() if l]
+            vm.__dict__["_firewall"] = [_qubesd_rule(l) for l in lines]
+            return b""
         if method == "admin.vm.Kill":
             vm.kill()
             return b""
@@ -325,7 +480,7 @@ def standard_fleet() -> FakeApp:
     app.vm("ai-debian-13", klass="TemplateVM", tags={"ai-managed"})
     app.vm("ai-tpl-g", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded"})
     router = app.vm("ai-net-router", provides_network=True, netvm=fw,
-                    tags={"ai-managed", "qmcp-guarded"})
+                    tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
     app.vm("ai-gw-unbadged", provides_network=True, netvm=fw, tags={"ai-managed"})
     app.vm("ai-work", template=app.domains["ai-debian-13"], netvm=router,
            tags={"ai-managed", "qmcp-owner_mcp-control", "operator-note"},

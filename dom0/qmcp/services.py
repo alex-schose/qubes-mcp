@@ -9,7 +9,8 @@ reply. State-changing services leave one audit line.
 The hub operates all of AI space. A lead operates its own project's members,
 spawns only from its project's approved templates, puts new workers only on
 its project's worker networks, creates only inside its project's name space
-and disk quota, and has no event stream. Everything else a lead names answers
+and disk quota, and has no event stream. Every network a create gives a qube,
+for the hub or a lead, is an enrolled gateway (`qmcp.gateways`) or none. Everything else a lead names answers
 like a qube that does not exist.
 
 No exception text reaches the caller: every failure answers with a
@@ -28,7 +29,7 @@ import re
 import sys
 import time
 
-from qmcp import birth, budget, core, projects, proposals, scope
+from qmcp import birth, budget, core, gateways, projects, proposals, scope
 from qmcp.core import refuse
 
 LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"})
@@ -66,8 +67,7 @@ TAG_EVENT_BASES = ("domain-tag-add", "domain-tag-delete")
 _PROP_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
 
 #: Properties whose value is an address of the qube's NETVM, not of the qube:
-#: read on a qube whose netvm is outside AI space they would describe that
-#: qube, so they are redacted with it.
+#: they describe that netvm, so they are redacted whenever its name is.
 NETVM_ADDRESS_PROPS = frozenset({"visible_gateway", "visible_gateway6", "gateway",
                                  "gateway6", "dns"})
 
@@ -102,36 +102,28 @@ def _local_app():
         raise refuse("qubesadmin unavailable") from None
 
 
-def _records():
-    """The project records, for a check that needs every project (the hub's
-    name space). Unreadable records refuse: the check cannot be made."""
-    try:
-        return projects.load()
-    except projects.ProjectsUnreadable:
-        raise refuse("project records unreadable") from None
-
-
 def _slot_of(tags) -> str | None:
     """The slot a qube belongs to, as a list shows it: a member's, or a lead's."""
     slots = projects.member_slots(tags) | projects.lead_slots(tags)
     return next(iter(slots)) if len(slots) == 1 else None
 
 
+def hub_space(prefix: str) -> str:
+    """The hub's own name space, `ai-hub-`. `hub` is never a project label,
+    so no project's space overlaps it."""
+    return f"{prefix}{projects.HUB_LABEL}-"
+
+
 def _create_name_refusal(name, who) -> str | None:
-    """Judged on the name, the prefix and the project records alone, before
-    any qube is looked up, so a create is no oracle over names. A lead creates
-    only inside its project's space; the hub, inside its prefix but outside
-    every project's space, so a lead collides only with its own workers or
-    with a qube the operator named inside its space or moved out of it."""
+    """Judged on the name and the prefix alone, before any qube is looked up,
+    so a create is no oracle over names. A lead creates only inside its
+    project's space (`ai-<label>-`), the hub only inside its own (`ai-hub-`):
+    a name says who owns the qube, so a lead collides only with its own
+    workers or with a qube the operator named inside its space or moved out
+    of it."""
     prefix = birth.read_name_prefix()
-    if not who.is_hub():
-        return birth.name_refusal(name, who.project.space(prefix))
-    err = birth.name_refusal(name, prefix)
-    if err:
-        return err
-    if projects.in_a_project_space(name, _records(), prefix):
-        return "name is inside a project's name space"
-    return None
+    space = hub_space(prefix) if who.is_hub() else who.project.space(prefix)
+    return birth.name_refusal(name, space)
 
 
 def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False, source_tags=()):
@@ -160,6 +152,8 @@ def _recheck(app, call, template=None, netvm=None) -> None:
     if who.kind != call.principal.kind or who.slot != call.principal.slot:
         raise core.Refusal(core.NOT_AUTHORIZED)
     call.principal = who
+    if netvm is not None and not gateways.is_enrolled(netvm):
+        raise refuse("netvm must be an enrolled gateway")
     if not who.is_hub():
         if template is not None and template not in who.project.templates:
             raise refuse("template is not on this project's approved list")
@@ -170,10 +164,17 @@ def _recheck(app, call, template=None, netvm=None) -> None:
 # ------------------------------------------------------------------ reads
 
 def svc_list(app, call, req):
+    """One tag read per qube. A qube whose tags or class cannot be read is not
+    listed: never as some other state."""
     who = call.principal
     out = []
     for vm in app.domains:
-        if not core.visible(vm, who):
+        try:
+            tags = core.tags_of(vm)
+            if not core.visible(vm, who, tags):
+                continue
+            klass = core.klass_of(vm)
+        except core.Unreadable:
             continue
         try:
             power = vm.get_power_state()
@@ -182,19 +183,18 @@ def svc_list(app, call, req):
         try:
             label = vm.label.name if vm.label else None
         except Exception:
-            label = None
+            label = core.UNREADABLE
         try:
-            template = getattr(vm, "template", None)
-        except Exception:
-            template = None
-        tags = core.tags_of(vm)
+            template = scope.scoped_name(app, core.template_of(vm), who)
+        except core.Unreadable:
+            template = core.UNREADABLE
         out.append({
             "name": vm.name,
-            "klass": vm.klass,
+            "klass": klass,
             "label": label,
-            "template": scope.scoped_name(app, template, who),
+            "template": template,
             "power_state": power,
-            "guarded": core.is_guarded(vm),
+            "guarded": core.is_guarded(vm, tags),
             "slot": _slot_of(tags),
             "lead": projects.LEAD in tags,
         })
@@ -209,6 +209,11 @@ def svc_get_property(app, call, req):
         return {"ok": True, "value": vm.get_power_state()}
     if prop == "tags":
         return {"ok": True, "value": scope.scoped_tags(vm.tags)}
+    if prop == "label":
+        try:
+            return {"ok": True, "value": vm.label.name}
+        except Exception:
+            raise refuse("read failed") from None
     # Only properties qubesd itself lists are read, so a name such as `app`
     # or `qubesd_call` can never reach an attribute of the client library.
     if not _PROP_RE.match(prop):
@@ -220,16 +225,20 @@ def svc_get_property(app, call, req):
     if prop not in known:
         raise refuse(f"property '{prop}' does not exist")
     if prop in NETVM_ADDRESS_PROPS:
+        # Whose addresses these are decides what may be shown: an unread
+        # network is refused, never taken for none (qubesadmin's read errors
+        # are AttributeErrors, which getattr with a default would swallow).
         try:
-            netvm = getattr(vm, "netvm", None)
+            netvm = vm.netvm
         except Exception:
-            netvm = None
+            raise refuse("read failed") from None
         if netvm is not None and scope.scoped_name(app, netvm, who) == scope.OUT_OF_SCOPE:
             return {"ok": True, "value": scope.OUT_OF_SCOPE}
     try:
         value = getattr(vm, prop)
-    except AttributeError:
-        raise refuse(f"property '{prop}' does not exist") from None
+    except Exception:
+        # qubesd listed it, so this is a read that failed, never an absence.
+        raise refuse("read failed") from None
     value = scope.scoped_value(app, value, who)
     if not isinstance(value, (str, int, float, bool, list, type(None))):
         raise refuse("property not readable")
@@ -260,9 +269,13 @@ def svc_pool_stats(app, call, req):
            "ai_managed_bytes_used": used,
            "ai_managed_bytes_cap": cap,
            "ai_managed_bytes_headroom": max(0, cap - used),
-           "name_prefix": prefix}
+           "name_prefix": hub_space(prefix)}
     if who.is_hub():
+        # The bare prefix a project's names build on: `name_prefix` is the
+        # hub's own space, which no project shares.
+        out["reserved_prefix"] = prefix
         out["projects"] = _project_rows(app)
+        out["gateways"] = _gateway_rows()
     else:
         p = who.project
         out.update({"project": p.label, "name_prefix": p.space(prefix),
@@ -271,12 +284,24 @@ def svc_pool_stats(app, call, req):
     return out
 
 
+def _gateway_rows():
+    """The registry as the hub reads it, so it can propose networks by name:
+    each enrolled gateway's name, whether it is anonymising, and its label.
+    Null when the registry cannot be read, never an empty list."""
+    try:
+        registry = gateways.load()
+    except gateways.GatewaysUnreadable:
+        return None
+    return [{"name": g.name, "anonymising": g.anonymising, "label": g.label}
+            for g in sorted(registry.values(), key=lambda g: g.name)]
+
+
 def _project_rows(app):
     """Every project's record as the hub may read it, so it can propose an edit
     that fits. A name in a record that is no longer in AI space (a template
     the operator took out, say) reads `<out-of-scope>`, as every read redacts
-    one; the dump sink is outside AI space, so only whether there is one is
-    told. One pass over the qubes gives both the names in scope and each
+    one, unless it is an enrolled gateway, which the hub reads by name; the
+    dump sink is outside AI space, so only whether there is one is told. One pass over the qubes gives both the names in scope and each
     slot's disk use; a slot's use that cannot be read is null, never zero, and
     records that cannot be read are null, never an empty list."""
     try:
@@ -286,8 +311,12 @@ def _project_rows(app):
     in_scope, used, unreadable = set(), {}, set()
     for vm in app.domains:
         try:
-            tags = set(vm.tags)
-        except Exception:
+            tags = core.tags_of(vm)
+        except core.Gone:
+            continue                        # removed since the list was read: holds nothing
+        except core.Unreadable:
+            # Whose member it is cannot be told, so no slot's use is known.
+            unreadable.update(records)
             continue
         if core.UMBRELLA not in tags:
             continue
@@ -297,7 +326,9 @@ def _project_rows(app):
                 used[slot] = used.get(slot, 0) + budget.persistent_bytes(vm)
             except Exception:
                 unreadable.add(slot)
-    shown = lambda name: name if name is None or name in in_scope else scope.OUT_OF_SCOPE  # noqa: E731
+    enrolled = gateways.enrolled_names()
+    shown = lambda name: (name if name is None or name in in_scope or name in enrolled  # noqa: E731
+                          else scope.OUT_OF_SCOPE)
     out = []
     for slot, p in sorted(records.items()):
         out.append({"slot": slot, "label": p.label, "lead": shown(p.lead),
@@ -368,7 +399,7 @@ def svc_set_feature(app, call, req):
     try:
         readback = vm.features.get(feature, None)
     except Exception:
-        readback = None
+        readback = core.UNREADABLE          # set; the read-back alone failed
     return {"ok": True, "feature": feature, "value": readback}
 
 
@@ -467,16 +498,18 @@ def _lead_netvm(app, req, project, source_vm, authoritative: bool):
     lead's own network. A clone source or a disposable template answers for
     itself, and its network must be on the list (or none). A spawn from a
     TemplateVM takes the requested listed network, or the list's first.
-    Requests are judged against the list, which the lead knows, before any
-    lookup. After birth a network can only be cleared, never moved."""
+    Requests are judged against the list, which the lead knows, and the
+    registry, before any lookup; every listed network must be enrolled. After
+    birth a network can only be cleared, never moved."""
     named = project.named_networks()
+    enrolled = gateways.enrolled_names()
     specified = "netvm" in req
     requested = req.get("netvm")
     if specified and requested is not None and not isinstance(requested, str):
         raise refuse("netvm must be a qube name or null")
     if authoritative:
         try:
-            src = _name_of(getattr(source_vm, "netvm", None))
+            src = _name_of(source_vm.netvm)
         except Exception:
             raise refuse("birth egress could not be resolved") from None
         if src is not None and src not in named:
@@ -486,7 +519,7 @@ def _lead_netvm(app, req, project, source_vm, authoritative: bool):
                 return None
             if requested != src:
                 raise refuse("netvm must match the inherited birth egress")
-        if src is not None and not core.in_ai_space_by_name(app, src):
+        if src is not None and src not in enrolled:
             raise refuse("birth egress could not be resolved")
         return src
     if specified:
@@ -494,33 +527,39 @@ def _lead_netvm(app, req, project, source_vm, authoritative: bool):
             return None
         if requested not in named:
             raise refuse("netvm must be one of this project's worker networks")
-        if not core.in_ai_space_by_name(app, requested):
-            raise refuse("netvm must reference an ai-managed qube")
+        if requested not in enrolled:
+            raise refuse("netvm must be an enrolled gateway")
         return requested
     default = project.networks[0]
-    if default is not None and not core.in_ai_space_by_name(app, default):
+    if default is not None and default not in enrolled:
         raise refuse("birth egress could not be resolved")
     return default
 
 
 def _birth_netvm(app, call, req, source_vm, authoritative: bool):
     """The netvm a create must use (the birth chain in birth.py), honouring an explicit
-    `netvm` in the request: null is always allowed (offline cannot leak); a
-    name must be in AI space AND equal the inherited answer. The explicit name
-    is checked by name, in one round trip either way, so it is no oracle."""
+    `netvm` in the request: for the hub, null is always allowed (offline
+    cannot leak); a name must be an enrolled gateway AND equal the inherited
+    answer. A lead's request is judged by `_lead_netvm`. Both are
+    judged from the registry file and the chain, never by looking the name up,
+    so it is no oracle."""
     if not call.principal.is_hub():
         return _lead_netvm(app, req, call.principal.project, source_vm, authoritative)
     specified = "netvm" in req
     requested = req.get("netvm")
     if specified and requested is not None and not isinstance(requested, str):
         raise refuse("netvm must be a qube name or null")
-    resolved, rule = birth.resolve_egress(app, core.lookup(app, call.caller),
-                                          source_vm, authoritative)
+    if specified and requested is None:
+        return None                         # no network: nothing to resolve or read
+    caller_vm = core.lookup(app, call.caller)
+    if caller_vm is None:
+        # The hub exists, so a failed lookup is a read that failed, never "no
+        # network of its own" (which would fall through to birth-egress).
+        raise core.Unreadable(f"cannot look up {call.caller}")
+    resolved, rule = birth.resolve_egress(app, caller_vm, source_vm, authoritative)
     if specified:
-        if requested is None:
-            return None
-        if not core.in_ai_space_by_name(app, requested):
-            raise refuse("netvm must reference an ai-managed qube")
+        if not gateways.is_enrolled(requested):
+            raise refuse("netvm must be an enrolled gateway")
         if rule == "unresolved" or requested != resolved:
             raise refuse("netvm must match the inherited birth egress")
         return requested
@@ -534,7 +573,7 @@ def _set_netvm(vm, netvm) -> None:
     default: a qube left following the global default would move when the
     operator changes it. Done before the first boot ("burn, don't repair")."""
     vm.netvm = netvm
-    if _name_of(getattr(vm, "netvm", None)) != netvm or vm.property_is_default("netvm"):
+    if _name_of(vm.netvm) != netvm or vm.property_is_default("netvm"):
         raise RuntimeError("netvm did not read back as set")
 
 
@@ -542,7 +581,7 @@ def _pin_default_dispvm(vm) -> None:
     """No default disposable template: Qubes' raw @dispvm shortcut from this
     qube then has nowhere to go, even if it later leaves AI space."""
     vm.default_dispvm = None
-    if getattr(vm, "default_dispvm", None) is not None or vm.property_is_default("default_dispvm"):
+    if core.default_dispvm_of(vm) is not None or vm.property_is_default("default_dispvm"):
         raise RuntimeError("default_dispvm did not read back as None")
 
 
@@ -598,7 +637,7 @@ def svc_spawn(app, call, req):
     if klass in ("AppVM", "DispVMTemplate"):
         if tpl.klass != "TemplateVM":
             raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
-    elif not getattr(tpl, "template_for_dispvms", False):
+    elif not core.is_dvmt(tpl):
         raise refuse(f"template '{template}' must be a disposable template for klass=DispVM")
     _not_a_gateway(tpl, "template")
     _claim_name(app, call, name)
@@ -609,6 +648,10 @@ def svc_spawn(app, call, req):
     _recheck(app, call, template=template, netvm=netvm)
     _claim_name(app, call, name)
     _check_budget(app, call, budget.estimate_new_private(private_size))
+    # Read after the lock, right before the create: a restriction the template
+    # carries (`anon-vm`) must reach the child, including one added while this
+    # call waited, and a read that fails refuses here, before anything is made.
+    tpl_tags = core.tags_of(tpl)
 
     create_klass = "AppVM" if klass == "DispVMTemplate" else klass
     try:
@@ -617,12 +660,12 @@ def svc_spawn(app, call, req):
         raise _create_failed(app, call, name, "create", e)
     step = "birth stamp"
     try:
-        birth.stamp(birth.TagIO.for_vm(vm), core.tags_of(tpl), call.caller,
+        birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
                     _slot_badge(who, create_klass, klass == "DispVMTemplate"))
         if klass == "DispVMTemplate":
             step = "disposable template flag"
             vm.template_for_dispvms = True
-            if not getattr(vm, "template_for_dispvms", False):
+            if not core.is_dvmt(vm):
                 raise RuntimeError("template_for_dispvms did not read back")
         step = "network check"
         if core.is_gateway(vm):
@@ -656,7 +699,7 @@ def svc_clone(app, call, req):
     # qube may still be spawned FROM; see the residuals in CLAUDE.md for what a
     # spawn carries over. The hub may clone a template it manages.
     src = core.operand(app, source, who)
-    src_is_template = src.klass == "TemplateVM" or bool(getattr(src, "template_for_dispvms", False))
+    src_is_template = core.is_template(src)
     if src_is_template and not who.is_hub():
         # Templates and disposable templates are never project members.
         raise core.Refusal(core.NOT_FOUND)
@@ -678,7 +721,7 @@ def svc_clone(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
-                    _slot_badge(who, src.klass, src_is_template, source_tags))
+                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags))
         step = "network check"
         if core.is_gateway(vm):
             raise RuntimeError("the new qube provides network")
@@ -731,7 +774,7 @@ def svc_spawn_disposable(app, call, req):
     call.summary.update({"template": _clip(template)})
     who = call.principal
     dvmt = core.reference(app, template, "template", who)
-    if not getattr(dvmt, "template_for_dispvms", False):
+    if not core.is_dvmt(dvmt):
         raise refuse(f"template '{template}' must be a disposable template")
     _not_a_gateway(dvmt, "disposable template")
     netvm = _birth_netvm(app, call, {}, dvmt, authoritative=True)
@@ -831,8 +874,11 @@ def svc_events(app, call, req, dispatcher_factory=None):
 
     snapshot = set()
     for vm in app.domains:
-        if core.in_scope(vm):
-            snapshot.add(vm.name)
+        try:
+            if core.in_scope(vm):
+                snapshot.add(vm.name)
+        except core.Gone:
+            pass                            # removed since the list was read
 
     collected: list = []
     warning: list = [None]
@@ -852,13 +898,17 @@ def svc_events(app, call, req, dispatcher_factory=None):
 
     def handler(subject, event, **kwargs):
         if hasattr(subject, "name"):
-            subject_name, klass = subject.name, getattr(subject, "klass", None)
+            subject_name = subject.name
+            try:
+                klass = core.klass_of(subject)
+            except core.Unreadable:
+                klass = core.UNREADABLE
         elif isinstance(subject, str) and subject:
             subject_name = subject
             try:
                 klass = app.domains[subject].klass
             except Exception:
-                klass = None
+                klass = core.UNREADABLE
         else:
             return
         if not include(subject_name, event, kwargs):
@@ -994,6 +1044,10 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         payload = r.payload
         if r.error_class:
             call.error_class = r.error_class
+    except core.Unreadable:
+        # A read of a qube that failed: refused, and never with the qube's name.
+        call.error_class = "Unreadable"
+        payload = {"ok": False, "error": "read failed"}
     except Exception as e:
         # Never the message: it can carry pool names and volume paths.
         call.error_class = type(e).__name__

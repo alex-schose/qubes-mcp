@@ -31,6 +31,7 @@ from qubes_mcp import tools  # noqa: E402
 
 CLIENT = "/usr/lib/qubes/qrexec-client-vm"
 GUARDED_QUBE = os.environ.get("QMCP_SEAT_GUARDED", "ai-net-router")
+TEMPLATE = os.environ.get("QMCP_SEAT_TEMPLATE", "ai-debian-13")
 OUTSIDE_QUBE = os.environ.get("QMCP_SEAT_OUTSIDE", "sys-net")
 results: list = []
 
@@ -49,6 +50,11 @@ def raw(target, service, payload=b"", timeout=30):
         return None, b""
 
 
+def not_run(name, why):
+    results.append(("NOT-RUN", name))
+    print(f"NOT-RUN {name}  -- {why}", flush=True)
+
+
 def refused_raw(name, target, service, payload=b""):
     rc, out = raw(target, service, payload)
     if rc is None:
@@ -63,7 +69,7 @@ def call(tool, **args):
     return t.handler(tools.validate_arguments(t, args))
 
 
-def from_hub(inside):
+def from_hub(inside, lead=None):
     print("== from the hub, bypassing the client")
     # Positive control first: a refusal proves nothing if no call can succeed.
     rc, out = raw("@adminvm", "qmcp.GetPoolStats")
@@ -95,6 +101,23 @@ def from_hub(inside):
     check("an oversized proposal is refused before parsing", b"request too large" in out, f"{out[:120]!r}")
     rc, out = raw("@adminvm", "qmcp.ProposalStatus", b"{}")
     check("the hub reads its proposals' states", rc == 0 and b'"proposals"' in out, f"{out[:120]!r}")
+    # A name says who owns a qube: the hub's are ai-hub-..., judged on the name alone.
+    rc, out = raw("@adminvm", "qmcp.SpawnAIManagedQube", b'{"name":"ai-rt-x","template":"x"}')
+    check("a hub name outside ai-hub- is refused", b"ai-hub-" in out and b'"ok": false' in out,
+          f"{out[:160]!r}")
+    # Only an enrolled gateway may be a network; nothing is created either way.
+    req = json.dumps({"name": "ai-hub-rt-net", "template": TEMPLATE, "netvm": OUTSIDE_QUBE}).encode()
+    rc, out = raw("@adminvm", "qmcp.SpawnAIManagedQube", req)
+    check("a network that is not enrolled is refused", b"enrolled gateway" in out, f"{out[:160]!r}")
+    # A lead's firewall is the operator's: the hub reads it, and never writes it.
+    if lead:
+        rc, out = raw(lead, "admin.vm.firewall.Get")
+        check("CONTROL: the hub reads a lead's firewall", rc == 0 and b"action=" in out,
+              f"rc={rc} out={out[:120]!r}")
+        refused_raw("firewall write on a lead", lead, "admin.vm.firewall.Set", b"action=accept\n")
+        refused_raw("firewall reload on a lead", lead, "admin.vm.firewall.Reload")
+    else:
+        not_run("firewall write on a lead", "name a lead with --lead LEAD")
     # More concurrent calls than the per-caller cap; at least one is refused.
     with concurrent.futures.ThreadPoolExecutor(10) as pool:
         outs = list(pool.map(lambda _: raw("@adminvm", "qmcp.AIManagedEvents",
@@ -152,15 +175,18 @@ def from_inside(inside, peer):
 
 def main() -> int:
     if "--inside" not in sys.argv:
-        print("usage: redteam_suite.py --inside <managed qube> [--peer <managed qube>]")
+        print("usage: redteam_suite.py --inside <managed qube> [--peer <managed qube>] [--lead LEAD]")
         return 2
     inside = sys.argv[sys.argv.index("--inside") + 1]
     peer = sys.argv[sys.argv.index("--peer") + 1] if "--peer" in sys.argv else inside
-    from_hub(inside)
+    lead = sys.argv[sys.argv.index("--lead") + 1] if "--lead" in sys.argv else None
+    from_hub(inside, lead)
     r = call("qubes_start", name=inside)
     from_inside(inside, peer)
     fails = [x for x in results if x[0] == "FAIL"]
-    verdict = "FAILED" if fails else ("GREEN" if results else "INCOMPLETE")
+    unrun = [x for x in results if x[0] == "NOT-RUN"]
+    # A probe that could not run leaves the suite INCOMPLETE, which is not green.
+    verdict = "FAILED" if fails else ("INCOMPLETE" if unrun or not results else "GREEN")
     print(f"\nred-team suite: {verdict}  ({len(results)} probes, {len(fails)} got through or hung)")
     return {"GREEN": 0, "FAILED": 2, "INCOMPLETE": 3}[verdict]
 

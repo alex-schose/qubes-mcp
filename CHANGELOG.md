@@ -26,6 +26,162 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.21] — 2026-10-05
+
+**Networks, part one (M3a): AI qubes get networks only from the gateways you
+enroll, and a lead's firewall is yours.** Every network a qube in AI space is
+given must be a gateway you enrolled in a new registry; a lead's firewall is
+written by dom0 from its model endpoint and changes only when you change it, or
+accept the hub's proposal to. **BREAKING:** the registry starts empty, so after
+installing over 0.9.20 no AI qube can be given a network, and `qmcp check`
+fails on every AI qube (other than a gateway) already on one, until you enroll
+the routers AI space uses (`sudo qmcp gateway enroll QUBE`); the hub's spawns
+and clones are named `ai-hub-…`; the hub can no longer write a lead's firewall.
+
+### Added
+
+- **The gateway registry**, `/etc/qmcp/gateways.json`, and `qmcp gateway
+  list|enroll|set|remove`. An entry is a qube, whether it is anonymising, and a
+  label. Enrolling requires a qube that provides network and carries Qubes'
+  own marker for applying its clients' firewall rules (the `qubes-firewall`
+  feature: the qube's own value, else its template's); it refuses a Whonix
+  gateway, a qube whose system comes from a template the hub manages, the hub,
+  a drop box, a lead or a project's member, and a qube in AI space that is not
+  guarded. `list` says whether each entry is still usable, its upstream, which
+  qubes and projects use it, and marks one whose upstream is a Whonix gateway:
+  its own firewall rules have no effect there. (Measured on Qubes 4.3.1 with
+  Whonix 18: `sys-whonix` applies none of its clients' Qubes firewall rules,
+  TCP or DNS, because Whonix hands their traffic to Tor inside the gateway;
+  Qube Manager does not warn.) Removing an entry is refused while a project
+  lists it or a qube in AI space sits on it, or might (its network cannot be
+  read).
+- **A lead's firewall is the operator's.** `project create` and `project lead`
+  take `--model HOST:PORT`, needed for a lead with a network (a new lead takes
+  the project's when none is given) and refused for one without. dom0 writes
+  "model endpoint only" (the endpoint over TCP, DNS, and nothing else) into the
+  lead once it wears `qmcp-lead`, which already bars the hub's firewall writes,
+  and before its slot's lead badge; the record keeps the model and the rules
+  qubesd read back as accepted. `qmcp project firewall NAME` shows the model,
+  the accepted rules and the live ones; `--model` (for a lead with a network),
+  `--rule` (repeatable) or `--accept-current` change them. `--accept-current`
+  takes only rules in qmcp's rule format (no `comment` or `expire`, at most
+  32); a write that does not read back as set is undone. `qmcp check` fails
+  when the live rules of a lead with a network differ from the accepted ones,
+  and warns about a lead with a network and no accepted rules (every such
+  lead, after this upgrade) until you accept its current rules, or set its
+  model or its rules.
+- **The `project-firewall` proposal**: a new model for a project's lead, or
+  exactly these rules (up to 32). It always needs the second tick, and `show`
+  gives the old model, accepted and live rules beside the new ones. Hub tool:
+  `qubes_propose_lead_firewall`. A `project-create` whose model no project uses
+  today, and a `project-lead` that gives the project a different model
+  endpoint, need the second tick too.
+- **`project lead --add-old-network`**: with `--keep-old`, adds the old lead's
+  network to the worker networks, so it keeps it. The `project-lead` proposal
+  takes `add_old_network`, and `project-create` and `project-lead` take
+  `model`; each is stored only when given, so a proposal 0.9.20 stored keeps
+  its fingerprint (but see the last item under Changed).
+- **The hub reads the registry** in `qmcp.GetPoolStats` (`gateways`: name,
+  anonymising, label), so it can propose networks by name; and reads name an
+  enrolled gateway where they used to say `<out-of-scope>`, with its addresses.
+  A lead sees its own worker networks named.
+- **The window**: a Gateways tab (the registry, every field of the selected
+  gateway, and forms to enroll, change and remove one); on a project and its
+  lead, the model endpoint and the accepted and live rules, with forms to set
+  the model or the rules (each showing the rules accepted now, live now and
+  after OK) or to accept the live rules (accepted and live); and the
+  `project-firewall` proposal with its rules one above the other. The project
+  and lead forms offer the enrolled gateways (one that no longer qualifies is
+  listed, marked and refused), take the lead's model endpoint, and offer
+  `--add-old-network` when the old lead is kept.
+- `qmcp settings` shows how many gateways are enrolled; `qmcp project list
+  --json` adds each project's model and accepted lead firewall.
+- **`tests/test_gateways.py`**, and policy matrix cases for leads' firewalls.
+
+### Changed
+
+- **BREAKING: every network an AI qube is given must be enrolled.** A
+  project's worker networks, a lead's network, and the hub's birth chain (the
+  source's network, the hub's own, then `/etc/qmcp/birth-egress`) take only
+  enrolled gateways; whether a network is enrolled is read from the registry
+  file, never by looking that name up. A gateway inside AI space no longer
+  qualifies by being there.
+- **BREAKING: the hub's spawns and clones are named `ai-hub-…`** (Qubes names
+  disposables), and `qmcp.GetPoolStats` gives the hub `ai-hub-` as its
+  `name_prefix`, and the bare prefix a project's names build on as
+  `reserved_prefix`. A name says which space created a qube: `ai-<label>-…` a
+  project's lead, `ai-hub-…` the hub. Existing qubes keep their names. The
+  hub's creates no longer read the project records.
+- **BREAKING: the hub can no longer write a lead's firewall.** The policy's
+  A1b denies it `admin.vm.firewall.Set` and `Reload` on a lead; it may still
+  read one. 27 precedence claims (was 26).
+- **`qmcp manage` and `qmcp guard` refuse a qube on a network that is not
+  enrolled** (a gateway's own upstream aside): `qmcp check` would fail on it.
+- **A network a member still sits on stays on its project's list:** taking it
+  off is refused until no member uses it.
+- **A promoted lead keeps its own network**, since no network moves:
+  `--lead-netvm` with `--lead-promote` takes only `none`, which disconnects it
+  (or the network the qube already has, which changes nothing), and
+  `lead_netvm` in a proposal only `none`.
+- **An AI qube's network that cannot be read is not taken for "no
+  network"**: `qmcp check` reports it as an error (INCOMPLETE), the commands
+  that decide on it refuse, and `qmcp list` shows it as `<unreadable>`.
+- **A kept old lead** (`project lead --keep-old`) keeps its network only when
+  the project lists it; otherwise it loses its network rather than the command
+  being refused, unless `--add-old-network` adds it.
+- **v0.9.16's `qmcp-egress-locked_*` is no longer carried to a created qube.**
+  Nothing reads it, since no network moves; a create strips it like every tag
+  in qmcp's vocabulary.
+- `projects.json` gains `model` and `lead_firewall`, written only when set, so
+  a record without them stays as 0.9.18 to 0.9.20 wrote it.
+- The installer stages the two new modules (`gateways`, `firewall`), refuses a
+  registry that does not load, and says when none is enrolled.
+- **A form says why OK is off where its command was**, under *OK is off:*, in
+  orange. Before, the command's line under *Runs:* went blank and the reason
+  appeared on the line below it, in the command's own style, where it could be
+  read as the command.
+- **Proposals still pending from 0.9.20:** a `project-create` that makes a lead
+  with a network has no model, so accepting it fails; a `project-lead` takes
+  the project's model if it has one by then; one that promotes a qube onto a
+  network no longer reads, and is closed with `qmcp proposal reject N`. The
+  hub can submit any of them again.
+
+### Fixed
+
+- `qmcp.GetPropertyAIManaged` could return a network address
+  (`visible_gateway`, `dns`, …) of a qube whose network could not be read,
+  without checking whose addresses they were; that read is now refused.
+- A network read that failed with qubesadmin's property-access error (an
+  `AttributeError`) could be taken for "no network": in the read-back of a
+  create asked for no network; in the source of a clone or disposable, which
+  then was born offline instead of refused; and in the hub's own network,
+  whose create then fell back to birth-egress. Every such read now fails the
+  call.
+- The same held for other qube reads in the dom0 library: tags that could not
+  be read were taken for none, and a failed read of `provides_network`,
+  `template`, `template_for_dispvms` or `default_dispvm` for its default. One
+  failure at the wrong moment could let the hub operate a guarded qube or
+  remove a lead, clone into p00, spawn without the template's `anon-vm`, or
+  slip past the pool cap; could make `qmcp revoke`, removing a lead or
+  deleting a project report success with badges left on the qube, `qmcp
+  manage` take in a gateway or a dump sink, and a new project reuse a slot
+  while a qube's tags could not be read; and could turn `qmcp check` GREEN.
+  Each such read now raises, and each decision takes its restrictive answer: a
+  service refuses (`read failed`, or as it refuses a qube that does not
+  exist), leaves the qube out of its list, or shows the value as
+  `<unreadable>`; a command refuses, stops, or goes on without what it could
+  not read, and reports the steps it completed; `qmcp check` reports an error
+  for each read it could not make; and `qmcp list` and the window show what
+  could not be read as `<unreadable>` (a power state as `NA` or `unknown`). A
+  qube qubesd says no longer exists is skipped where the fleet is counted. The new
+  `tests/test_strict_reads.py` fails the reads these decisions rest on, one at
+  a time, and refuses `getattr` with a default, `hasattr` and `_safe` on a
+  qube property in the dom0 library, and a `try` that swallows such a read
+  unless it is listed with its reason.
+- A project's default dump sink name could be no qube name (a label starting
+  with a digit makes `42-dump`), so the create failed only after its lead was
+  made, and a proposal for it failed at accept. Both are refused first now.
+
 ## [0.9.20] — 2026-10-04
 
 **Proposals (M2c): the hub asks, the operator accepts.** The hub may now ask for

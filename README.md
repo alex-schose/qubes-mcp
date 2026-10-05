@@ -18,16 +18,21 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.20 — proposals.** Besides the hub, up to 15 projects, each with
-its own lead agent that creates and runs its own workers inside the project's
-names, templates, networks and disk quota, and sees nothing outside it; a copy
-out of the project needs the operator's dialog. The operator runs it all from
-`qmcp-gui`, a window in dom0 that is the `qmcp` command with forms: every
-change it makes is a command it shows first. The hub may ask for a project, a
-change to one, a new lead or a deletion; nothing happens until the operator
-accepts it in dom0, in that window or with `qmcp proposal accept`. Next: gateways and anonymity (M3), other
-distributions (M4), sealed qubes (M5) and the complete GUI (1.0.0). 0.9.17
-replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+**Status: 0.9.21 — gateways and leads' firewalls.** Besides the hub, up to 15
+projects, each with its own lead agent that creates and runs its own workers
+inside the project's names, templates, networks and disk quota, and sees
+nothing outside it; a copy out of the project needs the operator's dialog.
+Every network an AI qube is given is a gateway the operator enrolled, and a
+lead's firewall, which dom0 writes to allow its model endpoint and DNS, nothing
+else, is the operator's.
+The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
+command with forms: every change it makes is a command it shows first. The hub
+may ask for a project, a change to one, a new lead, a lead's new firewall or a
+deletion; nothing happens until the operator accepts it in dom0, in that
+window or with `qmcp proposal accept`. Next: self-hosted model qubes and
+anonymous projects (the rest of M3), other distributions (M4), sealed qubes
+(M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
+0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -35,8 +40,8 @@ replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
   dom0 (trusted)
     30-mcp-control.policy     static rulebook, checked by qrexec's own parser at install
     qmcp.* services           one shared, fail-closed check; identity = the qrexec caller
-    qmcp (command)            the operator's tool: check, list, manage, guard, revoke,
-                              project, proposal, migrate
+    qmcp (command)            the operator's tool: check, list, gateway, manage, guard,
+                              revoke, project, proposal, migrate
         ▲  qrexec only
         │
   mcp-control (the hub)       MCP server, standard library only; reaches what dom0 allows
@@ -51,7 +56,8 @@ replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 - **AI space** is every qube carrying `ai-managed`. Everything else is
   invisible: a qube outside AI space answers exactly like one that does not
-  exist, and reads redact references to it. Three things still tell the hub
+  exist, and reads redact references to it, except the gateways the operator
+  enrolled, which the hub reads by name. Three things still tell the hub
   whether a name exists: a create colliding inside the reserved prefix; a
   proposal the operator accepted, which succeeds or fails; and a call to
   `@dispvm:<name>`, which Qubes refuses at once unless the name is a
@@ -66,20 +72,26 @@ replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
   and disk quota. Workers call no qmcp service, cannot reach their lead or
   the hub, and reach another project only by a copy through the operator's
   dialog. Copies inside a project, and into its dump sink, need no dialog.
-  What a project's qubes can reach is bounded by its egress, which you choose;
-  inside it the hub and the lead narrow with firewall rules.
+  What a project's workers can reach is bounded by the gateways you list for
+  it, which must be enrolled; inside that, the hub and the lead narrow each
+  worker's reach with its firewall rules. The lead's own reach is its
+  firewall, which is yours.
 - **Proposals.** The hub cannot create a project, change or remove a lead,
-  delete a project, or change a project's templates, networks or quota. It
+  delete a project, change a project's templates, networks or quota, or
+  change a lead's firewall. It
   may propose each of those, as the options of one `qmcp project` command,
   and the operator accepts or rejects it in dom0, in the window or with
   `qmcp proposal accept` or `reject`: accepting runs that command's own
   code, refused if the stored proposal is not the one shown. Removing a lead
   or a project, a network AI space does not use yet, promoting one of the
-  hub's qubes and an over-committed quota need a second tick. The hub learns
+  hub's qubes, an over-committed quota, a model endpoint no project uses,
+  giving a project a different model endpoint and every change to a lead's
+  firewall need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
-- **Creates** take only names the hub chooses inside a reserved prefix
-  (default `ai-`; Qubes names disposables itself), strip the qmcp badges a new
+- **Creates** take only names inside the caller's own space under a reserved
+  prefix (default `ai-`: the hub's `ai-hub-`, a lead's `ai-<label>-`; Qubes
+  names disposables itself), strip the qmcp badges a new
   qube must not carry, stamp it, and prove its network before handing it back.
 - **AI space cannot call dom0** beyond the services a qube needs to boot and
   keep its clock (a lead also calls nine qmcp services), cannot reach the hub
@@ -107,10 +119,10 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_props_set`, `qubes_feature_set` | label/memory/maxmem/vcpus, netvm only to none; features on an allowlist |
 | `qubes_run`, `qubes_copy` | run a command as root in a managed qube; copy a file out of one (operator dialog) |
 | `qubes_spawn_disposable`, `qubes_run_disposable` | disposables, or one command in a fresh disposable |
-| `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's |
+| `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's (a lead's is the operator's: propose it) |
 | `qubes_events` | a window of events for qubes in scope |
-| `qubes_get_pool_stats` | the caller's disk budget: AI space and every project's record for the hub, the project for a lead, with the names, templates and networks a lead may use |
-| `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a deletion |
+| `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use |
+| `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_lead_firewall`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a lead's new firewall, a deletion |
 | `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
 The hub and a lead run the same server and see the same tools; dom0 scopes
@@ -143,7 +155,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.20.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.21.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -153,7 +165,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 26 checked claims. It installs the policy last and ends with
+overrides its 27 checked claims. It installs the policy last and ends with
 `qmcp check`. Options: `--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`,
 `--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
@@ -162,20 +174,38 @@ keeps.
 It also installs **the operator's window**: *qubes-mcp* in the Qubes menu
 under Settings > Qubes Tools, or `qmcp-gui` in a dom0 terminal, run as your own
 user. It shows AI
-space and the projects as a tree, the `qmcp check` light, the audit log and the
+space and the projects as a tree, the gateways AI space may use, each lead's
+model endpoint and firewall, the `qmcp check` light, the audit log and the
 settings, and offers every command that changes something, but `migrate`, as
 a form. Each form shows the command it will run (`sudo -n qmcp ...`); the
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.17, 0.9.18 or 0.9.19? Install over it; nothing is retagged. Coming from 0.9.16?
+Coming from 0.9.17 to 0.9.20? Install over it; nothing is retagged. Then enroll
+the gateways AI space uses (step 3): the registry starts empty, and until then
+no AI qube can be given a network and `qmcp check` fails on every one (other
+than a gateway) that has one. A Whonix gateway cannot be enrolled: put AI
+qubes that sit directly on `sys-whonix` on a router in front of it
+(`qvm-prefs QUBE netvm ROUTER`), or clear their network. Then accept each
+lead's current firewall, or give it a model (`sudo qmcp project firewall NAME
+--accept-current` or `--model HOST:PORT`); `--accept-current` takes only rules
+in qmcp's format (no comment or expire, at most 32), so a lead with others
+needs `--model` or `--rule`. `qmcp check` warns until you do. The hub's spawns
+and clones must be named `ai-hub-…`.
+Coming from 0.9.16?
 Run the staged migration first; see "Install, migrate, uninstall" in
 [CLAUDE.md](CLAUDE.md).
 
 **3. AI space.** Agents run commands only in qubes whose template carries the
-two in-qube services. Install them into a template, then put it and your AI
-gateway in AI space:
+two in-qube services. Install them into a template and put it in AI space;
+then enroll the gateways AI qubes may sit on. Use a plain router of your own
+per kind of network (clearnet, Tor, a proxy, a VPN), in front of the qube that
+kind uses for your own work, named so it reads as yours: `sys-ai-net`,
+`sys-ai-tor`, `sys-ai-proxy`, `sys-ai-vpn`. A qube's own firewall rules are
+carried out by the qube directly above it, and only a router that passes its
+clients' traffic on carries them out: `sys-whonix` does not, so a Tor router
+goes in front of it, and a limit for all your Tor AI belongs inside that router.
 
 ```sh
 # in dom0
@@ -185,11 +215,16 @@ for s in qmcp.RunInAIManaged qmcp.CopyToAIManaged; do
     "cat > /etc/qubes-rpc/$s && chmod 0755 /etc/qubes-rpc/$s" < /tmp/qubes-mcp/template-rpc/$s
 done
 sudo qmcp manage ai-debian-13       # the hub may build on it; `guard` keeps it a reference only
-sudo qmcp guard ai-net-router       # a gateway is always guarded
-echo ai-net-router | sudo tee /etc/qmcp/birth-egress   # where template-based qubes go online
+qvm-create --class AppVM --template "$(qubes-prefs default_template)" --label red sys-ai-net
+qvm-prefs sys-ai-net provides_network True
+qvm-prefs sys-ai-net netvm sys-firewall
+sudo qmcp gateway enroll sys-ai-net --label clearnet   # AI qubes may sit on it
+echo sys-ai-net | sudo tee /etc/qmcp/birth-egress      # where the hub's template-based qubes go online
 ```
 
-The birth-egress file is needed unless the hub's own netvm is in AI space.
+`qmcp gateway list` shows what is enrolled and whether each is still usable,
+and marks a router whose upstream is a Whonix gateway. The birth-egress file is
+needed unless the hub's own netvm is enrolled.
 
 **4. Connect a client.** For Claude Code (`~/.claude.json`):
 
@@ -211,18 +246,33 @@ Reach the hub over a network you control (a tailnet, Headscale, WireGuard).
 *New project...* in the window, or in dom0, as root:
 
 ```sh
-sudo qmcp project create osint --lead-template ai-debian-13 --lead-netvm ai-net-router \
-  --network ai-net-router --network none --quota 40G --dump
+sudo qmcp project create osint --lead-template ai-debian-13 --lead-netvm sys-ai-net \
+  --model api.anthropic.com:443 --network sys-ai-net --network none --quota 40G --dump
 ```
 
-The lead is born as `ai-osint-lead`; its workers will be named `ai-osint-*`,
-built from the approved templates (the lead's own when it is in AI space, plus
+The lead is born as `ai-osint-lead`, with a firewall that allows its model
+endpoint, DNS and nothing else (`qmcp project firewall osint` shows it, and
+changes it); the qubes it creates will be named `ai-osint-*` (Qubes names
+disposables), built from the approved templates (the lead's own when it is in AI space, plus
 any `--template`), on the listed networks, inside the quota. `--lead-clone
 QUBE` copies one of the hub's own qubes that you prepared as an agent instead,
-and `--lead-promote QUBE` makes one of the hub's qubes the lead in place. Put the client in the lead as you did in the hub, give it its
-own model key, and connect its agent the same way. `qmcp project`, and the
-window, also edit, move qubes between slots, remove or change a lead, and
-delete a project.
+and `--lead-promote QUBE` makes one of the hub's qubes the lead in place.
+The lead's firewall lets it reach its model endpoint and DNS only, so it
+cannot fetch software, `git clone` included: its agent and qubes-mcp come from
+outside. Prepare both in one of the hub's qubes and make the lead with
+`--lead-clone` or `--lead-promote`. Or install the agent in the lead's
+template yourself, and copy qubes-mcp in from dom0, from step 2's tarball (if
+dom0 has restarted since, `/tmp` is empty: fetch it again as step 2 does):
+
+```sh
+qvm-run --pass-io ai-osint-lead \
+  'mkdir -p ~/qubes-mcp && tar -xzf - -C ~/qubes-mcp --strip-components=1' < /tmp/qmcp.tgz
+```
+
+Give the lead's agent its own model key. The agent runs in the lead, so its
+MCP client starts the server there (`cd ~/qubes-mcp && exec python3 -m
+qubes_mcp`), with no ssh. `qmcp project`, and the window, also edit, move
+qubes between slots, remove or change a lead, and delete a project.
 
 Or let the hub ask: its agent calls `qubes_propose_project` (or another
 `qubes_propose_*` tool), dom0 shows a notification, and you accept or reject
@@ -240,10 +290,16 @@ The policy suite runs every rule through qrexec's real parser (it needs
 rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
 `tests/project_suite.py` run in the hub against a real dom0; the last carries
 `tests/lead_seat.py` into a project's lead and runs it there. On a test
-machine running Qubes 4.3.1 they passed 38 of 38 checks, 30 of 30 probes and
-68 of 68 checks on 2026-10-02, the lead seat inside a lead made by an accepted
-proposal. `tests/test_proposals.py` covers proposals: who may submit, the
-store, the second tick, accepting and rejecting through the real commands.
+machine running Qubes 4.3.1 they passed 41 of 41 checks, 35 of 35 probes and
+69 of 69 checks on 2026-10-05, the lead seat inside a lead on an enrolled
+gateway whose firewall dom0 wrote from its model endpoint.
+`tests/test_strict_reads.py` fails qube reads one at a time, at each point a
+call makes them, and requires the restrictive answer: a failed read is never
+taken for "no tags", "no network" or "not a gateway".
+`tests/test_proposals.py` covers proposals: who may submit, the store, the
+second tick, accepting and rejecting through the real commands.
+`tests/test_gateways.py` covers the gateway registry, the networks AI qubes may
+be given and leads' firewalls.
 `tests/test_gui.py` drives the window's forms through the real `qmcp` command
 and fails if the command has a command, option or field the window neither
 offers nor exempts; `tests/GUI-CHECKLIST.md` is the click-through for a

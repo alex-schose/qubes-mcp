@@ -97,14 +97,18 @@ class PBase(ProjectBase):
 
 class Shape(unittest.TestCase):
     def test_every_type_normalises_to_a_fixed_point_with_every_key(self):
+        # (always, only when given): a field added in 0.9.21 joins the normal
+        # form only when given, so a proposal 0.9.20 stored reads back as itself.
         keys = {
-            "project-create": {"label", "lead", "lead_netvm", "lead_name", "templates", "networks",
-                               "quota", "dump"},
-            "project-edit": {"project", "add_templates", "remove_templates", "add_networks",
-                             "remove_networks", "default_network", "quota"},
-            "project-dump": {"project", "name"},
-            "project-lead": {"project", "remove", "lead", "lead_netvm", "lead_name", "keep_old"},
-            "project-delete": {"project"},
+            "project-create": ({"label", "lead", "lead_netvm", "lead_name", "templates", "networks",
+                                "quota", "dump"}, {"model"}),
+            "project-edit": ({"project", "add_templates", "remove_templates", "add_networks",
+                              "remove_networks", "default_network", "quota"}, set()),
+            "project-dump": ({"project", "name"}, set()),
+            "project-lead": ({"project", "remove", "lead", "lead_netvm", "lead_name", "keep_old"},
+                             {"model", "add_old_network"}),
+            "project-firewall": ({"project"}, {"model", "rules"}),
+            "project-delete": ({"project"}, set()),
         }
         samples = [
             create(), create(lead={"from": "promote", "qube": "ai-work2"}, lead_netvm="none",
@@ -119,11 +123,22 @@ class Shape(unittest.TestCase):
             {"type": "project-lead", "title": "t", "project": "osint", "keep_old": False,
              "lead": {"from": "clone", "qube": "ai-work2"}, "lead_name": "ai-osint-lead2"},
             {"type": "project-delete", "title": "t", "project": "other"},
+            create(lead_netvm="ai-net-router", model="api.anthropic.com:443"),
+            {"type": "project-lead", "title": "t", "project": "osint", "keep_old": True,
+             "add_old_network": True, "model": "api.anthropic.com:443",
+             "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_name": "ai-osint-lead2"},
+            {"type": "project-firewall", "title": "t", "project": "osint", "model": "h.example:8443"},
+            {"type": "project-firewall", "title": "t", "project": "osint",
+             "rules": ["action=accept proto=tcp dsthost=h.example dstports=443", "action=drop"]},
         ]
         self.assertEqual({s["type"] for s in samples}, set(proposals.TYPES))
         for req in samples:
             p = proposals.normalise(req, "ai-")
-            self.assertEqual(set(p), keys[p["type"]] | {"type", "title"}, req)
+            always, optional = keys[p["type"]]
+            self.assertTrue(always | {"type", "title"} <= set(p) <= always | optional | {"type", "title"},
+                            (req, set(p)))
+            self.assertEqual({k for k in optional if k in req and req[k] not in (None, False)},
+                             set(p) & optional, req)
             self.assertEqual(proposals.normalise(p), p, req)
             self.assertEqual(proposals.normalise(p, "ai-"), p, req)
 
@@ -190,6 +205,23 @@ class Shape(unittest.TestCase):
             with self.assertRaises(proposals.Invalid, msg=req) as ctx:
                 proposals.normalise(req, "ai-")
             self.assertIn(word, str(ctx.exception), req)
+
+    def test_a_default_sink_name_inside_the_prefix_is_refused_at_submit(self):
+        # A label such as "ai" makes the default sink "ai-dump", inside "ai-":
+        # the command refuses it at accept, so the submit refuses it, and says why.
+        for req in (create(label="ai", dump=True),
+                    {"type": "project-dump", "title": "t", "project": "ai"}):
+            with self.assertRaises(proposals.Invalid, msg=req) as ctx:
+                proposals.normalise(req, "ai-")
+            self.assertIn("ai-dump", str(ctx.exception))
+        # Without a sink, with a name, under another prefix or read back from a
+        # stored file (no prefix), nothing is refused.
+        proposals.normalise(create(label="ai", dump=False), "ai-")
+        proposals.normalise({"type": "project-dump", "title": "t", "project": "ai",
+                             "name": "box-ai"}, "ai-")
+        proposals.normalise(create(label="ai", dump=True), "x-")
+        proposals.normalise(create(label="ai", dump=True), None)
+        proposals.normalise({"type": "project-dump", "title": "t", "project": "p00"}, "ai-")
 
     def test_null_in_a_network_list_is_none(self):
         # The records and the hub's pool stats write no network as null; in a
@@ -623,6 +655,7 @@ class Accept(PBase):
                              "remove_networks": ["none"]})["id"]
         gone = self.submit({"type": "project-edit", "title": "t", "project": "osint",
                             "default_network": "ai-net-router"})["id"]
+        self.app.domains["ai-osint-w1"].netvm = None                 # off the network first
         fleet.edit_project(self.app, "osint", networks=["none"])     # the operator's own edit
         self.assertEqual(proposals.show(self.app, empty)["after"]["networks"], [])
         ok, report = self.accept(empty)
@@ -781,7 +814,8 @@ class AuditFixes(PBase):
         pid = self.submit({"type": "project-delete", "title": "t", "project": "osint"})["id"]
         ok, report = self.accept(pid, yes=True)
         self.assertFalse(ok)
-        self.assertIn("p01: NOT removed: ai-osint-w1: still present", report)
+        self.assertIn("p01: NOT removed: ai-osint-w1: still present; if it still runs, kill it by "
+                      "hand (qvm-kill ai-osint-w1)", report)
         self.assertEqual(self.status({"id": pid})["state"], "failed")
         rc, out, _ = self.cli("project", "delete", "other", "--yes")
         self.assertEqual(rc, 0, out)                       # a delete that completed exits 0
@@ -942,7 +976,7 @@ class OperatorLines(PBase):
             (("project", "move", "ai-work2", "p00"), "qmcp project move",
              {"qube": "ai-work2", "target": "p00", "yes": False}),
             (("project", "lead", "newp", "--remove"), "qmcp project lead",
-             {"project": "newp", "remove": True, "keep_old": False}),
+             {"project": "newp", "remove": True, "keep_old": False, "add_old_network": False}),
             (("project", "delete", "newp", "--yes"), "qmcp project delete", {"project": "newp"}),
             (("guard", "ai-on-operator-tpl"), "qmcp guard", {"qube": "ai-on-operator-tpl"}),
             (("manage", "ai-on-operator-tpl"), "qmcp manage", {"qube": "ai-on-operator-tpl"}),

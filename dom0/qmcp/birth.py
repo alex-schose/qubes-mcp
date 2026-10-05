@@ -14,23 +14,28 @@ stays detectable; `qmcp check` reports such qubes.
 `admin.vm.CreateDisposable` copies the disposable template's, so a created
 qube must not be assumed clean. `stamp()` adds what the child must carry —
 the umbrella, a provenance badge and, for a workload, the creator's slot
-badge — carries restrictions forward, removes every other tag in our
-controlled vocabulary (`qmcp-guarded` included: a child spawned from a guarded
-template is managed; and every role and slot badge, so a clone of a lead or
-of another project's member is neither), and then reads the tags back and
+badge — carries the platform's Whonix marker forward, removes every other tag
+in our controlled vocabulary (`qmcp-guarded` included: a child spawned from a
+guarded template is managed; every role and slot badge, so a clone of a lead or
+of another project's member is neither; and v0.9.16's `qmcp-egress-locked_*`,
+which nothing reads since no network moves), and then reads the tags back and
 asserts the exact result, both ways. The caller rolls the qube back if it
 raises. Tags outside our vocabulary (the operator's own, `created-by-*`) are
 left alone.
 
-**Birth network.** First match wins:
+**Birth network** (the hub's creates; a lead's follow its project's list).
+A hub request for no network is always granted (`services._birth_netvm`).
+Otherwise first match wins; every answer but "no network" is an enrolled
+gateway (`qmcp.gateways`), and a network that cannot be read refuses the
+create:
   1. the creation source's netvm, when the source answers for itself — a
-     clone source or a disposable template, including "no network";
-  2. the calling principal's netvm, when that netvm is in AI space;
-  3. `/etc/qmcp/birth-egress`, operator-owned;
+     clone source or a disposable template, including "no network"; a
+     source on a network that is not enrolled refuses the create;
+  2. the hub's own netvm, if it is enrolled;
+  3. `/etc/qmcp/birth-egress`, operator-owned, if it is enrolled;
   4. refuse the create.
 A TemplateVM used as the base of a spawn does not answer for itself: its
-netvm is an update path, not a workload's network. The gateway registry
-replaces rows 2 and 3 in M3.
+netvm is an update path, not a workload's network.
 
 qubesd's tag validator accepts only letters, digits, `-` and `_` (measured
 2026-08-18), which is why the separator is `_`.
@@ -39,11 +44,14 @@ from __future__ import annotations
 
 import re
 
-from qmcp.core import GUARDED, UMBRELLA, in_scope, lookup
+from qmcp import gateways
+from qmcp.core import GUARDED, UMBRELLA
 
 SEP = "_"
 NAMESPACE = "qmcp-"
 OWNER_PREFIX = f"{NAMESPACE}owner{SEP}"
+#: v0.9.16's egress lock. Nothing reads it since no network moves, so it is no
+#: longer carried to a child: like every tag in our vocabulary, a create strips it.
 EGRESS_LOCK_PREFIX = f"{NAMESPACE}egress-locked{SEP}"
 
 #: The v0.9.16 tier tags. No longer meaningful, but a child must never carry
@@ -53,7 +61,6 @@ LEGACY_TIER_TAGS = frozenset({"ai-exec", "ai-net", "ai-full"})
 #: Restrictions a child inherits unconditionally. `anon-vm` is the platform's
 #: Whonix marker: losing it on a clone would be a deanonymisation event.
 RESTRICTION_TAGS = frozenset({"anon-vm"})
-RESTRICTION_PREFIXES = (EGRESS_LOCK_PREFIX,)
 
 NAME_PREFIX_PATH = "/etc/qmcp/name-prefix"
 DEFAULT_NAME_PREFIX = "ai-"
@@ -132,7 +139,7 @@ def controlled(tag: str) -> bool:
 
 
 def is_restriction(tag: str) -> bool:
-    return tag in RESTRICTION_TAGS or tag.startswith(RESTRICTION_PREFIXES)
+    return tag in RESTRICTION_TAGS
 
 
 def expected_tags(source_tags, principal: str, slot_badge: str | None = None) -> set:
@@ -175,39 +182,44 @@ def _name(value):
 
 
 def resolve_egress(app, caller_vm, source_vm, source_authoritative: bool,
-                   path: str | None = None):
+                   path: str | None = None, registry_path: str | None = None):
     """(netvm name or None, rule). Branch on the RULE: `unresolved` means
-    refuse; `source-offline` is a resolved answer of "no network"."""
-    def _in_ai_space(name) -> bool:
-        vm = lookup(app, name)
-        return vm is not None and in_scope(vm)
+    refuse; `source-offline` is a resolved answer of "no network". Every
+    network answer is an enrolled gateway, judged from the registry file alone."""
+    enrolled = gateways.enrolled_names(registry_path)
 
     if source_authoritative:
         # A clone source or a disposable template answers for itself, "none"
-        # included; a network outside AI space is refused rather than
+        # included; a network that is not enrolled is refused rather than
         # re-homed. A TemplateVM base never gets here: its netvm is an update
-        # path, so an AI-space netvm on a template must not decide a child's
-        # network (v0.9.16's code let it, against its own documentation).
+        # path, so a template's netvm must not decide a child's network
+        # (v0.9.16's code let it, against its own documentation).
         try:
-            src = _name(getattr(source_vm, "netvm", None))
+            src = _name(source_vm.netvm)
         except Exception:
             return None, "unresolved"
         if src is None:
             return None, "source-offline"
-        return (src, "source") if _in_ai_space(src) else (None, "unresolved")
+        return (src, "source") if src in enrolled else (None, "unresolved")
 
     try:
-        own = _name(getattr(caller_vm, "netvm", None)) if caller_vm is not None else None
+        own = _name(caller_vm.netvm) if caller_vm is not None else None
     except Exception:
-        own = None
-    if own and _in_ai_space(own):
+        # A failed read is not "no network of its own": refuse rather than
+        # fall through to the configured one.
+        return None, "unresolved"
+    if own and own in enrolled:
         return own, "principal"
 
-    try:
-        with open(BIRTH_EGRESS_PATH if path is None else path, encoding="utf-8") as fh:
-            configured = fh.read(256).split("#", 1)[0].strip()
-    except OSError:
-        configured = ""
-    if configured and _in_ai_space(configured):
+    configured = read_birth_egress(path)
+    if configured and configured in enrolled:
         return configured, "configured"
     return None, "unresolved"
+
+
+def read_birth_egress(path: str | None = None) -> str:
+    try:
+        with open(BIRTH_EGRESS_PATH if path is None else path, encoding="utf-8") as fh:
+            return fh.read(256).split("#", 1)[0].strip()
+    except OSError:
+        return ""

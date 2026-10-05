@@ -15,10 +15,19 @@ hub) or GUARDED (`qmcp-guarded`, or a gateway: listed, read and referenced,
 never operated). Everything a principal may not see answers exactly like a
 qube that does not exist, at the same cost.
 
-Every check here fails closed. An unreadable tag set is out of scope, an
-unreadable `provides_network` is guarded, a missing hub file means no caller
-is the hub, an unreadable project record means no caller is a lead, and a
-missing runtime directory refuses the call.
+Every check here fails closed. A read of a qube that fails is never an
+answer: `tags_of`, `is_gateway` and the readers beside them raise
+`Unreadable`, and each decision turns that into its restrictive answer
+(refused, guarded, in use). `tags_of` raises `Gone`, a kind of `Unreadable`,
+when qubesd says the qube no longer exists. A property read cannot tell that
+apart from a failed read: qubesadmin turns the answer into its property-access
+error. `lookup` and the by-name checks answer None or False instead, which
+`_resolve` and `_resolve_member` refuse. qubesadmin's property errors are
+AttributeErrors, so a property is never read with a default (`getattr(vm, "x",
+default)` would return the default for a failed read);
+`tests/test_strict_reads.py` refuses the pattern. A missing hub
+file means no caller is the hub, an unreadable project record means no caller
+is a lead, and a missing runtime directory refuses the call.
 """
 from __future__ import annotations
 
@@ -32,6 +41,10 @@ from qmcp import projects
 
 UMBRELLA = "ai-managed"
 GUARDED = "qmcp-guarded"
+
+#: A value that could not be read, where one is shown: never a qube name or a
+#: state, so nothing that reads it can take it for none.
+UNREADABLE = "<unreadable>"
 
 HUB_PATH = "/etc/qmcp/hub"
 RUN_DIR = "/run/qmcp"
@@ -55,6 +68,18 @@ _QUBE_NAME_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 NOT_FOUND = {"ok": False, "error": "not found"}
 GUARDED_REFUSAL = {"ok": False, "error": "guarded: reference only"}
 NOT_AUTHORIZED = {"ok": False, "error": "caller is not a qmcp principal"}
+
+
+class Unreadable(Exception):
+    """A read of a qube that failed. Never an answer: each caller turns it into
+    its restrictive one."""
+
+
+class Gone(Unreadable):
+    """qubesd says the qube no longer exists (qubesadmin's
+    QubesVMNotFoundError, a KeyError): one removed after the domain list was
+    read, which disposables often are. A loop over the fleet may skip it: it
+    holds no disk and wears no badge. A decision about that qube refuses."""
 
 
 class Refusal(Exception):
@@ -210,34 +235,111 @@ def acquire_call_slot(caller_name: str, run_dir: str | None = None,
 # ------------------------------------------------------------------ the states
 
 def tags_of(vm) -> set:
+    """A qube's tags, one qubesd read. Raises `Unreadable`: tags that could
+    not be read are not "no tags", which would read as outside AI space,
+    unguarded and wearing no badge."""
     try:
         return set(vm.tags)
+    except KeyError:
+        raise Gone(f"{name_of(vm)} no longer exists") from None
     except Exception:
-        return set()
+        raise Unreadable(f"cannot read the tags of {name_of(vm)}") from None
+
+
+def name_of(vm) -> str:
+    """A qube's name, for messages. qubesadmin keeps it on the object (its
+    `name` property returns the name it was made with), so it is no qubesd
+    read."""
+    try:
+        return str(vm.name)
+    except Exception:
+        return "?"
 
 
 def in_scope(vm) -> bool:
     return UMBRELLA in tags_of(vm)
 
 
-def is_gateway(vm) -> bool:
-    """A qube that provides network. Unreadable counts as yes."""
+def klass_of(vm) -> str:
     try:
-        return bool(getattr(vm, "provides_network", False))
+        return vm.klass
     except Exception:
+        raise Unreadable(f"cannot read the class of {name_of(vm)}") from None
+
+
+#: Classes without a network (Qubes' NetVMMixin): no `netvm`, no
+#: `provides_network`, no `default_dispvm` either for a RemoteVM.
+NO_NETWORK_CLASSES = frozenset({"AdminVM", "RemoteVM"})
+
+
+def is_gateway(vm) -> bool:
+    """A qube that provides network. Raises `Unreadable` when that cannot be
+    read: the caller decides which answer is the restrictive one. dom0 and a
+    RemoteVM have no such property and are no gateway."""
+    if klass_of(vm) in NO_NETWORK_CLASSES:
+        return False
+    try:
+        return bool(vm.provides_network)
+    except Exception:
+        raise Unreadable(f"cannot read whether {name_of(vm)} provides network") from None
+
+
+def is_dvmt(vm) -> bool:
+    """A disposable template. Only an AppVM or a StandaloneVM can be one; for
+    those the flag is read, and a failed read raises `Unreadable`."""
+    if klass_of(vm) not in ("AppVM", "StandaloneVM"):
+        return False
+    try:
+        return bool(vm.template_for_dispvms)
+    except Exception:
+        raise Unreadable(f"cannot read whether {name_of(vm)} is a disposable template") from None
+
+
+def is_template(vm) -> bool:
+    """A TemplateVM or a disposable template. Raises `Unreadable`."""
+    return klass_of(vm) == "TemplateVM" or is_dvmt(vm)
+
+
+def template_of(vm):
+    """The qube's template (a disposable's is its disposable template), or None
+    for a class that has none. Raises `Unreadable`."""
+    if klass_of(vm) not in ("AppVM", "DispVM"):
+        return None
+    try:
+        return vm.template
+    except Exception:
+        raise Unreadable(f"cannot read the template of {name_of(vm)}") from None
+
+
+def default_dispvm_of(vm):
+    """The qube's default disposable template, or None. Every local class has
+    the property, so a failed read is never an absence: it raises
+    `Unreadable`. A RemoteVM has none."""
+    if klass_of(vm) == "RemoteVM":
+        return None
+    try:
+        return vm.default_dispvm
+    except Exception:
+        raise Unreadable(f"cannot read the default disposable template of {name_of(vm)}") from None
+
+
+def is_guarded(vm, tags=None) -> bool:
+    """Guarded = badged by the operator, or a gateway (always guarded). A read
+    that fails counts as guarded, so it never makes a qube operable."""
+    try:
+        return GUARDED in (tags_of(vm) if tags is None else tags) or is_gateway(vm)
+    except Unreadable:
         return True
 
 
-def is_guarded(vm) -> bool:
-    """Guarded = badged by the operator, or a gateway (always guarded)."""
-    return GUARDED in tags_of(vm) or is_gateway(vm)
-
-
 def state(vm) -> str | None:
-    """'managed', 'guarded', or None for anything outside AI space."""
-    if not in_scope(vm):
+    """'managed', 'guarded', or None for anything outside AI space, from one
+    tag read. Raises `Unreadable` when the tags cannot be read; a qube whose
+    network role cannot be read is guarded."""
+    tags = tags_of(vm)
+    if UMBRELLA not in tags:
         return None
-    return "guarded" if is_guarded(vm) else "managed"
+    return "guarded" if is_guarded(vm, tags) else "managed"
 
 
 def lookup(app, name):
@@ -279,13 +381,17 @@ def _resolve(app, name, refusal: "Refusal"):
     if not in_ai_space_by_name(app, name):
         raise refusal
     vm = lookup(app, name)
-    if vm is None or not in_scope(vm):
-        raise refusal
+    try:
+        if vm is None or not in_scope(vm):
+            raise refusal
+    except Unreadable:
+        raise refusal from None
     return vm
 
 
 def is_member(vm, slot: str) -> bool:
-    """In AI space, wearing `slot`'s member badge, and not a lead."""
+    """In AI space, wearing `slot`'s member badge, and not a lead. Raises
+    `Unreadable`."""
     tags = tags_of(vm)
     return (UMBRELLA in tags and projects.member_badge(slot) in tags
             and projects.LEAD not in tags)
@@ -308,23 +414,34 @@ def _resolve_member(app, name, slot: str, refusal: "Refusal"):
     if not member_by_name(app, name, slot):
         raise refusal
     vm = lookup(app, name)
-    if vm is None or not is_member(vm, slot):
-        raise refusal
+    try:
+        if vm is None or not is_member(vm, slot):
+            raise refusal
+    except Unreadable:
+        raise refusal from None
     return vm
 
 
-def visible(vm, who: "Principal | None") -> bool:
-    """May `who` see this qube in a list, a read or a reference?
+def visible(vm, who: "Principal | None", tags=None) -> bool:
+    """May `who` see this qube in a list, a read or a reference? `tags`, when
+    the caller read them already.
 
     The hub sees AI space. A lead sees its members, its approved templates and
-    its worker networks, all inside AI space."""
-    if not in_scope(vm):
+    its worker networks, all inside AI space. A qube whose tags cannot be read
+    is not seen."""
+    if tags is None:
+        try:
+            tags = tags_of(vm)
+        except Unreadable:
+            return False
+    if UMBRELLA not in tags:
         return False
     if who is None or who.is_hub():
         return True
     p = who.project
-    name = getattr(vm, "name", None)
-    return is_member(vm, p.slot) or name in p.templates or name in p.named_networks()
+    name = name_of(vm)
+    return (projects.member_badge(p.slot) in tags and projects.LEAD not in tags) \
+        or name in p.templates or name in p.named_networks()
 
 
 def operand(app, name, who: Principal):

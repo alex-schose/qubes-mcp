@@ -4,7 +4,9 @@
     qmcp list [--all] [--json]     AI space: state, class, template, network, slot, owner
     qmcp settings [--json]         the operator files and the disk AI space uses
     qmcp manage|guard|revoke QUBE  role actions
-    qmcp project ...               projects: list, show, create, edit, lead, dump, move, delete
+    qmcp gateway ...               the networks AI space may use: list, enroll, set, remove
+    qmcp project ...               projects: list, show, create, edit, lead, firewall, dump,
+                                   move, delete
     qmcp proposal ...              the hub's proposals: list, show, accept, reject
     qmcp migrate [--apply] ...     move a v0.9.16 tiered fleet to two states
     qmcp audit verify|tail [N]|rotate   the hash-chained record of state changes
@@ -13,9 +15,10 @@
 The operator's window, `qmcp-gui`, runs these same commands: reads as you,
 changes under `sudo -n`.
 
-Run it as root, or as a member of the `qubes` group. The project commands that
-change anything write /etc/qmcp/projects.json or take its lock, so they need
-root; so do accepting and rejecting a proposal.
+Run it as root, or as a member of the `qubes` group. The project and gateway
+commands that change anything write /etc/qmcp/projects.json or
+/etc/qmcp/gateways.json, or take the records' lock, so they need root; so do
+accepting and rejecting a proposal.
 
 Every command that changes something leaves one line on the audit chain, as
 caller "operator": the command, the names it acts on and its options, a quota
@@ -95,13 +98,58 @@ def cmd_role(args) -> int:
     except fleet.RoleError as e:
         print(f"qmcp {args.cmd}: {e}", file=sys.stderr)
         return 1
+    except Exception as e:
+        print(f"qmcp {args.cmd}: {type(e).__name__}", file=sys.stderr)
+        return 1
     return 0
 
 
-def _need_root(what: str) -> None:
+def _need_root(what: str, command: str = "project") -> None:
     if os.geteuid() != 0:
-        raise SystemExit(f"qmcp project {what}: run as root (sudo qmcp project {what} ...); "
-                         f"it writes {projects.PROJECTS_PATH} or takes its lock")
+        raise SystemExit(f"qmcp {command} {what}: run as root (sudo qmcp {command} {what} ...); "
+                         f"it writes /etc/qmcp or takes the records' lock")
+
+
+def cmd_gateway(args) -> int:
+    what = args.what
+    try:
+        if what == "list":
+            rows = fleet.gateway_rows(_app())
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            for r in rows:
+                notes = [n for n in (
+                    "anonymising" if r["anonymising"] else "",
+                    f"label '{r['label']}'" if r["label"] else "",
+                    f"upstream {r['upstream'] or 'none'}",
+                    "upstream ignores its firewall rules" if r["upstream_ignores_firewall"] is True
+                    else "whether its upstream ignores its firewall rules cannot be read"
+                    if r["upstream_ignores_firewall"] == fleet.UNREADABLE
+                    else "",
+                    f"NOT USABLE: {r['problem']}" if r["problem"] else "",
+                    f"used by {len(r['used_by'])} qube(s)",
+                    f"listed by {', '.join(r['projects'])}" if r["projects"] else "") if n]
+                print(f"{r['name']}: {'; '.join(notes)}")
+            if not rows:
+                print("no gateway enrolled")
+            return 0
+        _need_root(what, "gateway")
+        app = _app()
+        if what == "enroll":
+            print(fleet.enroll_gateway(app, args.qube, args.anonymising, args.label or ""))
+        elif what == "set":
+            anon = None if args.anonymising is None else args.anonymising == "yes"
+            print(fleet.set_gateway(app, args.qube, anon, args.label))
+        else:
+            print(fleet.remove_gateway(app, args.qube))
+    except (fleet.RoleError, RuntimeError) as e:
+        print(f"qmcp gateway {what}: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"qmcp gateway {what}: {type(e).__name__}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _lead_source(args):
@@ -125,13 +173,33 @@ def cmd_project(args) -> int:
                 used = "?" if r["used"] is None else f"{r['used'] / 1024 ** 3:.1f}"
                 quota = "-" if r["quota"] is None else f"{r['quota'] / 1024 ** 3:.1f}"
                 print(f"{r['slot']}  {r['label'] or '(hub)':8s}  lead={r['lead'] or '-'}  "
-                      f"members={r['members']}  disk={used}/{quota} GiB  sink={r['dump'] or '-'}")
+                      f"members={'?' if r['members'] is None else r['members']}  "
+                      f"disk={used}/{quota} GiB  sink={r['dump'] or '-'}")
             return 0
         if what == "show":
             p = projects.find(fleet._load_records(), args.name)
             if p is None:
                 raise fleet.ProjectError(f"no project '{args.name}'")
             print(json.dumps(dict(p.to_json(), slot=p.slot), indent=2))
+            return 0
+        if what == "firewall" and args.model is None and not args.rule and not args.accept_current:
+            # Reading needs no root: the window shows it beside the lead.
+            view = fleet.lead_firewall_view(app, fleet._load_records(), args.name)
+            if args.json:
+                print(json.dumps(view, indent=2))
+                return 0
+            print(f"{view['slot']} {view['project']}: lead {view['lead'] or '-'}, "
+                  f"model {view['model'] or '-'}")
+            for title, rules in (("accepted", view["accepted"]), ("live", view["live"])):
+                if rules:
+                    print(f"{title}:")
+                    for r in rules:
+                        print(f"  {r}")
+                elif title == "accepted":
+                    print("accepted: none on record")
+                else:
+                    print(f"live: {'unreadable (' + view['read_error'] + ')' if view['read_error'] else 'none'}")
+            print("same" if view["same"] else "DIFFERENT, or not both known")
             return 0
         if what == "delete" and not args.yes:
             # The plan changes nothing and reads only the records and the qube
@@ -150,7 +218,7 @@ def cmd_project(args) -> int:
                                          "--lead-clone or --lead-promote")
             report = fleet.create_project(app, args.name, source, origin, args.template or (),
                                           args.network or (), args.quota, args.lead_netvm,
-                                          args.dump, args.lead_name)
+                                          args.dump, args.lead_name, args.model)
         elif what == "edit":
             report = fleet.edit_project(app, args.name, args.template, args.network, args.quota)
         elif what == "lead":
@@ -162,7 +230,11 @@ def cmd_project(args) -> int:
                     raise fleet.ProjectError("--remove, or a new lead: --lead-template, "
                                              "--lead-clone or --lead-promote")
                 report = fleet.set_lead(app, args.name, source, origin, args.lead_netvm,
-                                        args.keep_old, args.lead_name)
+                                        args.keep_old, args.lead_name, args.model,
+                                        args.add_old_network)
+        elif what == "firewall":
+            report = fleet.set_lead_firewall(app, args.name, args.model, args.rule or None,
+                                             args.accept_current)
         elif what == "dump":
             report = fleet.add_dump(app, args.name, args.sink_name)
         elif what == "move":
@@ -249,6 +321,10 @@ def _add_lead_options(p) -> None:
     p.add_argument("--lead-promote", metavar="QUBE", help="make one of the hub's AppVMs the lead, in place")
     p.add_argument("--lead-netvm", metavar="QUBE|none", help="the lead's network (a fresh lead is born on it)")
     p.add_argument("--lead-name", metavar="NAME", help="a fresh lead's name (default: <space>lead)")
+    p.add_argument("--model", metavar="HOST:PORT",
+                   help="the lead's model endpoint: dom0 writes its firewall to allow that "
+                        "endpoint and DNS, nothing else (needed for a lead with a network, "
+                        "unless the project already has one)")
 
 
 def _choices(pairs) -> dict:
@@ -327,6 +403,20 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("qube")
         if name == "revoke":
             p.add_argument("--no-shutdown", action="store_true")
+    p = sub.add_parser("gateway", help="the networks AI space may use")
+    gsub = p.add_subparsers(dest="what", required=True)
+    q = gsub.add_parser("list", help="every enrolled gateway, and whether it is still usable")
+    q.add_argument("--json", action="store_true")
+    q = gsub.add_parser("enroll", help="let AI space use a gateway (root)")
+    q.add_argument("qube")
+    q.add_argument("--anonymising", action="store_true", help="it reaches the network anonymously (Tor)")
+    q.add_argument("--label", metavar="TEXT", help="a label, e.g. a jurisdiction (40 characters)")
+    q = gsub.add_parser("set", help="change an enrolled gateway's flag or label (root)")
+    q.add_argument("qube")
+    q.add_argument("--anonymising", choices=("yes", "no"))
+    q.add_argument("--label", metavar="TEXT")
+    q = gsub.add_parser("remove", help="stop AI space using a gateway (root; refused while in use)")
+    q.add_argument("qube")
     p = sub.add_parser("project", help="projects: a lead and its workers in one of 15 slots")
     psub = p.add_subparsers(dest="what", required=True)
     q = psub.add_parser("list", help="every slot in use")
@@ -352,6 +442,21 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--remove", action="store_true", help="remove the lead; the project and its workers stay")
     _add_lead_options(q)
     q.add_argument("--keep-old", action="store_true", help="keep the old lead as a worker of the project")
+    q.add_argument("--add-old-network", action="store_true",
+                   help="with --keep-old: add the old lead's network to the worker networks; "
+                        "without it, an old lead on an unlisted network loses its network")
+    q = psub.add_parser("firewall", help="a lead's firewall: show it, or change it (root)")
+    q.add_argument("name", help="label or slot")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--model", metavar="HOST:PORT",
+                   help="a new model endpoint for a lead with a network; its firewall becomes "
+                        "that endpoint and DNS, nothing else")
+    q.add_argument("--rule", action="append", metavar="RULE",
+                   help="set exactly these rules, in qubesd's format, e.g. "
+                        "'action=accept proto=tcp dsthost=example.com dstports=443' (repeatable)")
+    q.add_argument("--accept-current", action="store_true",
+                   help="record the lead's current rules as accepted, if they are in qmcp's rule "
+                        "format (no comment or expire, at most 32); the qube does not change")
     q = psub.add_parser("dump", help="create a dump sink for a project or p00 (root)")
     q.add_argument("name", help="label, slot, or p00")
     q.add_argument("--name", dest="sink_name", metavar="NAME")
@@ -412,11 +517,21 @@ def operator_line(args):
         if c == "revoke":
             summary["no_shutdown"] = bool(args.no_shutdown)
         return f"qmcp {c}", summary
+    if c == "gateway":
+        if args.what == "list":
+            return None
+        summary = {"qube": str(args.qube)[:128]}
+        if args.what in ("enroll", "set"):
+            summary["anonymising"] = args.anonymising if args.what == "set" else bool(args.anonymising)
+            summary["label"] = None if args.label is None else str(args.label)[:128]
+        return f"qmcp gateway {args.what}", summary
     if c == "migrate" and args.apply:
         return "qmcp migrate", {"map": _names(args.map), "exec_default": args.exec_default,
                                 "compat_default": args.compat_default}
     if c != "project" or args.what in ("list", "show") or \
-            (args.what == "delete" and not args.yes):
+            (args.what == "delete" and not args.yes) or \
+            (args.what == "firewall" and args.model is None and not args.rule
+             and not args.accept_current):
         return None
     w = args.what
     summary = {"project": str(args.name)[:128]}
@@ -424,7 +539,7 @@ def operator_line(args):
         source, origin = _lead_source(args)
         if source:
             summary[f"lead_{source}"] = str(origin)[:128]
-        for key in ("lead_netvm", "lead_name"):
+        for key in ("lead_netvm", "lead_name", "model"):
             if getattr(args, key) is not None:
                 summary[key] = str(getattr(args, key))[:128]
     if w == "create":
@@ -440,7 +555,11 @@ def operator_line(args):
         if args.quota is not None:
             summary["quota"] = "set"
     elif w == "lead":
-        summary.update({"remove": bool(args.remove), "keep_old": bool(args.keep_old)})
+        summary.update({"remove": bool(args.remove), "keep_old": bool(args.keep_old),
+                        "add_old_network": bool(args.add_old_network)})
+    elif w == "firewall":
+        summary.update({"model": None if args.model is None else str(args.model)[:128],
+                        "rules": len(args.rule or ()), "accept_current": bool(args.accept_current)})
     elif w == "dump":
         summary["name"] = None if args.sink_name is None else str(args.sink_name)[:128]
     elif w == "move":
@@ -461,7 +580,7 @@ def main(argv=None) -> int:
         return 0
     handler = {"check": cmd_check, "list": cmd_list, "settings": cmd_settings,
                "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
-               "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
+               "gateway": cmd_gateway, "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
                "audit": cmd_audit}[args.cmd]
     line = operator_line(args)
     if line is None:

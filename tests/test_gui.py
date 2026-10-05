@@ -20,6 +20,11 @@ Four guarantees, each with a test that fails when it breaks:
 - **A proposal runs only as it was read**: accepted with the fingerprint of the
   `proposal show` on display, with the second tick when the command asks for
   one, and never from a show that failed (`ProposalModel`, `Widgets`).
+- **A lead's firewall is shown as it was read**: rules that could not be read
+  are never an empty list, a form that changes them shows them now and after,
+  and runs only while the view it was opened on still reads the same
+  (`FirewallModel`, `Widgets`). The forms offer only enrolled gateways
+  (`GatewayModel`, `LeadModel`).
 
 The GTK tests build widgets without showing them, and are skipped where GTK
 cannot start (no PyGObject, or no display).
@@ -43,16 +48,20 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, cli, fleet, projects, proposals  # noqa: E402
+from qmcp import audit, cli, firewall, fleet, gateways, projects, proposals  # noqa: E402
 from qmcp import guimodel as gm  # noqa: E402
-from fakequbes import GiB  # noqa: E402
+from fakequbes import GiB, _qubesd_rule  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, OTHER_LEAD, ProjectBase  # noqa: E402
 
 GUI_SRC = HERE.parent / "dom0" / "qmcp" / "gui.py"
 MODEL_SRC = HERE.parent / "dom0" / "qmcp" / "guimodel.py"
-#: One proposal of every type the hub can submit, each valid on the projects
-#: fixture. Only the delete needs the second tick there.
+#: Rules a lead-firewall proposal sets, as the hub sends them.
+RULES = ["action=accept proto=tcp dsthost=example.com dstports=443",
+         "action=accept specialtarget=dns", "action=drop"]
+#: One proposal of every type the hub can submit, and every option, each
+#: valid on the projects fixture. The delete and the two lead-firewall ones
+#: need the second tick there.
 PROPOSALS = {
     "create": {"type": "project-create", "title": "new project <b>newp</b>", "label": "newp",
                "lead": {"from": "template", "qube": "ai-debian-13"},
@@ -65,6 +74,14 @@ PROPOSALS = {
              "lead": {"from": "clone", "qube": "ai-work2"}, "lead_name": "ai-other-boss",
              "keep_old": True},
     "delete": {"type": "project-delete", "title": "remove osint", "project": "osint"},
+    "rules": {"type": "project-firewall", "title": "example.com for osint's lead",
+              "project": "osint", "rules": RULES},
+    "model": {"type": "project-firewall", "title": "a model for osint's lead", "project": "osint",
+              "model": "api.anthropic.com:443"},
+    "netlead": {"type": "project-lead", "title": "a networked lead for osint", "project": "osint",
+                "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_netvm": "ai-net-router",
+                "lead_name": "ai-osint-boss", "keep_old": True, "add_old_network": True,
+                "model": "api.anthropic.com:443"},
 }
 HOSTILE = "ai-x\u202egnp.exe\nFAKE ok:true <b>bold</b> &amp; \x00\x7f\u200b\x1b[31m"
 
@@ -165,6 +182,30 @@ class GuiBase(ProjectBase):
 
     def show(self, pid):
         return gm.parse_proposal(self.runner.execute(gm.show_proposal(pid)), pid)
+
+    def routers(self):
+        """The operator's own routers, outside AI space and not enrolled:
+        sys-ai-net behind sys-firewall, and sys-ai-tor behind a Whonix
+        gateway, which wears Whonix's own tag. Both on a template that
+        advertises Qubes' firewall marker."""
+        a = self.app
+        a.domains["debian-13"].features["qubes-firewall"] = "1"
+        fw = a.domains["sys-firewall"]
+        a.vm("sys-ai-net", provides_network=True, netvm=fw, template=a.domains["debian-13"])
+        a.vm("sys-whonix", provides_network=True, netvm=fw, tags={"anon-gateway"},
+             features={"qubes-firewall": "1"})
+        a.vm("sys-ai-tor", provides_network=True, netvm=a.domains["sys-whonix"],
+             template=a.domains["debian-13"])
+
+    def gateways(self):
+        return self.read_json("gateway", "list", "--json")
+
+    def view(self, key="osint"):
+        """The lead firewall of a project, as the window reads it."""
+        return gm.parse_firewall(self.runner.execute(gm.show_lead_firewall(key)), key)
+
+    def lead_rules(self, name=LEAD):
+        return list(self.app.domains[name].__dict__["_firewall"])
 
 
 # ======================================================================= escaping
@@ -283,13 +324,19 @@ SAMPLES = {
              quota="1G"),
         dict(label="newr", lead_source="promote", lead_origin="ai-work2", networks=["none"],
              quota="1G"),
+        dict(label="news", lead_source="template", lead_origin="ai-debian-13",
+             lead_netvm="ai-net-router", networks=["none"], quota="1G",
+             model="api.anthropic.com:443"),
     ],
     gm.edit_project: [dict(key="osint", templates=["ai-debian-13"], networks=["none"], quota="30G")],
     gm.remove_lead: [dict(key="osint")],
     gm.change_lead: [dict(key="osint", lead_source="clone", lead_origin="ai-work2",
                           lead_name="ai-osint-lead2", lead_netvm="none", keep_old=True),
                      dict(key="osint", lead_source="template", lead_origin="ai-debian-13"),
-                     dict(key="osint", lead_source="promote", lead_origin="ai-work2")],
+                     dict(key="osint", lead_source="promote", lead_origin="ai-work2"),
+                     dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
+                          lead_name="ai-osint-boss", lead_netvm="ai-net-router", keep_old=True,
+                          model="api.anthropic.com:443", add_old_network=True)],
     gm.add_dump: [dict(key="other", sink_name="other-sink")],
     gm.move: [dict(qube="ai-work2", target="osint", confirm=True)],
     gm.delete_plan: [dict(key="osint")],
@@ -300,6 +347,13 @@ SAMPLES = {
     gm.show_proposal: [dict(pid=1)],
     gm.accept_proposal: [dict(pid=1, sha256="0" * 64), dict(pid=2, sha256="ab" * 32, tick="cd" * 32)],
     gm.reject_proposal: [dict(pid=1)],
+    gm.enroll_gateway: [dict(qube="sys-ai-tor", anonymising=True, label="Tor, CH")],
+    gm.change_gateway: [dict(qube="ai-net-router", anonymising=False, label="clearnet")],
+    gm.remove_gateway: [dict(qube="ai-net-router")],
+    gm.show_lead_firewall: [dict(key="osint")],
+    gm.set_lead_model: [dict(key="osint", model="api.anthropic.com:443")],
+    gm.set_lead_rules: [dict(key="osint", rules=RULES)],
+    gm.accept_lead_rules: [dict(key="osint")],
 }
 
 
@@ -360,6 +414,26 @@ class Parity(GuiBase):
         self.assertEqual(set(doc), set(gm.CHECK_DOC_FIELDS))
         self.assertEqual(set().union(*(f.keys() for f in doc["findings"])),
                          {k for k, _ in gm.CHECK_FIELDS})
+        # The gateway registry, and a lead's firewall: named, and on screen.
+        self.routers()
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-tor", True, "Tor")).rc, 0)
+        gws = self.gateways()
+        self.assertEqual(set().union(*(r.keys() for r in gws)), {k for k, _ in gm.GATEWAY_FIELDS})
+        self.assertLessEqual({k for k, _ in gm.GATEWAY_COLUMNS} - {"used", "notes"},
+                             {k for k, _ in gm.GATEWAY_FIELDS})
+        for row in gws:
+            self.assertEqual([h for h, _ in gm.gateway_details(row)],
+                             [h for _, h in gm.GATEWAY_FIELDS])
+        for failing in (True, False):                       # so read_error carries something
+            (self.app.fail.add if failing else self.app.fail.discard)("admin.vm.firewall.Get")
+            view = self.view()
+            self.assertEqual(set(view), set(gm.FIREWALL_OF) | {k for k, _ in gm.FIREWALL_FIELDS})
+            shown = dict(gm.firewall_details(view))
+            for key, heading in gm.FIREWALL_FIELDS:
+                if key != "read_error" or view[key] is not None:
+                    self.assertIn(heading, shown, key)
+            self.assertEqual(shown["Lead firewall of"], f"osint (p01), lead {LEAD}")
+            self.assertEqual(failing, view["read_error"] is not None)
 
     def test_every_field_of_an_audit_line_is_shown_or_left_to_verify(self):
         self.app.fail.add("start")
@@ -388,28 +462,37 @@ class Parity(GuiBase):
                              | set(gm.PROPOSAL_BY_PART))
         options = set().union(*(doc["proposal"].keys() for doc in docs))
         self.assertEqual(options - {"type", "title"}, {k for k, _ in gm.PROPOSAL_OPTIONS})
-        edits = [doc for doc in docs if doc["before"] is not None]
-        self.assertEqual(len(edits), 1)
-        self.assertEqual(set(edits[0]["before"]) | set(edits[0]["after"]),
-                         {k for k, _ in gm.EDIT_FIELDS})
+        # An edit's before and after are its record's parts; a lead
+        # firewall's, its model and its rules now and after.
+        with_before = {doc["type"]: doc for doc in docs if doc["before"] is not None}
+        self.assertEqual(set(with_before), {"project-edit", "project-firewall"})
+        for doc in docs:
+            if doc["before"] is None:
+                continue
+            table = gm.FIREWALL_CHANGE if doc["type"] == "project-firewall" else gm.EDIT_FIELDS
+            self.assertEqual(set(doc["before"]) | set(doc["after"]), {k for k, _ in table},
+                             doc["type"])
         decisions = [doc["decision"] for doc in docs if doc["decision"] is not None]
         self.assertEqual(len(decisions), 2)
         fields = set().union(*(d.keys() for d in decisions))
         self.assertEqual(fields - {k for k, _ in gm.DECISION_FIELDS}, set(gm.DECISION_NOT_SHOWN))
         self.assertLessEqual({k for k, _ in gm.DECISION_FIELDS}, fields)
         # Named is not enough: each field that carries something is on screen.
-        parts = {"proposal": gm.PROPOSAL_OPTIONS, "before": gm.EDIT_FIELDS,
-                 "after": gm.EDIT_FIELDS, "decision": gm.DECISION_FIELDS}
-        self.assertEqual(set(parts), set(gm.PROPOSAL_BY_PART))
+        self.assertEqual({"proposal", "before", "after", "decision"}, set(gm.PROPOSAL_BY_PART))
         self.assertTrue(any(doc["tick"] for doc in docs))
         for doc in docs:
             shown = {h for h, _ in gm.proposal_details(doc)}
+            change = gm.FIREWALL_CHANGE if doc["type"] == "project-firewall" else gm.EDIT_FIELDS
+            parts = {"proposal": gm.PROPOSAL_OPTIONS, "before": change, "after": change,
+                     "decision": gm.DECISION_FIELDS}
             for key, heading in gm.PROPOSAL_SHOW_FIELDS:
                 if doc[key] or (key == "second_tick" and doc["state"] == "pending"):
                     self.assertIn(heading, shown, (doc["id"], key))
             for key, table in parts.items():
                 if doc[key]:
                     self.assertTrue({h for _, h in table} & shown, (doc["id"], key))
+            if doc["type"] == "project-firewall" and doc["before"] is not None:
+                self.assertLessEqual({h for _, h in gm.FIREWALL_CHANGE}, shown)
 
 
 # ======================================================================= the model
@@ -493,6 +576,58 @@ class Model(GuiBase):
                 keys = [n.key for n in gm.walk(tree)]
                 self.assertEqual(len(keys), len(set(keys)))
 
+    def test_a_qube_that_cannot_be_read_is_under_needs_attention(self):
+        # A failed read is never state: the qube is shown, placed by none of
+        # the values that failed, and offers nothing until it reads.
+        for key, name in (("tag.List:ai-work", "ai-work"),
+                          ("get.provides_network:ai-work2", "ai-work2"),
+                          ("get.template_for_dispvms:ai-dvm", "ai-dvm")):
+            with self.subTest(key):
+                self.app.fail.add(key)
+                try:
+                    tree = self.tree()
+                    rows = self.read_json("list", "--all", "--json")
+                finally:
+                    self.app.fail.discard(key)
+                placed = [n for n in gm.walk(tree) if n.kind == "qube" and n.data.get("name") == name]
+                self.assertEqual([n.data.get("attention") for n in placed], ["unreadable"])
+                self.assertEqual(gm.actions(placed[0], {}), {"new_project", "add_to_ai_space"})
+                self.assertNotIn(name, gm.approved_template_choices(rows))
+                self.assertNotIn(name, gm.hubs_appvms(rows, HUB))
+                self.assertNotIn(name, gm.enroll_choices(rows, []))
+        # A template, and a qube outside AI space, that cannot be read are offered
+        # by no form either.
+        for key, name, offers in (("tag.List:ai-debian-13", "ai-debian-13", gm.lead_templates),
+                                  ("get.provides_network:personal", "personal",
+                                   lambda rows: gm.outside_choices(rows, HUB))):
+            with self.subTest(key):
+                self.assertIn(name, offers(self.read_json("list", "--all", "--json")))
+                self.app.fail.add(key)
+                try:
+                    rows = self.read_json("list", "--all", "--json")
+                finally:
+                    self.app.fail.discard(key)
+                self.assertNotIn(name, offers(rows))
+
+    def test_a_network_that_cannot_be_read_is_said_so_by_the_forms(self):
+        # In the commands' own words (fleet._lead_network, fleet._set_lead),
+        # never as a network called "<unreadable>" or as none.
+        self.app.fail.add("get.netvm:ai-hubq")
+        self.app.fail.add(f"get.netvm:{LEAD}")
+        try:
+            rows = self.read_json("list", "--all", "--json")
+        finally:
+            self.app.fail.clear()
+        gws = self.read_json("gateway", "list", "--json")
+        with self.assertRaises(gm.FormError) as cm:
+            gm.lead_network("promote", "ai-hubq", None, rows, gws)
+        self.assertIn("the network of 'ai-hubq' cannot be read", str(cm.exception))
+        osint = {r["slot"]: r for r in self.read_json("project", "list", "--json")}["p01"]
+        with self.assertRaises(gm.FormError) as cm:
+            gm.old_lead_network(osint, rows, gws, True, False)
+        self.assertIn(f"the network of the old lead {LEAD} cannot be read", str(cm.exception))
+        self.assertEqual(gm.old_lead_network(osint, rows, gws, False, False), "")   # not kept
+
     def test_an_unguarded_gateway_can_be_guarded_from_its_row(self):
         node = self.node("qube:ai-gw-unbadged")
         self.assertEqual(node.data["attention"], "gateway")
@@ -542,8 +677,11 @@ class Model(GuiBase):
         self.assertEqual(gm.hubs_appvms(rows, HUB), ["ai-hubq", "ai-on-operator-tpl", "ai-work", "ai-work2"])
         self.assertEqual(gm.approved_template_choices(rows),
                          ["ai-debian-13", "ai-dvm", "ai-dvm-g", "ai-tpl-g"])
-        self.assertEqual(gm.worker_network_choices(rows), ["none", "ai-net-router"])
-        self.assertIn("sys-firewall", gm.lead_network_choices(rows))
+        # The networks a project or a lead may use are the enrolled gateways,
+        # and none: a qube that provides network but is not enrolled is not offered.
+        self.assertEqual(gm.network_choices(self.gateways()), ["none", "ai-net-router"])
+        self.assertTrue({"sys-firewall", "ai-gw-unbadged"} <= {r["name"] for r in rows
+                                                               if r["gateway"]})
         outside = gm.outside_choices(rows, HUB, ["osint-dump"])
         self.assertIn("personal", outside)
         self.assertNotIn(HUB, outside)
@@ -671,7 +809,8 @@ class ProposalModel(GuiBase):
             if doc["tick"] is not None:
                 want.add("Second tick digest")
             if doc["before"] is not None:
-                want |= {h for _, h in gm.EDIT_FIELDS}
+                want |= {h for _, h in (gm.FIREWALL_CHANGE if doc["type"] == "project-firewall"
+                                        else gm.EDIT_FIELDS)}
             if doc["plan"] is not None:
                 want.add("Plan")
             if doc["decision"] is not None:
@@ -958,6 +1097,721 @@ class ProposalModel(GuiBase):
         self.assertIn("without running anything", gm.reject_intro(doc))
 
 
+# ======================================================================= gateways: the model
+
+#: The rules qubesd reads back for RULES, in its own spelling (`fakequbes`
+#: models it as measured on Qubes 4.3.1): its own option order, a port range.
+SPELLED = [_qubesd_rule(r) for r in RULES]
+MARK = "its own firewall rules have no effect upstream"
+
+
+class GatewayModel(GuiBase):
+    """The Gateways tab and the networks the forms offer, against the real
+    command. Each refusal the window makes before OK is checked against the
+    command's own."""
+
+    def setUp(self):
+        super().setUp()
+        self.routers()
+
+    def run_ok(self, argv):
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 0, (argv, result.out, result.err))
+        return result
+
+    def test_each_registry_command_is_exactly_what_runs(self):
+        sudo = [*gm.SUDO, gm.QMCP, "gateway"]
+        enroll = gm.enroll_gateway("sys-ai-tor", True, "Tor, CH")
+        self.assertEqual(enroll, sudo + ["enroll", "sys-ai-tor", "--anonymising", "--label",
+                                         "Tor, CH"])
+        self.assertEqual(gm.enroll_gateway("sys-ai-net", label=""), sudo + ["enroll", "sys-ai-net"])
+        self.run_ok(enroll)
+        g = gateways.load()["sys-ai-tor"]
+        self.assertEqual((g.anonymising, g.label), (True, "Tor, CH"))
+        change = gm.change_gateway("sys-ai-tor", anonymising=False, label="")
+        self.assertEqual(change, sudo + ["set", "sys-ai-tor", "--anonymising", "no", "--label", ""])
+        self.run_ok(change)
+        g = gateways.load()["sys-ai-tor"]
+        self.assertEqual((g.anonymising, g.label), (False, ""))
+        # A label that would read as an option goes as --label=TEXT, which parses.
+        dash = gm.change_gateway("sys-ai-tor", label="-eu")
+        self.assertEqual(dash, sudo + ["set", "sys-ai-tor", "--label=-eu"])
+        self.run_ok(dash)
+        self.assertEqual(gateways.load()["sys-ai-tor"].label, "-eu")
+        remove = gm.remove_gateway("sys-ai-tor")
+        self.assertEqual(remove, sudo + ["remove", "sys-ai-tor"])
+        self.run_ok(remove)
+        self.assertNotIn("sys-ai-tor", gateways.load())
+        for builder, kw in ((gm.enroll_gateway, dict(qube="-x")),
+                            (gm.enroll_gateway, dict(qube=None)),
+                            (gm.enroll_gateway, dict(qube="sys-ai-tor", label="x" * 41)),
+                            (gm.enroll_gateway, dict(qube="sys-ai-tor", label="a" + chr(10) + "b")),
+                            (gm.change_gateway, dict(qube="sys-ai-tor")),
+                            (gm.change_gateway, dict(qube="sys-ai-tor", label=chr(0x202E))),
+                            (gm.remove_gateway, dict(qube="--json"))):
+            with self.assertRaises(gm.FormError, msg=(builder.__name__, kw)):
+                builder(**kw)
+        # The window refuses a label exactly as the command does.
+        with self.assertRaises(gm.FormError) as cm:
+            gm.enroll_gateway("sys-ai-tor", label="x" * 41)
+        result = self.runner.execute(sudo + ["enroll", "sys-ai-tor", "--label", "x" * 41])
+        self.assertEqual(result.rc, 1)
+        self.assertIn(str(cm.exception), result.err)
+
+    def test_the_whonix_mark(self):
+        self.run_ok(gm.enroll_gateway("sys-ai-tor", True, "Tor"))
+        self.run_ok(gm.enroll_gateway("sys-ai-net"))
+        gws = self.gateways()
+        rows = {r["name"]: r for r in gws}
+        tor, net = rows["sys-ai-tor"], rows["sys-ai-net"]
+        self.assertTrue(tor["upstream_ignores_firewall"])
+        self.assertEqual(gm.UPSTREAM_IGNORES, MARK)
+        cells = dict(zip([k for k, _ in gm.GATEWAY_COLUMNS], gm.gateway_cells(tor)))
+        self.assertEqual((cells["upstream"], cells["notes"]), ("sys-whonix", MARK))
+        self.assertTrue(dict(gm.gateway_details(tor))["Its upstream ignores its firewall rules"]
+                        .startswith(f"yes: {MARK}. Its upstream, sys-whonix, is a Whonix gateway"))
+        self.assertEqual(gm.network_text("sys-ai-tor", gws), f"sys-ai-tor ({MARK})")
+        # A router behind sys-firewall carries no mark.
+        self.assertEqual(gm.gateway_notes(net), [])
+        self.assertEqual(dict(gm.gateway_details(net))["Its upstream ignores its firewall rules"], "no")
+        self.assertEqual(gm.network_text("sys-ai-net", gws), "sys-ai-net")
+        # The mark follows the upstream.
+        self.app.domains["sys-ai-tor"].netvm = self.app.domains["sys-firewall"]
+        self.assertEqual(gm.gateway_notes(next(r for r in self.gateways() if r["name"] == "sys-ai-tor")),
+                         [])
+        # Whether it does cannot be read, through the upstream's tags or the
+        # gateway's own network: said so, never "no".
+        unread = "whether its upstream ignores its firewall rules cannot be read now; refresh"
+        for key in ("tag.List:sys-firewall", "get.netvm:sys-ai-net"):
+            with self.subTest(key):
+                self.app.fail.add(key)
+                try:
+                    row = next(r for r in self.gateways() if r["name"] == "sys-ai-net")
+                finally:
+                    self.app.fail.discard(key)
+                self.assertIn(unread, gm.gateway_notes(row))
+                self.assertEqual(dict(gm.gateway_details(row))[
+                    "Its upstream ignores its firewall rules"], "cannot be read now; refresh")
+
+    def test_a_gateway_that_no_longer_qualifies_is_offered_and_marked(self):
+        # Enrolled as it was; then its template lost Qubes' firewall marker,
+        # and qmcp check fails on it.
+        self.run_ok(gm.enroll_gateway("sys-ai-net"))
+        self.app.domains["debian-13"].features.pop("qubes-firewall")
+        gws = self.gateways()
+        row = next(r for r in gws if r["name"] == "sys-ai-net")
+        self.assertIn("qubes-firewall", row["problem"])
+        self.assertIn("sys-ai-net", gm.network_choices(gws))
+        self.assertTrue(gm.network_text("sys-ai-net", gws).startswith("sys-ai-net (NOT USABLE: "))
+        self.assertTrue(gm.gateway_cells(row)[-1].startswith("NOT USABLE: "))
+        self.assertIn("qmcp check fails on it", dict(gm.gateway_details(row))["Problem"])
+        status = [f["status"] for f in self.read_json("check", "--json")["findings"]
+                  if f["check"] == "gateway registry"]
+        self.assertEqual(status, ["fail"])
+
+    def test_a_gateway_that_no_longer_qualifies_is_refused_where_the_command_refuses_it(self):
+        # sys-ai-net enrolled and on other's list while it qualified; then its
+        # template lost Qubes' firewall marker.
+        self.run_ok(gm.enroll_gateway("sys-ai-net"))
+        self.run_ok(gm.edit_project("other", networks=["none", "sys-ai-net"]))
+        self.app.domains["debian-13"].features.pop("qubes-firewall")
+        gws, rows = self.gateways(), self.read_json("list", "--all", "--json")
+        problem = next(r for r in gws if r["name"] == "sys-ai-net")["problem"]
+        why = f"'sys-ai-net' is enrolled but not usable: {problem}"
+        other = {r["slot"]: r for r in self.read_json("project", "list", "--json")}["p02"]
+
+        def refused(form_check, argv):
+            """The form refuses, in the command's words, and so does the command."""
+            with self.assertRaises(gm.FormError) as cm:
+                form_check()
+            self.assertEqual(str(cm.exception), why)
+            result = self.runner.execute(argv)
+            self.assertEqual(result.rc, 1, argv)
+            self.assertIn(why, result.err)
+        # A new project's worker network, and a new lead's network.
+        refused(lambda: gm.check_networks(["none", "sys-ai-net"], gws),
+                gm.create_project("newp", "template", "ai-debian-13", networks=["none", "sys-ai-net"],
+                                  quota="1G"))
+        refused(lambda: gm.lead_network("template", "ai-debian-13", "sys-ai-net", rows, gws),
+                gm.create_project("newp", "template", "ai-debian-13", lead_netvm="sys-ai-net",
+                                  networks=["none"], quota="1G", model="api.anthropic.com:443"))
+        refused(lambda: gm.lead_network("template", "ai-debian-13", "sys-ai-net", rows, gws),
+                gm.change_lead("other", "template", "ai-debian-13", "ai-other-l2", "sys-ai-net", True,
+                               "api.anthropic.com:443"))
+        # A promoted lead keeps its own network: refused too when that one is broken.
+        self.app.domains["ai-hubq"].netvm = self.app.domains["sys-ai-net"]
+        rows = self.read_json("list", "--all", "--json")
+        refused(lambda: gm.lead_network("promote", "ai-hubq", None, rows, gws),
+                gm.create_project("prom", "promote", "ai-hubq", networks=["none"], quota="1G",
+                                  model="api.anthropic.com:443"))
+        # Adding the old lead's network checks the whole new list, so a broken
+        # gateway already on it refuses the tick...
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]
+        rows = self.read_json("list", "--all", "--json")
+        refused(lambda: gm.old_lead_network(other, rows, gws, True, True),
+                gm.change_lead("other", "template", "ai-debian-13", "ai-other-l2", "none", True, None,
+                               True))
+        # ...and so does a broken network the old lead itself is on.
+        osint = {r["slot"]: r for r in self.read_json("project", "list", "--json")}["p01"]
+        self.app.domains[LEAD].netvm = self.app.domains["sys-ai-net"]
+        rows = self.read_json("list", "--all", "--json")
+        refused(lambda: gm.old_lead_network(osint, rows, gws, True, True),
+                gm.change_lead("osint", "template", "ai-debian-13", "ai-osint-l2", "none", True, None,
+                               True))
+        # An edit whose new list keeps it is refused; one that takes it off is
+        # not, and neither is an edit that leaves the list alone.
+        refused(lambda: gm.check_networks(["sys-ai-net", "none"], gws),
+                gm.edit_project("other", networks=["sys-ai-net", "none"]))
+        self.run_ok(gm.edit_project("other", quota="11G"))
+        self.assertEqual(gm.check_networks(["none"], gws), ["none"])
+        self.run_ok(gm.edit_project("other", networks=["none"]))
+        self.assertEqual(projects.find(projects.load(), "other").networks, (None,))
+        # Nothing the refusals stopped changed anything.
+        self.assertEqual((projects.find(projects.load(), "other").lead,
+                          projects.find(projects.load(), "osint").lead), (OTHER_LEAD, LEAD))
+        self.assertIsNone(projects.find(projects.load(), "newp"))
+
+    def test_enroll_offers_every_gateway_not_enrolled_and_refuses_as_the_command_does(self):
+        a = self.app
+        for name in ("ai-sink", "ai-osint-w1"):        # a drop box and a member that route
+            a.domains[name]._props["provides_network"] = True
+            a.domains[name].features["qubes-firewall"] = "1"
+        rows = self.read_json("list", "--all", "--json")
+        by_name = {r["name"]: r for r in rows}
+        choices = gm.enroll_choices(rows, self.gateways(), HUB)
+        self.assertNotIn("ai-net-router", choices)       # enrolled already
+        self.assertNotIn(HUB, choices)
+        self.assertLessEqual({"sys-ai-net", "sys-ai-tor", "sys-whonix", "sys-firewall",
+                              "ai-gw-unbadged", "ai-sink", "ai-osint-w1"}, set(choices))
+        seen = set()
+        for name in choices:
+            why = gm.enroll_refusal(by_name[name], HUB)
+            result = self.runner.execute(gm.enroll_gateway(name))
+            if why is not None:
+                self.assertEqual(result.rc, 1, name)
+                self.assertIn(why, result.err, name)      # in the command's words
+                seen.add("form")
+            elif result.rc:
+                # What only the command can see, the window's `list` row holding
+                # none of it: Whonix's own tag, the marker, the templates.
+                self.assertTrue(any(why in result.err for why in (
+                    "is a Whonix gateway", "qubes-firewall", "one the hub manages")),
+                    (name, result.err))
+                seen.add("command")
+            else:
+                seen.add("enrolled")
+        self.assertEqual(seen, {"form", "command", "enrolled"})
+        self.assertEqual(gm.enroll_refusal(by_name["ai-gw-unbadged"], HUB),
+                         "'ai-gw-unbadged' cannot be enrolled: is in AI space without "
+                         "qmcp-guarded (qmcp guard ai-gw-unbadged)")
+        self.assertIn("a drop box", gm.enroll_refusal(by_name["ai-sink"], HUB))
+        self.assertIn("member", gm.enroll_refusal(by_name["ai-osint-w1"], HUB))
+        self.assertEqual(gm.enroll_refusal(dict(by_name["sys-ai-net"], name=HUB), HUB),
+                         f"'{HUB}' cannot be enrolled: is the hub")
+        self.assertEqual(gm.enroll_refusal(None), "choose a qube that provides network")
+        self.assertEqual(gm.enroll_text(by_name["sys-ai-net"], HUB), "sys-ai-net (outside AI space)")
+        self.assertEqual(gm.enroll_text(by_name["ai-gw-unbadged"], HUB),
+                         "ai-gw-unbadged (in AI space; cannot be enrolled: is in AI space without "
+                         "qmcp-guarded (qmcp guard ai-gw-unbadged))")
+
+    def test_remove_is_refused_while_in_use_in_the_commands_words(self):
+        row = next(r for r in self.gateways() if r["name"] == "ai-net-router")
+        why = gm.gateway_in_use(row)
+        self.assertTrue(why.startswith("'ai-net-router' is in use: projects ['osint'], qubes ["), why)
+        result = self.runner.execute(gm.remove_gateway("ai-net-router"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)
+        self.run_ok(gm.enroll_gateway("sys-ai-net"))
+        free = next(r for r in self.gateways() if r["name"] == "sys-ai-net")
+        self.assertIsNone(gm.gateway_in_use(free))
+        self.assertIn("The qube itself does not change", gm.remove_gateway_intro(free))
+        self.run_ok(gm.remove_gateway("sys-ai-net"))
+
+    def test_settings_count_them_and_a_registry_that_does_not_read_is_no_registry(self):
+        settings = dict(gm.settings_rows(self.read_json("settings", "--json")))
+        self.assertEqual(settings["Gateways enrolled"], "1")
+        self.assertEqual(gm.gateways_note(self.gateways()), gm.GATEWAYS_NOTE)
+        pathlib.Path(gateways.GATEWAYS_PATH).write_text("{")
+        settings = dict(gm.settings_rows(self.read_json("settings", "--json")))
+        self.assertEqual(settings["Gateways enrolled"], "not known: the registry cannot be read")
+        result = self.read("gateway", "list", "--json")
+        self.assertEqual(result.rc, 1)
+        with self.assertRaises(gm.ReadError):             # a failed read, never an empty list
+            gm.parse_json(result)
+        self.assertEqual(gm.gateways_note(None), "The gateway registry has not been read.")
+        self.assertIn("None is enrolled", gm.gateways_note([]))
+        self.assertEqual(gm.gateway_actions(None), {"enroll_gateway"})
+        self.assertEqual(gm.gateway_actions({"name": "x"}),
+                         {"enroll_gateway", "change_gateway", "remove_gateway"})
+
+
+# ======================================================================= leads: network and model
+
+class LeadModel(GuiBase):
+    """A new lead's network, its model endpoint and the old lead's network,
+    as the project forms judge them before OK: each refusal is the
+    command's, checked against the command."""
+
+    def rows(self):
+        return self.read_json("list", "--all", "--json")
+
+    def test_the_network_a_new_lead_will_have(self):
+        gws = self.gateways()
+        net = lambda *a: gm.lead_network(*a, self.rows(), gws)  # noqa: E731
+        self.assertIsNone(net("template", "ai-debian-13", None))      # a fresh lead: none, unless chosen
+        self.assertIsNone(net("clone", "ai-work", None))               # its source's is not inherited
+        self.assertEqual(net("template", "ai-debian-13", "ai-net-router"), "ai-net-router")
+        self.assertIsNone(net("template", "ai-debian-13", "none"))
+        self.assertEqual(net("promote", "ai-hubq", None), "ai-net-router")   # a promoted lead keeps its own
+        self.assertIsNone(net("promote", "ai-hubq", "none"))
+        self.assertIsNone(net("promote", "ai-work2", None))
+        with self.assertRaises(gm.FormError) as cm:
+            net("template", "ai-debian-13", "sys-firewall")
+        self.assertEqual(str(cm.exception),
+                         "'sys-firewall' is not an enrolled gateway (qmcp gateway enroll sys-firewall)")
+        # A promoted lead on a network that is not enrolled: the form refuses
+        # as the command does.
+        self.app.domains["ai-work2"].netvm = self.app.domains["sys-firewall"]
+        with self.assertRaises(gm.FormError) as cm:
+            net("promote", "ai-work2", None)
+        result = self.runner.execute(gm.create_project("prom", "promote", "ai-work2", networks=["none"],
+                                                       quota="1G", model="api.anthropic.com:443"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(str(cm.exception), result.err)
+        # No network moves: a promoted lead takes its own, named or not, or
+        # none; never another, even an enrolled one.
+        self.enroll("sys-firewall")
+        gws = self.gateways()
+        self.assertEqual(gm.lead_network("promote", "ai-hubq", "ai-net-router", self.rows(), gws),
+                         "ai-net-router")
+        with self.assertRaises(gm.FormError) as cm:
+            gm.lead_network("promote", "ai-hubq", "sys-firewall", self.rows(), gws)
+        result = self.runner.execute(gm.create_project("prom", "promote", "ai-hubq", networks=["none"],
+                                                       quota="1G", lead_netvm="sys-firewall",
+                                                       model="api.anthropic.com:443"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(str(cm.exception), result.err)
+        self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-proj-p00"})   # untouched
+
+    def test_a_lead_with_a_network_needs_a_model_and_one_without_takes_none(self):
+        gws = self.gateways()
+        for i, (netvm, model, why) in enumerate((
+                ("ai-net-router", "", "needs its model endpoint"),
+                ("none", "api.anthropic.com:443", "reaches no model endpoint"),
+                ("ai-net-router", "no-port", "host:port"),
+                ("ai-net-router", " api.anthropic.com:443 ", None),
+                ("none", "", None))):
+            with self.subTest(netvm=netvm, model=model):
+                network = gm.lead_network("template", "ai-debian-13", netvm, self.rows(), gws)
+                raw = [*gm.SUDO, gm.QMCP, "project", "create", f"m{i}", "--lead-template",
+                       "ai-debian-13", "--lead-netvm", netvm, "--network", "none", "--quota", "1G"]
+                raw += ["--model", model.strip()] if model else []
+                result = self.runner.execute(raw)
+                if why is None:
+                    self.assertEqual(gm.lead_model(network, model), model.strip() or None)
+                    self.assertEqual(result.rc, 0, result.err)
+                    continue
+                with self.assertRaises(gm.FormError) as cm:
+                    gm.lead_model(network, model)
+                self.assertIn(why, str(cm.exception))
+                self.assertEqual(result.rc, 1)
+                self.assertIn(why, result.err)                       # the command's refusal
+        self.assertEqual(gm.lead_info(None), "The lead will have no network: leave the model "
+                                             "empty. It needs no firewall.")
+        self.assertTrue(gm.lead_info("ai-net-router").endswith("Give its model endpoint."))
+
+    def test_a_new_lead_of_a_project_takes_its_model(self):
+        # other has no model on record: a new lead with a network needs one typed.
+        with self.assertRaises(gm.FormError):
+            gm.lead_model("ai-net-router", "", None)
+        self.assertIn("The project has no model on record: give one.",
+                      gm.lead_info("ai-net-router", None, change=True))
+        result = self.runner.execute(gm.change_lead("other", "template", "ai-debian-13", "ai-other-l2",
+                                                    "ai-net-router", True))
+        self.assertEqual(result.rc, 1)
+        self.assertIn("needs its model endpoint", result.err)
+        self.assertIsNone(projects.find(projects.load(), "other").model)
+        # Once it has one, the field may stay empty, and the new lead takes it.
+        # A model is set only on a lead with a network: give other's one by
+        # hand first, as an upgrade from 0.9.20 leaves a lead (checklist step 28).
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]
+        self.assertEqual(self.runner.execute(gm.set_lead_model("other", "api.anthropic.com:443")).rc, 0)
+        self.assertEqual(projects.find(projects.load(), "other").model, "api.anthropic.com:443")
+        self.assertIsNone(gm.lead_model("ai-net-router", "", "api.anthropic.com:443"))
+        self.assertIn("Left empty, the model is the project's, api.anthropic.com:443.",
+                      gm.lead_info("ai-net-router", "api.anthropic.com:443", change=True))
+        # The old lead, kept, is now on ai-net-router, which other does not
+        # list: the form says it goes to no network, and the command does that.
+        other = {r["slot"]: r for r in self.read_json("project", "list", "--json")}["p02"]
+        self.assertIn("without the tick it goes to no network",
+                      gm.old_lead_network(other, self.rows(), self.gateways(), True, False))
+        argv = gm.change_lead("other", "template", "ai-debian-13", "ai-other-l2", "ai-net-router", True)
+        self.assertNotIn("--model", argv)                         # the field was left empty
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 0, result.err)
+        endpoint = [_qubesd_rule(r) for r in firewall.endpoint_rules("api.anthropic.com:443")]
+        self.assertEqual(self.lead_rules("ai-other-l2"), endpoint)    # the project's model
+        p = projects.find(projects.load(), "other")
+        self.assertEqual((p.lead, p.model, list(p.lead_firewall)),
+                         ("ai-other-l2", "api.anthropic.com:443", endpoint))
+        self.assertIn(f"{OTHER_LEAD} lost its network", result.out)
+        self.assertIsNone(self.app.domains[OTHER_LEAD].netvm)
+        self.assertIn("qmcp-proj-p02", self.tags(OTHER_LEAD))         # kept, as a worker
+
+    def test_what_happens_to_a_kept_leads_network(self):
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        osint, other = records["p01"], records["p02"]
+        gws = self.gateways()
+        self.assertEqual(gm.old_lead_network(osint, self.rows(), gws, True, False),
+                         f"{LEAD} is on ai-net-router, which osint lists: it keeps it as a worker.")
+        self.assertEqual(gm.old_lead_network(osint, self.rows(), gws, False, False), "")
+        with self.assertRaises(gm.FormError):
+            gm.old_lead_network(osint, self.rows(), gws, False, True)   # the tick without keep
+        self.assertEqual(gm.old_lead_network(other, self.rows(), gws, True, False),
+                         f"{OTHER_LEAD} has no network, and keeps none as a worker.")
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]   # other lists none only
+        self.assertEqual(gm.old_lead_network(other, self.rows(), gws, True, False),
+                         f"{OTHER_LEAD} is on ai-net-router, which other does not list: without the "
+                         f"tick it goes to no network as a worker.")
+        self.assertEqual(gm.old_lead_network(other, self.rows(), gws, True, True),
+                         f"{OTHER_LEAD} is on ai-net-router, which other does not list: the tick adds "
+                         f"ai-net-router to the worker networks, and {OTHER_LEAD} keeps it.")
+        # On a network that is not enrolled the tick is refused, by the form
+        # and the command alike, and nothing changes.
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["sys-firewall"]
+        with self.assertRaises(gm.FormError) as cm:
+            gm.old_lead_network(other, self.rows(), gws, True, True)
+        argv = gm.change_lead("other", "template", "ai-debian-13", "ai-other-l2", "none", True, None, True)
+        self.assertEqual(argv[-2:], ["--keep-old", "--add-old-network"])
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 1)
+        self.assertIn(str(cm.exception), result.err)
+        self.assertEqual(projects.find(projects.load(), "other").lead, OTHER_LEAD)
+        # A list that is full takes no more, by the form and the command alike.
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]
+        doc = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        doc["slots"]["p02"]["networks"] = [None] + [f"gw{i}" for i in range(projects.MAX_NETWORKS - 1)]
+        self.write_records(doc)
+        other = {r["slot"]: r for r in self.read_json("project", "list", "--json")}["p02"]
+        with self.assertRaises(gm.FormError) as cm:
+            gm.old_lead_network(other, self.rows(), gws, True, True)
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 1)
+        self.assertIn(str(cm.exception), result.err)
+        # The tick without keep: the builder refuses it, and so does the command.
+        with self.assertRaises(gm.FormError):
+            gm.change_lead("other", "template", "ai-debian-13", add_old_network=True)
+        raw = [*gm.SUDO, gm.QMCP, "project", "lead", "other", "--lead-template", "ai-debian-13",
+               "--lead-name", "ai-other-l3", "--add-old-network"]
+        self.assertEqual(self.runner.execute(raw).rc, 1)
+
+    def test_the_commands_with_a_model(self):
+        sudo = [*gm.SUDO, gm.QMCP, "project"]
+        self.assertEqual(gm.create_project("newp", "template", "ai-debian-13", None, "ai-net-router", [],
+                                           ["none"], "5G", False, "api.anthropic.com:443"),
+                         sudo + ["create", "newp", "--lead-template", "ai-debian-13", "--lead-netvm",
+                                 "ai-net-router", "--model", "api.anthropic.com:443", "--network",
+                                 "none", "--quota", "5G"])
+        self.assertEqual(gm.change_lead("osint", "template", "ai-debian-13", "ai-osint-boss",
+                                        "ai-net-router", True, "api.anthropic.com:443", True),
+                         sudo + ["lead", "osint", "--lead-template", "ai-debian-13", "--lead-name",
+                                 "ai-osint-boss", "--lead-netvm", "ai-net-router", "--keep-old",
+                                 "--add-old-network", "--model", "api.anthropic.com:443"])
+        self.assertNotIn("--model", gm.change_lead("osint", "template", "ai-debian-13", model=" "))
+        for kw in (dict(model="no-port"), dict(model="a.b:0")):
+            with self.assertRaises(gm.FormError, msg=kw):
+                gm.create_project("newp", "template", "ai-debian-13", networks=["none"], quota="1G", **kw)
+        self.assertEqual(gm.check_networks(["none", "ai-net-router"], self.gateways()),
+                         ["none", "ai-net-router"])
+        with self.assertRaises(gm.FormError):
+            gm.check_networks(["sys-firewall"], self.gateways())
+
+
+# ======================================================================= lead firewalls: the model
+
+class FirewallModel(GuiBase):
+    """A lead's firewall: the view, its pane, the forms' commands, and the
+    proposal that changes it, against the real command. osint's lead has a
+    network and no rules on record, as after an upgrade."""
+
+    def test_each_firewall_command_is_exactly_what_runs(self):
+        sudo = [*gm.SUDO, gm.QMCP, "project", "firewall"]
+        self.assertEqual(gm.show_lead_firewall("osint"),
+                         [gm.QMCP, "project", "firewall", "osint", "--json"])         # a read
+        self.assertEqual(gm.set_lead_model("osint", " API.anthropic.com:443 "),
+                         sudo + ["osint", "--model", "API.anthropic.com:443"])
+        self.assertEqual(gm.set_lead_rules("osint", RULES),
+                         sudo + ["osint", "--rule", RULES[0], "--rule", RULES[1], "--rule", RULES[2]])
+        self.assertEqual(gm.accept_lead_rules("p01"), sudo + ["p01", "--accept-current"])
+        for builder, kw in ((gm.set_lead_model, dict(key="osint", model="")),
+                            (gm.set_lead_model, dict(key="osint", model="no-port")),
+                            (gm.set_lead_model, dict(key="osint", model="a.b:0")),
+                            (gm.set_lead_rules, dict(key="osint", rules=[])),
+                            (gm.set_lead_rules, dict(key="osint", rules=["action=drop"] * 33)),
+                            (gm.set_lead_rules, dict(key="osint", rules=["action=accept  proto=tcp"])),
+                            (gm.accept_lead_rules, dict(key="--json")),
+                            (gm.show_lead_firewall, dict(key="Bad"))):
+            with self.assertRaises(gm.FormError, msg=(builder.__name__, kw)):
+                builder(**kw)
+        # The window refuses a rule exactly when the command does, in its words.
+        for rules in (["action=accept comment=hi"], ["action=allow"], ["proto=tcp"]):
+            with self.assertRaises(gm.FormError) as cm:
+                gm.set_lead_rules("osint", rules)
+            result = self.runner.execute(sudo + ["osint"] + [x for r in rules for x in ("--rule", r)])
+            self.assertEqual(result.rc, 1, rules)
+            self.assertIn(str(cm.exception), result.err)
+        self.assertEqual(self.lead_rules(), ["action=accept"])
+
+    def test_the_view_of_a_lead_with_no_rules_accepted(self):
+        doc = self.view()
+        self.assertEqual((doc["lead"], doc["model"], doc["accepted"], doc["live"], doc["same"]),
+                         (LEAD, None, None, ["action=accept"], False))
+        rows = dict(gm.firewall_details(doc))
+        self.assertEqual(rows["Rules you accepted"], "none on record")
+        self.assertEqual(rows["Rules it has now (live)"], "action=accept")
+        self.assertEqual(rows["Live rules are the ones you accepted"],
+                         "not known: the rules you accepted or the live ones are missing")
+        self.assertNotIn("Live rules not read", rows)
+        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules", "accept_rules"})
+        self.assertEqual(self.runner.execute(gm.accept_lead_rules("osint")).rc, 0)
+        doc = self.view()
+        self.assertEqual((doc["accepted"], doc["same"]), (["action=accept"], True))
+        self.assertEqual(dict(gm.firewall_details(doc))["Live rules are the ones you accepted"], "yes")
+        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules"})   # nothing to accept
+        # A change made by hand in dom0: they differ, and check fails on it.
+        self.app.domains[LEAD].__dict__["_firewall"] = ["action=drop"]
+        doc = self.view()
+        self.assertEqual(dict(gm.firewall_details(doc))["Live rules are the ones you accepted"],
+                         "no: they differ, and qmcp check fails on it while the lead has a network")
+        self.assertIn("accept_rules", gm.firewall_actions(doc))
+        cols = gm.rules_compare(doc)
+        self.assertEqual(cols, [("Accepted now", "action=accept"), ("Live now", "action=drop")])
+
+    def test_rules_that_were_not_read_are_never_an_empty_list(self):
+        self.app.fail.add("admin.vm.firewall.Get")
+        doc = self.view()
+        self.assertEqual((doc["live"], doc["read_error"], doc["same"]), (None, "Injected", False))
+        rows = dict(gm.firewall_details(doc))
+        self.assertEqual(rows["Rules it has now (live)"], "could not be read (Injected)")
+        self.assertEqual(rows["Live rules not read"], "Injected")
+        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules"})   # nothing read to accept
+        self.assertEqual(dict(gm.rules_compare(doc))["Live now"], "could not be read (Injected)")
+        self.assertEqual(gm.live_text(dict(doc, live=[], read_error=None)), "(no rules)")  # read: empty
+        # A project without a lead has none to show, and nothing to change.
+        self.assertEqual(self.runner.execute(gm.remove_lead("other")).rc, 0)
+        doc = self.view("other")
+        self.assertEqual(dict(gm.firewall_details(doc))["Rules it has now (live)"],
+                         "none: the project has no lead")
+        self.assertEqual(gm.firewall_actions(doc), set())
+        # A read that failed, or answered about something else, is no view.
+        for result in (gm.Result(gm.show_lead_firewall("osint"), 1, "", "qmcp project firewall: x"),
+                       gm.Result(gm.show_lead_firewall("osint"), 0, json.dumps(dict(self.view(),
+                                                                                  live="action=accept"))),
+                       gm.Result(gm.show_lead_firewall("osint"), 0, json.dumps(self.view("other")))):
+            with self.assertRaises(gm.ReadError):
+                gm.parse_firewall(result, "osint")
+
+    def test_each_rule_is_one_line_and_is_sent_as_it_is(self):
+        quoted = 'action=accept dsthost=a"b'
+        shown = gm.esc_items([quoted, "action=drop"])
+        self.assertIsInstance(shown, gm.Shown)
+        self.assertEqual(shown, "action=accept dsthost=a" + chr(92) + '"b' + chr(10) + "action=drop")
+        self.assertEqual(gm.typed_rules(shown, [quoted, "action=drop"]), [quoted, "action=drop"])
+        self.assertEqual(gm.typed_rules("  action=drop  \n\n\taction=accept\n"),
+                         ["action=drop", "action=accept"])
+        hostile = gm.esc_items([HOSTILE, "action=drop"])
+        self.assertEqual(len(hostile.split(chr(10))), 2)
+        self.assertTrue(hostile.isascii())
+        self.assertIn(chr(92) + "u202e", hostile)
+
+    def test_the_pane_keeps_the_last_view_of_its_project_only(self):
+        read = lambda key="osint": self.runner.execute(gm.show_lead_firewall(key))  # noqa: E731
+        pane = gm.FirewallPane()
+        self.assertEqual((pane.note(), pane.actions("osint")), ("", set()))
+        seq = pane.select("osint")
+        self.assertEqual(pane.actions("osint"), set())                 # reading: nothing yet
+        self.assertEqual(pane.note(), "reading: qmcp project firewall osint --json")
+        self.assertTrue(pane.answer(seq, read(), "10:00:00"))
+        self.assertEqual(pane.actions("osint"), {"set_model", "set_rules", "accept_rules"})
+        self.assertEqual(pane.actions("other"), set())                 # not the selection's
+        self.assertEqual(pane.note(), "read at 10:00:00: qmcp project firewall osint --json")
+        good = pane.doc
+        failed = gm.Result(gm.show_lead_firewall("osint"), 1, "", "QubesDaemonCommunicationError")
+        self.assertTrue(pane.answer(pane.select("osint"), failed, "10:01:00"))
+        self.assertIs(pane.doc, good)
+        self.assertEqual(pane.actions("osint"), set())
+        self.assertIn("could not be read", pane.note())
+        self.assertIn("Showing it as read at 10:00:00", pane.note())
+        section = gm.firewall_section(pane, "osint")
+        self.assertEqual(section[0], ("Lead firewall", pane.note()))
+        self.assertEqual(section[1:], gm.firewall_details(good))
+        self.assertEqual(gm.firewall_section(pane, "other"), [])
+        # Another project's failed read never shows this one's view.
+        self.assertTrue(pane.answer(pane.select("other"), failed, "10:02:00"))
+        self.assertIsNone(pane.doc)
+        # A late answer changes nothing; a refresh makes the view stale.
+        old, new = pane.select("osint"), pane.select("osint")
+        self.assertFalse(pane.answer(old, read(), "x"))
+        self.assertTrue(pane.answer(new, read(), "10:03:00"))
+        self.assertTrue(pane.actions("osint"))
+        pane.stale()
+        self.assertEqual(pane.actions("osint"), set())
+
+    def test_an_open_form_is_checked_against_the_view_on_display(self):
+        read = lambda: self.runner.execute(gm.show_lead_firewall("osint"))  # noqa: E731
+        pane = gm.FirewallPane()
+        pane.answer(pane.select("osint"), read(), "10:00:00")
+        opened = pane.doc
+        self.assertIsNone(gm.firewall_changed(opened, "set_rules", pane))
+        pane.stale()
+        self.assertIsNotNone(gm.firewall_changed(opened, "set_rules", pane))      # being read again
+        pane.answer(pane.select("osint"), read(), "10:01:00")
+        self.assertIsNone(gm.firewall_changed(opened, "set_rules", pane))         # it reads the same
+        self.app.domains[LEAD].__dict__["_firewall"] = ["action=drop"]
+        pane.answer(pane.select("osint"), read(), "10:02:00")
+        self.assertIn("changed since this form opened", gm.firewall_changed(opened, "set_rules", pane))
+        self.assertEqual(self.runner.execute(gm.accept_lead_rules("osint")).rc, 0)
+        pane.answer(pane.select("osint"), read(), "10:03:00")
+        opened = pane.doc
+        self.assertIsNotNone(gm.firewall_changed(opened, "accept_rules", pane))   # not allowed now
+        self.assertIsNone(gm.firewall_changed(opened, "set_model", pane))
+
+    def test_a_lead_with_no_network_takes_no_model(self):
+        # other's lead has no network. The command refuses it a model, in
+        # these words, and changes nothing; its rules can still be set or accepted.
+        why = (f"{OTHER_LEAD} has no network, so it reaches no model endpoint; set its rules, or "
+               f"give the project a new lead on a network")
+        fleet_rows = lambda: self.read_json("list", "--all", "--json")  # noqa: E731
+        doc = self.view("other")
+        self.assertIs(gm.lead_on_network(doc, fleet_rows()), False)
+        self.assertEqual(gm.model_refusal(doc, fleet_rows()), why)
+        self.assertEqual(gm.firewall_actions(doc, fleet_rows()), {"set_rules", "accept_rules"})
+        result = self.runner.execute(gm.set_lead_model("other", "api.anthropic.com:443"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)
+        p = projects.find(projects.load(), "other")
+        self.assertEqual((p.model, p.lead_firewall, self.lead_rules(OTHER_LEAD)),
+                         (None, None, ["action=accept"]))
+        self.assertEqual(self.runner.execute(gm.accept_lead_rules("other")).rc, 0)
+        self.assertEqual(self.runner.execute(gm.set_lead_rules("other", ["action=drop"])).rc, 0)
+        self.assertEqual(self.lead_rules(OTHER_LEAD), ["action=drop"])
+        # The view's pane says why Set lead model is off, and keeps it off.
+        pane = gm.FirewallPane()
+        pane.answer(pane.select("other"), self.runner.execute(gm.show_lead_firewall("other")), "10:00:00")
+        self.assertEqual(pane.actions("other", fleet_rows()), {"set_rules"})
+        section = dict(gm.firewall_section(pane, "other", fleet_rows()))
+        self.assertEqual(section["Set lead model"], f"off: {why}")
+        opened = pane.doc
+        self.assertEqual(gm.firewall_changed(opened, "set_model", pane, fleet_rows()), why)
+        self.assertIsNone(gm.firewall_changed(opened, "set_rules", pane, fleet_rows()))
+        # On a network, it takes one.
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]
+        self.assertIs(gm.lead_on_network(opened, fleet_rows()), True)
+        self.assertIn("set_model", pane.actions("other", fleet_rows()))
+        self.assertNotIn("Set lead model", dict(gm.firewall_section(pane, "other", fleet_rows())))
+        self.assertIsNone(gm.firewall_changed(opened, "set_model", pane, fleet_rows()))
+        self.assertEqual(self.runner.execute(gm.set_lead_model("other", "api.anthropic.com:443")).rc, 0)
+        # A lead whose row is not on show: the command decides.
+        self.assertIsNone(gm.lead_on_network(opened, []))
+        self.assertIn("set_model", gm.firewall_actions(opened, []))
+        # A network the listing could not read is never taken for none, nor for
+        # one: the window says the command's reason before OK, and the command,
+        # which reads it again, refuses in the same words.
+        self.app.fail.add(f"get.netvm:{OTHER_LEAD}")
+        rows = fleet_rows()
+        self.assertEqual(next(r for r in rows if r["name"] == OTHER_LEAD)["netvm"], "<unreadable>")
+        self.assertIsNone(gm.lead_on_network(opened, rows))
+        self.assertEqual(gm.model_refusal(opened, rows), f"the network of {OTHER_LEAD} cannot be read")
+        self.assertNotIn("set_model", gm.firewall_actions(opened, rows))
+        result = self.runner.execute(gm.set_lead_model("other", "api.anthropic.com:443"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn("cannot be read", result.err)
+        self.app.fail.discard(f"get.netvm:{OTHER_LEAD}")
+
+    def test_the_forms_say_what_they_do(self):
+        doc = self.view()
+        after = gm.model_rules("API.anthropic.com:443")
+        self.assertEqual(after, firewall.endpoint_rules("api.anthropic.com:443"))
+        cols = gm.rules_compare(doc, after)
+        self.assertEqual([h for h, _ in cols], ["Accepted now", "Live now", "After OK"])
+        self.assertEqual(cols[2][1], chr(10).join(after))
+        self.assertEqual(gm.model_rules(""), "type the endpoint, host:port")
+        self.assertIn("host:port", gm.model_rules("no-port"))
+        self.assertEqual(dict(gm.rules_compare(doc, "no rules typed"))["After OK"], "no rules typed")
+        self.assertIn(f"Sets the model endpoint of {LEAD}, the lead of osint", gm.model_intro(doc))
+        self.assertIn("compare the rules below", gm.rules_intro(doc))
+        self.assertIn("nothing on the qube changes", gm.accept_rules_intro(doc, "10:00:00"))
+        self.assertIn("as read at 10:00:00", gm.accept_rules_intro(doc, "10:00:00"))
+
+    def test_the_check_tab_lists_the_lead_firewall_findings(self):
+        def rows():
+            return {(r[0], r[1]) for r in gm.check_rows(self.read_json("check", "--json"))}
+        self.assertIn(("WARN", "lead firewalls not accepted"), rows())
+        self.assertEqual(self.runner.execute(gm.accept_lead_rules("osint")).rc, 0)
+        self.assertNotIn(("WARN", "lead firewalls not accepted"), rows())
+        self.assertIn(("PASS", "lead firewalls"), rows())
+        self.app.domains[LEAD].__dict__["_firewall"] = ["action=drop"]      # by hand, in dom0
+        self.assertIn(("FAIL", "lead firewalls"), rows())
+
+    def test_a_lead_firewall_proposal_shows_the_rules_now_and_after(self):
+        reply = self.submit_proposal("rules")
+        doc = self.show(reply["id"])
+        rows = dict(gm.proposal_details(doc))
+        self.assertEqual(rows["Lead's model, now -> after"], "- -> -")
+        self.assertEqual(rows["Lead firewall now, as you accepted it"], "none on record")
+        self.assertEqual(rows["Lead firewall now, live"], "action=accept")
+        self.assertEqual(rows["Lead firewall after accepting"], chr(10).join(RULES))
+        self.assertEqual(rows["Lead firewall rules"], chr(10).join(RULES))      # the option itself
+        self.assertTrue(rows["Equivalent command"].startswith("qmcp project firewall osint --rule "))
+        self.assertEqual(rows["Second tick"], "needed: the reasons are in red below")
+        self.assertIn("- changes the lead firewall of osint to 3 rules: compare the old and new rules",
+                      gm.second_tick_text(doc))
+        self.assertEqual(gm.proposal_actions(doc), {"reject_proposal"})
+        self.assertIn("compare its firewall now and after accepting", gm.accept_intro(doc))
+        self.assertEqual(self.runner.execute(gm.accept_proposal(reply["id"], doc["sha256"])).rc, 1)
+        self.assertEqual(self.runner.execute(gm.accept_proposal(reply["id"], doc["sha256"],
+                                                                doc["tick"])).rc, 0)
+        self.assertEqual(self.lead_rules(), SPELLED)
+        self.assertEqual(self.view()["accepted"], SPELLED)
+        # A model: the model now and after, and the rules the endpoint writes.
+        rows = dict(gm.proposal_details(self.show(self.submit_proposal("model")["id"])))
+        self.assertEqual(rows["Lead's model, now -> after"], "- -> api.anthropic.com:443")
+        self.assertEqual(rows["Lead firewall now, as you accepted it"], chr(10).join(SPELLED))
+        self.assertEqual(rows["Lead firewall after accepting"],
+                         chr(10).join(firewall.endpoint_rules("api.anthropic.com:443")))
+        # Rules not read say so; each rule is one line, escaped, whatever it holds.
+        rows = dict(gm.firewall_change({"model": None, "accepted": None, "live": None,
+                                        "read_error": None}, None))
+        self.assertEqual(rows["Lead firewall now, live"],
+                         "not read: the project has no lead, or no qube of that name")
+        live = dict(gm.firewall_change({"live": [HOSTILE, "action=drop"]}, {}))["Lead firewall now, live"]
+        self.assertEqual(len(live.split(chr(10))), 2)
+        self.assertTrue(live.isascii())
+        # Live rules that could not be read say so, with the error: never an
+        # empty list, never "no lead". Through the real show.
+        self.app.fail.add("admin.vm.firewall.Get")
+        doc = self.show(self.submit_proposal("rules")["id"])
+        self.assertEqual((doc["before"]["live"], doc["before"]["read_error"]), (None, "Injected"))
+        rows = dict(gm.proposal_details(doc))
+        self.assertEqual(rows["Lead firewall now, live"], "could not be read (Injected)")
+        self.assertEqual(rows["Lead firewall now, as you accepted it"], chr(10).join(SPELLED))
+        self.app.fail.discard("admin.vm.firewall.Get")
+        # A project with no lead now: no live rules, and no error either.
+        self.assertEqual(self.runner.execute(gm.remove_lead("osint")).rc, 0)
+        doc = self.show(self.submit_proposal("rules")["id"])
+        self.assertEqual((doc["before"]["live"], doc["before"]["read_error"]), (None, None))
+        self.assertEqual(dict(gm.proposal_details(doc))["Lead firewall now, live"],
+                         "not read: the project has no lead, or no qube of that name")
+
+    def test_a_lead_proposal_shows_its_model_and_the_old_leads_network(self):
+        doc = self.show(self.submit_proposal("netlead")["id"])
+        rows = dict(gm.proposal_details(doc))
+        self.assertEqual(rows["Lead's model endpoint"], "api.anthropic.com:443")
+        self.assertEqual(rows["Add the old lead's network to the worker networks"], "yes")
+        self.assertTrue(rows["Equivalent command"].endswith(
+            "--keep-old --add-old-network --model api.anthropic.com:443"), rows["Equivalent command"])
+
+
 # ======================================================================= the command's new reads
 
 class CliReads(GuiBase):
@@ -1191,7 +2045,7 @@ class Structure(unittest.TestCase):
             if any(isinstance(c, ast.Call) and getattr(c.func, "id", None) == "Shown"
                    for c in ast.walk(fn)):
                 makers.add(fn.name)
-        self.assertEqual(makers, {"esc", "esc_lines", "audit_detail"})
+        self.assertEqual(makers, {"esc", "esc_lines", "esc_items", "audit_detail"})
 
     def test_the_window_never_makes_shown_text_itself(self):
         calls = [n for n in ast.walk(self.tree) if isinstance(n, ast.Call)
@@ -1306,6 +2160,36 @@ class Widgets(GuiBase):
         self.win.proposal_store.foreach(visit)
         self.assertEqual(self.win.pane.pid, pid)
 
+    def gateway_select(self, name):
+        def visit(model, path, it):
+            if model[it][0] == name:
+                self.win.gateway_view.get_selection().select_iter(it)
+                return True
+            return False
+        self.win.gateway_store.foreach(visit)
+        self.assertEqual(self.win.gateway_selected, name)
+
+    def one_line(self, form, ok=True):
+        """One line under one heading: the command while OK is on, why OK is
+        off otherwise, never both and never neither. show_all() runs over the
+        fields first, as it does when the window shows the form (on the
+        content area: the dialog itself is never put on the screen here)."""
+        form.get_content_area().show_all()
+        want = (self.gui.RUNS, True, False) if ok else (self.gui.OK_OFF, False, True)
+        self.assertEqual((form.runs.get_text(), form.preview.get_visible(),
+                          form.error.get_visible()), want, form.get_title())
+        self.assertEqual(form.ok.get_sensitive(), ok, form.get_title())
+        self.assertTrue(form.error.get_style_context().has_class("qmcp-note"))
+
+    def registry(self):
+        """The Gateways tab's buttons that are on."""
+        return {k for k, b in self.win.gateway_buttons.items() if b.get_sensitive()}
+
+    def grid(self, grid):
+        """A details grid, heading -> text."""
+        return {grid.get_child_at(0, i).get_text(): grid.get_child_at(1, i).get_text()
+                for i in range(len(grid.get_children()) // 2)}
+
     def propose(self, name, **changes):
         """A proposal from the hub; then Refresh, and select it."""
         reply = self.submit_proposal(name, **changes)
@@ -1325,6 +2209,8 @@ class Widgets(GuiBase):
         import inspect
         self.select("project:p01")
         record = self.win.node().data
+        view = self.win.fw_pane.doc
+        self.assertEqual(view["project"], "osint")
         row = next(r for r in self.win.fleet if r["name"] == "ai-work2")
         self.propose("delete")
         doc = self.win.pane.doc
@@ -1335,15 +2221,31 @@ class Widgets(GuiBase):
                 "pid": "doc", "sha256": "doc", "tick": "ticked"}),
             gm.reject_proposal: (self.gui.ProposalForm(self.win, doc, "reject_proposal"),
                                  {"pid": "doc"}),
-            gm.create_project: (self.gui.ProjectForm(self.win, self.win.fleet, HUB), {
+            gm.create_project: (self.gui.ProjectForm(self.win, self.win.fleet, self.win.gateways,
+                                                     HUB), {
                 "label": "label_entry", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "templates": "templates",
-                "networks": "nets", "quota": "quota", "dump": "dump"}),
-            gm.edit_project: (self.gui.EditForm(self.win, self.win.fleet, record), {
+                "networks": "nets", "quota": "quota", "dump": "dump", "model": "model"}),
+            gm.edit_project: (self.gui.EditForm(self.win, self.win.fleet, self.win.gateways,
+                                                record), {
                 "key": "record", "templates": "templates", "networks": "nets", "quota": "quota"}),
-            gm.change_lead: (self.gui.LeadForm(self.win, self.win.fleet, HUB, record), {
+            gm.change_lead: (self.gui.LeadForm(self.win, self.win.fleet, self.win.gateways, HUB,
+                                               record), {
                 "key": "record", "lead_source": "source", "lead_origin": "origin",
-                "lead_name": "lead_name", "lead_netvm": "lead_netvm", "keep_old": "old_lead"}),
+                "lead_name": "lead_name", "lead_netvm": "lead_netvm", "keep_old": "old_lead",
+                "model": "model", "add_old_network": "add_old"}),
+            # The registry's forms; the qube and its current values come from the row.
+            gm.enroll_gateway: (self.gui.EnrollForm(self.win, self.win.fleet, self.win.gateways,
+                                                    HUB), {
+                "qube": "qube", "anonymising": "anonymising", "label": "label_entry"}),
+            gm.change_gateway: (self.gui.GatewayForm(self.win, self.win.gateways[0]), {
+                "qube": "row_data", "anonymising": "anonymising", "label": "label_entry"}),
+            # A lead firewall's: the project comes from the view the form opened on.
+            gm.set_lead_model: (self.gui.ModelForm(self.win, view), {"key": "doc",
+                                                                     "model": "model"}),
+            gm.set_lead_rules: (self.gui.RulesForm(self.win, view), {"key": "doc",
+                                                                     "rules": "rules_view"}),
+            gm.accept_lead_rules: (self.gui.AcceptRulesForm(self.win, view), {"key": "doc"}),
             gm.add_dump: (self.gui.DumpForm(self.win, "osint", "osint-dump"), {
                 "key": "key", "sink_name": "sink_name"}),
             gm.move: (self.gui.MoveForm(self.win, row, self.win.records), {
@@ -1357,17 +2259,22 @@ class Widgets(GuiBase):
             for attr in fields.values():
                 self.assertTrue(hasattr(form, attr), (builder.__name__, attr))
             form.destroy()
-        for ident in ("remove_lead", "delete_project", "add_to_ai_space", "manage", "guard"):
+        for ident in ("remove_lead", "delete_project", "add_to_ai_space", "manage", "guard",
+                      "set_model", "set_rules", "accept_rules"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
+        self.assertEqual(set(self.win.gateway_buttons),
+                         {"enroll_gateway", "change_gateway", "remove_gateway"})
         self.assertTrue(self.win.proposal_tick.get_visible())
         # Close runs reject_proposal too, from its own form (test_a_proposal_that_needs_closing...).
         self.assertEqual(set(self.win.proposal_buttons),
                          {"accept_proposal", "reject_proposal", "close_proposal"})
         for builder in set(gm.BUILDERS) - set(forms):
-            # show_proposal runs when a proposal is selected, as delete_plan
-            # runs before the delete form.
+            # show_proposal runs when a proposal is selected, and
+            # show_lead_firewall when a project or its lead is, as delete_plan
+            # runs before the delete form. The others are confirmations.
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
-                                             "audit_rotate", "show_proposal"},
+                                             "audit_rotate", "show_proposal", "remove_gateway",
+                                             "show_lead_firewall"},
                           "a builder without a form")
 
     def test_refresh_fills_every_page_from_the_command(self):
@@ -1639,14 +2546,20 @@ class Widgets(GuiBase):
         argvs = list(gm.READS.values()) + [gm.AUDIT_VERIFY]
         rows = self.win.fleet
 
+        gws = self.win.gateways
+
         def project(source, origin, name):
-            f = self.gui.ProjectForm(self.win, rows, HUB)
+            f = self.gui.ProjectForm(self.win, rows, gws, HUB)
             f.label_entry.set_text("newp")
             f.source[source].set_active(True)
             f.origin.set_active_id(origin)
             if name:
                 f.lead_name.set_text(name)
-            f.lead_netvm.set_active_id("ai-net-router")
+            if source == "promote":             # it keeps its own network (none), or takes none
+                f.lead_netvm.set_active_id("none")
+            else:
+                f.lead_netvm.set_active_id("ai-net-router")
+                f.model.set_text("api.anthropic.com:443")
             f.templates["ai-dvm"].set_active(True)
             f.nets["none"].set_active(True)
             f.quota.set_text("5G")
@@ -1656,20 +2569,39 @@ class Widgets(GuiBase):
                  project("clone", "ai-work2", "ai-newp-boss"), project("promote", "ai-work2", None)]
         self.select("project:p01")
         record = self.win.node().data
-        f = self.gui.EditForm(self.win, rows, record)
+        f = self.gui.EditForm(self.win, rows, gws, record)
         f.templates["ai-dvm"].set_active(False)
         f.default_net.set_active_id("none")
         f.quota.set_text("30G")
         forms.append(f)
         for source, origin in (("template", "ai-debian-13"), ("clone", "ai-work2"), ("promote", "ai-work2")):
-            f = self.gui.LeadForm(self.win, rows, HUB, record)
+            f = self.gui.LeadForm(self.win, rows, gws, HUB, record)
             f.source[source].set_active(True)
             f.origin.set_active_id(origin)
             if source != "promote":
                 f.lead_name.set_text("ai-osint-boss")
-            f.lead_netvm.set_active_id("none")
             f.old_lead.set_active_id("keep")
+            if source == "template":
+                f.lead_netvm.set_active_id("ai-net-router")
+                f.model.set_text("api.anthropic.com:443")
+                f.add_old.set_active(True)
+            else:
+                f.lead_netvm.set_active_id("none")
             forms.append(f)
+        # The registry: enroll a router, change one, remove one no project uses.
+        self.routers()
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-net")).rc, 0)
+        self.win.refresh()
+        rows, gws = self.win.fleet, self.win.gateways
+        f = self.gui.EnrollForm(self.win, rows, gws, HUB)
+        f.qube.set_active_id("sys-ai-tor")
+        f.anonymising.set_active(True)
+        f.label_entry.set_text("Tor")
+        forms.append(f)
+        f = self.gui.GatewayForm(self.win, next(r for r in gws if r["name"] == "ai-net-router"))
+        f.anonymising.set_active_id("yes")
+        f.label_entry.set_text("clearnet")
+        forms.append(f)
         f = self.gui.DumpForm(self.win, "other", "other-dump")
         f.sink_name.set_text("other-sink")
         forms.append(f)
@@ -1686,12 +2618,30 @@ class Widgets(GuiBase):
             getattr(f, kind).set_active(True)
             forms.append(f)
         for argv in forms:
+            self.one_line(argv)
             argvs.append(argv.argv())
             argv.destroy()
         for ident in ("manage", "guard", "remove_lead", "rotate"):
             self.select({"manage": "qube:ai-tpl-g", "guard": "qube:ai-work2",
                          "remove_lead": "project:p01", "rotate": "project:p01"}[ident])
             form = self.win.act(ident)
+            self.one_line(form)
+            argvs.append(form.argv())
+            form.destroy()
+        self.gateway_select("sys-ai-net")
+        form = self.win.act("remove_gateway")
+        argvs.append(form.argv())
+        form.destroy()
+        # A lead's firewall: the read when its project is selected, then each form.
+        self.select("qube:ai-work2")
+        self.runner.calls.clear()
+        self.select("project:p01")
+        argvs.append(self.runner.calls[-1])
+        self.assertEqual(self.runner.calls[-1], gm.show_lead_firewall("osint"))
+        for ident in ("set_model", "set_rules", "accept_rules"):
+            form = self.win.act(ident)
+            if ident == "set_model":
+                form.model.set_text("api.anthropic.com:443")
             argvs.append(form.argv())
             form.destroy()
         self.select("project:p02")
@@ -2039,8 +2989,9 @@ class Widgets(GuiBase):
         def off(n):
             self.assertEqual(self.deciding(), set(), f"after {n} replies")
             self.assertIsNone(self.win.act("accept_proposal"), f"after {n} replies")
-        # The change, the reads of the refresh it starts, then the re-show.
-        self.assertEqual(self.release_all(off), 1 + len(gm.READS) + 1)
+        # The change, the reads of the refresh it starts, then the lead
+        # firewall of the project selected on the Qubes tab, and the re-show.
+        self.assertEqual(self.release_all(off), 1 + len(gm.READS) + 1 + 1)
         self.runner.hold = False
         self.assertEqual(projects.find(projects.load(), "other").lead, "ai-other-l2")
         self.assertIn("removes the old lead ai-other-l2", self.win.proposal_warning.get_text())
@@ -2250,6 +3201,454 @@ class Widgets(GuiBase):
         self.assertEqual(self.deciding(), set())
         self.assertEqual(checks()["proposal store"], "PASS")
         self.assertEqual((store / f"{reply['id']:06d}.decision.unreadable").read_text(), "garbage")
+
+    # ------------------------------------------------------------------ gateways and lead firewalls
+
+    def text(self, view):
+        buf = view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def test_the_gateways_tab(self):
+        self.routers()
+        self.win.refresh()
+        rows = self.rows(self.win.gateway_store)
+        self.assertEqual([r[0] for r in rows], ["ai-net-router"])
+        self.assertEqual(rows[0][1:], gm.gateway_cells(self.gateways()[0]))
+        self.assertEqual(self.registry(), {"enroll_gateway"})              # nothing selected
+        self.gateway_select("ai-net-router")
+        self.assertEqual(self.registry(), {"enroll_gateway", "change_gateway", "remove_gateway"})
+        pane = self.grid(self.win.gateway_details)
+        self.assertEqual(list(pane), [h for _, h in gm.GATEWAY_FIELDS])
+        self.assertEqual(pane["Problem"], "none: AI space may use it")
+        self.assertEqual(self.grid(self.win.settings_grid)["Gateways enrolled"], "1")
+        # Enroll: the form offers every qube that provides network and is not
+        # enrolled, and refuses what the command would, where it can see why.
+        form = self.win.act("enroll_gateway")
+        self.assertIsNone(form.qube.get_active_id())
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertNotIn("ai-net-router", [row[1] for row in form.qube.get_model()])
+        form.qube.set_active_id("ai-gw-unbadged")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("is in AI space without qmcp-guarded", form.error.get_text())
+        form.qube.set_active_id("sys-ai-tor")
+        form.anonymising.set_active(True)
+        form.label_entry.set_text("Tor, CH")
+        self.assertEqual(form.argv(), gm.enroll_gateway("sys-ai-tor", True, "Tor, CH"))
+        self.submit(form)
+        self.assertEqual(gateways.load()["sys-ai-tor"].label, "Tor, CH")
+        self.assertEqual([r[0] for r in self.rows(self.win.gateway_store)], ["ai-net-router", "sys-ai-tor"])
+        self.assertEqual(self.grid(self.win.settings_grid)["Gateways enrolled"], "2")
+        # A router behind a Whonix gateway is marked on its row and beside its fields.
+        tor = next(r for r in self.rows(self.win.gateway_store) if r[0] == "sys-ai-tor")
+        self.assertEqual(tor[-1], MARK)
+        self.gateway_select("sys-ai-tor")
+        self.assertEqual(self.win.gateway_warning.get_text(), MARK)
+        self.assertTrue(self.win.gateway_warning.get_style_context().has_class("qmcp-note"))
+        self.assertTrue(self.grid(self.win.gateway_details)["Its upstream ignores its firewall rules"]
+                        .startswith("yes: " + MARK))
+        # Change: only what changed is sent.
+        form = self.win.act("change_gateway")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), "nothing changed")
+        form.anonymising.set_active_id("no")
+        self.assertEqual(form.argv(), gm.change_gateway("sys-ai-tor", anonymising=False))
+        form.label_entry.set_text("Tor")
+        self.submit(form)
+        g = gateways.load()["sys-ai-tor"]
+        self.assertEqual((g.anonymising, g.label), (False, "Tor"))
+        # Remove: the form refuses one still in use, in the command's words; it
+        # removes authority, never a qube, so no red line.
+        self.gateway_select("ai-net-router")
+        form = self.win.act("remove_gateway")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("'ai-net-router' is in use: projects ['osint']", form.error.get_text())
+        self.assertEqual(form.warning.get_text(), "")
+        form.destroy()
+        self.gateway_select("sys-ai-tor")
+        result = self.submit(self.win.act("remove_gateway"))
+        self.assertEqual(result.argv, gm.remove_gateway("sys-ai-tor"))
+        self.assertNotIn("sys-ai-tor", gateways.load())
+        self.assertEqual([r[0] for r in self.rows(self.win.gateway_store)], ["ai-net-router"])
+        self.assertIsNone(self.win.gateway_selected)
+        self.assertEqual(self.registry(), {"enroll_gateway"})
+        for row in self.rows(self.win.gateway_store):
+            for cell in row[1:]:
+                self.assertTrue(cell.isascii() and "\n" not in cell, cell)
+
+    def test_a_failed_registry_read_turns_changes_off(self):
+        self.assertIsNone(self.win.act("change_gateway"))       # nothing selected: no form
+        self.assertIsNone(self.win.act("remove_gateway"))
+        self.gateway_select("ai-net-router")
+        pathlib.Path(gateways.GATEWAYS_PATH).write_text("{")
+        self.win.refresh()
+        self.assertFalse(self.win.complete)
+        self.assertIn("gateway list --json failed", self.win.status.get_text())
+        self.assertEqual((self.sensitive(), self.registry()), (set(), set()))
+        self.assertEqual([r[0] for r in self.rows(self.win.gateway_store)], ["ai-net-router"])  # last good
+        for ident in ("enroll_gateway", "change_gateway", "remove_gateway"):
+            self.assertIsNone(self.win.act(ident), ident)       # no form opens while changes are off
+
+    def test_the_edit_form_refuses_a_network_that_is_not_enrolled(self):
+        # Listed before the registry existed (an upgrade), or removed from it since.
+        self.routers()
+        doc = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        doc["slots"]["p02"]["networks"] = [None, "sys-ai-net"]
+        self.write_records(doc)
+        self.win.refresh()
+        self.select("project:p02")
+        form = self.win.act("edit_project")
+        self.assertEqual(form.nets["sys-ai-net"].get_label(), "sys-ai-net (not enrolled)")
+        form.quota.set_text("11G")
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())   # networks unchanged
+        form.default_net.set_active_id("sys-ai-net")
+        self.assertFalse(form.ok.get_sensitive())
+        why = "'sys-ai-net' is not an enrolled gateway (qmcp gateway enroll sys-ai-net)"
+        self.assertEqual(form.error.get_text(), why)
+        result = self.runner.execute(gm.edit_project("other", networks=["sys-ai-net", "none"]))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)                          # the command's refusal
+        form.nets["sys-ai-net"].set_active(False)               # off the list: no worker is on it
+        self.assertEqual(form.argv(), gm.edit_project("other", networks=["none"], quota="11G"))
+        self.submit(form)
+        self.assertEqual(projects.find(projects.load(), "other").networks, (None,))
+
+    def test_a_refusal_takes_the_commands_line_never_one_below_it(self):
+        # The 0.9.21 click-through: ticking a gateway that no longer qualifies
+        # emptied the line under "Runs:" and put the reason one line lower, in
+        # the command's own style, where it reads as the command.
+        self.routers()
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-net")).rc, 0)
+        self.app.domains["debian-13"].features.pop("qubes-firewall")
+        self.win.refresh()
+        form = self.win.act("new_project")
+        self.one_line(form, ok=False)                           # empty: no label yet
+        form.label_entry.set_text("newp")
+        form.quota.set_text("1G")
+        form.nets["none"].set_active(True)
+        self.one_line(form)
+        command = form.preview.get_text()
+        self.assertTrue(command.startswith("/usr/bin/sudo -n "), command)
+        form.nets["sys-ai-net"].set_active(True)
+        self.one_line(form, ok=False)
+        self.assertTrue(form.error.get_text().startswith("'sys-ai-net' is enrolled but not usable: "))
+        self.assertEqual(form.preview.get_text(), "")           # no command left behind
+        form.nets["sys-ai-net"].set_active(False)
+        self.one_line(form)
+        self.assertEqual((form.preview.get_text(), form.error.get_text()), (command, ""))
+        form.destroy()
+
+    def test_the_forms_refuse_a_gateway_that_no_longer_qualifies(self):
+        # Enrolled and on other's list while it qualified; then its template
+        # lost Qubes' firewall marker.
+        self.routers()
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-net")).rc, 0)
+        self.assertEqual(self.runner.execute(gm.edit_project("other", networks=["none",
+                                                                                "sys-ai-net"])).rc, 0)
+        self.app.domains["debian-13"].features.pop("qubes-firewall")
+        self.win.refresh()
+        problem = next(r for r in self.win.gateways if r["name"] == "sys-ai-net")["problem"]
+        why = f"'sys-ai-net' is enrolled but not usable: {problem}"
+        # A new project: as a worker network, or as the lead's.
+        form = self.win.act("new_project")
+        form.label_entry.set_text("newp")
+        form.quota.set_text("1G")
+        form.nets["none"].set_active(True)
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        self.assertTrue(form.nets["sys-ai-net"].get_label().startswith("sys-ai-net (NOT USABLE: "))
+        form.nets["sys-ai-net"].set_active(True)
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), why)
+        form.nets["sys-ai-net"].set_active(False)
+        form.lead_netvm.set_active_id("sys-ai-net")
+        form.model.set_text("api.anthropic.com:443")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), why)
+        form.destroy()
+        # Editing other: the quota alone changes, the list keeping it does not,
+        # and taking it off the list does.
+        self.select("project:p02")
+        form = self.win.act("edit_project")
+        form.quota.set_text("11G")
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        form.default_net.set_active_id("sys-ai-net")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), why)
+        form.nets["sys-ai-net"].set_active(False)
+        self.assertEqual(form.argv(), gm.edit_project("other", networks=["none"], quota="11G"))
+        self.submit(form)
+        self.assertEqual(projects.find(projects.load(), "other").networks, (None,))
+        # A new lead on it, from the change-lead form.
+        self.select("project:p02")
+        form = self.win.act("change_lead")
+        form.lead_name.set_text("l2")
+        form.old_lead.set_active_id("keep")
+        form.lead_netvm.set_active_id("sys-ai-net")
+        form.model.set_text("api.anthropic.com:443")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), why)
+        form.destroy()
+
+    def test_the_project_forms_offer_the_enrolled_gateways_marked(self):
+        self.routers()
+        self.enroll("sys-firewall")          # by hand: no qubes-firewall marker, so not usable
+        self.win.refresh()
+        form = self.win.act("new_project")
+        self.assertEqual(list(form.nets), ["none", "ai-net-router", "sys-firewall"])
+        labels = {n: cb.get_label() for n, cb in form.nets.items()}
+        self.assertEqual(labels["ai-net-router"], "ai-net-router")
+        self.assertTrue(labels["sys-firewall"].startswith("sys-firewall (NOT USABLE: "))
+        self.assertEqual([row[1] for row in form.lead_netvm.get_model()],
+                         ["", "none", "ai-net-router", "sys-firewall"])
+        form.destroy()
+        self.select("project:p01")
+        form = self.win.act("edit_project")
+        self.assertEqual(set(form.nets), {"none", "ai-net-router", "sys-firewall"})
+        form.destroy()
+
+    def test_a_lead_with_a_network_needs_its_model(self):
+        form = self.win.act("new_project")
+        form.label_entry.set_text("newp")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("5G")
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())    # no network, no model
+        self.assertIn("will have no network", form.lead_info.get_text())
+        form.model.set_text("api.anthropic.com:443")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("reaches no model endpoint", form.error.get_text())
+        form.lead_netvm.set_active_id("ai-net-router")
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        self.assertIn("will be on ai-net-router", form.lead_info.get_text())
+        form.model.set_text("")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("needs its model endpoint", form.error.get_text())
+        form.model.set_text("api.anthropic.com:443")
+        self.assertEqual(form.argv(), gm.create_project(
+            "newp", "template", "ai-debian-13", None, "ai-net-router", [], ["none"], "5G", False,
+            "api.anthropic.com:443"))
+        self.submit(form)
+        p = projects.find(projects.load(), "newp")
+        endpoint = [_qubesd_rule(r) for r in firewall.endpoint_rules("api.anthropic.com:443")]
+        self.assertEqual((p.model, list(p.lead_firewall)), ("api.anthropic.com:443", endpoint))
+        # Its details show the model and the rules you accepted; the view
+        # beside them reads the live ones: the same.
+        self.select(f"project:{p.slot}")
+        details = self.grid(self.win.details)
+        self.assertEqual(details["Lead's model endpoint"], "api.anthropic.com:443")
+        self.assertEqual(details["Lead firewall you accepted"], chr(10).join(endpoint))
+        self.assertTrue(details["Lead firewall"].startswith("read at "), details["Lead firewall"])
+        self.assertEqual(details["Rules it has now (live)"], chr(10).join(endpoint))
+        self.assertEqual(details["Live rules are the ones you accepted"], "yes")
+        self.assertLessEqual({"set_model", "set_rules"}, self.sensitive())
+        self.assertNotIn("accept_rules", self.sensitive())
+        # A promoted lead keeps its network, so it needs a model too.
+        form = self.win.act("new_project")
+        form.label_entry.set_text("prom")
+        form.source["promote"].set_active(True)
+        form.origin.set_active_id("ai-hubq")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        self.assertIn("needs its model endpoint", form.error.get_text())
+        self.assertIn("will be on ai-net-router", form.lead_info.get_text())
+        form.destroy()
+
+    def test_the_lead_form_says_what_happens_to_the_old_leads_network(self):
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]   # other lists none only
+        self.win.refresh()
+        self.select("project:p02")
+        form = self.win.act("change_lead")
+        form.source["clone"].set_active(True)
+        form.origin.set_active_id("ai-work2")
+        form.lead_name.set_text("l2")
+        self.assertFalse(form.add_old.get_sensitive())                 # nothing chosen yet
+        form.old_lead.set_active_id("keep")
+        self.assertTrue(form.add_old.get_sensitive())
+        self.assertIn("without the tick it goes to no network", form.old_info.get_text())
+        self.assertNotIn("--add-old-network", form.argv())
+        form.add_old.set_active(True)
+        self.assertIn("the tick adds ai-net-router to the worker networks", form.old_info.get_text())
+        self.assertIn("--add-old-network", form.argv())
+        form.old_lead.set_active_id("remove")                          # the tick goes with keep only
+        self.assertFalse(form.add_old.get_active())
+        self.assertFalse(form.add_old.get_sensitive())
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        self.assertNotIn("--add-old-network", form.argv())
+        form.old_lead.set_active_id("keep")
+        form.add_old.set_active(True)
+        # A network for the new lead, and other has no model on record.
+        form.lead_netvm.set_active_id("ai-net-router")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("needs its model endpoint", form.error.get_text())
+        self.assertIn("The project has no model on record", form.lead_info.get_text())
+        form.model.set_text("api.anthropic.com:443")
+        self.assertEqual(form.argv(), gm.change_lead("other", "clone", "ai-work2", "ai-other-l2",
+                                                     "ai-net-router", True, "api.anthropic.com:443",
+                                                     True))
+        self.submit(form)
+        p = projects.find(projects.load(), "other")
+        self.assertEqual((p.lead, p.networks, p.model),
+                         ("ai-other-l2", (None, "ai-net-router"), "api.anthropic.com:443"))
+        self.assertEqual(self.app.domains[OTHER_LEAD].netvm.name, "ai-net-router")   # it kept it
+
+    def test_the_lead_firewall_view_and_its_forms(self):
+        fw = {"set_model", "set_rules", "accept_rules"}
+        self.select("project:p01")
+        details = self.grid(self.win.details)
+        grid = self.win.details
+        headings = [grid.get_child_at(0, i).get_text() for i in range(len(grid.get_children()) // 2)]
+        self.assertEqual(len(headings), len(set(headings)), headings)      # no line said twice
+        self.assertEqual(details["Lead firewall of"], f"osint (p01), lead {LEAD}")
+        self.assertEqual(details["Rules you accepted"], "none on record")
+        self.assertEqual(details["Rules it has now (live)"], "action=accept")
+        self.assertLessEqual(fw, self.sensitive())
+        # The lead's own row shows the same view, with the same buttons; a worker's, none.
+        self.select(f"qube:{LEAD}")
+        self.assertEqual(self.grid(self.win.details)["Rules it has now (live)"], "action=accept")
+        self.assertLessEqual(fw, self.sensitive())
+        self.select("qube:ai-osint-w1")
+        self.assertNotIn("Lead firewall", self.grid(self.win.details))
+        self.assertFalse(fw & self.sensitive())
+        # Accept current rules: the rules now side by side; the qube does not change.
+        self.select("project:p01")
+        form = self.win.act("accept_rules")
+        self.assertEqual(form.argv(), gm.accept_lead_rules("osint"))
+        self.assertEqual([self.text(v) for v in form.compare], ["none on record", "action=accept"])
+        self.submit(form)
+        self.assertEqual(self.view()["accepted"], ["action=accept"])
+        self.assertEqual(self.lead_rules(), ["action=accept"])
+        self.assertEqual(self.grid(self.win.details)["Live rules are the ones you accepted"], "yes")
+        self.assertNotIn("accept_rules", self.sensitive())
+        # Set rules: it starts from the rules you accepted; what you type is the After column.
+        form = self.win.act("set_rules")
+        self.assertEqual(self.text(form.rules_view), "action=accept")
+        form.rules_view.get_buffer().set_text(chr(10).join(["action=allow"]))
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("accept or drop", form.error.get_text())
+        form.rules_view.get_buffer().set_text(chr(10).join(RULES + ["", ""]))
+        self.assertEqual(form.argv(), gm.set_lead_rules("osint", RULES))
+        self.assertEqual([self.text(v) for v in form.compare],
+                         ["action=accept", "action=accept", chr(10).join(RULES)])
+        self.submit(form)
+        self.assertEqual(self.lead_rules(), SPELLED)
+        self.assertEqual(self.view()["accepted"], SPELLED)
+        # Set model: the After column is what the endpoint writes.
+        form = self.win.act("set_model")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(self.text(form.compare[2]), "type the endpoint, host:port")
+        form.model.set_text("api.anthropic.com:443")
+        self.assertEqual(self.text(form.compare[2]),
+                         chr(10).join(firewall.endpoint_rules("api.anthropic.com:443")))
+        self.submit(form)
+        self.assertEqual(projects.find(projects.load(), "osint").model, "api.anthropic.com:443")
+        self.assertEqual(self.grid(self.win.details)["Lead's model endpoint"], "api.anthropic.com:443")
+        lines = [r for r in self.win.audit_rows if r.get("service") == "qmcp project firewall"]
+        self.assertEqual([r["caller"] for r in lines], ["operator"] * 3)
+
+    def test_set_lead_model_is_off_for_a_lead_with_no_network(self):
+        why = (f"{OTHER_LEAD} has no network, so it reaches no model endpoint; set its rules, or "
+               f"give the project a new lead on a network")
+        for key in ("project:p02", f"qube:{OTHER_LEAD}"):        # the project, and its lead's row
+            self.select(key)
+            self.assertIn("set_rules", self.sensitive())
+            self.assertNotIn("set_model", self.sensitive())
+            self.assertEqual(self.grid(self.win.details)["Set lead model"], f"off: {why}")
+            self.assertIsNone(self.win.act("set_model"))           # no form opens
+        # On a network, it is on, and the line saying why is gone.
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]
+        self.win.refresh()
+        self.select("project:p02")
+        self.assertIn("set_model", self.sensitive())
+        self.assertNotIn("Set lead model", self.grid(self.win.details))
+        form = self.win.act("set_model")
+        form.model.set_text("api.anthropic.com:443")
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        # The lead loses its network while the form is open (the hub may clear
+        # a qube's network): after a refresh, OK refuses in the command's words,
+        # and runs nothing. The command refuses the same.
+        self.app.domains[OTHER_LEAD].netvm = None
+        self.win.refresh()
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(writes(), before)
+        self.assertEqual(form.error.get_text(), why)
+        result = self.runner.execute(form.argv())
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)
+        self.assertIsNone(projects.find(projects.load(), "other").model)
+        self.assertNotIn("set_model", self.sensitive())
+
+    def test_a_failed_firewall_read_keeps_the_view_and_turns_its_buttons_off(self):
+        fw = {"set_model", "set_rules", "accept_rules"}
+        self.select("project:p01")
+        before = self.grid(self.win.details)
+        self.runner.fail.add(tuple(gm.show_lead_firewall("osint")))
+        self.win.refresh()
+        details = self.grid(self.win.details)
+        self.assertIn("could not be read", details["Lead firewall"])
+        self.assertIn("Showing it as read at", details["Lead firewall"])
+        self.assertEqual(details["Rules it has now (live)"], before["Rules it has now (live)"])
+        self.assertFalse(fw & self.sensitive())
+        self.assertIn("edit_project", self.sensitive())         # the rest of the window is current
+        self.assertIsNone(self.win.act("set_rules"))
+        self.runner.fail.clear()
+        self.win.refresh()
+        self.assertLessEqual(fw, self.sensitive())
+
+    def test_while_the_view_is_read_again_its_buttons_are_off(self):
+        self.select("project:p01")
+        self.runner.hold = True
+        self.win.refresh()
+        self.assertFalse({"set_model", "set_rules", "accept_rules"} & self.sensitive())
+        self.release_all()
+        self.runner.hold = False
+        self.assertLessEqual({"set_model", "set_rules", "accept_rules"}, self.sensitive())
+
+    def test_an_open_firewall_form_runs_nothing_once_the_view_reads_differently(self):
+        self.select("project:p01")
+        form = self.win.act("set_rules")
+        # The firewall changes from a dom0 terminal, and a refresh reads it.
+        self.assertEqual(self.runner.execute(gm.set_lead_model("osint", "api.anthropic.com:443")).rc, 0)
+        self.win.refresh()
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(writes(), before)
+        self.assertIn("changed since this form opened", form.error.get_text())
+        form.destroy()
+        # The control: a refresh that reads the same leaves an open form able to run.
+        form = self.win.act("set_rules")
+        self.win.refresh()
+        result = self.submit(form)
+        self.assertEqual(result.argv[-1], "action=drop")
+
+    def test_a_lead_firewall_proposal_shows_the_rules_now_and_after(self):
+        self.propose("rules")
+        pane = self.pane()
+        self.assertEqual(pane["Lead firewall now, live"], "action=accept")
+        self.assertEqual(pane["Lead firewall after accepting"], chr(10).join(RULES))
+        self.assertIn("changes the lead firewall of osint to 3 rules",
+                      self.win.proposal_warning.get_text())
+        self.assertTrue(self.win.proposal_tick.get_visible())
+        self.assertEqual(self.deciding(), {"reject_proposal"})
+        self.win.proposal_tick.set_active(True)
+        form = self.win.act("accept_proposal")
+        self.assertEqual(form.argv()[-2], "--yes")
+        self.submit(form)
+        self.assertEqual(self.lead_rules(), SPELLED)
+        self.select("project:p01")
+        self.assertEqual(self.grid(self.win.details)["Rules you accepted"], chr(10).join(SPELLED))
+
+    def test_the_check_tab_shows_the_lead_firewall_findings(self):
+        checks = lambda: {r[2]: r[1] for r in self.rows(self.win.check_store)}  # noqa: E731
+        self.assertEqual(checks()["lead firewalls not accepted"], "WARN")
+        self.select("project:p01")
+        self.submit(self.win.act("accept_rules"))
+        self.assertNotIn("lead firewalls not accepted", checks())
+        self.assertEqual(checks()["lead firewalls"], "PASS")
+        self.app.domains[LEAD].__dict__["_firewall"] = ["action=drop"]     # by hand, in dom0
+        self.win.refresh()
+        self.assertEqual(checks()["lead firewalls"], "FAIL")
+        self.assertIn("accept_rules", self.sensitive())
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,

@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.20.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.21.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -93,7 +93,7 @@ say() { echo "==> $*"; }
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash $0)"
 [ -e /etc/qubes-release ] && command -v qvm-ls >/dev/null || die "this is not dom0"
 for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py \
-         dom0/qmcp/proposals.py dom0/rpc/qmcp-service \
+         dom0/qmcp/proposals.py dom0/qmcp/gateways.py dom0/qmcp/firewall.py dom0/rpc/qmcp-service \
          dom0/bin/qmcp policy/30-mcp-control.policy deploy/qmcp-tmpfiles.conf pyproject.toml \
          dom0/qmcp/gui.py dom0/qmcp/guimodel.py dom0/bin/qmcp-gui deploy/qubes-mcp.desktop; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
@@ -127,15 +127,21 @@ qvm-check -q "$HUB" 2>/dev/null || die "the hub qube '$HUB' does not exist"
 if [ -n "$BIRTH_EGRESS" ]; then
     [[ "$BIRTH_EGRESS" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,30}$ ]] || die "'$BIRTH_EGRESS' is not a qube name"
     qvm-check -q "$BIRTH_EGRESS" 2>/dev/null || die "the birth-egress qube '$BIRTH_EGRESS' does not exist"
-    qvm-tags "$BIRTH_EGRESS" list 2>/dev/null | grep -qx ai-managed \
-        || echo "install.sh: warning: '$BIRTH_EGRESS' is not in AI space; template spawns are refused until it is" >&2
+    PYTHONPATH="$SRC/dom0" python3 -c 'import sys; from qmcp import gateways; sys.exit(0 if gateways.is_enrolled(sys.argv[1]) else 1)' "$BIRTH_EGRESS" \
+        || echo "install.sh: warning: '$BIRTH_EGRESS' is not an enrolled gateway; the hub's template spawns do not use it until it is (qmcp gateway enroll $BIRTH_EGRESS)" >&2
 fi
 
 # Project records that exist must load: while they cannot, the services refuse
-# every lead, and every create that names a qube.
+# every lead's call.
 if [ -e "$ETC_QMCP/projects.json" ]; then
     PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import projects; projects.load()' 2>/dev/null \
         || die "$ETC_QMCP/projects.json does not load; fix it (qmcp check names the problem) before installing"
+fi
+
+# So must the gateway registry: while it cannot, no AI qube may be given a network.
+if [ -e "$ETC_QMCP/gateways.json" ]; then
+    PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import gateways; gateways.load()' 2>/dev/null \
+        || die "$ETC_QMCP/gateways.json does not load; fix it (qmcp check names the problem) before installing"
 fi
 
 # The fleet must already be in the two-state shape: no tier tags, gateways
@@ -314,5 +320,12 @@ if [ "$CHECK_STATUS" -eq 0 ]; then
     say "qubes-mcp $VERSION installed. Hub: $HUB."
 else
     say "qubes-mcp $VERSION installed, but qmcp check is not GREEN (status $CHECK_STATUS)."
+fi
+# The registry starts empty, on a fresh install and on an upgrade from 0.9.20:
+# no AI qube can be given a network until the operator enrolls one.
+if ! PYTHONPATH="$LIB" python3 -c 'import sys; from qmcp import gateways; sys.exit(0 if gateways.load() else 1)' 2>/dev/null; then
+    say "no gateway is enrolled: AI qubes can be given no network, and qmcp check fails on any"
+    say "(gateways aside) that already has one. Enroll each router AI space may use:"
+    say "sudo qmcp gateway enroll QUBE"
 fi
 exit "$CHECK_STATUS"

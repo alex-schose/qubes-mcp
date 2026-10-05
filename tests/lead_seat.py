@@ -234,6 +234,8 @@ def main() -> int:
     check("firewall read on a worker", r.get("ok") is True, json.dumps(r)[:200])
     r = call("qubes_firewall_set", name=w1, rules="action=accept\n", reload=True)
     check("firewall write on a worker", r.get("ok") is True, json.dumps(r)[:200])
+    # Its own firewall is the operator's: the rulebook refuses the lead's write.
+    refused_raw("a lead writing its own firewall", lead, "admin.vm.firewall.Set", b"action=accept\n")
     call("qubes_start", name=w2)
     wait_power(w2, "Running")
     # A file that exists: a missing path fails before any copy is attempted.
