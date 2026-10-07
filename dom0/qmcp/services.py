@@ -248,7 +248,9 @@ def svc_get_property(app, call, req):
 def svc_pool_stats(app, call, req):
     """The caller's disk budget: AI space against the fleet cap for the hub; the
     project's members against its quota for a lead, with the project's name
-    space, approved templates, worker networks and dump sink. A lead never
+    space, approved templates, worker networks, dump sink and model (a remote
+    endpoint, or the model qube it reaches over qubes.ConnectTCP on
+    `model_port`). A lead never
     sees the fleet's figures; a create the fleet cap refuses inside its quota
     does tell it that the rest of AI space is full (`qmcp check` warns when the
     projects' quotas add up to more than the cap)."""
@@ -278,9 +280,14 @@ def svc_pool_stats(app, call, req):
         out["gateways"] = _gateway_rows()
     else:
         p = who.project
+        # A model qube that left AI space is redacted, as every read redacts one.
+        mq = p.model_qube
+        if mq is not None and not core.in_ai_space_by_name(app, mq):
+            mq = scope.OUT_OF_SCOPE
         out.update({"project": p.label, "name_prefix": p.space(prefix),
                     "templates": list(p.templates), "networks": list(p.networks),
-                    "dump": p.dump})
+                    "dump": p.dump, "model": p.model, "model_qube": mq,
+                    "model_port": projects.MODEL_PORT if p.model_qube else None})
     return out
 
 
@@ -301,7 +308,9 @@ def _project_rows(app):
     that fits. A name in a record that is no longer in AI space (a template
     the operator took out, say) reads `<out-of-scope>`, as every read redacts
     one, unless it is an enrolled gateway, which the hub reads by name; the
-    dump sink is outside AI space, so only whether there is one is told. One pass over the qubes gives both the names in scope and each
+    dump sink is outside AI space, so only whether there is one is told. The
+    model is a remote endpoint, or the name of the project's model qube, read
+    as any other name. One pass over the qubes gives both the names in scope and each
     slot's disk use; a slot's use that cannot be read is null, never zero, and
     records that cannot be read are null, never an empty list."""
     try:
@@ -335,7 +344,8 @@ def _project_rows(app):
                     "templates": [shown(t) for t in p.templates],
                     "networks": [shown(n) for n in p.networks], "quota": p.quota,
                     "used": None if slot in unreadable else used.get(slot, 0),
-                    "has_dump": p.dump is not None})
+                    "has_dump": p.dump is not None, "model": p.model,
+                    "model_qube": None if p.model_qube is None else shown(p.model_qube)})
     return out
 
 

@@ -24,7 +24,13 @@ command, never a second implementation of it:
   operator read it;
 - the networks the forms offer are the enrolled gateways (`gateway list`),
   and a lead's firewall is shown from its own read (`project firewall NAME
-  --json`): rules that could not be read are never shown as an empty list.
+  --json`): rules that could not be read are never shown as an empty list;
+- a lead's model is a remote endpoint or a self-hosted model qube. The forms
+  offer as a model qube only the qubes the command would take, as their `list`
+  rows show it; choosing one takes the lead's network to none, which the form
+  says in red before OK when the lead has one, and a qube that already serves
+  another project carries the command's own warning that sharing it is a path
+  between them.
 
 It cannot go stale: `tests/test_gui.py` walks the command's parser and the
 JSON each read returns, and fails on any command, option or field the window
@@ -205,6 +211,32 @@ def _model(text) -> str:
     return text
 
 
+def _model_qube(name, allow_none=False) -> str:
+    """A self-hosted model qube as the command takes it: a qube's name, or
+    `none` where taking the project's away is meant (a lead change, a lead's
+    firewall). A new project has none to take away."""
+    if name == "none":
+        if allow_none:
+            return name
+        raise FormError("choose the model qube")
+    return _qube(name, "the model qube")
+
+
+def _model_options(model, model_qube, lead_netvm, allow_none=False) -> list:
+    """`--model HOST:PORT` or `--model-qube QUBE`, never both, refused where
+    the command refuses them (`fleet._model_qube_lead_netvm`), in its words: a
+    lead whose model is a qube has no network."""
+    typed = (model or "").strip()
+    if model_qube is None:
+        return ["--model", _model(typed)] if typed else []
+    if typed:
+        raise FormError("say --model HOST:PORT or --model-qube QUBE, not both")
+    if lead_netvm not in (None, "none"):
+        raise FormError("a lead whose model is a qube has no network: drop --lead-netvm "
+                        "(or give --lead-netvm none)")
+    return ["--model-qube", _model_qube(model_qube, allow_none)]
+
+
 def _gateway_label(label) -> str:
     """A gateway's label, checked with the command's own check."""
     why = gateways.label_refusal(label) if isinstance(label, str) else "a label is text"
@@ -251,16 +283,18 @@ def lead_name_from(typed, space):
 
 
 def create_project(label, lead_source, lead_origin, lead_name=None, lead_netvm=None,
-                   templates=(), networks=(), quota=None, dump=False, model=None) -> list:
+                   templates=(), networks=(), quota=None, dump=False, model=None,
+                   model_qube=None) -> list:
     """`model` is the lead's model endpoint, or None. Whether the lead needs
-    one depends on its network, which `lead_model()` judges with the fleet."""
+    one depends on its network, which `lead_model()` judges with the fleet.
+    `model_qube` is a self-hosted model qube instead; then the lead has no
+    network."""
     check_label(label)
     if not networks:
         raise FormError("tick at least one worker network (a gateway, or none)")
     argv = write_cmd("project", "create", label,
                      *_lead(lead_source, lead_origin, lead_name, lead_netvm))
-    if (model or "").strip():
-        argv += ["--model", _model(model)]
+    argv += _model_options(model, model_qube, lead_netvm)
     for t in templates:
         argv += ["--template", _qube(t, "an approved template")]
     for n in networks:
@@ -296,9 +330,12 @@ def remove_lead(key) -> list:
 
 
 def change_lead(key, lead_source, lead_origin, lead_name=None, lead_netvm=None,
-                keep_old=False, model=None, add_old_network=False) -> list:
-    """`model` None: a new lead with a network takes the project's model.
-    `add_old_network` goes with `keep_old` only, as the command has it."""
+                keep_old=False, model=None, add_old_network=False, model_qube=None) -> list:
+    """`model` None: a new lead with a network takes the project's model, and
+    one without keeps the project's model qube. `model_qube` names another
+    model qube, or `none` takes the project's away; either way the new lead
+    has no network. `add_old_network` goes with `keep_old` only, as the
+    command has it."""
     argv = write_cmd("project", "lead", _key(key),
                      *_lead(lead_source, lead_origin, lead_name, lead_netvm))
     if add_old_network and not keep_old:
@@ -307,9 +344,7 @@ def change_lead(key, lead_source, lead_origin, lead_name=None, lead_netvm=None,
         argv.append("--keep-old")
     if add_old_network:
         argv.append("--add-old-network")
-    if (model or "").strip():
-        argv += ["--model", _model(model)]
-    return argv
+    return argv + _model_options(model, model_qube, lead_netvm, allow_none=True)
 
 
 def add_dump(key, sink_name=None) -> list:
@@ -387,8 +422,16 @@ def show_lead_firewall(key) -> list:
 
 def set_lead_model(key, model) -> list:
     """The lead's model endpoint changes, and its firewall becomes that
-    endpoint, DNS and nothing else."""
+    endpoint, DNS when it is a host name, and nothing else."""
     return write_cmd("project", "firewall", _key(key), "--model", _model(model))
+
+
+def set_lead_model_qube(key, model_qube) -> list:
+    """The project's model becomes the self-hosted model qube `model_qube`:
+    the lead loses its network, and the qube leaves p00, loses its network
+    and is guarded. `none` takes the project's model qube away."""
+    return write_cmd("project", "firewall", _key(key), "--model-qube",
+                     _model_qube(model_qube, allow_none=True))
 
 
 def set_lead_rules(key, rules) -> list:
@@ -448,7 +491,8 @@ def reject_proposal(pid) -> list:
 BUILDERS = (create_project, edit_project, remove_lead, change_lead, add_dump, move,
             delete_plan, delete_project, role, audit_rotate, show_proposal, accept_proposal,
             reject_proposal, enroll_gateway, change_gateway, remove_gateway,
-            show_lead_firewall, set_lead_model, set_lead_rules, accept_lead_rules)
+            show_lead_firewall, set_lead_model, set_lead_model_qube, set_lead_rules,
+            accept_lead_rules)
 
 #: Commands and options the window does not offer, and why the operator types
 #: them. An entry covers everything under it. Adding one is a decision, not a
@@ -471,15 +515,16 @@ SHOWN_BY = {
 QUBE_FIELDS = (
     ("name", "Name"), ("state", "State"), ("klass", "Class"), ("template", "Template"),
     ("netvm", "Network"), ("power", "Power"), ("slot", "Slot badges"), ("lead", "Lead badge"),
-    ("owner", "Created by"), ("gateway", "Provides network"), ("dvmt", "Disposable template"),
-    ("badges", "Badges"),
+    ("model", "Model qube of"), ("owner", "Created by"), ("gateway", "Provides network"),
+    ("dvmt", "Disposable template"), ("badges", "Badges"),
 )
 #: Every field of a `project list` row.
 PROJECT_FIELDS = (
     ("slot", "Slot"), ("label", "Label"), ("lead", "Lead"), ("members", "Members"),
     ("used", "Disk used"), ("quota", "Disk quota"), ("templates", "Approved templates"),
     ("networks", "Worker networks (first is the default)"), ("dump", "Dump sink"),
-    ("model", "Lead's model endpoint"), ("lead_firewall", "Lead firewall you accepted"),
+    ("model", "Lead's model endpoint"), ("model_qube", "Lead's model qube"),
+    ("lead_firewall", "Lead firewall you accepted"),
 )
 #: Every field of `settings --json`.
 SETTINGS_FIELDS = (
@@ -671,7 +716,8 @@ def badges(row) -> dict:
             "lead_tag": projects.LEAD in tags, "drop_box": projects.DROP_BOX in tags,
             "member": {s for k, s in parts if k == "proj"},
             "lead": {s for k, s in parts if k == "lead"},
-            "dump": {s for k, s in parts if k == "dump"}}
+            "dump": {s for k, s in parts if k == "dump"},
+            "model": {s for k, s in parts if k == "model"}}
 
 
 #: Why a qube is under Needs attention: (the Role column, the details pane).
@@ -688,9 +734,32 @@ ATTENTION = {
                 "a gateway without qmcp-guarded: the rulebook lets the hub run commands in it"),
     "outside": ("badges outside AI space", "slot badges outside AI space: the rulebook acts on them"),
     "sink": ("stray sink badge", "a sink badge that is not its record's"),
-    "unreadable": ("cannot be read", "a read of its tags, class or role failed, so the window "
-                                     "offers nothing on it. A command reads it again and "
-                                     "refuses what it still cannot read. Refresh"),
+    "model_kind": ("model badge on a template or gateway",
+                   "a model badge on a template, a disposable template, a disposable or a "
+                   "gateway, which is never a model qube: the rulebook still lets the badge's "
+                   f"lead reach it on port {projects.MODEL_PORT}"),
+    "model_member": ("model qube in a slot",
+                     "a model badge on a member of a slot, p00 included: a model qube is in no "
+                     "slot. In one, it copies into the slot's members and its sink without a "
+                     f"dialog, and the leads it serves reach a qube of that slot on port "
+                     f"{projects.MODEL_PORT}"),
+    "model_record": ("model badge, no record",
+                     "a model badge its slot's record does not name: the rulebook still lets that "
+                     f"slot's lead reach it on port {projects.MODEL_PORT}"),
+    "model_network": ("model qube with a network",
+                      "a model qube with a network: the leads it serves reach that network through "
+                      "it, around the firewalls you accepted for them"),
+    "model_template": ("model qube on a managed template",
+                       "its template is one the hub manages (in AI space and not guarded): the hub "
+                       "can change what runs in it at its next start"),
+    "model_lead": ("lead with a network, model a qube",
+                   "its project's model is a qube, so it has no network, and this lead was given "
+                   "one: the project is no longer sealed. Set model qube... on the project, with "
+                   "the same qube, takes the network away again (as qvm-prefs LEAD netvm '' does)"),
+    "unreadable": ("cannot be read", "a read of its tags, class or role failed (for a model qube, "
+                                     "its network or its template too), so the window offers "
+                                     "nothing on it. A command reads it again and refuses what it "
+                                     "still cannot read. Refresh"),
 }
 
 
@@ -698,17 +767,35 @@ def _attention(code):
     return "attention", f"needs attention: {ATTENTION[code][0]}", code
 
 
-def classify(row, records, hub=None):
+def _and(items) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    items = [str(i) for i in items]
+    return ", ".join(items[:-1]) + " and " + items[-1] if len(items) > 1 else "".join(items)
+
+
+def model_role(slots, guarded=True, records_read=True) -> str:
+    """A model qube's role: the slots it serves, shared when more than one,
+    and not guarded while the operator has it managed."""
+    role = f"model qube of {_and(sorted(slots))}"
+    if len(slots) > 1:
+        role += ", shared"
+    if not guarded:
+        role += ", not guarded"
+    return role if records_read else role + " (records not read)"
+
+
+def classify(row, records, hub=None, by_name=None):
     """(where, role, attention) for one qube, from its badges and the records.
-    `where` is a slot, `templates`, `gateways`, `guarded`, `noslot`,
+    `where` is a slot, `templates`, `gateways`, `models`, `guarded`, `noslot`,
     `attention`, or None (not in the tree). `records` is None when they could
-    not be read: then nothing is judged against them."""
+    not be read: then nothing is judged against them. `by_name` holds every
+    `list` row by name: a model qube is judged by its template's row too."""
     b = badges(row)
     name = row["name"]
     if unread_row(row):
         return _attention("unreadable")
     if row.get("state") is None:
-        if b["member"] or b["lead"] or b["lead_tag"]:
+        if b["member"] or b["lead"] or b["lead_tag"] or b["model"]:
             return _attention("outside")
         if b["dump"] and records is not None:
             slot = next(iter(b["dump"]))
@@ -722,12 +809,20 @@ def classify(row, records, hub=None):
         return _attention("drop_box")
     if b["lead_tag"] or b["lead"]:
         slot = next(iter(b["lead"])) if len(b["lead"]) == 1 else None
-        if records is None and slot is not None:
-            return slot, "lead (records not read)", None
-        rec = (records or {}).get(slot) if slot else None
-        if (not b["lead_tag"] or slot is None or b["member"] or b["guarded"]
-                or rec is None or rec.get("lead") != name):
+        # What the badges alone show (`core.lead_badges_agree`) is judged
+        # whether or not the records were read; only the record waits for them.
+        if not b["lead_tag"] or slot is None or b["member"] or b["guarded"] or b["model"]:
             return _attention("lead")
+        if records is None:
+            return slot, "lead (records not read)", None
+        rec = records.get(slot)
+        if rec is None or rec.get("lead") != name:
+            return _attention("lead")
+        # A lead whose model is a qube has none; one that was given a network
+        # outside qmcp fails the check (one whose network does not read leaves it
+        # incomplete, and is shown as the lead it is).
+        if rec.get("model_qube") and row.get("netvm") not in (None, UNREADABLE):
+            return _attention("model_lead")
         return slot, "lead", None
     if len(b["member"]) > 1:
         return _attention("two_slots")
@@ -735,6 +830,8 @@ def classify(row, records, hub=None):
         return _attention("template_member")
     if row.get("gateway") and not b["guarded"]:
         return _attention("gateway")
+    if b["model"]:
+        return _model_place(row, b, records, by_name)
     if b["member"]:
         slot = next(iter(b["member"]))
         return slot, ("hub's qube" if slot == projects.HUB_SLOT else "worker"), None
@@ -747,24 +844,100 @@ def classify(row, records, hub=None):
     return "noslot", "hub's qube, no slot", None
 
 
+def _model_why(row, by_name=None, hub=None):
+    """(kind, why) when the command refuses `row`'s qube as a model qube
+    (`fleet.model_qube_refusal`), as far as `list` rows show it, in the
+    command's order and words; None when they show no reason. `kind` is
+    `unreadable` (a value it needs could not be read, its template's
+    included), `hub`, `kind` (a class, a disposable template or a gateway),
+    `drop_box`, `outside` (outside AI space: the command never brings one
+    in), `lead`, `member` (of a project other than p00) or `template` (one
+    the hub manages, anywhere in its template chain, read from `by_name`)."""
+    if unread_row(row) or UNREADABLE in row.values():
+        return "unreadable", "cannot be read now; refresh"
+    if hub is not None and row.get("name") == hub:
+        return "hub", "is the hub"
+    klass = row.get("klass")
+    if klass not in ("AppVM", "StandaloneVM"):
+        return "kind", f"is a {klass}; a model qube is an AppVM or a StandaloneVM"
+    if row.get("dvmt"):
+        return "kind", "is a disposable template"
+    if row.get("gateway"):
+        return "kind", "provides network"
+    b = badges(row)
+    if b["drop_box"] or b["dump"]:
+        return "drop_box", "is a drop box"
+    if row.get("state") is None:
+        return "outside", f"is outside AI space: guard it first (qmcp guard {row.get('name')})"
+    if b["lead_tag"] or b["lead"]:
+        return "lead", "is a lead"
+    others = b["member"] - {projects.HUB_SLOT}
+    if others:
+        return "member", f"is a member of {', '.join(sorted(others))}"
+    tpl, seen = row.get("template"), set()
+    while tpl is not None and tpl not in seen:
+        seen.add(tpl)
+        trow = (by_name or {}).get(tpl)
+        if trow is None or unread_row(trow) or trow.get("template") == UNREADABLE:
+            return "unreadable", f"its template {tpl} cannot be read now; refresh"
+        tb = badges(trow)
+        if tb["umbrella"] and not tb["guarded"]:
+            return "template", (f"its template {tpl} is one the hub manages (guard it, or use "
+                                f"another)")
+        tpl = trow.get("template")
+    return None
+
+
+def _model_place(row, b, records, by_name):
+    """Where a qube that wears a model badge goes, in the tree: Model qubes
+    when it is one as the rulebook and the records need it, else Needs
+    attention for the first thing `qmcp check` fails on it
+    (`fleet.model_qube_findings`); one that is not guarded is only warned
+    about, and stays a model qube. The hub, a drop box and a lead were
+    placed before this is asked."""
+    why = _model_why(row, by_name)
+    kind = why[0] if why else None
+    if kind == "kind":
+        return _attention("model_kind")
+    if b["member"]:
+        return _attention("model_member")
+    if kind == "unreadable":
+        return _attention("unreadable")
+    if records is not None and any(
+            not (records.get(s) or {}).get("label") or (records.get(s) or {}).get("model_qube")
+            != row["name"] for s in b["model"]):
+        return _attention("model_record")
+    if row.get("netvm") is not None:
+        return _attention("model_network")
+    if kind == "template":
+        return _attention("model_template")
+    return "models", model_role(b["model"], b["guarded"], records is not None), None
+
+
 def _qube_node(row, role, attention=None) -> Node:
     return Node(f"qube:{row['name']}", "qube", _cells(row["name"], role, row),
                 dict(row, role=role, attention=attention))
 
 
-def _ref(slot, what, name, role) -> Node:
-    """A project's lead or sink that is shown elsewhere, or missing: a key of
-    its own, so no qube is ever two rows under one key."""
-    return Node(f"ref:{slot}:{what}", "ref", _cells(name, role), {"name": name, "role": role})
+def _ref(slot, what, name, role, shared=None) -> Node:
+    """A project's lead, sink or model qube that is shown elsewhere, or
+    missing: a key of its own, so no qube is ever two rows under one key.
+    `shared`: what a model qube that serves other projects too means."""
+    data = {"name": name, "role": role}
+    if shared:
+        data["shared"] = shared
+    return Node(f"ref:{slot}:{what}", "ref", _cells(name, role), data)
 
 
 def build_tree(fleet_rows, project_rows, settings) -> list:
     """The tree: the hub with p00 and the qubes in no slot, the projects with
-    their leads, workers and sinks, templates, gateways, other guarded qubes,
-    and Needs attention: the qubes whose badges the rulebook acts on against
-    the records (see `ATTENTION`); every other failure of `qmcp check` is on
-    the Check tab. `project_rows` None means the records could not be read,
-    and nothing is judged against them."""
+    their leads, workers, sinks and model qubes, templates, gateways, model
+    qubes, other guarded qubes, and Needs attention: the qubes whose badges
+    the rulebook acts on against the records (see `ATTENTION`); every other
+    failure of `qmcp check` is on the Check tab. A model qube may serve
+    several projects, so it has one row, under Model qubes, and each project
+    it serves a reference to it. `project_rows` None means the records could
+    not be read, and nothing is judged against them."""
     rows = [r for r in fleet_rows or () if isinstance(r, dict) and isinstance(r.get("name"), str)]
     by_name = {r["name"]: r for r in rows}
     records = None if project_rows is None else {
@@ -774,7 +947,7 @@ def build_tree(fleet_rows, project_rows, settings) -> list:
     buckets: dict = {}
     placed: dict = {}
     for row in rows:
-        where, role, attention = classify(row, records, hub_name)
+        where, role, attention = classify(row, records, hub_name, by_name)
         if where is None:
             continue
         buckets.setdefault(where, []).append(_qube_node(row, role, attention))
@@ -787,6 +960,17 @@ def build_tree(fleet_rows, project_rows, settings) -> list:
         if placed.get(name) == "attention":
             return _ref(slot, "dump", name, "dump sink (see Needs attention)")
         return _qube_node(row, "dump sink")
+
+    def model_child(slot, name):
+        row = by_name.get(name)
+        if row is None:
+            return _ref(slot, "model", name, "model qube (missing)")
+        if placed.get(name) == "attention":
+            return _ref(slot, "model", name, "model qube (see Needs attention)")
+        if slot not in badges(row)["model"]:
+            return _ref(slot, "model", name, "model qube (no badge: its lead cannot reach it)")
+        return _ref(slot, "model", name, "model qube (see Model qubes)",
+                    model_shared(records.get(slot), rows))
 
     hub = Node("hub", "hub", _cells(hub_name or "(no hub)", "hub", {"power": settings.get("hub_power")}),
                {"name": hub_name})
@@ -823,11 +1007,15 @@ def build_tree(fleet_rows, project_rows, settings) -> list:
         node.children = leads + [m for m in members if m.data.get("role") != "lead"]
         if rec.get("dump"):
             node.children.append(sink_child(slot, rec["dump"]))
+        if rec.get("model_qube"):
+            node.children.append(model_child(slot, rec["model_qube"]))
         projects_node.children.append(node)
 
     out = [hub, projects_node]
     for where, title, note in (("templates", "Templates", "the hub builds managed ones"),
                                ("gateways", "Gateways", "guarded"),
+                               ("models", "Model qubes",
+                                f"no network; their leads reach them on port {projects.MODEL_PORT}"),
                                ("guarded", "Other guarded", "reference only"),
                                ("attention", "Needs attention", "qmcp check fails on these")):
         items = buckets.pop(where, [])
@@ -848,20 +1036,65 @@ def walk(nodes):
         yield from walk(node.children)
 
 
-def details(node: Node, project_rows=None) -> list:
-    """(heading, text) pairs for the details pane."""
+def _row(fleet_rows, name):
+    """The `list` row of `name`, or None."""
+    return next((r for r in fleet_rows or () if isinstance(r, dict) and r.get("name") == name),
+                None) if name else None
+
+
+def model_shared(record, fleet_rows) -> str | None:
+    """When a project's model qube serves other projects as well: which, and
+    what sharing one means, in the command's words. None otherwise, and when
+    its row is not on show or does not read."""
+    q = (record or {}).get("model_qube")
+    row = _row(fleet_rows, q)
+    if row is None or unread_row(row):
+        return None
+    others = sorted(badges(row)["model"] - {record.get("slot")})
+    return f"{q} also serves {', '.join(others)}: {fleet.SHARED_MODEL_WARNING}" if others else None
+
+
+def model_notes(row, project_rows=None) -> list:
+    """What to know about a model qube, under its role: the projects it
+    serves, that one serving several is a path between them, and whether the
+    hub may operate it now (the operator's maintenance window)."""
+    b = badges(row)
+    slots = sorted(b["model"])
+    labels = {p.get("slot"): p.get("label") for p in project_rows or () if isinstance(p, dict)}
+    serves = ", ".join(f"{s} {labels[s]}" if labels.get(s) else s for s in slots)
+    who = "its lead reaches" if len(slots) == 1 else "the lead of each reaches"
+    out = [("Serves", esc(f"{serves}: {who} it over qubes.ConnectTCP on port "
+                          f"{projects.MODEL_PORT}"))]
+    if len(slots) > 1:
+        out.append(("Shared", esc(fleet.SHARED_MODEL_WARNING)))
+    out.append(("Maintenance", esc(
+        "guarded: the hub cannot operate it. Manage... opens it to the hub while it needs changes, "
+        "and qmcp check warns until Guard... closes it again" if b["guarded"] else
+        "not guarded: the hub may operate it (run commands in it as root, change it) until you "
+        "guard it again with Guard...; qmcp check warns meanwhile")))
+    return out
+
+
+def details(node: Node, project_rows=None, fleet_rows=None) -> list:
+    """(heading, text) pairs for the details pane. `fleet_rows` say whether
+    a project's model qube serves other projects too."""
     if node.kind == "qube":
         rows = [(label, field_text(key, node.data.get(key))) for key, label in QUBE_FIELDS
                 if key in node.data]
         why = ATTENTION.get(node.data.get("attention"))
+        notes = (model_notes(node.data, project_rows)
+                 if str(node.data.get("role") or "").startswith("model qube") else [])
         return ([("Role", esc(node.data.get("role")))] + ([("Why", esc(why[1]))] if why else [])
-                + rows)
+                + notes + rows)
     if node.kind == "project":
-        return [(label, field_text(key, node.data.get(key))) for key, label in PROJECT_FIELDS]
+        out = [(label, field_text(key, node.data.get(key))) for key, label in PROJECT_FIELDS]
+        shared = model_shared(node.data, fleet_rows)
+        return out + ([("Its model qube is shared", esc(shared))] if shared else [])
     if node.kind == "slot":
         return [("Slot", esc(node.data.get("slot")))]
     if node.kind == "ref":
-        return [("Role", esc(node.data.get("role"))), ("Name", esc(node.data.get("name")))]
+        out = [("Role", esc(node.data.get("role"))), ("Name", esc(node.data.get("name")))]
+        return out + ([("Shared", esc(node.data["shared"]))] if node.data.get("shared") else [])
     if node.kind == "hub":
         return [("Hub", esc(node.data.get("name")))]
     return []
@@ -900,11 +1133,51 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
             out.add("move")
         if state == "guarded" and role != "gateway":
             out.add("manage")
-        if state == "managed" and role in ("hub's qube, no slot", "template", "disposable template"):
+        # A model qube is managed only for its maintenance window, which Guard closes.
+        if state == "managed" and (role in ("hub's qube, no slot", "template", "disposable template")
+                                   or role.startswith("model qube")):
             out.add("guard")
         if not role.startswith("lead"):
             out.add("revoke")
     return out
+
+
+def role_intro(action, row) -> str:
+    """What Manage or Guard does to a qube, for the form that confirms it. A
+    model qube's says what it means for the leads it serves: managed is the
+    operator's maintenance window, during which the hub may operate it."""
+    name = row.get("name")
+    becomes, what = (("managed", "the hub may run commands in it as root and change it")
+                     if action == "manage" else
+                     ("guarded", "it is listed and referenced, never operated"))
+    text = f"{name} becomes {becomes}: {what}."
+    # Only a kind that can be a model qube is one, whatever it wears: Guard
+    # never kills a gateway or a template.
+    kind = row.get("klass") in ("AppVM", "StandaloneVM") and row.get("dvmt") is False \
+        and row.get("gateway") is False
+    serves = sorted(badges(row)["model"]) if kind else []
+    if serves and action == "manage":
+        text += (f" It stays the model qube of {_and(serves)}, and their leads still reach it on "
+                 f"port {projects.MODEL_PORT}: this opens its maintenance window, and qmcp check "
+                 f"warns until you guard it again.")
+    elif serves:
+        text += (f" It stays the model qube of {_and(serves)}; its maintenance window closes: if "
+                 f"it runs, it is killed, so no process the hub started in it runs on. Its files "
+                 f"stay: what the hub left in /home, /usr/local or /rw (anywhere, in a "
+                 f"StandaloneVM), and whatever is set to start from there runs at its next "
+                 f"start.")
+    return text
+
+
+def revoke_note(row) -> str:
+    """What revoking a model qube means for the projects it serves, for the
+    form that asks; empty for any other qube."""
+    serves = sorted(badges(row or {})["model"])
+    if not serves:
+        return ""
+    return (f"It is the model qube of {_and(serves)}: revoking takes its model badges too, so "
+            f"their leads no longer reach it, and qmcp check warns until each project gets "
+            f"another (Set model qube...).")
 
 
 def slot_of(node: Node) -> str | None:
@@ -969,7 +1242,7 @@ PROPOSAL_BY_PART = {
 PROPOSAL_OPTIONS = (
     ("label", "Label"), ("project", "Project"),
     ("lead", "Lead"), ("lead_name", "Lead name"), ("lead_netvm", "Lead network"),
-    ("model", "Lead's model endpoint"),
+    ("model", "Lead's model endpoint"), ("model_qube", "Lead's model qube"),
     ("remove", "Remove the lead"), ("keep_old", "Keep the old lead as a worker"),
     ("add_old_network", "Add the old lead's network to the worker networks"),
     ("templates", "More approved templates"),
@@ -985,10 +1258,12 @@ EDIT_FIELDS = (("templates", "Templates, now -> after"),
                ("networks", "Worker networks, now -> after"),
                ("quota", "Quota, now -> after"))
 #: A lead-firewall proposal's lead now and after accepting, one above the
-#: other: `before` holds the model, the accepted and live rules, and why the
-#: live ones could not be read (shown in their line, in place of the rules);
-#: `after` the model and the rules it sets.
+#: other: `before` holds the model and the model qube, the accepted and live
+#: rules, and why the live ones could not be read (shown in their line, in
+#: place of the rules); `after` the model, the model qube and the rules it
+#: sets, none for a model qube change, which writes no rules.
 FIREWALL_CHANGE = (("model", "Lead's model, now -> after"),
+                   ("model_qube", "Lead's model qube, now -> after"),
                    ("accepted", "Lead firewall now, as you accepted it"),
                    ("live", "Lead firewall now, live"),
                    ("read_error", "Lead firewall now, live"),
@@ -1142,28 +1417,46 @@ def _option_text(key, value) -> Shown:
         return esc(LEAD_FROM[value["from"]].format(value.get("qube")))
     if key == "quota":
         return esc(_plain(key, value))      # exact: what the operator accepts is what runs
+    if key == "model_qube" and value == "none":
+        return esc("none: the project's model qube is taken away")
     return field_text(key, value)
 
 
 def firewall_change(before, after) -> list:
-    """(heading, text) for a lead-firewall proposal: the model now and after,
-    then the rules the operator accepted, the live ones, and the ones
-    accepting sets, a rule per line, one above the other. Live rules that
-    were not read say why: they could not be read (and the error), or there
-    was no lead's qube to read them from; never an empty list."""
+    """(heading, text) for a lead-firewall proposal: the model and the model
+    qube now and after, then the rules the operator accepted, the live ones,
+    and the ones accepting sets, a rule per line, one above the other. Live
+    rules that were not read say why: they could not be read (and the error),
+    or there was no lead's qube to read them from; never an empty list. A
+    model qube change sets no rules, and says why. With no "after" (the
+    change cannot apply), each "after" value points at the plan, which says
+    why."""
     before = before if isinstance(before, dict) else {}
-    after = after if isinstance(after, dict) else {}
+    known = isinstance(after, dict)
+    after = after if known else {}
     h = dict(FIREWALL_CHANGE)
+
+    def then(key):
+        return _plain(key, after.get(key)) if known else "? (see Plan)"
+
     if isinstance(before.get("live"), list) or not before.get("read_error"):
         live = rules_text(before.get("live"), "not read: the project has no lead, or no qube "
                                               "of that name")
     else:
         live = esc(f"could not be read ({before['read_error']})")
-    return [(h["model"], esc(f"{_plain('model', before.get('model'))} -> "
-                             f"{_plain('model', after.get('model'))}")),
+    if not known:
+        rules = esc("? (see Plan)")
+    elif "model_qube" in after and after.get("rules") is None:
+        rules = esc("(none: the lead has no network)" if after.get("model_qube") else
+                    "(none: nothing is written to the lead)")
+    else:
+        rules = rules_text(after.get("rules"), "-")
+    return [(h["model"], esc(f"{_plain('model', before.get('model'))} -> {then('model')}")),
+            (h["model_qube"], esc(f"{_plain('model_qube', before.get('model_qube'))} -> "
+                                  f"{then('model_qube')}")),
             (h["accepted"], rules_text(before.get("accepted"), "none on record")),
             (h["live"], live),
-            (h["rules"], rules_text(after.get("rules"), "-"))]
+            (h["rules"], rules)]
 
 
 def proposal_details(doc) -> list:
@@ -1585,22 +1878,180 @@ def lead_model(network, model, carried=None):
         return typed
     if network is not None and not carried:
         raise FormError("a lead with a network needs its model endpoint, host:port: dom0 writes "
-                        "its firewall to allow that endpoint and DNS, nothing else")
+                        "its firewall to allow that endpoint, DNS when it is a host name, and "
+                        "nothing else")
     return None
 
 
-def lead_info(network, carried=None, change=False) -> str:
+def lead_info(network, carried=None, change=False, qube=None, project_qube=None) -> str:
     """The line under the lead's fields: where it will be, and what that asks
     of the model field. `change`: a new lead of a project, which takes the
-    project's model, `carried`, when none is typed."""
+    project's model, `carried`, when none is typed, and with no network keeps
+    the project's model qube, `project_qube`. `qube`: a self-hosted model
+    chosen instead ("" keeps `project_qube`, "none" takes it away); then the
+    lead has no network."""
+    if qube is not None:
+        if qube == "none":
+            return (f"The lead will have no network and no model: {project_qube} stops being the "
+                    f"project's model qube. It needs no firewall.")
+        if not (qube or project_qube):
+            return ("The lead will have no network: a lead whose model is a qube has none. "
+                    "Choose its model qube.")
+        return (f"The lead will have no network: a lead whose model is a qube has none. It "
+                f"reaches {qube or project_qube} on port {projects.MODEL_PORT}, and needs no "
+                f"firewall.")
     if network is None:
+        if change and project_qube:
+            return (f"The lead will have no network: leave the endpoint empty. It needs no "
+                    f"firewall, and reaches the project's model qube {project_qube}.")
         return "The lead will have no network: leave the model empty. It needs no firewall."
     text = (f"The lead will be on {network}: dom0 writes its firewall to allow its model "
-            f"endpoint and DNS, and nothing else.")
+            f"endpoint, DNS when that is a host name, and nothing else.")
     if not change:
         return text + " Give its model endpoint."
+    if project_qube:
+        return text + (f" Give its model endpoint: a remote model replaces the project's model "
+                       f"qube {project_qube}.")
     return text + (f" Left empty, the model is the project's, {carried}." if carried
                    else " The project has no model on record: give one.")
+
+
+# ======================================================================= model qubes
+
+#: Why a model-qube field offers nothing to choose.
+NO_MODEL_QUBE = ("no qube here can be a model qube: an AppVM or a StandaloneVM in AI space that "
+                 "is no disposable template, gateway, drop box, lead or member of a project but "
+                 "p00, on no template the hub manages (a qube of yours outside AI space joins it "
+                 "with qmcp guard NAME, once it has no network or sits on an enrolled gateway)")
+#: Why it offers nothing when the hub is not known: the command refuses every qube then.
+NO_HUB = ("the hub is not known (Settings: the hub file cannot be read), so the command refuses "
+          "every model qube until it reads")
+
+
+def no_model_qube(hub) -> str:
+    """Why a model-qube field offers nothing to choose."""
+    return NO_MODEL_QUBE if hub else NO_HUB
+
+
+def model_qube_choices(fleet_rows, hub=None) -> list:
+    """The qubes a form offers as a project's model qube: those the command
+    would take (`fleet.model_qube_refusal`), as far as their `list` rows show
+    it. Never one outside AI space: the command takes only a qube already in
+    it. A row with a value that could not be read is not offered, nor one
+    whose template's row does not read, and nothing is while the hub is not
+    known; the command checks everything again when it runs."""
+    if not hub:
+        return []
+    rows = [r for r in fleet_rows or () if isinstance(r, dict) and isinstance(r.get("name"), str)]
+    by_name = {r["name"]: r for r in rows}
+    return sorted(r["name"] for r in rows if _model_why(r, by_name, hub) is None)
+
+
+def model_qube_text(row, slot=None) -> str:
+    """A qube as a model-qube field lists it: its name, where it is, and the
+    slots it serves already (`slot`'s own: the project's model qube now)."""
+    b = badges(row)
+    notes = [str(row.get("state"))]
+    if projects.HUB_SLOT in b["member"]:
+        notes.append("in p00")
+    if row.get("netvm") is not None:
+        notes.append(f"on {row['netvm']}")
+    if slot in b["model"]:
+        notes.append(f"{slot}'s model qube now")
+    others = sorted(b["model"] - {slot})
+    if others:
+        notes.append(f"serves {', '.join(others)}")
+    return f"{row['name']} ({'; '.join(notes)})"
+
+
+def model_qube_options(fleet_rows, hub=None, slot=None, current=None, keep=False) -> list:
+    """(id, text) for a form's model-qube field: every qube the command
+    would take (`model_qube_choices`), said where it is and whom it serves.
+    With `keep` (a lead change), first, the project's model qube now,
+    `current`, kept as it is (id ""), and it is not listed again; with a
+    `current`, last, taking it away (id "none")."""
+    rows = {r["name"]: r for r in fleet_rows or () if isinstance(r, dict)
+            and isinstance(r.get("name"), str)}
+    out = [("", f"keep {current}, the project's model qube now")] if keep and current else []
+    out += [(n, model_qube_text(rows[n], slot)) for n in model_qube_choices(fleet_rows, hub)
+            if not (keep and n == current)]
+    if current:
+        out.append(("none", f"none: take {current} away; the lead reaches no model"))
+    return out
+
+
+def chosen_model_qube(choice, current=None) -> str:
+    """The self-hosted model a form sends: a qube's name, "none", or "" to
+    keep `current`, the project's model qube now. Nothing chosen is refused."""
+    if choice is None or (choice == "" and not current):
+        raise FormError("choose the model qube, or a remote endpoint")
+    return choice
+
+
+def model_qube_red(qube, lead=None, slot=None, fleet_rows=()) -> str:
+    """What a form says in red before OK when `qube` becomes the model qube
+    of `slot` (None: a project not made yet): that `lead`, the qube that will
+    lead it, loses its network, since a lead whose model is a qube has none;
+    and that `qube` already serves another project, with the command's own
+    warning of what that means. Empty when neither, or when no qube is
+    chosen."""
+    if not qube or qube == "none":
+        return ""
+    lines = []
+    lrow = _row(fleet_rows, lead)
+    net = lrow.get("netvm") if lrow else None
+    if net not in (None, UNREADABLE):
+        lines.append(f"{lead} loses its network ({net}): a lead whose model is a qube has none, "
+                     f"and going back to a remote model takes a new lead.")
+    qrow = _row(fleet_rows, qube)
+    others = sorted(badges(qrow)["model"] - {slot}) if qrow and not unread_row(qrow) else []
+    if others:
+        lines.append(f"WARNING: {qube} also serves {', '.join(others)}: "
+                     f"{fleet.SHARED_MODEL_WARNING}")
+    return "\n".join(lines)
+
+
+def model_qube_info(qube, fleet_rows=(), slot=None, current=None) -> str:
+    """What OK does to the chosen model qube, in the order the command does
+    it (`fleet._set_model_qube`), or what taking `current` away does."""
+    if qube is None:
+        return ""
+    if qube == "none":
+        return (f"{current} loses {projects.model_badge(slot) if slot else 'its badge'} and stops "
+                f"serving the project; it stays as it is otherwise. The lead reaches no model.")
+    if qube == "":
+        return f"{current} stays the project's model qube."
+    row = _row(fleet_rows, qube)
+    if row is None:
+        return ""
+    b, steps = badges(row), []
+    if projects.HUB_SLOT in b["member"]:
+        steps.append("leaves p00")
+    if row.get("netvm") is not None:
+        steps.append(f"loses its network ({row['netvm']})")
+    if not b["guarded"]:
+        steps.append("is guarded (the hub can no longer operate it)")
+    if not b["guarded"] or not b["model"]:
+        # The command spares only a guarded qube that already serves a project.
+        steps.append("is killed if it runs")
+    badge = projects.model_badge(slot) if slot else "the project's model badge"
+    head = f"{qube} {_and(steps)}; then it" if steps else f"{qube}"
+    return (f"{head} is recorded and wears {badge}, and the lead reaches it on port "
+            f"{projects.MODEL_PORT}.")
+
+
+def model_qube_refusal(doc, choice, fleet_rows) -> str | None:
+    """Why the command refuses `--model-qube choice` for the firewall view's
+    project, where the window can see why, in its words
+    (`fleet._set_model_qube`): nothing chosen, and a lead whose network cannot
+    be read, which it must take to none."""
+    if not choice:
+        return "choose the model qube, or none"
+    lead = (doc or {}).get("lead")
+    lrow = _row(fleet_rows, lead)
+    if choice != "none" and lrow is not None and lrow.get("netvm") == UNREADABLE:
+        return f"the network of {lead} cannot be read"
+    return None
 
 
 def old_lead_network(record, fleet_rows, gw_rows, keep_old, add_old_network) -> str:
@@ -1642,7 +2093,7 @@ def old_lead_network(record, fleet_rows, gw_rows, keep_old, add_old_network) -> 
 FIREWALL_OF = ("project", "slot", "lead")
 #: Its other fields, a line each, as the view names them.
 FIREWALL_FIELDS = (
-    ("model", "Model endpoint"), ("accepted", "Rules you accepted"),
+    ("model", "Model endpoint"), ("model_qube", "Model qube"), ("accepted", "Rules you accepted"),
     ("live", "Rules it has now (live)"), ("read_error", "Live rules not read"),
     ("same", "Live rules are the ones you accepted"),
 )
@@ -1721,10 +2172,16 @@ def lead_on_network(doc, fleet_rows):
 
 def model_refusal(doc, fleet_rows) -> str | None:
     """Why the command refuses `--model` for the view's lead where the window
-    can see why, in its words (`fleet._set_lead_firewall`): a lead whose
-    network cannot be read, and a lead with no network, which reaches no model
-    endpoint. Its rules can still be set or accepted."""
+    can see why, in its words (`fleet._set_lead_firewall`): a project whose
+    model is a qube, whose lead has no network; a lead whose network cannot
+    be read; and a lead with no network, which reaches no model endpoint. Its
+    rules can still be set or accepted."""
     lead = doc.get("lead") if isinstance(doc, dict) else None
+    if lead and doc.get("model_qube"):
+        project = doc.get("project")
+        return (f"the model of {project} is the qube {doc['model_qube']}, and its lead has no "
+                f"network: a remote model takes a new lead on a network (qmcp project lead "
+                f"{project} ... --lead-netvm NET --model HOST:PORT)")
     if lead and any(isinstance(r, dict) and r.get("name") == lead
                     and r.get("netvm") == fleet.UNREADABLE for r in fleet_rows or ()):
         return f"the network of {lead} cannot be read"
@@ -1734,14 +2191,29 @@ def model_refusal(doc, fleet_rows) -> str | None:
     return None
 
 
+def lead_rules_refusal(doc) -> str | None:
+    """Why the command refuses `--rule` and `--accept-current` for the view's
+    project, in its words (`fleet._set_lead_firewall`): its model is a qube,
+    and its lead has no network, so no firewall to set or accept."""
+    if isinstance(doc, dict) and doc.get("model_qube"):
+        return (f"the model of {doc.get('project')} is the qube {doc['model_qube']}, and its lead "
+                f"has no network, so it has no firewall to set or accept")
+    return None
+
+
 def firewall_actions(doc, fleet_rows=None) -> set:
-    """Set rules while the project has a lead, and Set model too unless
-    `model_refusal` finds, in `fleet_rows`, why the command refuses it; Accept current
-    rules while its live rules were read, hold some, and are not the ones
-    accepted. The command decides the rest."""
-    if not isinstance(doc, dict) or not doc.get("lead"):
+    """Set model qube for any project read, one with no lead yet included, as
+    the command takes it; Set rules while the project has a lead and its model
+    is no qube (`lead_rules_refusal`), and Set model too unless
+    `model_refusal` finds, in `fleet_rows`, why the command refuses it; Accept
+    current rules on the same terms as Set rules, while its live rules were
+    read, hold some, and are not the ones accepted. The command decides the
+    rest."""
+    if not isinstance(doc, dict):
         return set()
-    out = {"set_rules"}
+    if not doc.get("lead") or lead_rules_refusal(doc):
+        return {"set_model_qube"}
+    out = {"set_model_qube", "set_rules"}
     if model_refusal(doc, fleet_rows) is None:
         out.add("set_model")
     live = doc.get("live")
@@ -1786,6 +2258,15 @@ def firewall_section(pane, key, fleet_rows=None) -> list:
     why = model_refusal(pane.doc, fleet_rows)
     if why:
         out.append(("Set lead model", esc(f"off: {why}")))
+    why = lead_rules_refusal(pane.doc)
+    if why:
+        out.append(("Lead rules", esc(f"Set lead rules and Accept current rules are off: {why}")))
+    doc = pane.doc if isinstance(pane.doc, dict) else {}
+    if firewall.dns_left_open(doc.get("model"), doc.get("accepted")):
+        out.append(("Lead DNS", esc(f"open, as written before 0.9.22, though an endpoint given as "
+                                    f"an address needs none; qmcp check warns. Set lead model with "
+                                    f"the same endpoint, {doc.get('model')}, writes the rules "
+                                    f"without it")))
     return out + firewall_details(pane.doc)
 
 
@@ -1796,14 +2277,15 @@ def firewall_changed(opened, ident, pane, fleet_rows=None) -> str | None:
     if a refresh ran. A model for a lead that has lost its network since is
     refused in the command's words."""
     doc = pane.doc
-    why = model_refusal(opened, fleet_rows) if ident == "set_model" else None
+    why = (model_refusal(opened, fleet_rows) if ident == "set_model" else
+           lead_rules_refusal(doc) if ident in ("set_rules", "accept_rules") else None)
     if why:
         return why
     if (not isinstance(opened, dict)
             or ident not in pane.actions(opened.get("project"), fleet_rows)
             or not isinstance(doc, dict)
             or any(doc.get(k) != opened.get(k)
-                   for k in ("project", "slot", "lead", "model", "accepted", "live"))):
+                   for k in ("project", "slot", "lead", "model", "model_qube", "accepted", "live"))):
         return ("the lead's firewall is being read again, or changed since this form opened: "
                 "look at it again, and open the form again")
     return None
@@ -1843,9 +2325,27 @@ def typed_rules(text, shown=()) -> list:
 
 def model_intro(doc) -> str:
     return (f"Sets the model endpoint of {doc.get('lead')}, the lead of {doc.get('project')}: its "
-            f"firewall becomes that endpoint, DNS and nothing else, and the project's record "
-            f"keeps the endpoint as its model (now {doc.get('model') or 'none'}). This changes "
-            f"what the lead can reach on the network: compare the rules below.")
+            f"firewall becomes that endpoint, DNS when it is a host name, and nothing else, and "
+            f"the project's record keeps the endpoint as its model (now "
+            f"{doc.get('model') or 'none'}). This changes what the lead can reach on the "
+            f"network: compare the rules below.")
+
+
+def model_qube_intro(doc) -> str:
+    """What Set model qube does, for its form."""
+    now = (f"the model qube {doc['model_qube']}" if doc.get("model_qube") else
+           f"the endpoint {doc['model']}" if doc.get("model") else "none")
+    lead = (f"its lead, {doc['lead']}," if doc.get("lead") else
+            "its lead, when it has one,")
+    return (f"Makes a qube the self-hosted model of {doc.get('project')}: {lead} reaches it over "
+            f"qubes.ConnectTCP on port {projects.MODEL_PORT}, and has no network, since a lead "
+            f"whose model is a qube has none. In this order: the badge "
+            f"{projects.model_badge(str(doc.get('slot')))} comes off any other qube, the lead "
+            f"loses its network, the qube leaves p00, loses its network, is guarded and is "
+            f"killed if it runs (unless it already serves a project as a guarded model qube), "
+            f"the record names it (a model endpoint on record goes, with the rules you accepted "
+            f"for the lead), and only then does it wear the badge. none takes the project's "
+            f"model qube away. The project's model now: {now}.")
 
 
 def rules_intro(doc) -> str:
@@ -1875,11 +2375,12 @@ def lead_templates(fleet_rows) -> list:
 
 def hubs_appvms(fleet_rows, hub=None) -> list:
     """Managed AppVMs of the hub's (p00 or no slot): a lead's clone source or a
-    qube to promote."""
+    qube to promote. Never a model qube, even one managed for its maintenance:
+    the command refuses it (`fleet._hubs_own_appvm`)."""
     out = []
     for r in fleet_rows:
         if (r.get("state") == "managed" and r.get("klass") == "AppVM" and not r.get("dvmt")
-                and not r.get("gateway") and not r.get("lead")
+                and not r.get("gateway") and not r.get("lead") and not r.get("model")
                 and (r.get("slot") in (None, projects.HUB_SLOT)) and r.get("name") != hub):
             out.append(r["name"])
     return sorted(out)

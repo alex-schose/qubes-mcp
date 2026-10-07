@@ -3,7 +3,8 @@
 
 Run it IN the hub qube, from the public tree:
 
-    PYTHONPATH=. python3 tests/redteam_suite.py --inside <managed qube>
+    PYTHONPATH=. python3 tests/redteam_suite.py --inside <managed qube> [--peer QUBE]
+        [--lead LEAD] [--model-qube QUBE]
 
 Two vantage points:
 
@@ -69,7 +70,7 @@ def call(tool, **args):
     return t.handler(tools.validate_arguments(t, args))
 
 
-def from_hub(inside, lead=None):
+def from_hub(inside, lead=None, model=None):
     print("== from the hub, bypassing the client")
     # Positive control first: a refusal proves nothing if no call can succeed.
     rc, out = raw("@adminvm", "qmcp.GetPoolStats")
@@ -118,6 +119,14 @@ def from_hub(inside, lead=None):
         refused_raw("firewall reload on a lead", lead, "admin.vm.firewall.Reload")
     else:
         not_run("firewall write on a lead", "name a lead with --lead LEAD")
+    # A model qube is its leads' alone, on port 11434.
+    if model:
+        # The policy's refusal, exit status 126: a call into a closed port fails too.
+        rc, out = raw(model, "qubes.ConnectTCP+11434")
+        check("TCP from the hub to a model qube", rc == 126 and not out.strip(), f"rc={rc} out={out[:80]!r}")
+        refused_raw("exec into a model qube", model, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
+    else:
+        not_run("TCP from the hub to a model qube", "name one with --model-qube QUBE")
     # More concurrent calls than the per-caller cap; at least one is refused.
     with concurrent.futures.ThreadPoolExecutor(10) as pool:
         outs = list(pool.map(lambda _: raw("@adminvm", "qmcp.AIManagedEvents",
@@ -143,14 +152,19 @@ PROBES = [
     ("copy a file to the hub", "mcp-control", "qubes.Filecopy"),
     ("drive qmcp exec in another AI qube", "{peer}", "qmcp.RunInAIManaged"),
     ("a dom0 desktop notification through @default", "@default", "qubes.Notifications"),
+    ("a TCP connection into another AI qube", "{peer}", "qubes.ConnectTCP+22"),
+    ("a TCP connection into a model qube", "{model}", "qubes.ConnectTCP+11434"),
 ]
 
 
-def from_inside(inside, peer):
+def from_inside(inside, peer, model=None):
     print(f"== from inside {inside} (root), against {peer}")
+    probes = [p for p in PROBES if "{model}" not in p[1] or model]
+    if not model:
+        not_run("a TCP connection into a model qube", "name one with --model-qube QUBE")
     lines = ["set +e"]
-    for i, (_, target, svc) in enumerate(PROBES):
-        tgt = target.replace("{peer}", peer)
+    for i, (_, target, svc) in enumerate(probes):
+        tgt = target.replace("{peer}", peer).replace("{model}", model or "")
         lines.append(f"timeout 25 {CLIENT} {shlex.quote(tgt)} {shlex.quote(svc)} </dev/null >/tmp/p{i}.out 2>/dev/null; "
                      f"echo \"P{i} rc=$? bytes=$(wc -c </tmp/p{i}.out)\"")
     r = call("qubes_run", name=inside, cmd="\n".join(lines), shell=True, timeout=400)
@@ -162,27 +176,32 @@ def from_inside(inside, peer):
         if line.startswith("P"):
             tag, rc, size = line.split()
             got[int(tag[1:])] = (int(rc.split("=")[1]), int(size.split("=")[1]))
-    for i, (label, _, _) in enumerate(PROBES):
+    for i, (label, _, svc) in enumerate(probes):
         rc, size = got.get(i, (None, None))
         if i == 0:
             check(label, rc == 0 and (size or 0) > 0, f"rc={rc} bytes={size}")
             continue
         if rc == 124:
             check(label, False, "HUNG: a dialog may be waiting")
+        elif svc.startswith("qubes.ConnectTCP"):
+            # The policy's refusal, exit status 126, never a closed port's failure.
+            check(label, rc == 126 and size == 0, f"rc={rc} bytes={size}")
         else:
             check(label, rc not in (None, 0) and size == 0, f"rc={rc} bytes={size}")
 
 
 def main() -> int:
     if "--inside" not in sys.argv:
-        print("usage: redteam_suite.py --inside <managed qube> [--peer <managed qube>] [--lead LEAD]")
+        print("usage: redteam_suite.py --inside <managed qube> [--peer <managed qube>] [--lead LEAD] "
+              "[--model-qube QUBE]")
         return 2
     inside = sys.argv[sys.argv.index("--inside") + 1]
     peer = sys.argv[sys.argv.index("--peer") + 1] if "--peer" in sys.argv else inside
     lead = sys.argv[sys.argv.index("--lead") + 1] if "--lead" in sys.argv else None
-    from_hub(inside, lead)
+    model = sys.argv[sys.argv.index("--model-qube") + 1] if "--model-qube" in sys.argv else None
+    from_hub(inside, lead, model)
     r = call("qubes_start", name=inside)
-    from_inside(inside, peer)
+    from_inside(inside, peer, model)
     fails = [x for x in results if x[0] == "FAIL"]
     unrun = [x for x in results if x[0] == "NOT-RUN"]
     # A probe that could not run leaves the suite INCOMPLETE, which is not green.

@@ -12,6 +12,12 @@ qubes, another project's lead or worker, a qube outside AI space. Each must
 read exactly like a name that does not exist, and the rulebook must refuse
 running a command in it. `--guarded` is a guarded qube in AI space.
 
+`--model-qube` names the project's self-hosted model qube, serving `--model`
+(default qwen2.5:0.5b) with Ollama on its 127.0.0.1:11434: the seat reaches it
+through `qvm-connect-tcp`, as a lead's agent would, and asks it a question; the
+lead itself must have no network. `--foreign-model` names another project's
+model qube, which must be refused, from the lead and from inside a worker.
+
 Every call goes through the shipped client and real qrexec, so the chain is
 the lead's own: the client, the lead's slot lines in the policy, the dom0
 library reading the lead's project record, the platform. Then the suite runs
@@ -33,17 +39,21 @@ import json
 import os
 import random
 import shlex
+import signal
 import statistics
 import string
 import subprocess
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from qubes_mcp import tools  # noqa: E402
 
 CLIENT = "/usr/lib/qubes/qrexec-client-vm"
 GiB = 1024 ** 3
+#: The port a lead reaches its model qube on.
+MODEL_PORT = 11434
 RUN = "".join(random.choice(string.ascii_lowercase) for _ in range(3))
 results: list = []
 created: list = []
@@ -85,6 +95,18 @@ def refused_raw(name, target, service, payload=b""):
     return check(name, rc != 0 and not out.strip(), f"rc={rc} out={out[:120]!r}")
 
 
+#: qrexec-client-vm's status when the policy refuses a call (measured on 4.3.1).
+#: A call the policy allowed into a closed port fails too, with another status.
+POLICY_REFUSED = 126
+
+
+def refused_by_policy(name, target, service, payload=b""):
+    rc, out = raw(target, service, payload)
+    if rc is None:
+        return check(name, False, "HUNG: a dialog may be waiting")
+    return check(name, rc == POLICY_REFUSED and not out.strip(), f"rc={rc} out={out[:120]!r}")
+
+
 def wait_power(name, want, tries=30):
     for _ in range(tries):
         if call("qubes_state", name=name).get("power_state") == want:
@@ -93,8 +115,11 @@ def wait_power(name, want, tries=30):
     return False
 
 
-def worker_probes(worker, lead, peer, hub, others):
-    """Root inside a worker, against the lead, dom0, the hub and other qubes."""
+def worker_probes(worker, lead, peer, hub, others, models=()):
+    """Root inside a worker, against the lead, dom0, the hub, other qubes and
+    the model qubes, its own project's included: only the lead reaches that.
+    A model probe must be the policy's refusal, exit status 126: a call into a closed port
+    fails too."""
     probes = [
         ("CONTROL: an allowed call from the worker succeeds", "@default", "qubes.GetDate", True),
         ("worker copies a file to its lead", lead, "qubes.Filecopy", False),
@@ -105,7 +130,9 @@ def worker_probes(worker, lead, peer, hub, others):
         ("worker raw @dispvm shell", "@dispvm", "qubes.VMShell", False),
         ("worker reaches the hub", hub, "qubes.OpenURL", False),
         ("worker drives exec in a peer", peer, "qmcp.RunInAIManaged", False),
-    ] + [(f"worker drives exec in {o}", o, "qmcp.RunInAIManaged", False) for o in others]
+    ] + [(f"worker drives exec in {o}", o, "qmcp.RunInAIManaged", False) for o in others] \
+      + [(f"worker connects to the model qube {m}", m, f"qubes.ConnectTCP+{MODEL_PORT}", "policy")
+         for m in models]
     lines = ["set +e"]
     for i, (_, target, svc, _) in enumerate(probes):
         lines.append(f"timeout 25 {CLIENT} {shlex.quote(target)} {shlex.quote(svc)} </dev/null "
@@ -120,10 +147,12 @@ def worker_probes(worker, lead, peer, hub, others):
             got[int(tag[1:])] = (int(rc.split("=")[1]), int(size.split("=")[1]))
     for i, (label, _, _, allowed) in enumerate(probes):
         rc, size = got.get(i, (None, None))
-        if allowed:
+        if allowed is True:
             check(label, rc == 0 and (size or 0) > 0, f"rc={rc} bytes={size}")
         elif rc == 124:
             check(label, False, "HUNG: a dialog may be waiting")
+        elif allowed == "policy":
+            check(label, rc == POLICY_REFUSED and size == 0, f"rc={rc} bytes={size}")
         else:
             check(label, rc not in (None, 0) and size == 0, f"rc={rc} bytes={size}")
 
@@ -134,6 +163,10 @@ def main() -> int:
     ap.add_argument("--guarded", default=os.environ.get("QMCP_SEAT_GUARDED", "ai-net-router"))
     ap.add_argument("--hub", default="mcp-control")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--model-qube", help="the project's self-hosted model qube")
+    ap.add_argument("--model", default="qwen2.5:0.5b", help="the model it serves")
+    ap.add_argument("--foreign-model", action="append", default=[],
+                    help="another project's model qube, which must be refused")
     args = ap.parse_args()
     t0 = time.monotonic()
     lead = os.uname().nodename
@@ -260,7 +293,11 @@ def main() -> int:
     check("exec in a guarded qube refused", r.get("ok") is False, json.dumps(r)[:200])
 
     # ------------------------------------------------------------ worker probes
-    worker_probes(w1, lead, w2, args.hub, args.other)
+    worker_probes(w1, lead, w2, args.hub, args.other,
+                  ([args.model_qube] if args.model_qube else []) + args.foreign_model)
+
+    # ------------------------------------------------------------ the model qube
+    model_section(args, stats, w1)
 
     # ------------------------------------------------------------ raw from the lead
     rc, out = raw("@adminvm", "qmcp.GetPoolStats")
@@ -323,6 +360,84 @@ def main() -> int:
         check("a foreign name costs what a missing one costs (within 10 ms)", spread < 10,
               f"spread {spread:.1f} ms")
     return report(t0, args.keep)
+
+
+def http(method, path, body=None, timeout=60):
+    """One request to the model qube, through the lead's own localhost."""
+    req = urllib.request.Request(f"http://127.0.0.1:{MODEL_PORT}{path}", method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def no_network_here():
+    """(no network, detail): no address in QubesDB and no default route. A
+    connection that times out would also read as offline behind a firewall."""
+    ip = subprocess.run(["qubesdb-read", "/qubes-ip"], capture_output=True, text=True)
+    route = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True)
+    return (ip.returncode != 0 and not ip.stdout.strip() and route.returncode == 0
+            and not route.stdout.strip(),
+            f"qubes-ip rc={ip.returncode} {ip.stdout.strip()!r}, default route {route.stdout.strip()!r}")
+
+
+def model_section(args, stats, worker):
+    """The lead reaches its model qube on port 11434 through Qubes' ConnectTCP,
+    as its agent would, and nothing else of it; another project's is refused."""
+    mq = args.model_qube
+    if not mq:
+        not_run("the lead reaches its model qube", "name it with --model-qube")
+        return
+    check("pool stats name the project's model qube and its port",
+          (stats.get("model"), stats.get("model_qube"), stats.get("model_port")) == (None, mq, MODEL_PORT),
+          json.dumps({k: stats.get(k) for k in ("model", "model_qube", "model_port")}))
+    # Control first: the probe sees a network where there is one, in a worker
+    # born on the project's first network.
+    r = call("qubes_run", name=worker, cmd=["qubesdb-read", "/qubes-ip"], timeout=30)
+    check("CONTROL: a worker on a network shows its address in QubesDB",
+          r.get("ok") is True and r.get("rc") == 0 and r.get("stdout", "").strip(), json.dumps(r)[:200])
+    offline, detail = no_network_here()
+    check("the lead has no network (a lead whose model is a qube has none)", offline, detail)
+    proc = subprocess.Popen(["qvm-connect-tcp", f"{MODEL_PORT}:{mq}:{MODEL_PORT}"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        names, err = None, None
+        # The first connection starts the model qube; its server needs a moment.
+        for _ in range(20):
+            time.sleep(5)
+            try:
+                names = [m.get("name") for m in http("GET", "/api/tags", timeout=30).get("models", [])]
+                break
+            except Exception as e:
+                err = repr(e)[:160]
+        ok = check(f"the model qube answers on localhost:{MODEL_PORT} and serves {args.model}",
+                   names is not None and args.model in names, str(names if names is not None else err))
+        if ok:
+            t = time.monotonic()
+            try:
+                r = http("POST", "/api/generate", {"model": args.model, "stream": False,
+                                                    "prompt": "Reply with the single word OK.",
+                                                    "options": {"num_predict": 16}}, timeout=900)
+                text = str(r.get("response", ""))
+            except Exception as e:
+                text = ""
+                info(f"generate failed: {e!r}"[:200])
+            check("the model answers a prompt", bool(text.strip()), repr(text)[:120])
+            info(f"the model answered {json.dumps(text.strip()[:60])} in {time.monotonic() - t:.1f}s")
+        else:
+            not_run("the model answers a prompt", "the model qube did not answer")
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    refused_by_policy("raw TCP to the model qube on another port", mq, "qubes.ConnectTCP+22")
+    refused_by_policy("raw exec into the model qube", mq, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
+    refused_by_policy("raw copy into the model qube", mq, "qubes.Filecopy")
+    for other in args.foreign_model:
+        refused_by_policy(f"raw TCP to {other}, another project's model qube", other,
+                          f"qubes.ConnectTCP+{MODEL_PORT}")
 
 
 def cleanup():

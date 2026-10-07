@@ -312,3 +312,177 @@ what runs. While OK is off, that line says why instead, in orange, under
     qubes steps 1 to 17 leave behind; skip what a step you did not run never
     made. Expect: `qmcp check` GREEN. The decided proposals stay in the list:
     nothing removes them.
+
+Steps 31 to 37 cover self-hosted model qubes. Start them with `qmcp check`
+GREEN. Besides `<template>`, `<gateway>` and `<model>` as above, they need a
+TemplateVM outside AI space for the model qube, `<model-template>` (such as
+your default template): `qmcp` refuses a model qube whose template the hub
+manages, and `<template>` is usually one. Step 34 needs the hub's terminal, as
+steps 18 to 21 do. The names `ai-hub-llm`, `t6`, `t7`, `t8`, `ai-t6-lead`,
+`ai-t7-lead` and `ai-t8-lead` must not exist yet, and three slots must be
+free; their quotas are 1 GiB each, which must fit under *Pool cap (all of AI
+space)* with the others. Each project's slot is shown in the tree beside its
+label (`p03 t6`); below, `pT6`, `pT7` and `pT8` stand for the slots of `t6`,
+`t7` and `t8`. A model qube serves projects; the window lists it once, under
+*Model qubes*, and each project it serves points to it.
+
+31. **A qube to serve a model.** Make the qube the hub would have set up, in
+    p00 and on a network:
+    `qvm-create --class AppVM --template <model-template> --label gray ai-hub-llm`,
+    then `qvm-prefs ai-hub-llm netvm <gateway>`. Press Refresh, *Add a qube to
+    AI space...*, choose `ai-hub-llm`, tick *managed*, OK; then select it,
+    *Move...*, choose p00, OK. Expect `ai-hub-llm` under p00, *Role*
+    `hub's qube`, *Network* `<gateway>`.
+32. **A project whose model is a qube.** *New project...*: *Label* `t6`; *The
+    lead is* a fresh qube from a template, *Made from* `<template>`; under
+    *Worker networks* tick `none`; *Workers' disk quota* `1G`. Under *The lead's
+    model*, choose *a self-hosted model qube: the lead then has no network*.
+    Expect *Lead network* to change to `none` and grey out, and *Lead's model
+    endpoint* to grey out; OK greyed out, saying
+    `choose the model qube, or a remote endpoint`; and *The lead's network*
+    reading `The lead will have no network: a lead whose model is a qube has
+    none. Choose its model qube.` Open *Model qube*: it lists the qubes `qmcp`
+    would take as a model qube, each saying where it is, and only qubes in AI
+    space (one of yours outside it would have to be guarded first). Expect
+    `ai-hub-llm (managed; in p00; on <gateway>)`. Choose it. Expect: *The
+    model qube* reading
+    `ai-hub-llm leaves p00, loses its network (<gateway>), is guarded (the hub
+    can no longer operate it) and is killed if it runs; then it is recorded and
+    wears the project's model badge, and the lead reaches it on port 11434.`; *The
+    lead's network* reading `... It reaches ai-hub-llm on port 11434, and needs
+    no firewall.`; no red line (the lead is new, and the qube serves no other
+    project); and the command `/usr/bin/sudo -n /usr/local/bin/qmcp project
+    create t6 --lead-template <template> --lead-netvm none --model-qube
+    ai-hub-llm --network none --quota 1G`. Choose *a remote endpoint* once:
+    *Lead network* comes back on, at its first entry, *not set*; then choose
+    the model qube again. OK. Expect a report ending
+    `pT6: model qube ai-hub-llm; the lead reaches it on port 11434`, after
+    `ai-hub-llm is out of p00`, `ai-hub-llm lost its network (<gateway>)` and
+    `ai-hub-llm is guarded`. In the tree: the project `t6` with its lead
+    `ai-t6-lead`, and under it a row `ai-hub-llm` whose *Role* reads
+    `model qube (see Model qubes)`; a group *Model qubes* holding `ai-hub-llm`,
+    *Role* `model qube of pT6`. Select that row. Expect *Serves*
+    `pT6 t6: its lead reaches it over qubes.ConnectTCP on port 11434`,
+    *Maintenance* starting `guarded: the hub cannot operate it`, *Network*
+    `-`; *Manage...* and *Revoke...* on, *Move...* and *Guard...* greyed
+    out. The light stays `GREEN`; the Check tab's *model qubes* PASS. In a
+    dom0 terminal, `qvm-prefs ai-t6-lead netvm` prints nothing: the lead has
+    no network.
+33. **A lead with a network gets a shared model qube.** First a project like
+    step 26's: *New project...*, *Label* `t7`, the lead a fresh qube from
+    `<template>`, *Lead network* `<gateway>`, *The lead's model* left at *a
+    remote endpoint*, *Lead's model endpoint* `<model>`, worker network
+    `none`, quota `1G`, OK. Select `t7`, press *Set model qube...*. Expect the
+    form to say what OK does, in order, ending `The project's model now: the
+    endpoint <model>.`; *Model qube* with nothing chosen and OK greyed out,
+    saying `choose the model qube, or none`; and no `none` among the choices,
+    since `t7` has no model qube to take away. Choose
+    `ai-hub-llm (guarded; serves pT6)`. Expect two red paragraphs:
+    `ai-t7-lead loses its network (<gateway>): a lead whose model is a qube has
+    none, and going back to a remote model takes a new lead.`, and
+    `WARNING: ai-hub-llm also serves pT6: a model qube that serves several
+    projects is a path between them: Ollama's API has no login ...`, ending
+    `... It is safe only behind an API filter that lets inference calls through
+    and nothing else; qmcp ships none`. *What OK does* reads `ai-hub-llm is
+    recorded and wears qmcp-model-pT7, and the lead reaches it on port 11434.`,
+    and the command `/usr/bin/sudo -n /usr/local/bin/qmcp project firewall t7
+    --model-qube ai-hub-llm`. OK. Expect a report holding
+    `pT7: ai-t7-lead lost its network (<gateway>): a lead whose model is a
+    qube has none` and the same WARNING line. Select `ai-hub-llm`: *Role*
+    `model qube of pT6 and pT7, shared`, and a *Shared* line holding the
+    warning word for word. Select `t7`: *Lead's model endpoint* `-`, *Lead's
+    model qube* `ai-hub-llm`, *Its model qube is shared* `ai-hub-llm also serves
+    pT6: ...`, and *Set lead model* `off: the model of t7 is the qube
+    ai-hub-llm, and its lead has no network: a remote model takes a new lead on
+    a network (qmcp project lead t7 ... --lead-netvm NET --model HOST:PORT)`,
+    and *Lead rules* `Set lead rules and Accept current rules are off: the
+    model of t7 is the qube ai-hub-llm, and its lead has no network, so it has
+    no firewall to set or accept`; *Set lead model...*, *Set lead rules...*
+    and *Accept current rules...* greyed out, *Set model qube...* on. The
+    light stays `GREEN`.
+34. **The hub proposes a project with a model qube.** In the hub:
+
+    ```sh
+    printf '%s' '{"type": "project-create", "title": "a sealed project",
+      "label": "t8", "lead": {"from": "template", "qube": "<template>"},
+      "networks": ["none"], "quota": 1073741824, "model_qube": "ai-hub-llm"}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Expect `"ok": true` and an id M. Refresh, select M on the Proposals tab.
+    Expect *Lead's model qube* `ai-hub-llm`; *Equivalent command* `qmcp project
+    create t8 --lead-template <template> --network none --quota 1G
+    --model-qube ai-hub-llm`; and red text saying accepting it needs the
+    second tick, for two reasons: `- makes ai-hub-llm the model qube of t8:
+    dom0 takes it out of p00, removes its network, guards it and kills it if it
+    runs (unless it is already a guarded model qube), and the lead has no
+    network`, and `- ai-hub-llm already serves pT6, pT7:` followed by
+    the same warning as in step 33. The tick box is empty and *Accept...*
+    greyed out. Tick it, *Accept...*: the command ends in `--yes` and the
+    *Second tick digest*, and the form repeats the red text. OK. Expect a
+    report ending `proposal M: accepted`, after `pT8: model qube ai-hub-llm;
+    the lead reaches it on port 11434` and a WARNING line naming pT6 and pT7.
+    On the Qubes tab, `t8` with its lead `ai-t8-lead`, and `ai-hub-llm`
+    reading `model qube of pT6, pT7 and pT8, shared`.
+35. **A model qube given a network outside qmcp.** In dom0:
+    `qvm-prefs ai-hub-llm netvm <gateway>`, then Refresh. Expect the light
+    `FAILED`, and the Check tab's *model qubes* FAIL
+    `ai-hub-llm has a network (<gateway>): its leads reach that network
+    through it`. In the tree, *Model qubes* is gone and `ai-hub-llm` is under
+    *Needs attention*, *Role* `needs attention: model qube with a network`;
+    selected, its *Why* reads `a model qube with a network: the leads it
+    serves reach that network through it, around the firewalls you accepted
+    for them`, and only *New project...* and *Add a qube to AI space...* are
+    on. Each of `t6`, `t7` and `t8` points to it with
+    `model qube (see Needs attention)`. Then `qvm-prefs ai-hub-llm netvm ''`
+    and Refresh: the light `GREEN` again, and `ai-hub-llm` back under *Model
+    qubes*. Now its lead: `qvm-prefs ai-t6-lead netvm <gateway>`, Refresh.
+    Expect the light `FAILED`, the Check tab's *model-qube leads* FAIL
+    `t6: ai-t6-lead is on <gateway>, though its model is the qube ai-hub-llm:
+    clear its network (qvm-prefs LEAD netvm ''), or give the project a remote
+    model with a new lead`, and `ai-t6-lead` under *Needs attention*, *Role*
+    `needs attention: lead with a network, model a qube`, while `t6` shows
+    `lead (see Needs attention)`. Select `t6`, *Set model qube...*, choose
+    `ai-hub-llm (guarded; pT6's model qube now; serves pT7, pT8)`. Expect a
+    red line `ai-t6-lead loses its network (<gateway>): a lead whose model is
+    a qube has none, ...`, followed by the WARNING paragraph (it serves pT7
+    and pT8 too). OK. Expect a report holding `ai-t6-lead lost its network
+    (<gateway>)`, `ai-t6-lead` back under `t6`, and the light `GREEN`.
+36. **Its maintenance window.** Select `ai-hub-llm`, *Manage...*. The form
+    reads `ai-hub-llm becomes managed: the hub may run commands in it as root
+    and change it. It stays the model qube of pT6, pT7 and pT8, and their leads
+    still reach it on port 11434: this opens its maintenance window, and qmcp
+    check warns until you guard it again.` OK. Expect a report
+    `ai-hub-llm: managed; it is still the model qube of pT6, pT7, pT8: while it
+    is managed the hub may operate it (qmcp guard ai-hub-llm when its changes
+    are done, which kills it if it runs)`; its *Role* `model qube of pT6, pT7
+    and pT8, shared, not guarded`, still under *Model qubes*; *Maintenance* starting
+    `not guarded: the hub may operate it`; *Guard...* and *Revoke...* on,
+    *Manage...* greyed out; the Check tab's *model qubes* WARN
+    `ai-hub-llm is not guarded: ...`, and the light still `GREEN` (a warning
+    is not a failure). Press *Revoke...* and read it: the form adds `It is the
+    model qube of pT6, pT7 and pT8: revoking takes its model badges too, ...`;
+    Cancel. Press *Guard...*: the form reads `ai-hub-llm becomes guarded: it
+    is listed and referenced, never operated. It stays the model qube of pT6,
+    pT7 and pT8; its maintenance window closes: if it runs, it is killed, so no
+    process the hub started in it runs on. Its files stay: what the hub left in
+    /home, /usr/local or /rw (anywhere, in a StandaloneVM), and whatever is set
+    to start from there runs at its next start.` OK. Expect a report
+    `ai-hub-llm: guarded`; if it was running, followed by `; killed, so no
+    process the hub started in it while it was managed runs on (...)`, and
+    `qvm-ls ai-hub-llm` in a dom0 terminal shows it Halted. Expect the *Role*
+    without `not guarded`, and the WARN gone.
+37. **Take it away, and clean up.** Select `t7`, *Set model qube...*. Expect
+    `ai-hub-llm (guarded; pT7's model qube now; serves pT6, pT8)` among the
+    choices, and last `none: take ai-hub-llm away; the lead reaches no model`.
+    Choose that: no red line, *What OK does* `ai-hub-llm loses qmcp-model-pT7
+    and stops serving the project; it stays as it is otherwise. The lead
+    reaches no model.`, and the command ending `project firewall t7
+    --model-qube none`. OK. Expect a report `pT7: ai-hub-llm is no longer its
+    model qube` and `pT7: the record names no model qube`; `t7` no longer
+    points to it. Delete `t6` (*Delete project...*): the plan before OK ends
+    `its model qube ai-hub-llm is kept and loses pT6's badge.`; OK. Delete `t8`
+    and `t7` the same way. Expect `ai-hub-llm` under *Other guarded*, *Role*
+    `guarded`. *Revoke...* it, OK; then `qvm-remove -f ai-hub-llm`
+    (`qvm-shutdown --wait ai-hub-llm` first if it runs). Expect: `qmcp check`
+    GREEN.

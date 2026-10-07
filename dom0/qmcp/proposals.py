@@ -37,8 +37,10 @@ lead a network by itself.
   in AI space uses and no project lists, a promoted lead, a quota that would
   make the projects' quotas add up to more than the pool cap, a new project's
   model endpoint that no project uses, a lead change that gives the project a
-  different model endpoint, and every change to a lead's firewall, which the
-  window shows as the old and new rules. The window shows
+  different model endpoint, every change to a lead's firewall, which the
+  window shows as the old and new rules, and anything that makes a qube a
+  model qube or takes one away (it touches a guarded qube; a model qube that
+  would serve a second project is named, with what sharing one means). The window shows
   the reasons, and `accept` refuses without `--yes TICK`, the digest of the
   reasons shown, while there are any.
 - **The hub learns a state word only**: pending, accepted, rejected, expired or
@@ -260,20 +262,36 @@ def _model(value) -> str:
         raise Invalid(f"model: {e}") from None
 
 
+def _model_qube(value, allow_none: bool) -> str:
+    """A self-hosted model qube's name, or (where taking it away is meant)
+    "none". The shape only: submit looks no name up."""
+    if allow_none and value == NONE:
+        return NONE
+    return _qube(value, "model_qube")
+
+
 #: Per type, the fields that join the normal form only when given (see below).
-OPTIONAL = {"project-create": frozenset({"model"}),
-            "project-lead": frozenset({"model", "add_old_network"}),
-            "project-firewall": frozenset({"model", "rules"})}
+OPTIONAL = {"project-create": frozenset({"model", "model_qube"}),
+            "project-lead": frozenset({"model", "add_old_network", "model_qube"}),
+            "project-firewall": frozenset({"model", "rules", "model_qube"})}
 
 
-def _optional(out: dict, req: dict) -> dict:
-    """Fields added in 0.9.21 join the normal form only when given, so a
-    proposal stored by 0.9.20 still reads back as itself: its fingerprint, which
-    the operator may already have seen, does not change."""
+def _optional(out: dict, req: dict, model_qube_none: bool = False) -> dict:
+    """Fields added in 0.9.21 and 0.9.22 join the normal form only when given,
+    so a proposal stored by an earlier version still reads back as itself: its
+    fingerprint, which the operator may already have seen, does not change."""
     if req.get("model") is not None:
         out["model"] = _model(req["model"])
     if req.get("add_old_network") is not None and _bool(req["add_old_network"], "add_old_network"):
         out["add_old_network"] = True
+    if req.get("model_qube") is not None:
+        out["model_qube"] = _model_qube(req["model_qube"], model_qube_none)
+        if out["model_qube"] != NONE:
+            if req.get("model") is not None:
+                raise Invalid("model_qube: give model (an endpoint) or model_qube, not both")
+            if req.get("lead_netvm") not in (None, NONE):
+                raise Invalid("model_qube: a lead whose model is a qube has no network; leave "
+                              "lead_netvm out")
     return out
 
 
@@ -298,7 +316,7 @@ def _sink_refusal(key: str, prefix) -> str | None:
 
 def _create(req: dict, prefix) -> dict:
     _fields(req, {"label", "lead", "networks", "quota"},
-            {"lead_netvm", "lead_name", "templates", "dump", "model"})
+            {"lead_netvm", "lead_name", "templates", "dump", "model", "model_qube"})
     label = req["label"]
     why = projects.label_refusal(label)
     if why:
@@ -369,12 +387,12 @@ def _dump(req: dict, prefix) -> dict:
 
 def _lead_change(req: dict, prefix) -> dict:
     _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old", "model",
-                               "add_old_network"})
+                               "add_old_network", "model_qube"})
     project = _key(req["project"])
     remove = req.get("remove")
     if remove is True:
         if any(req.get(k) is not None for k in ("lead", "lead_netvm", "lead_name", "keep_old",
-                                                "model", "add_old_network")):
+                                                "model", "add_old_network", "model_qube")):
             raise Invalid("remove: takes no other lead field")
         return {"project": project, "remove": True, "lead": None, "lead_netvm": None,
                 "lead_name": None, "keep_old": None}
@@ -392,21 +410,26 @@ def _lead_change(req: dict, prefix) -> dict:
            "lead_netvm": _lead_netvm(req.get("lead_netvm"), lead),
            "lead_name": _lead_name(req.get("lead_name"), lead, prefix),
            "keep_old": _bool(req["keep_old"], "keep_old")}
-    _optional(out, req)
+    _optional(out, req, model_qube_none=True)
     if out.get("add_old_network") and not out["keep_old"]:
         raise Invalid("add_old_network: only with keep_old true")
     return out
 
 
 def _lead_firewall(req: dict, prefix) -> dict:
-    """A new model endpoint (the firewall becomes that endpoint and DNS), or
-    exactly these rules. Either way the operator sees the old and new rules,
-    and accepting takes the second tick."""
-    _fields(req, {"project"}, {"model", "rules"})
+    """A new model endpoint (the firewall becomes that endpoint, and DNS for a
+    host name), a self-hosted model qube (the lead loses its network), none
+    (the project's model qube is taken away, nothing else), or exactly these
+    rules. The operator sees the old and new; a new endpoint, new rules, a
+    model qube, and taking one away take the second tick."""
+    _fields(req, {"project"}, {"model", "rules", "model_qube"})
     out = {"project": _key(req["project"])}
-    if (req.get("model") is None) == (req.get("rules") is None):
-        raise Invalid("say one of model (host:port) or rules (a list of firewall rules)")
-    if req.get("model") is not None:
+    if sum(req.get(k) is not None for k in ("model", "rules", "model_qube")) != 1:
+        raise Invalid("say one of model (host:port), model_qube (a qube, or none) or rules "
+                      "(a list of firewall rules)")
+    if req.get("model_qube") is not None:
+        out["model_qube"] = _model_qube(req["model_qube"], True)
+    elif req.get("model") is not None:
         out["model"] = _model(req["model"])
     else:
         rules = req["rules"]
@@ -786,6 +809,8 @@ def command(p: dict) -> str | None:
             argv.append("--dump")
         if p.get("model") is not None:
             argv += ["--model", p["model"]]
+        if p.get("model_qube") is not None:
+            argv += ["--model-qube", p["model_qube"]]
     elif t == "project-lead":
         argv = ["qmcp", "project", "lead", p["project"]]
         if p["remove"]:
@@ -802,10 +827,14 @@ def command(p: dict) -> str | None:
                 argv.append("--add-old-network")
             if p.get("model") is not None:
                 argv += ["--model", p["model"]]
+            if p.get("model_qube") is not None:
+                argv += ["--model-qube", p["model_qube"]]
     elif t == "project-firewall":
         argv = ["qmcp", "project", "firewall", p["project"]]
         if p.get("model") is not None:
             argv += ["--model", p["model"]]
+        if p.get("model_qube") is not None:
+            argv += ["--model-qube", p["model_qube"]]
         for rule in p.get("rules", ()):
             argv += ["--rule", rule]
     elif t == "project-dump":
@@ -865,6 +894,48 @@ def _gib(n: int) -> str:
     return f"{n / 1024 ** 3:.1f} GiB"
 
 
+def _model_slots_of(app, name):
+    """The slots `name` serves as a model qube; empty when there is no such
+    qube; None when its tags cannot be read."""
+    try:
+        return projects.model_slots(set(app.domains[name].tags)) if name in app.domains else set()
+    except Exception:
+        return None
+
+
+def _model_qube_reasons(app, p: dict, target) -> list:
+    """Why a proposal that names a model qube, or takes one away, needs the
+    second tick: it touches a guarded qube, takes a lead's network, and may
+    share one model qube between projects (a path between them)."""
+    from qmcp import fleet
+    q = p.get("model_qube")
+    current = None if target is None else target.model_qube
+    out = []
+    if q == NONE:
+        if current:
+            out.append(f"takes the model qube {current} away from {target.label}: it loses that "
+                       f"project's badge" + ("" if p.get("model") else
+                                             " and the lead reaches no model"))
+        return out
+    if q is None:
+        if p["type"] == "project-lead" and p.get("model") and current:
+            out.append(f"the model qube {current} stops serving {target.label}: a remote model "
+                       f"replaces it")
+        return out
+    who = p.get("label") or p.get("project")
+    out.append(f"makes {q} the model qube of {who}: dom0 takes it out of p00, removes its "
+               f"network, guards it and kills it if it runs (unless it is already a guarded "
+               f"model qube), and the lead has no network")
+    slots = _model_slots_of(app, q)
+    if slots is None:
+        out.append(f"{q} may already serve other projects: its badges could not be read")
+        return out
+    others = sorted(slots - ({target.slot} if target is not None else set()))
+    if others:
+        out.append(f"{q} already serves {', '.join(others)}: {fleet.SHARED_MODEL_WARNING}")
+    return out
+
+
 def second_tick(app, p: dict, records: dict) -> list:
     """Why accepting `p` needs the second tick, against the fleet as it is.
     Empty when one click is enough."""
@@ -888,7 +959,8 @@ def second_tick(app, p: dict, records: dict) -> list:
         elif wears:
             reasons.append(f"removes {which} lead {target.lead} with everything in it")
     if p.get("lead") and p["lead"]["from"] == "promote":
-        keeps = "files, template and network" if p.get("lead_netvm") is None else \
+        keeps = "files, template and network" if p.get("lead_netvm") is None \
+            and p.get("model_qube") in (None, NONE) else \
             "files and template, and loses its network"
         reasons.append(f"promotes {p['lead']['qube']}, one of the hub's own qubes, into a lead: it "
                        f"keeps its {keeps}")
@@ -897,15 +969,18 @@ def second_tick(app, p: dict, records: dict) -> list:
     if t == "project-create" and p.get("model") and \
             p["model"] not in {r.model for r in records.values() if r.model}:
         reasons.append(f"gives the lead a model endpoint no project uses today: {p['model']}, "
-                       f"the only place it may reach besides DNS")
+                       f"the only place it may reach besides DNS for a host name")
     if t == "project-lead" and not p["remove"] and p.get("model") and target is not None \
             and p["model"] != target.model:
         reasons.append(f"changes the project's model endpoint from {target.model or 'none'} to "
-                       f"{p['model']}: the new lead may reach that and DNS, nothing else")
-    if t == "project-firewall":
-        new = f"model {p['model']} only" if p.get("model") else f"{len(p['rules'])} rules"
+                       f"{p['model']}: the new lead may reach that, and DNS for a host name, "
+                       f"nothing else")
+    if t == "project-firewall" and p.get("model_qube") is None:
+        new = f"model {firewall.endpoint_summary(p['model'])}" if p.get("model") \
+            else f"{len(p['rules'])} rules"
         reasons.append(f"changes the lead firewall of {p['project']} to {new}: compare the old and "
                        f"new rules")
+    reasons += _model_qube_reasons(app, p, target)
     asked = []
     if t == "project-create":
         asked = [p["lead_netvm"]] + p["networks"]
@@ -939,7 +1014,8 @@ def _execute(app, p: dict) -> list:
     if t == "project-create":
         return fleet.create_project(app, p["label"], p["lead"]["from"], p["lead"]["qube"],
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
-                                    p["dump"], p["lead_name"], p.get("model"))
+                                    p["dump"], p["lead_name"], p.get("model"),
+                                    p.get("model_qube"))
     if t == "project-edit":
         return fleet.edit_project_changes(app, p["project"], p["add_templates"],
                                           p["remove_templates"], p["add_networks"],
@@ -951,9 +1027,10 @@ def _execute(app, p: dict) -> list:
             return fleet.remove_lead(app, p["project"])
         return fleet.set_lead(app, p["project"], p["lead"]["from"], p["lead"]["qube"],
                               p["lead_netvm"], p["keep_old"], p["lead_name"], p.get("model"),
-                              bool(p.get("add_old_network")))
+                              bool(p.get("add_old_network")), p.get("model_qube"))
     if t == "project-firewall":
-        return fleet.set_lead_firewall(app, p["project"], p.get("model"), p.get("rules"))
+        return fleet.set_lead_firewall(app, p["project"], p.get("model"), p.get("rules"),
+                                       model_qube=p.get("model_qube"))
     if t == "project-delete":
         return fleet.delete_project(app, p["project"])
     raise Refused(f"unknown type {t}")
@@ -1006,11 +1083,28 @@ def show(app, pid: int, now: float | None = None, directory: str | None = None) 
             doc["plan"] = f"this edit cannot apply to the record as it is now: {err}"
     if p["type"] == "project-firewall" and target is not None and target.label:
         view = fleet.lead_firewall_view(app, records, p["project"])
-        doc["before"] = {"model": view["model"], "accepted": view["accepted"], "live": view["live"],
+        doc["before"] = {"model": view["model"], "model_qube": view["model_qube"],
+                         "accepted": view["accepted"], "live": view["live"],
                          "read_error": view["read_error"]}
-        doc["after"] = {"model": p.get("model") or view["model"],
-                        "rules": firewall.endpoint_rules(p["model"]) if p.get("model")
-                        else list(p["rules"])}
+        if p.get("model_qube") not in (None, NONE):
+            # A model qube: the lead loses its network, so no rules apply after.
+            doc["after"] = {"model": None, "model_qube": p["model_qube"], "rules": None}
+        elif p.get("model_qube") == NONE:
+            # none: only the model qube goes. A lead with a model qube has no
+            # network and stays so; a remote model and its rules stay as they are.
+            doc["after"] = {"model": view["model"], "model_qube": None,
+                            "rules": None if view["model_qube"] else view["accepted"]}
+        elif view["model_qube"]:
+            # The command refuses a remote model and rules for a lead whose
+            # model is a qube, so nothing changes: no "after" to show.
+            doc["plan"] = (f"the model of {target.label} is the qube {view['model_qube']}, and its "
+                           f"lead has no network: a remote model or rules cannot apply to it, so "
+                           f"accepting it will fail")
+        else:
+            doc["after"] = {"model": p.get("model") or view["model"],
+                            "model_qube": None if p.get("model") else view["model_qube"],
+                            "rules": firewall.endpoint_rules(p["model"]) if p.get("model")
+                            else list(p["rules"])}
     if p["type"] == "project-delete":
         # The command's own plan, which also covers finishing a half-done delete.
         doc["plan"] = fleet.delete_plan(app, records, p["project"])[1]

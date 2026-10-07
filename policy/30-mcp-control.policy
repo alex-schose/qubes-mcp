@@ -10,7 +10,7 @@
 #                    through section E.
 #   @tag:qmcp-lead   a project's lead, one per slot p01-p15 (qmcp-lead-pNN).
 #                    It is ai-managed, so every AI-space deny applies to it
-#                    unless a line in sections B or C sorts above that deny.
+#                    unless a line in A6, B or C sorts above that deny.
 #   @tag:ai-managed  AI space: every qube the hub or a lead manages or
 #                    references.
 # A few denies also name @anyvm (any source) or @tag:ai-dump (the drop boxes).
@@ -21,10 +21,13 @@
 # Projects. Sixteen slots: p00 holds the hub's own working qubes, p01-p15 are
 # projects. A member wears qmcp-proj-pNN; a lead wears qmcp-lead and
 # qmcp-lead-pNN and no member badge; a slot's optional dump sink wears ai-dump
-# and qmcp-dump-pNN and is never in AI space. Only dom0 writes these badges.
+# and qmcp-dump-pNN and is never in AI space; a slot's self-hosted model qube,
+# guarded and never a member, wears qmcp-model-pNN (one per slot it serves).
+# Only dom0 writes these badges.
 #
 # First match wins, across every file in /etc/qubes/policy.d/ in name order.
-# Order inside this file: A hard denies, B the project slots, C leads to dom0,
+# Order inside this file: A hard denies (with the leads' model lines, which
+# must sort above the guarded deny), B the project slots, C leads to dom0,
 # D the rest of AI space's denies, E the hub, F copies out of AI space, G the
 # hub's own operator UX, H the hub's catch-alls. A guards everything below it;
 # D comes after B and C because a lead is in AI space too.
@@ -32,26 +35,10 @@
 # Never put a comment on the same line as a rule. Write it on its own line.
 
 # =========================================================================
-# A. HARD DENIES
+# A. HARD DENIES, AND THE LEADS' MODEL LINES ABOVE THE GUARDED DENY
 # =========================================================================
 
-# A1. Guarded qubes are read and spawned from, never written. The hub cannot
-# run, copy or change firewall rules in one (it may still read its firewall),
-# and nothing from AI space reaches one at all.
-qmcp.RunInAIManaged        *  mcp-control      @tag:qmcp-guarded        deny
-qmcp.CopyToAIManaged       *  mcp-control      @tag:qmcp-guarded        deny
-admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-guarded        deny
-admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-guarded        deny
-qubes.Filecopy             *  mcp-control      @tag:qmcp-guarded        deny
-*                          *  @tag:ai-managed  @tag:qmcp-guarded        deny
-
-# A1b. A lead's firewall is the operator's. dom0 writes it when the lead is
-# created, and again only when the operator changes it, directly or by
-# accepting the hub's proposal. The hub may still read it.
-admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-lead           deny
-admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-lead           deny
-
-# A2. Disposables: Qubes' raw @dispvm shortcut is closed for AI space.
+# A1. Disposables: Qubes' raw @dispvm shortcut is closed for AI space.
 # A `@dispvm` rule target matches only the bare keyword. The second line works
 # from the template's side: any source, any @dispvm form, any template inside
 # AI space, so it still holds for a qube stripped of ai-managed. qmcp's own
@@ -59,26 +46,71 @@ admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-lead           deny
 *                          *  @tag:ai-managed  @dispvm                  deny
 *                          *  @anyvm           @dispvm:@tag:ai-managed  deny
 
-# A3. No command execution from AI space into another qube, whatever form the
+# A2. No command execution from AI space into another qube, whatever form the
 # target takes, including a named disposable template outside AI space.
 qubes.VMShell              *  @tag:ai-managed  @anyvm                   deny
 qubes.VMRootShell          *  @tag:ai-managed  @anyvm                   deny
 qubes.VMExec               *  @tag:ai-managed  @anyvm                   deny
 qubes.VMExecGUI            *  @tag:ai-managed  @anyvm                   deny
 
-# A4. AI space never reaches the hub, by any service. The hub is named here,
+# A3. AI space never reaches the hub, by any service. The hub is named here,
 # never matched through @anyvm, so this cannot swallow anything else.
 *                          *  @tag:ai-managed  mcp-control              deny
 
-# A5. Nothing in AI space reaches a lead, by any service: not its workers, not
+# A4. Nothing in AI space reaches a lead, by any service: not its workers, not
 # another project, not another lead. The hub is not in AI space and keeps its
 # own lines in E.
 *                          *  @tag:ai-managed  @tag:qmcp-lead           deny
 
-# A6. A drop box (ai-dump) never reaches back into AI space, by any service,
+# A5. A drop box (ai-dump) never reaches back into AI space, by any service,
 # even by dialog. It sits here, above the project lines, so no slot line can
 # ever let a dump sink in.
 *                          *  @tag:ai-dump     @tag:ai-managed          deny
+
+# A6. A lead reaches its own slot's self-hosted model qube (qmcp-model-pNN),
+# on port 11434 only, through Qubes' qubes.ConnectTCP; the model qube's own
+# qrexec agent connects the call to its 127.0.0.1:11434. A model qube is
+# guarded, so these lines sit above A7, and below A3 and A4 and the drop-box
+# line just here: a model badge on the hub, a lead or a dump sink still opens
+# nothing. qmcp check fails on a model badge outside AI space, on a qube with a
+# network, on a member (p00 included), lead, template, disposable, disposable
+# template, gateway, drop box or the hub, on a qube whose template the hub
+# manages, or on a badge its slot's record does not name; it warns while a
+# model qube is not guarded. p00 has no lead, so no line.
+# Every other qubes.ConnectTCP call from AI space is refused: to dom0 by D2,
+# to any other target in A or D4.
+qubes.ConnectTCP           *  @tag:ai-managed  @tag:ai-dump             deny
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p01  @tag:qmcp-model-p01  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p02  @tag:qmcp-model-p02  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p03  @tag:qmcp-model-p03  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p04  @tag:qmcp-model-p04  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p05  @tag:qmcp-model-p05  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p06  @tag:qmcp-model-p06  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p07  @tag:qmcp-model-p07  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p08  @tag:qmcp-model-p08  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p09  @tag:qmcp-model-p09  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p10  @tag:qmcp-model-p10  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p11  @tag:qmcp-model-p11  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p12  @tag:qmcp-model-p12  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p13  @tag:qmcp-model-p13  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p14  @tag:qmcp-model-p14  allow
+qubes.ConnectTCP           +11434  @tag:qmcp-lead-p15  @tag:qmcp-model-p15  allow
+
+# A7. Guarded qubes are read and spawned from, never written. The hub cannot
+# run, copy or change firewall rules in one (it may still read its firewall),
+# and nothing from AI space reaches one at all, but a lead its model qube (A6).
+qmcp.RunInAIManaged        *  mcp-control      @tag:qmcp-guarded        deny
+qmcp.CopyToAIManaged       *  mcp-control      @tag:qmcp-guarded        deny
+admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-guarded        deny
+admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-guarded        deny
+qubes.Filecopy             *  mcp-control      @tag:qmcp-guarded        deny
+*                          *  @tag:ai-managed  @tag:qmcp-guarded        deny
+
+# A8. A lead's firewall is the operator's. dom0 writes it when the lead is
+# created, and again only when the operator changes it, directly or by
+# accepting the hub's proposal. The hub may still read it.
+admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-lead           deny
+admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-lead           deny
 
 # =========================================================================
 # B. PROJECT SLOTS
@@ -433,6 +465,12 @@ policy.UnregisterArgument                     *  @tag:ai-managed  @anyvm  deny
 policy.EvalSimulate                           *  @tag:ai-managed  @anyvm  deny
 policy.EvalGUI                                *  @tag:ai-managed  @anyvm  deny
 
+# D4. AI space opens no TCP connection into another qube through Qubes'
+# qubes.ConnectTCP: only a lead into its own slot's model qube, which A6
+# allows above. Qubes' own default file refuses it too; this makes the
+# refusal ours. @anyvm also matches @default.
+qubes.ConnectTCP           *  @tag:ai-managed  @anyvm                   deny
+
 # =========================================================================
 # E. THE HUB
 # =========================================================================
@@ -455,7 +493,7 @@ qmcp.SubmitProposal            *  mcp-control  @adminvm  allow
 qmcp.ProposalStatus            *  mcp-control  @adminvm  allow
 
 # E2. Command execution, copy-out and firewall on AI space. Guarded targets
-# were refused in A1, firewall writes to a lead in A1b.
+# were refused in A7, firewall writes to a lead in A8.
 qmcp.RunInAIManaged        *  mcp-control  @tag:ai-managed  allow  user=root
 qmcp.CopyToAIManaged       *  mcp-control  @tag:ai-managed  allow  user=root
 admin.vm.firewall.Get      *  mcp-control  @tag:ai-managed  allow  target=@adminvm

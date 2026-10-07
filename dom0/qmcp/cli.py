@@ -174,7 +174,8 @@ def cmd_project(args) -> int:
                 quota = "-" if r["quota"] is None else f"{r['quota'] / 1024 ** 3:.1f}"
                 print(f"{r['slot']}  {r['label'] or '(hub)':8s}  lead={r['lead'] or '-'}  "
                       f"members={'?' if r['members'] is None else r['members']}  "
-                      f"disk={used}/{quota} GiB  sink={r['dump'] or '-'}")
+                      f"disk={used}/{quota} GiB  sink={r['dump'] or '-'}  "
+                      f"model={r['model'] or r['model_qube'] or '-'}")
             return 0
         if what == "show":
             p = projects.find(fleet._load_records(), args.name)
@@ -182,14 +183,16 @@ def cmd_project(args) -> int:
                 raise fleet.ProjectError(f"no project '{args.name}'")
             print(json.dumps(dict(p.to_json(), slot=p.slot), indent=2))
             return 0
-        if what == "firewall" and args.model is None and not args.rule and not args.accept_current:
+        if what == "firewall" and args.model is None and not args.rule and not args.accept_current \
+                and args.model_qube is None:
             # Reading needs no root: the window shows it beside the lead.
             view = fleet.lead_firewall_view(app, fleet._load_records(), args.name)
             if args.json:
                 print(json.dumps(view, indent=2))
                 return 0
-            print(f"{view['slot']} {view['project']}: lead {view['lead'] or '-'}, "
-                  f"model {view['model'] or '-'}")
+            model = (f"model qube {view['model_qube']}" if view["model_qube"]
+                     else f"model {view['model'] or '-'}")
+            print(f"{view['slot']} {view['project']}: lead {view['lead'] or '-'}, {model}")
             for title, rules in (("accepted", view["accepted"]), ("live", view["live"])):
                 if rules:
                     print(f"{title}:")
@@ -199,7 +202,12 @@ def cmd_project(args) -> int:
                     print("accepted: none on record")
                 else:
                     print(f"live: {'unreadable (' + view['read_error'] + ')' if view['read_error'] else 'none'}")
-            print("same" if view["same"] else "DIFFERENT, or not both known")
+            if view["model_qube"]:
+                # A lead whose model is a qube has no network: no rule applies to it.
+                print("the lead's model is a qube: it should have no network, and qmcp check "
+                      "fails if it has one; with none, no firewall rule applies to it")
+            else:
+                print("same" if view["same"] else "DIFFERENT, or not both known")
             return 0
         if what == "delete" and not args.yes:
             # The plan changes nothing and reads only the records and the qube
@@ -218,7 +226,8 @@ def cmd_project(args) -> int:
                                          "--lead-clone or --lead-promote")
             report = fleet.create_project(app, args.name, source, origin, args.template or (),
                                           args.network or (), args.quota, args.lead_netvm,
-                                          args.dump, args.lead_name, args.model)
+                                          args.dump, args.lead_name, args.model,
+                                          args.model_qube)
         elif what == "edit":
             report = fleet.edit_project(app, args.name, args.template, args.network, args.quota)
         elif what == "lead":
@@ -231,10 +240,10 @@ def cmd_project(args) -> int:
                                              "--lead-clone or --lead-promote")
                 report = fleet.set_lead(app, args.name, source, origin, args.lead_netvm,
                                         args.keep_old, args.lead_name, args.model,
-                                        args.add_old_network)
+                                        args.add_old_network, args.model_qube)
         elif what == "firewall":
             report = fleet.set_lead_firewall(app, args.name, args.model, args.rule or None,
-                                             args.accept_current)
+                                             args.accept_current, args.model_qube)
         elif what == "dump":
             report = fleet.add_dump(app, args.name, args.sink_name)
         elif what == "move":
@@ -323,8 +332,14 @@ def _add_lead_options(p) -> None:
     p.add_argument("--lead-name", metavar="NAME", help="a fresh lead's name (default: <space>lead)")
     p.add_argument("--model", metavar="HOST:PORT",
                    help="the lead's model endpoint: dom0 writes its firewall to allow that "
-                        "endpoint and DNS, nothing else (needed for a lead with a network, "
-                        "unless the project already has one)")
+                        "endpoint, and DNS when it is a host name, nothing else (needed for a "
+                        "lead with a network, unless the project already has one)")
+    p.add_argument("--model-qube", metavar="QUBE|none",
+                   help="instead of --model, the project's self-hosted model qube, which the "
+                        "lead reaches on port 11434: the lead then has no network, and the qube "
+                        "leaves p00, loses its network, is guarded and, unless it is already a "
+                        "guarded model qube, is killed if it runs; none takes the project's "
+                        "model qube away")
 
 
 def _choices(pairs) -> dict:
@@ -397,7 +412,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("settings", help="the operator files and the disk AI space uses")
     p.add_argument("--json", action="store_true")
     for name, text in (("manage", "make a qube managed (the hub may operate it)"),
-                       ("guard", "make a qube guarded (reference only)"),
+                       ("guard", "make a qube guarded (reference only); a model qube that was "
+                                 "managed is killed if it runs (never a gateway or a template)"),
                        ("revoke", "take a qube out of AI space and shut it down")):
         p = sub.add_parser(name, help=text)
         p.add_argument("qube")
@@ -450,7 +466,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--json", action="store_true")
     q.add_argument("--model", metavar="HOST:PORT",
                    help="a new model endpoint for a lead with a network; its firewall becomes "
-                        "that endpoint and DNS, nothing else")
+                        "that endpoint, and DNS when it is a host name, nothing else")
+    q.add_argument("--model-qube", metavar="QUBE|none",
+                   help="the project's self-hosted model qube (the lead loses its network, and "
+                        "the qube leaves p00, loses its network, is guarded and, unless it is "
+                        "already a guarded model qube, is killed if it runs), or none (the "
+                        "project's model qube is taken away; nothing else changes)")
     q.add_argument("--rule", action="append", metavar="RULE",
                    help="set exactly these rules, in qubesd's format, e.g. "
                         "'action=accept proto=tcp dsthost=example.com dstports=443' (repeatable)")
@@ -531,7 +552,7 @@ def operator_line(args):
     if c != "project" or args.what in ("list", "show") or \
             (args.what == "delete" and not args.yes) or \
             (args.what == "firewall" and args.model is None and not args.rule
-             and not args.accept_current):
+             and not args.accept_current and args.model_qube is None):
         return None
     w = args.what
     summary = {"project": str(args.name)[:128]}
@@ -539,7 +560,7 @@ def operator_line(args):
         source, origin = _lead_source(args)
         if source:
             summary[f"lead_{source}"] = str(origin)[:128]
-        for key in ("lead_netvm", "lead_name", "model"):
+        for key in ("lead_netvm", "lead_name", "model", "model_qube"):
             if getattr(args, key) is not None:
                 summary[key] = str(getattr(args, key))[:128]
     if w == "create":
@@ -559,6 +580,7 @@ def operator_line(args):
                         "add_old_network": bool(args.add_old_network)})
     elif w == "firewall":
         summary.update({"model": None if args.model is None else str(args.model)[:128],
+                        "model_qube": None if args.model_qube is None else str(args.model_qube)[:128],
                         "rules": len(args.rule or ()), "accept_current": bool(args.accept_current)})
     elif w == "dump":
         summary["name"] = None if args.sink_name is None else str(args.sink_name)[:128]

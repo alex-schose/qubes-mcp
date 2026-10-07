@@ -582,7 +582,7 @@ class FirewallProposals(ProjectBase):
         doc = proposals.show(self.app, r["id"])
         self.assertEqual(doc["before"]["accepted"], ["action=accept"])
         self.assertEqual(doc["before"]["live"], ["action=accept"])
-        self.assertEqual(doc["after"], {"model": "api.anthropic.com:443",
+        self.assertEqual(doc["after"], {"model": "api.anthropic.com:443", "model_qube": None,
                                         "rules": firewall.endpoint_rules("api.anthropic.com:443")})
         self.assertEqual(len(doc["second_tick"]), 1)
         self.assertIn("compare the old and new rules", doc["second_tick"][0])
@@ -625,7 +625,7 @@ class AuditFixes(ProjectBase):
         self.app.qubesd_call = call
         return seen
 
-    # The rules are written while qmcp-lead already stops the hub (A1b)
+    # The rules are written while qmcp-lead already stops the hub (A8)
     # and before the slot's lead badge exists.
     def test_a_fresh_leads_rules_are_written_under_qmcp_lead_and_before_its_slot_badge(self):
         seen = self.spy_firewall_set("ai-res-lead")
@@ -670,7 +670,7 @@ class AuditFixes(ProjectBase):
 
     def test_rules_someone_else_wrote_in_between_are_never_accepted(self):
         # A write that lands between dom0's Set and its read-back (the hub's,
-        # before A1b could apply) makes the read-back differ: the lead is undone.
+        # before A8 could apply) makes the read-back differ: the lead is undone.
         real = self.app.qubesd_call
 
         def call(dest, method, arg=None, payload=None):

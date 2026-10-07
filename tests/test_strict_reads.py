@@ -446,7 +446,7 @@ class Commands(StrictBase):
     def test_a_failed_read_never_stops_the_kill_of_a_stripped_lead(self):
         # Its badges come off first; a read-back that fails must not stop the
         # kill: a lead left running without them keeps its network and loses
-        # the rulebook's guard on its firewall (A1b).
+        # the rulebook's guard on its firewall (A8).
         ops = {"remove": lambda: fleet.remove_lead(self.app, "osint"),
                "replace": lambda: fleet.set_lead(self.app, "osint", "template", "ai-debian-13",
                                                  lead_netvm="none", keep_old=False,
@@ -771,6 +771,8 @@ ALLOWED_TRY = {
     ("fleet.py", "_undo_lead"): "a write and its read-back; the failure is returned and reported",
     ("proposals.py", "_netvm_name"): "UNREADABLE is no network in use: a reason, never one fewer",
     ("proposals.py", "_wears_lead_badge"): "None counts as a removal: a reason, never one fewer",
+    ("proposals.py", "_model_slots_of"): "None adds a may-be-shared reason: a reason, never one "
+                                         "fewer",
     ("services.py", "svc_list"): "the label is shown, as UNREADABLE when it fails",
     ("services.py", "svc_set_feature"): "the read-back is shown, as UNREADABLE when it fails",
     ("services.py", "svc_spawn"): "a resize that fails is reported as a warning",

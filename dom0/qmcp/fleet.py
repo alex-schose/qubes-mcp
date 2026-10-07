@@ -151,12 +151,18 @@ PRECEDENCE_CLAIMS = (
     ("a worker calling a qmcp service", "qmcp.ListAIManagedQubes", "member", "dom0"),
     ("a worker's copy into its dump sink", "qubes.Filecopy", "member", "sink"),
     ("a dump sink reaching back into its project", "qubes.Filecopy", "sink", "member"),
+    ("a lead's connection to its model qube", "qubes.ConnectTCP+11434", "lead", "model"),
+    ("a worker's connection to its slot's model qube", "qubes.ConnectTCP+11434", "member", "model"),
+    ("the hub's connection to a model qube", "qubes.ConnectTCP+11434", "hub", "model"),
+    ("a TCP connection from AI space into another qube", "qubes.ConnectTCP+22", "ai", "peer"),
+    ("a TCP connection from AI space through @default", "qubes.ConnectTCP+11434", "ai", "@default"),
 )
 _PROBES = {"ai": "qmcp-probe-ai", "peer": "qmcp-probe-peer",
            "guarded": "qmcp-probe-guarded", "outside": "qmcp-probe-outside",
            "lead": "qmcp-probe-lead", "member": "qmcp-probe-member",
-           "other": "qmcp-probe-other", "sink": "qmcp-probe-sink"}
-#: Synthetic project p01 (lead, member, sink) and a member of p02.
+           "other": "qmcp-probe-other", "sink": "qmcp-probe-sink",
+           "model": "qmcp-probe-model"}
+#: Synthetic project p01 (lead, member, sink, model qube) and a member of p02.
 _PROBE_TAGS = {
     "ai": [core.UMBRELLA], "peer": [core.UMBRELLA], "guarded": [core.UMBRELLA, core.GUARDED],
     "outside": [],
@@ -164,6 +170,7 @@ _PROBE_TAGS = {
     "member": [core.UMBRELLA, projects.member_badge("p01")],
     "other": [core.UMBRELLA, projects.member_badge("p02")],
     "sink": [projects.DROP_BOX, projects.dump_badge("p01")],
+    "model": [core.UMBRELLA, core.GUARDED, projects.model_badge("p01")],
 }
 
 
@@ -189,9 +196,10 @@ def precedence(policy, system_info, hub: str) -> list:
     si = {"domains": domains}
     ai_sources = sorted({n for n, d in domains.items()
                          if not n.startswith("uuid:") and core.UMBRELLA in d.get("tags", [])
-                         and n not in (_PROBES["peer"], _PROBES["guarded"])})
+                         and n not in (_PROBES["peer"], _PROBES["guarded"], _PROBES["model"])})
     problems = []
     for label, service, role, target in PRECEDENCE_CLAIMS:
+        service, _, argument = service.partition("+")
         tgt = {"hub": hub, "dom0": "dom0"}.get(target, _PROBES.get(target, target))
         sources = (ai_sources if role == "ai" else [hub] if role == "hub"
                    else [_PROBES[role]])
@@ -199,7 +207,7 @@ def precedence(policy, system_info, hub: str) -> list:
             if src == tgt:
                 continue
             try:
-                req = Request(service, "+", src, tgt, system_info=si)
+                req = Request(service, f"+{argument}", src, tgt, system_info=si)
             except (AccessDenied, RequestError):
                 continue                    # refused before any rule: the claim holds
             rule = next((r for r in policy.rules if r.is_match(req)), None)
@@ -567,6 +575,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("pass", "project records",
             f"{sum(1 for p in records.values() if p.label)} project(s) in {projects.PROJECTS_PATH}")
     out.extend(project_findings(vms, by_name, records, prefix, registry, tags_by))
+    out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub))
     out.extend(lead_firewall_findings(app, by_name, records))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
@@ -758,8 +767,8 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
     for vm in vms:
         tags = tags_by[vm.name]
         if core.UMBRELLA not in tags or core.GUARDED in tags or projects.LEAD in tags \
-                or projects.member_slots(tags):
-            continue
+                or projects.member_slots(tags) or projects.model_slots(tags):
+            continue            # a model qube joins no slot: the model checks judge it
         try:
             if core.klass_of(vm) == "AppVM" and not core.is_template(vm) \
                     and not core.is_gateway(vm):
@@ -795,16 +804,26 @@ def lead_firewall_findings(app, by_name: dict, records: dict) -> list:
     """A lead's firewall is the operator's: it must still be the rules the
     operator accepted. A lead with no network needs none; a lead with one
     and no accepted rules on record (upgraded from 0.9.20) is warned about
-    until the operator accepts its current rules or sets its model."""
-    drift, unaccepted, unread = [], [], []
+    until the operator accepts its current rules or sets its model. A lead
+    with a network whose project's model is a qube fails: it should have
+    none. One whose endpoint is an address and whose accepted rules still
+    hold the DNS rule set before 0.9.22 is warned about."""
+    drift, unaccepted, unread, dns, sealed = [], [], [], [], []
     for p in sorted(records.values(), key=lambda p: p.slot):
         if p.slot == projects.HUB_SLOT or p.lead is None or p.lead not in by_name:
             continue
         try:
-            if _netvm(by_name[p.lead]) is None:
-                continue
+            net = _netvm(by_name[p.lead])
         except NetvmUnreadable:
             unread.append(f"{p.lead} (network)")
+            continue
+        if net is None:
+            continue
+        if p.model_qube is not None:
+            # A lead whose model is a qube has no network: this one was given
+            # one outside qmcp, so its project is no longer sealed.
+            sealed.append(f"{p.label}: {p.lead} is on {net}, though its model is the qube "
+                          f"{p.model_qube}")
             continue
         if p.lead_firewall is None:
             unaccepted.append(f"{p.label}: {p.lead}")
@@ -816,7 +835,13 @@ def lead_firewall_findings(app, by_name: dict, records: dict) -> list:
             continue
         if tuple(live) != tuple(p.lead_firewall):
             drift.append(f"{p.label}: {p.lead}")
+        elif firewall.dns_left_open(p.model, p.lead_firewall):
+            dns.append(f"{p.label}: {p.lead} (qmcp project firewall {p.label} --model {p.model})")
     out = []
+    if sealed:
+        out.append(Finding("fail", "model-qube leads", f"{'; '.join(sealed)}: clear its network "
+                           f"(qvm-prefs LEAD netvm ''), or give the project a remote model with a "
+                           f"new lead"))
     if unread:
         out.append(Finding("error", "lead firewalls", f"cannot read: {', '.join(unread)}"))
     if drift:
@@ -826,6 +851,11 @@ def lead_firewall_findings(app, by_name: dict, records: dict) -> list:
     elif not unread:
         out.append(Finding("pass", "lead firewalls", "every lead firewall you accepted is still as "
                                                      "you accepted it"))
+    if dns:
+        out.append(Finding("warn", "lead DNS",
+                           f"leads whose model endpoint is an address still have the DNS rule "
+                           f"set before 0.9.22, which they do not need: {'; '.join(dns)} "
+                           f"rewrites the rules without it"))
     if unaccepted:
         out.append(Finding("warn", "lead firewalls not accepted",
                            f"{', '.join(unaccepted)}: accept the current rules with qmcp project "
@@ -1008,6 +1038,164 @@ def remove_gateway(app, name: str) -> str:
         del registry[name]
         gateways.save(registry)
     return f"{name}: no longer enrolled"
+
+
+# ------------------------------------------------------------------ model qubes
+#
+# A project's lead may use a self-hosted model: a model qube, guarded and with
+# no network, which the lead reaches over qubes.ConnectTCP on port 11434 (the
+# rulebook's A6 lines, one per slot, routed on `qmcp-model-pNN`). A lead whose
+# model is a qube has no network itself. One model qube may serve several
+# projects, one badge each; that is a path between them (`SHARED_MODEL_WARNING`).
+
+MODEL_PORT = projects.MODEL_PORT
+
+#: Said wherever a model qube is shared: the command's report, the window and
+#: the docs. qmcp ships no filter.
+SHARED_MODEL_WARNING = (
+    "a model qube that serves several projects is a path between them: Ollama's API has "
+    "no login and lets any client create, copy and delete models, so a hijacked lead can "
+    "change the model another project's lead uses, or pass it data. It is safe only behind "
+    "an API filter that lets inference calls through and nothing else; qmcp ships none")
+
+
+def model_qube_refusal(by_name: dict, name: str, hub=None) -> str | None:
+    """None if `name` may be a project's model qube, else why not.
+
+    An AppVM or StandaloneVM in AI space (the command guards it; it never
+    brings a qube into AI space, so neither can a proposal) that is no
+    template, disposable template or gateway; not the hub, a drop box, a lead
+    or a member of any project (one in p00 leaves p00 when it becomes a model
+    qube); its system comes from no template the hub manages (every template in
+    its chain outside AI space or guarded), since what runs in it comes from
+    that template at every start. Serving another project already is no
+    refusal: the command warns that it is shared. A read that fails refuses
+    it, until it reads; so does a hub file that cannot be read."""
+    try:
+        return _model_qube_refusal(by_name, name, hub)
+    except core.Unreadable as e:
+        return f"{e}, so it is refused until that reads"
+
+
+def _model_qube_refusal(by_name: dict, name: str, hub) -> str | None:
+    vm = by_name.get(name)
+    if vm is None or core.klass_of(vm) == "AdminVM":
+        return "no such qube"
+    hub = core.read_hub() if hub is None else hub
+    if hub is None:
+        return f"{core.HUB_PATH} cannot be read, so it is not known whether it is the hub"
+    if name == hub:
+        return "is the hub"
+    klass = core.klass_of(vm)
+    if klass not in ("AppVM", "StandaloneVM"):
+        return f"is a {klass}; a model qube is an AppVM or a StandaloneVM"
+    if core.is_dvmt(vm):
+        return "is a disposable template"
+    if core.is_gateway(vm):
+        return "provides network"
+    try:
+        tags = _tags(vm)
+    except core.Gone:
+        return "no such qube"
+    if projects.DROP_BOX in tags or _dump_slots(tags):
+        return "is a drop box"
+    if core.UMBRELLA not in tags:
+        return f"is outside AI space: guard it first (qmcp guard {name})"
+    if projects.LEAD in tags or projects.lead_slots(tags):
+        return "is a lead"
+    others = projects.member_slots(tags) - {projects.HUB_SLOT}
+    if others:
+        return f"is a member of {', '.join(sorted(others))}"
+    for tpl in _template_chain(vm):
+        tpl_tags = _tags(tpl)
+        if core.UMBRELLA in tpl_tags and core.GUARDED not in tpl_tags:
+            return f"its template {tpl.name} is one the hub manages (guard it, or use another)"
+    return None
+
+
+def _dump_slots(tags) -> set:
+    return {p[1] for p in map(projects.slot_badge_parts, tags) if p and p[0] == "dump"}
+
+
+def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, hub) -> list:
+    """The model qubes, judged by the badges the rulebook routes on. A lead
+    reaches whatever wears its slot's model badge on port 11434 (but the hub,
+    a lead or a drop box, which the rulebook refuses first), so a badge in the
+    wrong place fails: on a qube with a network (a model server with one is
+    a way out for the lead around the firewall the operator owns: Ollama
+    fetches a "model" from any host it is told to), outside AI space, on a
+    member, lead, template, gateway, drop box or the hub, on a qube whose
+    template the hub manages, or a badge its slot's record does not name. An
+    un-guarded model qube is a warning: the operator's maintenance window,
+    during which the hub may operate it. So is a recorded model qube that is
+    gone or unbadged: its lead just cannot reach it."""
+    out: list = []
+    bad, warn, unread = [], [], []
+    holders = {}
+    for vm in vms:
+        if vm.name not in tags_by:
+            continue
+        slots = projects.model_slots(tags_by[vm.name])
+        if slots:
+            holders[vm.name] = slots
+    for name in sorted(holders):
+        vm, tags, slots = by_name[name], tags_by[name], holders[name]
+        for slot in sorted(slots):
+            rec = records.get(slot)
+            if rec is None or not rec.label:
+                bad.append(f"{name} wears {projects.model_badge(slot)}, which no project's record names")
+            elif rec.model_qube != name:
+                bad.append(f"{name} wears {projects.model_badge(slot)}, but {rec.label}'s record names "
+                           f"{rec.model_qube or 'no model qube'}")
+        if core.UMBRELLA not in tags:
+            # Not the command's advice to guard it: a stray badge comes off.
+            bad.append(f"{name} is outside AI space but wears a model badge, which the rulebook "
+                       f"still routes on")
+            continue
+        try:
+            why = _model_qube_refusal(by_name, name, hub)
+        except core.Unreadable as e:
+            unread.append(str(e).removeprefix("cannot read "))
+            why = None
+        if why:
+            bad.append(f"{name}: {why}")
+        if projects.HUB_SLOT in projects.member_slots(tags):
+            label = next((records[s].label for s in sorted(slots)
+                          if s in records and records[s].label), "PROJECT")
+            bad.append(f"{name} is in p00: it copies into the hub's p00 qubes without a dialog "
+                       f"(qmcp project firewall {label} --model-qube {name} takes it out)")
+        try:
+            net = _netvm(vm)
+        except NetvmUnreadable:
+            unread.append(f"the network of {name}")
+            net = None
+        if net is not None:
+            bad.append(f"{name} has a network ({net}): its leads reach that network through it")
+        if core.GUARDED not in tags:
+            warn.append(f"{name} is not guarded: while it serves "
+                        f"{', '.join(sorted(slots))}, the hub may operate it (qmcp guard {name} "
+                        f"when its changes are done)")
+    for p in sorted(records.values(), key=lambda p: p.slot):
+        if not p.label or p.model_qube is None:
+            continue
+        if p.model_qube not in by_name:
+            warn.append(f"{p.label}: its model qube {p.model_qube} does not exist")
+        elif p.model_qube in tags_by and p.slot not in holders.get(p.model_qube, set()):
+            warn.append(f"{p.label}: its model qube {p.model_qube} does not wear "
+                        f"{projects.model_badge(p.slot)}, so its lead cannot reach it "
+                        f"(qmcp project firewall {p.label} --model-qube {p.model_qube})")
+    note = f"; cannot read {', '.join(sorted(set(unread)))}" if unread else ""
+    if bad:
+        out.append(Finding("fail", "model qubes", "; ".join(bad) + note))
+    elif unread:
+        out.append(Finding("error", "model qubes", note[2:]))
+    else:
+        out.append(Finding("pass", "model qubes",
+                           f"{len(holders)} model qube(s), each in AI space with no network, in no "
+                           f"slot, and named by its projects' records" if holders else "none"))
+    if warn:
+        out.append(Finding("warn", "model qubes", "; ".join(warn)))
+    return out
 
 
 # ------------------------------------------------------------------ migrate
@@ -1267,30 +1455,147 @@ def manage(app, name) -> str:
                         + f", but {e}; run qmcp manage {name} again") from None
     for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
         vm.tags.discard(t)
-    return f"{name}: managed"
+    serves = projects.model_slots(tags)
+    kind = _model_qube_kind(vm) if serves else False
+    if kind is False:
+        # No model qube, whatever it wears: qmcp check fails on the badge.
+        return f"{name}: managed"
+    return (f"{name}: managed; it is still the model qube of {', '.join(sorted(serves))}: "
+            f"while it is managed the hub may operate it (qmcp guard {name} when its changes "
+            f"are done" + (", which kills it if it runs)" if kind else ")"))
 
 
-def _not_in_a_slot(vm, name, action: str) -> None:
+def _not_in_a_slot(vm, name, action: str) -> set:
+    """The qube's tags, read once; refuses a lead, and a member unless revoking."""
     tags = _read_tags(vm)
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise RoleError(f"'{name}' is a lead; use qmcp project lead <project> --remove first")
     if projects.member_slots(tags) and action != "revoke":
         raise RoleError(f"'{name}' is in a project slot; qmcp project move {name} none first")
+    return tags
 
 
 def guard(app, name) -> str:
     vm = _target(app, name)
-    _not_in_a_slot(vm, name, "guard")
+    before = _not_in_a_slot(vm, name, "guard")
     _network_enrolled(vm, name)
-    vm.tags.add(core.GUARDED)
-    vm.tags.add(core.UMBRELLA)
+    serves = sorted(projects.model_slots(before))
+    # A model qube's maintenance window closes (managed to guarded): nothing
+    # the hub started in it while it was managed runs on. It is killed right
+    # after the guard lands, before any other read or write, so no later
+    # failure leaves it guarded and still running (a second guard finds it
+    # guarded and kills nothing). The kill ends the hub's processes, not its
+    # files: what it left in /home, /usr/local or /rw (anywhere, in a
+    # StandaloneVM) stays, and whatever is set to start from there runs at its
+    # next start. One already guarded is left alone: the hub could not reach it, and
+    # its leads may be using it. Only a kind of qube that can be a model qube is
+    # killed: a gateway or a template wearing a stray badge is not (killing it
+    # would take its clients' network, or break an update).
+    candidate = bool(serves) and core.UMBRELLA in before and core.GUARDED not in before
+    # A kind that cannot be read never stops the guard, which takes the hub's
+    # authority away: it only stops the kill, and the operator is told.
+    kind = _model_qube_kind(vm) if candidate else False
+    window = candidate and kind is True
+    # Said with every outcome from the guard on, since a second guard finds
+    # the qube guarded and says nothing of a kill.
+    unknown = (f"whether it can be a model qube could not be read, so it was not killed: if it "
+               f"runs and is no gateway or disposable template, kill it by hand (qvm-kill {name})"
+               if candidate and kind is None else "")
+    try:
+        vm.tags.add(core.GUARDED)
+    except Exception as e:
+        # qubesd may have set the tag before the call failed: kill as if it
+        # had, or a second guard would find it guarded and spare it.
+        failed, done = type(e).__name__, (_kill_if_running(vm) if window else "halted")
+        if done not in ("halted", "killed"):
+            raise RoleError(f"'{name}' may be guarded now, but the call failed ({failed}), and it "
+                            f"could NOT be killed ({done}): a process the hub started in it may "
+                            f"still run; kill it by hand (qvm-kill {name}), then run qmcp guard "
+                            f"{name} again") from None
+        raise RoleError(f"'{name}' may be guarded now, but the call failed ({failed})"
+                        + ("; it was killed" if done == "killed" else "")
+                        + (f"; {unknown}" if unknown else "")
+                        + f"; run qmcp guard {name} again") from None
+    tail = _kill_after_guard(vm, name, serves) if window else ""
+    if unknown:
+        # Right after the guard lands, before any other read or write can fail
+        # and hide it. The umbrella is already on (a candidate is in AI space);
+        # a second guard strips any old tier tags.
+        raise RoleError(f"'{name}' is guarded now, but {unknown}; then run qmcp guard {name} "
+                        f"again")
+    try:
+        vm.tags.add(core.UMBRELLA)
+    except Exception as e:
+        raise RoleError(f"'{name}' is guarded now" + ("; it was killed" if tail else "")
+                        + f", but it could not be added to AI space ({type(e).__name__}); run "
+                        f"qmcp guard {name} again") from None
     try:
         tags = _tags(vm)
     except core.Unreadable as e:
         raise RoleError(f"'{name}' is guarded now, but {e}; run qmcp guard {name} again") from None
     for t in sorted(tags & LEGACY_TIER_TAGS):
         vm.tags.discard(t)
-    return f"{name}: guarded"
+    return f"{name}: guarded" + tail
+
+
+def _kill_if_running(vm) -> str:
+    """"halted" (it was not running), "killed", or the name of the error that
+    left it running or its state unknown. Only "Halted" counts as not running:
+    "NA" is qubesadmin's answer for a qube it cannot read, and a state that
+    cannot be read is never taken for halted (a kill on a halted qube fails,
+    and the state read after it decides)."""
+    if _safe(vm.get_power_state, "unknown") == "Halted":
+        return "halted"
+    try:
+        vm.kill()
+    except Exception as e:
+        return "halted" if _safe(vm.get_power_state, "unknown") == "Halted" else type(e).__name__
+    return "killed"
+
+
+def _model_qube_kind(vm):
+    """True for an AppVM or a StandaloneVM that is no disposable template and
+    provides no network (the kinds `model_qube_refusal` lets be a model qube),
+    False for any other kind, None when that cannot be read."""
+    try:
+        return core.klass_of(vm) in ("AppVM", "StandaloneVM") and not core.is_dvmt(vm) \
+            and not core.is_gateway(vm)
+    except core.Unreadable:
+        return None
+
+
+def _kill_after_guard(vm, name, serves) -> str:
+    """Kill a model qube that is running once its maintenance window closes:
+    its leads' next connection starts it. The report's tail, in words; a kill
+    that fails, its state not Halted, is a RoleError, so the command exits 1."""
+    done = _kill_if_running(vm)
+    if done == "halted":
+        return ""
+    if done != "killed":
+        raise RoleError(f"'{name}' is guarded now, but it could NOT be killed ({done}): a process "
+                        f"the hub started in it may still run; kill it by hand (qvm-kill {name})")
+    return (f"; killed, so no process the hub started in it while it was managed runs on "
+            f"(a lead of {', '.join(serves)} starts it again by connecting)")
+
+
+def _kill_model_qube(report, slot, vm, name, managed: bool, guard_failed: str = "") -> None:
+    """The model command's kill, in the report. A kill that fails stops the
+    command before the record names the qube and before it wears this slot's
+    badge, so the command gives no further lead a qube that may still run what
+    was started in it. `guard_failed`: the guard step's own error, when that
+    step failed and the guard may not have landed."""
+    done = _kill_if_running(vm)
+    started = ("the hub started in it while it was managed" if managed else
+               "started in it before it became a model qube")
+    if done == "killed":
+        report.append(f"{slot}: {name} killed, so no process {started} runs on; its lead starts "
+                      f"it again by connecting")
+    elif done != "halted":
+        state = (f"may not be guarded (that step failed too: {guard_failed})" if guard_failed
+                 else "is guarded")
+        raise ProjectError(f"{name} {state}, and it could NOT be killed ({done}): a process "
+                           f"{started} may still run; kill it by hand (qvm-kill {name}), then "
+                           f"run the command again")
 
 
 def revoke(app, name, shutdown: bool = True) -> str:
@@ -1354,6 +1659,9 @@ def listing(app, everything: bool = False) -> list:
             # What the tags say is not known when they cannot be read: never empty.
             "slot": UNREADABLE if tags is None else ",".join(sorted(slots)) or None,
             "lead": UNREADABLE if tags is None else projects.LEAD in tags,
+            # The slots whose lead reaches it as their model qube.
+            "model": UNREADABLE if tags is None else
+            ",".join(sorted(projects.model_slots(tags))) or None,
             "owner": UNREADABLE if tags is None else _owner(tags),
             "gateway": _shown(lambda: core.is_gateway(vm)),
             "dvmt": _shown(lambda: core.is_dvmt(vm)),
@@ -1622,8 +1930,8 @@ def _lead_rules(app, source: str, origin: str, lead_netvm, model):
     if model is None:
         if net is not None:
             raise ProjectError("a lead with a network needs its model endpoint (--model HOST:PORT): "
-                               "dom0 writes its firewall to allow that endpoint and DNS, "
-                               "nothing else")
+                               "dom0 writes its firewall to allow that endpoint, and DNS for "
+                               "a host name, nothing else")
         return None, None
     try:
         model = firewall.model_text(model)
@@ -1648,6 +1956,8 @@ def _hubs_own_appvm(app, name, what: str):
         raise ProjectError(f"'{name}' is guarded or a drop box")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' already leads a project")
+    if projects.model_slots(tags):
+        raise ProjectError(f"'{name}' is a model qube of {', '.join(sorted(projects.model_slots(tags)))}")
     if projects.member_slots(tags) - {projects.HUB_SLOT}:
         raise ProjectError(f"'{name}' is another project's member; move it to p00 first")
     return vm
@@ -1795,7 +2105,7 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
             # `qmcp-lead` first: it grants nothing alone (the services refuse a
             # lead without its record, and the slot lines need the slot's
             # badge), and the rulebook denies the hub any firewall write to a
-            # qube wearing it (A1b). A hub write admitted just before is
+            # qube wearing it (A8). A hub write admitted just before is
             # overwritten if it lands first, fails the read-back below if it
             # lands between the write and the read-back, and shows in
             # `qmcp check` if it lands later.
@@ -1919,7 +2229,7 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
     except core.Unreadable as e:
         # The removes went through; only their read-back failed. The kill and
         # the record must not wait on a read: a lead left running unrecorded
-        # would keep its network and lose A1b's guard on its firewall.
+        # would keep its network and lose A8's guard on its firewall.
         report.fail(f"{p.slot}: {p.lead}'s lead badges were taken off, but {e}; qmcp check "
                     f"shows whether any is left")
     power = _safe(vm.get_power_state, "unknown")
@@ -1939,18 +2249,37 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
 
 def create_project(app, label: str, lead_source: str, lead_origin: str, templates=(),
                    networks=(), quota=None, lead_netvm=None, dump: bool = False,
-                   lead_name: str | None = None, model: str | None = None) -> list:
+                   lead_name: str | None = None, model: str | None = None,
+                   model_qube: str | None = None) -> list:
     """Make a project; returns the report lines. The record is written last, so
-    the lead is no principal until everything else is in place."""
+    the lead is no principal until everything else is in place. With
+    `model_qube` the lead has no network, and the qube becomes the project's
+    model qube once the project is recorded (`_set_model_qube`)."""
     return _run(_create_project, app, label, lead_source, lead_origin, templates, networks,
-                quota, lead_netvm, dump, lead_name, model)
+                quota, lead_netvm, dump, lead_name, model, model_qube)
+
+
+def _model_qube_lead_netvm(model, model_qube, lead_netvm):
+    """A lead whose model is a qube has no network: the lead network it gets.
+    `none` is no model qube, and asks nothing of the lead's network."""
+    if model_qube in (None, "none"):
+        return lead_netvm
+    if model is not None:
+        raise ProjectError("say --model HOST:PORT or --model-qube QUBE, not both")
+    if lead_netvm not in (None, "none"):
+        raise ProjectError("a lead whose model is a qube has no network: drop --lead-netvm "
+                           "(or give --lead-netvm none)")
+    return "none"
 
 
 def _create_project(report, app, label, lead_source, lead_origin, templates, networks, quota,
-                    lead_netvm, dump, lead_name, model=None):
+                    lead_netvm, dump, lead_name, model=None, model_qube=None):
     err = projects.label_refusal(label)
     if err:
         raise ProjectError(err)
+    if model_qube == "none":
+        model_qube = None
+    lead_netvm = _model_qube_lead_netvm(model, model_qube, lead_netvm)
     prefix = birth.read_name_prefix()
     space = f"{prefix}{label}-"
     quota = _quota(quota)
@@ -1984,11 +2313,15 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         tpls.insert(0, lead_tpl)
     tpls = _check_templates(app, tpls)
     nets = _check_networks(app, networks)
+    if model_qube is not None:
+        if lead_source == "promote" and model_qube == lead_origin:
+            raise ProjectError(f"'{model_qube}' cannot be both the lead and its model qube")
+        _plan_model_qube(app, slot, model_qube)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, slot, lead_source,
                                                                  lead_origin, name, lead_netvm,
                                                                  model)
     report.append(f"{slot}: lead {lead} ({'created' if fresh else 'promoted'})"
-                  + (f", firewall: {model} and DNS only" if stored else ""))
+                  + (f", firewall: {firewall.endpoint_summary(model)}" if stored else ""))
     try:
         if sink:
             _make_sink(app, slot, sink)
@@ -2005,6 +2338,8 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
             report.append(f"{slot}: undone")
         raise
     report.append(f"{slot}: project '{label}' recorded; workers are named {space}*")
+    if model_qube is not None:
+        _set_model_qube(report, app, records, records[slot], model_qube)
 
 
 def _make_sink(app, slot: str, name: str):
@@ -2056,23 +2391,28 @@ def _remove_lead(report, app, key):
 
 def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
              keep_old: bool = False, lead_name: str | None = None, model: str | None = None,
-             add_old_network: bool = False) -> list:
+             add_old_network: bool = False, model_qube: str | None = None) -> list:
     """Give a project a new lead. Everything about the new lead is checked
     before the old one is touched. The old one is removed, or kept as a worker
     of the same project, never as one of the hub's qubes. A kept lead keeps
     its network when the project lists it; otherwise `add_old_network` adds
     it to the list, and without that the old lead loses its network. The new
     lead gets `model`; one with a network and no `model` takes the project's,
-    and one with no network leaves the project with none."""
+    and one with no network leaves the project with no remote model. A
+    project's model qube stays for a new lead with no network; `model_qube`
+    changes it (a qube: the new lead then has no network; "none": the
+    project's model qube is taken away, nothing else); a remote `model`
+    takes it away before the old lead is touched."""
     return _run(_set_lead, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
-                model, add_old_network)
+                model, add_old_network, model_qube)
 
 
 def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
-              model=None, add_old_network=False):
+              model=None, add_old_network=False, model_qube=None):
     prefix = birth.read_name_prefix()
     records = _load_records()
     p = _project(records, key)
+    lead_netvm = _model_qube_lead_netvm(model, model_qube, lead_netvm)
     old_vm = _recorded_lead(app, p)
     old_net, disconnect = None, False
     if add_old_network and not keep_old:
@@ -2099,10 +2439,20 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
     name = _plan_lead(app, p.space(prefix), lead_source, lead_origin, lead_netvm, lead_name, freed,
                       model=model)
     model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
+    if model_qube not in (None, "none"):
+        if lead_source == "promote" and model_qube == lead_origin:
+            raise ProjectError(f"'{model_qube}' cannot be both the lead and its model qube")
+        _plan_model_qube(app, p.slot, model_qube)
+    elif model is not None and p.model_qube is not None:
+        _model_badge_holders(app, p.slot)
     try:
         projects.parse(projects.dump_json(records))     # the record as it will be saved
     except projects.ProjectsUnreadable as e:
         raise ProjectError(f"the project's record would not be valid: {e}") from None
+    if model is not None and p.model_qube is not None:
+        # The project's model becomes a remote endpoint: its model qube goes
+        # first, before any lead changes, so no lead ever has both.
+        _set_model_qube(report, app, records, p, None)
     old = p.lead
     if old is not None:
         ours = _demote_lead(app, p, report, removing=not keep_old)
@@ -2151,7 +2501,9 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                                f"new lead did not finish: {err}") from e
         raise
     report.append(f"{p.slot}: lead {lead} ({'created' if fresh else 'promoted'})"
-                  + (f", firewall: {model} and DNS only" if stored else ""))
+                  + (f", firewall: {firewall.endpoint_summary(model)}" if stored else ""))
+    if model_qube is not None:
+        _set_model_qube(report, app, records, p, None if model_qube == "none" else model_qube)
 
 
 def edit_project(app, key: str, templates=None, networks=None, quota=None) -> list:
@@ -2263,27 +2615,39 @@ def lead_firewall_view(app, records: dict, key: str) -> dict:
             error = type(e).__name__
     accepted = None if p.lead_firewall is None else list(p.lead_firewall)
     return {"project": p.label, "slot": p.slot, "lead": p.lead, "model": p.model,
+            "model_qube": p.model_qube,
             "accepted": accepted, "live": live, "read_error": error,
             "same": live is not None and accepted is not None and live == accepted}
 
 
 def set_lead_firewall(app, key: str, model: str | None = None, rules=None,
-                      accept_current: bool = False) -> list:
+                      accept_current: bool = False, model_qube: str | None = None) -> list:
     """Change a lead's firewall, or accept the rules it has. With `model`, the
     lead's model endpoint changes and its firewall becomes "model endpoint
     only" (for a lead with a network); with `rules`, its firewall becomes
     exactly those rules; with `accept_current`, its live rules become the
     accepted ones and nothing on the qube changes, if they are in qmcp's rule
     format (no comment or expire, at most 32). The record keeps what qubesd
-    reads back; a write that does not read back is undone."""
-    return _run(_set_lead_firewall, app, key, model, rules, accept_current)
+    reads back; a write that does not read back is undone. With `model_qube`,
+    a qube: the project's model becomes that self-hosted model qube, and a
+    lead with a network loses it (`_set_model_qube`); "none": the project's
+    model qube is taken away, and nothing else changes."""
+    return _run(_set_lead_firewall, app, key, model, rules, accept_current, model_qube)
 
 
-def _set_lead_firewall(report, app, key, model, rules, accept_current):
-    if sum(x is not None and x is not False for x in (model, rules, accept_current or None)) != 1:
-        raise ProjectError("say one of --model HOST:PORT, --rule RULE (repeatable) or --accept-current")
+def _set_lead_firewall(report, app, key, model, rules, accept_current, model_qube=None):
+    if sum(x is not None and x is not False
+           for x in (model, rules, accept_current or None, model_qube)) != 1:
+        raise ProjectError("say one of --model HOST:PORT, --model-qube QUBE|none, --rule RULE "
+                           "(repeatable) or --accept-current")
     records = _load_records()
     p = _project(records, key)
+    if model_qube is not None:
+        _set_model_qube(report, app, records, p, None if model_qube == "none" else model_qube)
+        return
+    if p.model_qube is not None and model is None:
+        raise ProjectError(f"the model of {p.label} is the qube {p.model_qube}, and its lead has no "
+                           f"network, so it has no firewall to set or accept")
     vm = _recorded_lead(app, p)
     if vm is None:
         raise ProjectError(f"project '{p.label}' has no lead wearing its lead badge")
@@ -2307,6 +2671,10 @@ def _set_lead_firewall(report, app, key, model, rules, accept_current):
             model = firewall.model_text(model)
         except firewall.FirewallError as e:
             raise ProjectError(str(e)) from None
+        if p.model_qube is not None:
+            raise ProjectError(f"the model of {p.label} is the qube {p.model_qube}, and its lead "
+                               f"has no network: a remote model takes a new lead on a network "
+                               f"(qmcp project lead {p.label} ... --lead-netvm NET --model HOST:PORT)")
         try:
             if _netvm(vm) is None:
                 raise ProjectError(f"{p.lead} has no network, so it reaches no model endpoint; "
@@ -2334,6 +2702,112 @@ def _set_lead_firewall(report, app, key, model, rules, accept_current):
     projects.save(records)
     report.append(f"{p.slot}: {p.lead}'s firewall set ({len(stored)} rules)"
                   + (f", model {model}" if model else ""))
+
+
+def _model_badge_holders(app, slot: str) -> list:
+    """Every qube wearing `slot`'s model badge. A qube whose tags cannot be
+    read stops the command: it may wear the badge."""
+    badge = projects.model_badge(slot)
+    out, unread = [], []
+    for vm in app.domains:
+        try:
+            if badge in _tags(vm):
+                out.append(vm.name)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            unread.append(vm.name)
+    if unread:
+        raise ProjectError(f"cannot read the tags of {', '.join(sorted(unread))}, so whether they "
+                           f"wear {badge} is not known; try again")
+    return sorted(out)
+
+
+def _plan_model_qube(app, slot: str, name) -> None:
+    """Check `name` (or None: no model qube) as `slot`'s model qube, changing
+    nothing."""
+    if name is not None:
+        why = model_qube_refusal({vm.name: vm for vm in app.domains}, name)
+        if why:
+            raise ProjectError(f"'{name}' cannot be a model qube: {why}")
+    _model_badge_holders(app, slot)
+
+
+def _set_model_qube(report, app, records, p, name) -> None:
+    """Make `name` the model qube of `p`'s slot, or with None give the slot
+    none. In authority order: the slot's model badge comes off every other
+    qube; the lead loses its network (a lead whose model is a qube has none);
+    the model qube leaves p00, loses its network, is guarded and is killed if
+    it runs (unless it is already a guarded model qube); the record names it;
+    and only then does it wear the slot's model badge, which is what
+    lets the lead reach it. Checked again here, against the fleet as it is
+    now. A failure part-way leaves less authority than the command meant,
+    never more, and the report says how far it got."""
+    _plan_model_qube(app, p.slot, name)
+    badge = projects.model_badge(p.slot)
+    for holder in _model_badge_holders(app, p.slot):
+        if holder != name and (vm := _vm(app, holder)) is not None:
+            _set_tags(vm, remove={badge})
+            report.append(f"{p.slot}: {holder} is no longer its model qube")
+    if name is None:
+        p.model_qube = None
+        projects.save(records)
+        report.append(f"{p.slot}: the record names no model qube")
+        return
+    lead = _recorded_lead(app, p)
+    if lead is not None:
+        try:
+            had = _netvm(lead)
+        except NetvmUnreadable:
+            raise ProjectError(f"the network of {p.lead} cannot be read") from None
+        if had is not None:
+            lead.netvm = None
+            if _netvm(lead) is not None:
+                raise ProjectError(f"{p.lead}'s network did not read back as none")
+            report.append(f"{p.slot}: {p.lead} lost its network ({had}): a lead whose model "
+                          f"is a qube has none")
+    vm = _vm(app, name)
+    tags = _tags(vm)
+    if projects.member_badge(projects.HUB_SLOT) in tags:
+        _set_tags(vm, remove={projects.member_badge(projects.HUB_SLOT)})
+        report.append(f"{p.slot}: {name} is out of p00")
+    try:
+        had = _netvm(vm)
+    except NetvmUnreadable:
+        raise ProjectError(f"the network of {name} cannot be read") from None
+    if had is not None:
+        vm.netvm = None
+        if _netvm(vm) is not None:
+            raise ProjectError(f"{name}'s network did not read back as none")
+        report.append(f"{p.slot}: {name} lost its network ({had})")
+    managed = core.GUARDED not in tags
+    # Guarding stops new calls from the hub, not the ones it started while the
+    # qube was managed: those end with the qube, and so does anything started
+    # in one the operator guarded before it became a model qube. One already a
+    # guarded model qube is left alone: the hub could not reach it, and its
+    # leads may be using it. A lead starts it again by connecting.
+    kill = managed or not projects.model_slots(tags)
+    if managed or tags & LEGACY_TIER_TAGS:
+        try:
+            _set_tags(vm, add={core.GUARDED}, remove=tags & LEGACY_TIER_TAGS)
+        except Exception as e:
+            # The guard may have landed before its read-back failed: a second
+            # run would find it guarded, and spare it if it already serves
+            # another project. So the kill comes first.
+            if kill:
+                _kill_model_qube(report, p.slot, vm, name, managed, type(e).__name__)
+            raise
+        report.append(f"{p.slot}: {name} is guarded")
+    if kill:
+        _kill_model_qube(report, p.slot, vm, name, managed)
+    p.model, p.model_qube, p.lead_firewall = None, name, None
+    projects.save(records)
+    _set_tags(vm, add={badge})
+    report.append(f"{p.slot}: model qube {name}; the lead reaches it on port {MODEL_PORT}")
+    shared = sorted(projects.model_slots(_tags(vm)) - {p.slot})
+    if shared:
+        report.append(f"{p.slot}: WARNING: {name} also serves {', '.join(shared)}: "
+                      f"{SHARED_MODEL_WARNING}")
 
 
 def add_dump(app, key: str, name: str | None = None) -> list:
@@ -2379,6 +2853,8 @@ def _move(report, app, name, target, confirm):
         raise ProjectError(f"'{name}' is not a managed AppVM; templates and gateways join no slot")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' is a lead; use qmcp project lead")
+    if projects.model_slots(tags) and target != "none":
+        raise ProjectError(f"'{name}' is a model qube; a model qube joins no slot")
     if target == "none":
         slot = None
     elif target == projects.HUB_SLOT:
@@ -2439,9 +2915,11 @@ def delete_plan(app, records: dict, key: str) -> tuple:
         except core.Unreadable:
             unread.append(vm.name)
     note = f"; the tags of {', '.join(sorted(unread))} cannot be read now" if unread else ""
+    model = f"; its model qube {p.model_qube} is kept and loses {p.slot}'s badge" \
+        if p.model_qube else ""
     return True, (f"this removes {p.slot} '{p.label}': its lead {p.lead or '(none)'} and every "
                   f"member qube ({', '.join(sorted(members)) if members else 'none'}), and keeps "
-                  f"its dump sink {p.dump or '(none)'}{note}")
+                  f"its dump sink {p.dump or '(none)'}{model}{note}")
 
 
 def delete_project(app, key: str) -> list:
@@ -2506,7 +2984,8 @@ def _delete_project(report, app, key):
                                   f"but {e}; read again below")
                     continue
             report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}"
-                          + (" (the dump sink, kept)" if name == p.dump else ""))
+                          + (" (the dump sink, kept)" if name == p.dump else
+                             " (the model qube, kept)" if name == p.model_qube else ""))
         except Exception as e:
             report.fail(f"{p.slot}: could NOT strip badges from {name} ({type(e).__name__})")
     left, unread = _badges_of_slot(app, p.slot)
@@ -2540,5 +3019,6 @@ def project_rows(app, records: dict) -> list:
         rows.append({"slot": slot, "label": p.label, "lead": p.lead, "members": members,
                      "used": used, "quota": p.quota, "templates": list(p.templates),
                      "networks": list(p.networks), "dump": p.dump, "model": p.model,
+                     "model_qube": p.model_qube,
                      "lead_firewall": None if p.lead_firewall is None else list(p.lead_firewall)})
     return rows

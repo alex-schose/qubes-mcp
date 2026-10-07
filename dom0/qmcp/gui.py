@@ -7,7 +7,9 @@ root. A proposal from the hub is read with `qmcp proposal show` when it is
 selected, and accepted with the fingerprint that show gave; a project's lead
 firewall is read with `qmcp project firewall NAME --json` when the project or
 its lead is selected, and the forms that change it show its rules now and
-after, side by side.
+after, side by side. A lead's model is a remote endpoint or a self-hosted
+model qube; a form that takes a lead's network away for one says so in red
+before OK, and so does one that shares a model qube between projects.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()`,
@@ -160,6 +162,33 @@ def _scrolled(child, min_height=0) -> Gtk.ScrolledWindow:
     return sw
 
 
+def _screen_room(widget, reserve: int) -> int:
+    """The height a scrolled part may take on the monitor `widget` is on (the
+    first one before it is shown), less `reserve` for what stays outside it:
+    title bar, buttons, the command line. Never less than 160."""
+    display = Gdk.Display.get_default()
+    monitor = None
+    if display is not None:
+        window = widget.get_window() if widget is not None else None
+        monitor = display.get_monitor_at_window(window) if window is not None else None
+        if monitor is None:
+            monitor = display.get_primary_monitor() or (
+                display.get_monitor(0) if display.get_n_monitors() else None)
+    height = monitor.get_workarea().height if monitor is not None else 768
+    return max(160, height - reserve)
+
+
+def _bounded(child, max_height: int) -> Gtk.ScrolledWindow:
+    """`child` at its natural height up to `max_height`, scrolled beyond it:
+    a long text never pushes what follows it off the screen."""
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sw.set_propagate_natural_height(True)
+    sw.set_max_content_height(max_height)
+    sw.add(child)
+    return sw
+
+
 def _text_view() -> Gtk.TextView:
     view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
     view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
@@ -231,17 +260,25 @@ class Form(Gtk.Dialog):
         box.set_spacing(8)
         for side in ("start", "end", "top", "bottom"):
             getattr(box, f"set_margin_{side}")(12)
+        # The intro, the fields and the red text scroll, within the screen; the
+        # command line and the buttons below them stay in view, whatever the
+        # length of the text (a shared model qube's warning is long).
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.body = _bounded(body, _screen_room(parent, 260))
+        box.pack_start(self.body, True, True, 0)
+        self.intro = None
         if intro is not None:
-            box.pack_start(_label(intro if isinstance(intro, gm.Shown) else esc(intro),
-                                  wrap=True, selectable=True), False, False, 0)
+            self.intro = _label(intro if isinstance(intro, gm.Shown) else esc(intro),
+                                wrap=True, selectable=True)
+            body.pack_start(self.intro, False, False, 0)
         self.grid = Gtk.Grid(column_spacing=12, row_spacing=6)
-        box.pack_start(self.grid, False, False, 0)
+        body.pack_start(self.grid, False, False, 0)
         self.rows = 0
         # What OK destroys, in red, before it runs.
         self.warning = _label(esc(""), wrap=True)
         self.warning.get_style_context().add_class("qmcp-FAILED")
         _named(self.warning, esc("warning"))
-        box.pack_start(self.warning, False, False, 0)
+        body.pack_start(self.warning, False, False, 0)
         # One line under one heading: the command OK runs, or why OK is off, in
         # orange, so a reason is never taken for the command. show_all() leaves
         # the two alone; _line() shows one.
@@ -363,17 +400,26 @@ class ConfirmForm(Form):
 
 
 class LeadFields:
-    """The lead's source, name, network and model endpoint, shared by the
-    new-project form and the change-lead form."""
+    """The lead's source, name, network and model, shared by the new-project
+    form and the change-lead form. The model is a remote endpoint or a
+    self-hosted model qube; choosing a model qube takes the lead's network to
+    none, which the form shows in the network field and in its command."""
 
     SOURCES = (("template", "a fresh qube from a template"),
                ("clone", "a clone of one of the hub's AppVMs"),
                ("promote", "one of the hub's AppVMs, promoted in place"))
+    MODELS = (("remote", "a remote endpoint, host:port, reached through the lead's network"),
+              ("qube", "a self-hosted model qube: the lead then has no network"))
 
-    def add_lead_fields(self, fleet_rows, gw_rows, hub, space, model_hint):
+    def add_lead_fields(self, fleet_rows, gw_rows, hub, space, model_hint, slot=None,
+                        current_qube=None):
         """`space` gives the project's name space (`ai-<label>-`) when called.
-        The networks offered are the enrolled gateways, from `gw_rows`."""
+        The networks offered are the enrolled gateways, from `gw_rows`. `slot`
+        and `current_qube`: a lead change's project, and its model qube now,
+        which the model-qube field offers to keep or to take away."""
         self._fleet, self._gateways, self._hub, self._space = fleet_rows, gw_rows, hub, space
+        self._slot, self._current_qube = slot, current_qube
+        self._netvm_before = None
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.source = {}
         group = None
@@ -400,10 +446,91 @@ class LeadFields:
             "Lead network",
             [("", esc("not set: a new lead gets none, a promoted one keeps its own"))]
             + [(n, esc(gm.network_text(n, gw_rows))) for n in gm.network_choices(gw_rows)])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.model_kind = {}
+        group = None
+        for ident, text in self.MODELS:
+            rb = _radio(group, esc(text))
+            group = group or rb
+            _named(rb, esc(f"lead's model: {ident}"))
+            box.pack_start(rb, False, False, 0)
+            self.model_kind[ident] = rb
+        self.row("The lead's model", box)
         self.model = self.entry("Lead's model endpoint", model_hint)
+        options = gm.model_qube_options(fleet_rows, hub, slot, current_qube, keep=True)
+        self.model_qube = self.combo("Model qube", [(i, esc(t)) for i, t in options],
+                                     active="" if current_qube else None, preselect=False)
+        self.qube_info = _label(esc(""), wrap=True)
+        self.row("The model qube", self.qube_info)
         self.lead_info = _label(esc(""), wrap=True)
         self.row("The lead's network", self.lead_info)
+        if current_qube:
+            self.model_kind["qube"].set_active(True)
+        for rb in self.model_kind.values():
+            rb.connect("toggled", self._model_changed)
         self._source_changed()
+        self._model_changed()
+
+    def _model_changed(self, *_):
+        """A model qube means no network for the lead: the network field shows
+        none and is off while it is chosen, and gets back what it had after."""
+        qube = self.model_kind["qube"].get_active()
+        self.model.set_sensitive(not qube)
+        self.model_qube.set_sensitive(qube)
+        if qube and self.lead_netvm.get_sensitive():
+            self._netvm_before = self.lead_netvm.get_active_id()
+            self.lead_netvm.set_active_id("none")
+            self.lead_netvm.set_sensitive(False)
+        elif not qube and not self.lead_netvm.get_sensitive():
+            self.lead_netvm.set_active_id(self._netvm_before or "")
+            self.lead_netvm.set_sensitive(True)
+        self.update()
+
+    def model_choice(self):
+        """("remote", None), or ("qube", the field's choice): a qube's name,
+        "" to keep the project's model qube, "none" to take it away, or None
+        while nothing is chosen."""
+        if not self.model_kind["qube"].get_active():
+            return "remote", None
+        return "qube", self.model_qube.get_active_id()
+
+    def model_red_lines(self, fleet_rows) -> list:
+        """What the form says in red about the model, worked out from
+        `fleet_rows`: a promoted lead that loses its network, and a model qube
+        that already serves another project."""
+        kind, qube = self.model_choice()
+        if kind != "qube":
+            return []
+        lead = self.origin.get_active_id() if self.lead_source() == "promote" else None
+        return gm.model_qube_red(qube, lead, self._slot, fleet_rows).splitlines()
+
+    def lead_model_values(self, source, origin, netvm, typed, carried=None, change=False):
+        """(model endpoint, model qube) as the form sends them, each refused
+        where the command refuses it, with the lines under the fields said
+        first: where the lead will be, and what OK does to the model qube. A
+        lead change that keeps the project's model qube sends neither."""
+        kind, choice = self.model_choice()
+        _set(self.qube_info, esc(gm.model_qube_info(choice, self._fleet, self._slot,
+                                                    self._current_qube) if kind == "qube" else ""))
+        if kind == "remote":
+            net = self.lead_network(source, origin, netvm, carried, change)
+            return gm.lead_model(net, typed, carried), None
+        self.lead_network(source, origin, netvm, carried, change, qube=choice or "")
+        if not len(self.model_qube.get_model()):
+            raise gm.FormError(gm.no_model_qube(self._hub))
+        return None, gm.chosen_model_qube(choice, self._current_qube) or None
+
+    def red_changed(self, fleet_rows):
+        """Why OK may no longer run what the form showed in red, or None: the
+        red text, worked out from the fleet as it is now, `fleet_rows`, is
+        not the text worked out from the fleet the form was opened on."""
+        if self.red_text(fleet_rows) != self.red_text(self._fleet):
+            return ("what this form says in red has changed since it opened (a qube's network, "
+                    "or the projects a model qube serves): open the form again")
+        return None
+
+    def red_text(self, fleet_rows) -> str:
+        return "\n".join(self.model_red_lines(fleet_rows))
 
     def lead_source(self):
         return next((k for k, rb in self.source.items() if rb.get_active()), None)
@@ -430,15 +557,16 @@ class LeadFields:
         return (source, self.origin.get_active_id(), gm.lead_name_from(typed, space), netvm,
                 self.model.get_text())
 
-    def lead_network(self, source, origin, netvm, carried=None, change=False):
-        """The network the new lead will have, said under the fields; the
-        command's refusal of one that is not enrolled, before OK."""
+    def lead_network(self, source, origin, netvm, carried=None, change=False, qube=None):
+        """The network the new lead will have, said under the fields with what
+        it asks of the model; the command's refusal of one that is not
+        enrolled, before OK. `qube`: the model qube chosen, if any."""
         try:
             net = gm.lead_network(source, origin, netvm, self._fleet, self._gateways)
         except gm.FormError:
             _set(self.lead_info, esc(""))
             raise
-        _set(self.lead_info, esc(gm.lead_info(net, carried, change)))
+        _set(self.lead_info, esc(gm.lead_info(net, carried, change, qube, self._current_qube)))
         return net
 
 
@@ -476,10 +604,13 @@ class ProjectForm(Form, LeadFields, NetworkFields):
         super().__init__(parent, "New project", "Create project",
                          "A project is a lead, the workers it creates, and optionally a dump "
                          "sink. The lead's own template is approved first when it is in AI space. "
-                         "The networks are the enrolled gateways (the Gateways tab). A lead with "
-                         "a network needs its model endpoint: dom0 writes the lead's firewall to "
-                         "allow that endpoint and DNS, and nothing else; a lead with no network "
-                         "takes none.")
+                         "The networks are the enrolled gateways (the Gateways tab). The lead's "
+                         "model is a remote endpoint or a self-hosted model qube. A lead with a "
+                         "network needs its model endpoint: dom0 writes the lead's firewall to "
+                         "allow that endpoint, DNS when it is a host name, and nothing else; a "
+                         "lead with no network takes none. A lead whose model is a qube has no "
+                         "network, and reaches the qube on port 11434: the qube leaves p00, loses "
+                         "its network and is guarded.")
         self.prefix = prefix
         self.label_entry = self.entry("Label", "1-8 lowercase letters or digits")
         self.add_lead_fields(fleet_rows, gw_rows, hub, self.space,
@@ -498,14 +629,15 @@ class ProjectForm(Form, LeadFields, NetworkFields):
         return f"{self.prefix}{label or '<label>'}-"
 
     def build(self):
+        _set(self.warning, esc_lines(self.red_text(self._fleet)))
         gm.check_label(self.label_entry.get_text().strip())   # the label first: it makes the space
-        source, origin, name, netvm, model = self.lead_values()
-        model = gm.lead_model(self.lead_network(source, origin, netvm), model)
+        source, origin, name, netvm, typed = self.lead_values()
+        model, qube = self.lead_model_values(source, origin, netvm, typed)
         return gm.create_project(
             self.label_entry.get_text().strip(), source, origin, name, netvm,
             [n for n, cb in self.templates.items() if cb.get_active()],
             gm.check_networks(self.network_values(), self._gateways), self.quota.get_text(),
-            self.dump.get_active(), model)
+            self.dump.get_active(), model, qube)
 
 
 class EditForm(Form, NetworkFields):
@@ -546,7 +678,7 @@ class EditForm(Form, NetworkFields):
 class LeadForm(Form, LeadFields):
     def __init__(self, parent, fleet_rows, gw_rows, hub, record, prefix="ai-"):
         old = record.get("lead")
-        carried = record.get("model")
+        carried, qube = record.get("model"), record.get("model_qube")
         super().__init__(
             parent, f"Change the lead of {record.get('label')}", "Change lead",
             (f"A new lead takes over. The old lead, {old}, is kept as a worker of this project "
@@ -554,14 +686,20 @@ class LeadForm(Form, LeadFields):
              "another. Kept, it keeps its network if the project lists it; otherwise the tick "
              "below adds that network to the list, and without the tick it goes to no network."
              if old else "The project has no lead: the new one takes over its workers.")
-            + " A new lead with a network takes the model endpoint you give, or else the "
-              f"project's ({carried or 'none on record'}); dom0 writes its firewall to allow that "
-              "endpoint and DNS, and nothing else.")
+            + (f" The project's model is the model qube {qube}: a new lead with no network keeps "
+               "it, and one with a network needs a model endpoint, which replaces it; dom0 writes "
+               "its firewall to allow that endpoint, DNS when it is a host name, and nothing "
+               "else." if qube else
+               " A new lead with a network takes the model endpoint you give, or else the "
+               f"project's ({carried or 'none on record'}); dom0 writes its firewall to allow "
+               "that endpoint, DNS when it is a host name, and nothing else. A new lead whose "
+               "model is a qube has no network."))
         self.record = record
         self.prefix = prefix
         self.add_lead_fields(fleet_rows, gw_rows, hub, self.space,
                              f"empty: the project's, {carried}" if carried else
-                             "host:port; the project has none on record")
+                             "host:port; the project has none on record",
+                             record.get("slot"), qube)
         self.old_lead = None
         self.add_old = None
         if old:
@@ -590,19 +728,25 @@ class LeadForm(Form, LeadFields):
             self.add_old.set_active(False)
         self.add_old.set_sensitive(keep)
 
+    def red_text(self, fleet_rows) -> str:
+        """A removal, then what the model choice does that the form says in red."""
+        old = self.record.get("lead")
+        lines = ([f"{old} will be removed, with everything in it. This cannot be undone."]
+                 if old and self.old_lead.get_active_id() == "remove" else [])
+        return "\n".join(lines + self.model_red_lines(fleet_rows))
+
     def build(self):
         old = self.record.get("lead")
         keep = add = False
+        _set(self.warning, esc_lines(self.red_text(self._fleet)))
         if old:
             choice = self.old_lead.get_active_id()
-            _set(self.warning, esc(f"{old} will be removed, with everything in it. This cannot "
-                                   "be undone." if choice == "remove" else ""))
             _set(self.old_info, esc(""))
             if choice is None:
                 raise gm.FormError(f"choose what happens to the old lead, {old}")
             keep = choice == "keep"
             add = self.add_old.get_active()
-        source, origin, name, netvm, model = self.lead_values()
+        source, origin, name, netvm, typed = self.lead_values()
         default = f"{self.space()}lead"
         if keep and source != "promote" and not name and old == default:
             raise gm.FormError(f"the old lead keeps the name {default}: type a lead name "
@@ -610,11 +754,10 @@ class LeadForm(Form, LeadFields):
         if old:
             _set(self.old_info, esc(gm.old_lead_network(self.record, self._fleet,
                                                         self._gateways, keep, add)))
-        carried = self.record.get("model")
-        model = gm.lead_model(self.lead_network(source, origin, netvm, carried, change=True),
-                              model, carried)
+        model, qube = self.lead_model_values(source, origin, netvm, typed,
+                                             self.record.get("model"), change=True)
         return gm.change_lead(self.record.get("label"), source, origin, name, netvm, keep,
-                              model, add)
+                              model, add, qube)
 
 
 class DumpForm(Form):
@@ -683,13 +826,14 @@ class MoveForm(Form):
 
 
 class RevokeForm(Form):
-    def __init__(self, parent, name):
+    def __init__(self, parent, name, note=""):
+        """`note`: what revoking it means beyond that (`guimodel.revoke_note`)."""
         super().__init__(parent, f"Revoke {name}", "Revoke",
                          "Takes it out of AI space: removes ai-managed and every other qmcp "
                          "badge, so the hub and every lead lose it and this window stops "
                          "listing it (Add a qube to AI space brings it back). Its default "
                          "disposable is set to none, and it is shut down unless you leave it "
-                         "running. The qube itself is not removed.")
+                         "running. The qube itself is not removed." + (f" {note}" if note else ""))
         self.qube_name = name
         self.keep = _check(esc("leave it running"))
         self.keep.connect("toggled", self.update)
@@ -889,6 +1033,48 @@ class AcceptRulesForm(FirewallForm):
         return gm.accept_lead_rules(self.key)
 
 
+class ModelQubeForm(FirewallForm):
+    """The project's self-hosted model qube, or none. A model qube means no
+    network for the lead: on a lead that has one, the form says in red before
+    OK that it loses it; a qube that already serves another project carries
+    the command's warning, in red too. Both are worked out from the fleet the
+    form opened on, and OK refuses once they read differently."""
+
+    def __init__(self, parent, doc, read_at=None, fleet_rows=(), hub=None):
+        super().__init__(parent, f"The lead's model qube, {doc.get('project')}", "Set model qube",
+                         gm.model_qube_intro(doc), doc)
+        self.set_default_size(620, -1)              # no rules side by side: nothing is written
+        self._fleet, self._hub = list(fleet_rows or ()), hub
+        options = gm.model_qube_options(self._fleet, hub, doc.get("slot"), doc.get("model_qube"))
+        self.model_qube = self.combo("Model qube", [(i, esc(t)) for i, t in options],
+                                     preselect=False)
+        self.info = _label(esc(""), wrap=True)
+        self.row("What OK does", self.info)
+        self.done_building()
+
+    def red_text(self, fleet_rows) -> str:
+        return gm.model_qube_red(self.model_qube.get_active_id(), self.doc.get("lead"),
+                                 self.doc.get("slot"), fleet_rows)
+
+    def red_changed(self, fleet_rows):
+        if self.red_text(fleet_rows) != self.red_text(self._fleet):
+            return ("what this form says in red has changed since it opened (the lead's network, "
+                    "or the projects the model qube serves): open the form again")
+        return None
+
+    def build(self):
+        choice = self.model_qube.get_active_id()
+        _set(self.warning, esc_lines(self.red_text(self._fleet)))
+        _set(self.info, esc(gm.model_qube_info(choice, self._fleet, self.doc.get("slot"),
+                                               self.doc.get("model_qube"))))
+        if not len(self.model_qube.get_model()):
+            raise gm.FormError(gm.no_model_qube(self._hub))
+        why = gm.model_qube_refusal(self.doc, choice, self._fleet)
+        if why:
+            raise gm.FormError(why)
+        return gm.set_lead_model_qube(self.key, choice)
+
+
 # ======================================================================= the window
 
 class Window(Gtk.Window):
@@ -904,12 +1090,13 @@ class Window(Gtk.Window):
         ("finish_delete", "Finish delete..."), ("move", "Move..."), ("manage", "Manage..."),
         ("guard", "Guard..."), ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
-        ("accept_rules", "Accept current rules..."),
+        ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
     )
-    #: The forms that change a lead's firewall: action -> (form, title).
+    #: The forms that change a lead's firewall or model: action -> (form, title).
     FIREWALL_FORMS = {"set_model": (ModelForm, "Set lead model"),
                       "set_rules": (RulesForm, "Set lead rules"),
-                      "accept_rules": (AcceptRulesForm, "Accept current rules")}
+                      "accept_rules": (AcceptRulesForm, "Accept current rules"),
+                      "set_model_qube": (ModelQubeForm, "Set model qube")}
     GATEWAY_ACTIONS = (("enroll_gateway", "Enroll..."), ("change_gateway", "Change..."),
                        ("remove_gateway", "Remove..."))
 
@@ -1043,12 +1230,14 @@ class Window(Gtk.Window):
         _named(self.proposal_note, esc("proposal status"))
         right.pack_start(self.proposal_note, False, False, 0)
         self.proposal_details = Gtk.Grid(column_spacing=12, row_spacing=4)
-        right.pack_start(_scrolled(self.proposal_details, 260), True, True, 0)
+        right.pack_start(_scrolled(self.proposal_details, 160), True, True, 0)
         # Why accepting needs the second tick, in red, and the tick that gives it.
+        # The reasons scroll past a fifth of the screen, so the tick and the
+        # buttons under them never leave it.
         self.proposal_warning = _label(esc(""), wrap=True, selectable=True)
         self.proposal_warning.get_style_context().add_class("qmcp-FAILED")
         _named(self.proposal_warning, esc("second tick reasons"))
-        right.pack_start(self.proposal_warning, False, False, 0)
+        right.pack_start(_bounded(self.proposal_warning, _screen_room(None, 0) // 5), False, False, 0)
         self.proposal_tick = _check(esc("I have read these reasons"))
         _named(self.proposal_tick, esc("second tick"))
         self.proposal_tick.set_no_show_all(True)
@@ -1339,7 +1528,7 @@ class Window(Gtk.Window):
         node = self.node()
         if node is None:
             return
-        rows = gm.details(node, self.project_rows)
+        rows = gm.details(node, self.project_rows, self.fleet)
         rows += gm.firewall_section(self.fw_pane, gm.firewall_key(node, self.records), self.fleet)
         for i, (heading, text) in enumerate(rows):
             self.details.attach(_label(esc(heading)), 0, i, 1, 1)
@@ -1564,8 +1753,8 @@ class Window(Gtk.Window):
         hub = self.settings.get("hub")
         prefix = self.settings.get("name_prefix") or "ai-"
         if ident == "new_project":
-            return self._open(ProjectForm(self, self.fleet, self.gateways, hub, prefix),
-                              "Create project")
+            form = ProjectForm(self, self.fleet, self.gateways, hub, prefix)
+            return self._open(form, "Create project", check=lambda: form.red_changed(self.fleet))
         if ident == "add_to_ai_space":
             sinks = [r.get("dump") for r in self.records.values() if r.get("dump")]
             return self._open(AddForm(self, self.fleet, hub, sinks), "Add to AI space")
@@ -1585,8 +1774,8 @@ class Window(Gtk.Window):
         if ident == "edit_project":
             return self._open(EditForm(self, self.fleet, self.gateways, node.data), "Edit project")
         if ident == "change_lead":
-            return self._open(LeadForm(self, self.fleet, self.gateways, hub, node.data, prefix),
-                              "Change lead")
+            form = LeadForm(self, self.fleet, self.gateways, hub, node.data, prefix)
+            return self._open(form, "Change lead", check=lambda: form.red_changed(self.fleet))
         if ident == "remove_lead":
             lead = node.data.get("lead")
             return self._open(ConfirmForm(
@@ -1609,12 +1798,10 @@ class Window(Gtk.Window):
         if ident == "move":
             return self._open(MoveForm(self, node.data, self.records), "Move")
         if ident == "revoke":
-            return self._open(RevokeForm(self, name), "Revoke")
+            return self._open(RevokeForm(self, name, gm.revoke_note(node.data)), "Revoke")
         if ident in ("manage", "guard"):
-            what = ("the hub may run commands in it as root and change it" if ident == "manage"
-                    else "it is listed and referenced, never operated")
             return self._open(ConfirmForm(self, f"{ident.capitalize()} {name}", ident.capitalize(),
-                                          f"{name} becomes {ident}d: {what}.",
+                                          gm.role_intro(ident, node.data),
                                           gm.role(ident, name)), ident.capitalize())
         return None
 
@@ -1676,6 +1863,11 @@ class Window(Gtk.Window):
             return None
         doc = self.fw_pane.doc
         form_class, title = self.FIREWALL_FORMS[ident]
+        if form_class is ModelQubeForm:
+            form = form_class(self, doc, self.fw_pane.read_at, self.fleet, self.settings.get("hub"))
+            return self._open(form, title, check=lambda: (
+                gm.firewall_changed(doc, ident, self.fw_pane, self.fleet)
+                or form.red_changed(self.fleet)))
         return self._open(form_class(self, doc, self.fw_pane.read_at), title,
                           check=lambda: gm.firewall_changed(doc, ident, self.fw_pane, self.fleet))
 

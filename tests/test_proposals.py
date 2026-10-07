@@ -397,7 +397,8 @@ class HubReadsProjects(PBase):
         self.assertEqual(rows["p01"], {"slot": "p01", "label": "osint", "lead": LEAD,
                                        "templates": ["ai-debian-13", "ai-dvm"],
                                        "networks": ["ai-net-router", None], "quota": 20 * GiB,
-                                       "used": rows["p01"]["used"], "has_dump": True})
+                                       "used": rows["p01"]["used"], "has_dump": True,
+                                       "model": None, "model_qube": None})
         self.assertIsInstance(rows["p01"]["used"], int)
         self.assertNotIn("osint-dump", json.dumps(r))
         self.assertNotIn("projects", self.lcall("qmcp.GetPoolStats"))

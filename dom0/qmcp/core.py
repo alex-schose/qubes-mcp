@@ -145,10 +145,11 @@ class Principal:
 
 def lead_badges_agree(tags, slot: str) -> bool:
     """A lead wears the umbrella, `qmcp-lead` and exactly its own slot's lead
-    badge, no member badge, and is not guarded."""
+    badge, no member badge and no model badge, and is not guarded."""
     tags = set(tags)
     return (UMBRELLA in tags and projects.LEAD in tags and GUARDED not in tags
-            and projects.lead_slots(tags) == {slot} and not projects.member_slots(tags))
+            and projects.lead_slots(tags) == {slot} and not projects.member_slots(tags)
+            and not projects.model_slots(tags))
 
 
 def principal(app, caller_name: str, hub: str | None = None) -> Principal:

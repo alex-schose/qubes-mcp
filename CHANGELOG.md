@@ -26,6 +26,124 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.22] — 2026-10-08
+
+**Networks, part two (M3b): a project's lead can use a self-hosted model.** A
+**model qube** runs the model (Ollama, say) with no network and guarded; the
+project's lead reaches it on port 11434 through Qubes' `qubes.ConnectTCP`, and
+while it is guarded nothing else in AI space reaches it. A lead whose model is
+a qube has no network, so a
+project can be sealed: a self-hosted model, a lead with no network and workers
+on no network. One model qube may serve several projects, and that is a path
+between them: Ollama's API has no login and lets any client create, copy and
+delete models, so a hijacked lead can change the model another project's lead
+uses or pass it data; it is safe only behind an API filter that lets inference
+calls through and nothing else, and qmcp ships none. An endpoint given as an
+address no longer gets a DNS rule.
+
+### Added
+
+- **Model qubes.** `qmcp project firewall NAME --model-qube QUBE` (and
+  `--model-qube` on `project create` and `project lead`) makes a qube the
+  project's model qube in one command, in the order that fails toward less
+  authority: the slot's model badge comes off any other qube, the lead loses
+  its network, the qube leaves p00, loses its network, is guarded and is
+  killed if it runs, the record names it (`model_qube`), and only then does it
+  wear the slot's new badge, `qmcp-model-pNN`. The kill spares only a qube
+  that is already a guarded model qube, of this project or another, whose
+  leads may be using it; otherwise no process started in it before, the hub's
+  included, runs on. A power state that cannot be read is never taken for
+  halted, and a kill that fails stops the command before the record and the
+  badge. The kill ends processes, not files: what the hub left in `/home`,
+  `/usr/local` or `/rw` (anywhere, in a StandaloneVM) stays, and whatever is
+  set to start from there runs at its next start, normally when its lead
+  first connects. The command refuses, before changing anything, a qube
+  outside AI space (guard it first: the command never brings a qube into AI
+  space, so neither can a hub proposal), a template, a disposable template, a
+  disposable, a gateway, the hub, a drop box, a lead, a member of any project (a qube in p00
+  leaves p00), and a qube whose system comes from a template the hub manages.
+  `--model-qube none` takes the slot's model qube away. A qube that already
+  serves another project is accepted, and the report warns what sharing it
+  means. `qmcp guard`, which ends a model qube's maintenance window, kills it
+  too if it runs; guarding one already guarded kills nothing, and it never
+  kills a gateway or a template, whatever badge it wears.
+- **The rulebook's model lines**: `qubes.ConnectTCP +11434 @tag:qmcp-lead-pNN
+  @tag:qmcp-model-pNN allow`, one per project slot, above the guarded-qube
+  deny and below the denies into the hub, leads and drop boxes (a new
+  ConnectTCP deny into drop boxes), so a model badge on one of those still
+  opens nothing. 32 precedence claims (was 27).
+- **`qmcp check` fails on a lead whose project's model is a qube but which has
+  a network** (given outside qmcp: its project is no longer sealed), and no
+  longer advises accepting that lead's rules.
+- **`qmcp check` judges model qubes by their badges.** It fails on a model
+  badge on a qube with a network (a model server with one is a way out for
+  its leads: Ollama fetches a "model" from any host it is told to), outside AI
+  space, on a member, lead, template, gateway, drop box or the hub, in p00, on
+  a qube whose template the hub manages, or that its slot's record does not
+  name;
+  and warns on a model qube that is not guarded (the operator's maintenance
+  window, `qmcp manage`, which now says so) and a recorded model qube that is
+  gone or does not wear its badge.
+- **The lead is told its model**: `qmcp.GetPoolStats` gives a lead `model`,
+  `model_qube` (`<out-of-scope>` once it has left AI space) and `model_port`
+  (11434 with a model qube, else null), and the hub each project's `model`
+  and `model_qube`. `qmcp list --json` adds the slots a qube serves as a model
+  qube (`model`); `qmcp project list --json` and `project firewall --json` add
+  `model_qube`.
+- **Proposals take `model_qube`**: `project-create`, `project-lead` and
+  `project-firewall` (`none`, in a lead or firewall proposal, takes it away),
+  stored only when given, so a
+  proposal stored before keeps its fingerprint. Naming a model qube, or taking
+  one away, needs the second tick, which names any other project the qube
+  already serves and what sharing one means. Hub tools: `model_qube` on
+  `qubes_propose_project`, `qubes_propose_lead` and
+  `qubes_propose_lead_firewall`.
+- **The window**: a lead's model in *New project*, *Change lead* and the lead's
+  firewall pane is a remote endpoint or a self-hosted model qube (*Set model
+  qube...*, which also takes one away). Choosing a model qube sets the lead's
+  network to none; a form that takes a lead's network away for one, or whose
+  model qube already serves another project, says so in red before OK, and
+  OK refuses if that changed after the form opened. A *Model qubes* group in
+  the tree, each project pointing to its model qube, and every model-qube
+  failure of `qmcp check` under Needs attention, with a lead with a network
+  whose project's model is a qube. The lead-firewall proposal shows the model
+  qube now and after. `tests/GUI-CHECKLIST.md` steps 31–37.
+- **`tests/test_models.py`**, policy matrix cases for model qubes, and model
+  checks in the lead seat (a question to the model through `qvm-connect-tcp`)
+  and the red-team suite.
+
+### Changed
+
+- **An endpoint given as an address gets no DNS rule**: "model endpoint only"
+  is the endpoint, DNS when the endpoint is a host name the lead must look up,
+  and nothing else. A lead set before keeps the rules you accepted, DNS
+  included; `qmcp check` warns until you set its model again.
+- **A TCP connection from AI space into another qube is refused by our own
+  file** (policy D4), not only by Qubes' default one; a later file of yours
+  that allowed AI qubes `qubes.ConnectTCP` no longer does. A lead into its own
+  model qube is the one exception.
+- **The rulebook's section A is reordered and renumbered**: A1 disposables, A2
+  exec, A3 the hub, A4 leads, A5 drop boxes, A6 the model lines, A7 guarded
+  qubes, A8 a lead's firewall.
+- **A lead wearing a model badge is no principal**, like one wearing a member
+  badge; a model qube is no lead source and joins no slot.
+- **Deleting a project keeps its model qube** and strips the slot's badge from
+  it, like the dump sink's.
+- A project with a model qube refuses `project firewall --model`, `--rule` and
+  `--accept-current`: its lead has no network, and a remote model takes a new
+  lead on a network (`project lead ... --lead-netvm NET --model HOST:PORT`),
+  which takes the model qube away before the old lead is touched.
+
+### Fixed
+
+- The window's *Guard* confirmation said a qube "becomes guardd"; it now says
+  "becomes guarded", and for a model qube, that it still serves its projects
+  and is killed if it runs.
+- A long red text, such as a shared model qube's warning, made the proposal
+  pane and the forms taller than the screen, so the second tick and the OK
+  button could not be reached. The text now scrolls within the screen; the
+  tick, the command and the buttons stay in view.
+
 ## [0.9.21] — 2026-10-05
 
 **Networks, part one (M3a): AI qubes get networks only from the gateways you

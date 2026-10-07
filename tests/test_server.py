@@ -1263,6 +1263,10 @@ PAYLOAD_CASES = [
         ("qubes_propose_project", "project-create", {
             "title": "With a model", "label": "res", "lead": {"from": "template", "qube": "deb"},
             "lead_netvm": "ai-gw", "networks": ["ai-gw"], "quota": 1, "model": "api.anthropic.com:443"}),
+        ("qubes_propose_project", "project-create", {
+            "title": "A self-hosted model", "label": "sealed",
+            "lead": {"from": "template", "qube": "deb"}, "networks": ["none"], "quota": 1,
+            "model_qube": "ai-hub-model"}),
         ("qubes_propose_project_edit", "project-edit", MINIMAL_PROPOSALS["qubes_propose_project_edit"]),
         ("qubes_propose_project_edit", "project-edit", {
             "title": "Tor first", "project": "osint", "add_templates": ["ai-deb"],
@@ -1290,6 +1294,13 @@ PAYLOAD_CASES = [
             "title": "A new network", "project": "osint",
             "lead": {"from": "template", "qube": "deb"}, "lead_netvm": "ai-tor", "keep_old": True,
             "add_old_network": True, "model": "api.anthropic.com:443"}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "A sealed lead", "project": "osint",
+            "lead": {"from": "template", "qube": "deb"}, "keep_old": False,
+            "model_qube": "ai-hub-model"}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "No model qube", "project": "osint",
+            "lead": {"from": "template", "qube": "deb"}, "keep_old": False, "model_qube": "none"}),
         ("qubes_propose_lead_firewall", "project-firewall",
          MINIMAL_PROPOSALS["qubes_propose_lead_firewall"]),
         ("qubes_propose_lead_firewall", "project-firewall", {
@@ -1297,6 +1308,10 @@ PAYLOAD_CASES = [
             "rules": ["action=accept proto=tcp dsthost=api.anthropic.com dstports=443",
                       "action=accept proto=tcp dsthost=docs.anthropic.com dstports=443",
                       "action=accept specialtarget=dns", "action=drop"]}),
+        ("qubes_propose_lead_firewall", "project-firewall", {
+            "title": "Self-hosted", "project": "osint", "model_qube": "ai-hub-model"}),
+        ("qubes_propose_lead_firewall", "project-firewall", {
+            "title": "No model qube", "project": "osint", "model_qube": "none"}),
         ("qubes_propose_project_delete", "project-delete",
          MINIMAL_PROPOSALS["qubes_propose_project_delete"]),
      )

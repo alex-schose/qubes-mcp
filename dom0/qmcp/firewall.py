@@ -1,8 +1,8 @@
 """qmcp.firewall — a lead's firewall: its model endpoint, and the rules dom0 writes.
 
 A lead's firewall is the operator's. dom0 writes it when the lead is created,
-from the lead's model endpoint ("model endpoint only": the endpoint, DNS, and
-nothing else), and again only when the operator changes it, directly or by
+from the lead's model endpoint ("model endpoint only": the endpoint, DNS for a
+host name, and nothing else), and again only when the operator changes it, directly or by
 accepting the hub's proposal; the rulebook denies the hub any write to a
 lead's firewall, and a lead cannot write its own. The rules the operator
 accepted are kept in the project's record, and `qmcp check` fails when the
@@ -17,10 +17,15 @@ is an undo, which puts back qubesd's own lines as they were. What is stored as
 accepted is what qubesd reads back after the write, so the comparison is never
 between two spellings of one rule.
 
-DNS stays open for every lead with a model endpoint, one given as an address
-included: "model endpoint only" is the endpoint, DNS and nothing else. A lead
+DNS is open only for a lead whose endpoint is a host name, which it must look
+up: "model endpoint only" is the endpoint, DNS for a name, and nothing else. An
+endpoint given as an address gets no DNS rule, so a lead that needs no name has
+no lookups to hide data in (from 0.9.22; a lead set before keeps the rules the
+operator accepted, and `qmcp check` warns until its model is set again). A lead
 that may ask DNS questions can hide data in them; that is an accepted residual
-(a hijacked lead can send data out through any networked worker anyway).
+(a hijacked lead can send data out through any networked worker anyway). A
+lead whose model is a self-hosted model qube has no network, and so no
+firewall to write.
 """
 from __future__ import annotations
 
@@ -62,13 +67,48 @@ def model_text(text) -> str:
     return f"{host}:{port}"
 
 
+def is_address(host: str) -> bool:
+    """Is the endpoint's host an IPv4 address rather than a name to look up?"""
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def endpoint_rules(model: str) -> list:
-    """"Model endpoint only": the endpoint over TCP, DNS so the lead can find
-    it, and nothing else."""
+    """"Model endpoint only": the endpoint over TCP, DNS when the endpoint is a
+    host name the lead must look up, and nothing else."""
     host, port = parse_model(model)
-    return [f"action=accept proto=tcp dsthost={host} dstports={port}",
-            "action=accept specialtarget=dns",
-            "action=drop"]
+    rules = [f"action=accept proto=tcp dsthost={host} dstports={port}"]
+    if not is_address(host):
+        rules.append("action=accept specialtarget=dns")
+    return rules + ["action=drop"]
+
+
+def endpoint_summary(model: str) -> str:
+    """What `endpoint_rules(model)` lets the lead reach, in words."""
+    host, _ = parse_model(model)
+    return f"{model} only" if is_address(host) else f"{model} and DNS only"
+
+
+def dns_left_open(model, accepted) -> bool:
+    """Are a lead's accepted rules what 0.9.21 wrote for an endpoint given as
+    an address: the endpoint, DNS and a drop? From 0.9.22 such an endpoint
+    gets no DNS rule. A lead set before keeps the rules the operator accepted
+    until its model is set again; rules the operator chose otherwise are not
+    this, and are left to them."""
+    if model is None or accepted is None:
+        return False
+    try:
+        host, port = parse_model(model)
+    except FirewallError:
+        return False
+    if not is_address(host):
+        return False
+    old = [f"action=accept proto=tcp dsthost={host} dstports={port}",
+           "action=accept specialtarget=dns", "action=drop"]
+    return same_rules(old, list(accepted))
 
 
 def rule_refusal(rule) -> str | None:

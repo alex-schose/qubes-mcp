@@ -131,6 +131,9 @@ class FakeTags:
         if not _TAG_RE.match(tag):
             raise ValueError("disallowed characters")
         self._tags.add(tag)
+        # qubesd sets the tag, then saves and fires its event: either can
+        # fail after the tag is set, so a write can land and still raise.
+        self._vm.app._maybe_fail(f"tag.add.landed:{tag}")
 
     def discard(self, tag):
         self._vm.app._maybe_fail(f"tag.discard:{tag}")

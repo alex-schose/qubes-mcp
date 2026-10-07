@@ -123,6 +123,16 @@ for _s in SLOTS:
     FLEET[f"w-{_s}-b"] = _dom(tags=[AI, f"qmcp-proj-{_s}"])
     FLEET[f"sink-{_s}"] = _dom(tags=["ai-dump", f"qmcp-dump-{_s}"])
 FLEET["w-p01-g"] = _dom(tags=[AI, G, "qmcp-proj-p01"])
+# Self-hosted model qubes: one per project slot, guarded; one shared by p01 and
+# p02 (allowed, with a warning); and model badges in places qmcp check fails
+# on, to show what the order of A3-A7 still stops and what it cannot.
+for _s in PROJECT_SLOTS:
+    FLEET[f"model-{_s}"] = _dom(tags=[AI, G, f"qmcp-model-{_s}"])
+FLEET["model-shared"] = _dom(tags=[AI, G, "qmcp-model-p01", "qmcp-model-p02"])
+FLEET["model-p01-open"] = _dom(tags=[AI, "qmcp-model-p01"])
+FLEET["model-p01-outside"] = _dom(tags=["qmcp-model-p01"])
+FLEET["sink-model-p01"] = _dom(tags=["ai-dump", "qmcp-dump-p01", "qmcp-model-p01"])
+FLEET["lead-p03-model-p01"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p03", "qmcp-model-p01"])
 SYSINFO = {"domains": FLEET}
 
 
@@ -157,9 +167,11 @@ def _load(extra: dict[str, str] | None = None) -> FilePolicy:
 
 
 def _first_rule(policy, rules, service, source, target):
-    """(outcome, rule) for one request. `rules` overrides policy.rules."""
+    """(outcome, rule) for one request. `rules` overrides policy.rules.
+    `service` may carry its argument: `qubes.ConnectTCP+11434`."""
+    service, _, argument = service.partition("+")
     try:
-        req = Request(service, "+", source, target, system_info=SYSINFO)
+        req = Request(service, f"+{argument}", source, target, system_info=SYSINFO)
     except (AccessDenied, RequestError):
         # Refused before any rule is read (e.g. @dispvm:<not a template>).
         return "deny", None
@@ -274,7 +286,7 @@ def _cases() -> list[Case]:
     for m in POLICY_API:
         add("ai policy api", m, "ai-work", "dom0", "deny", "deny")
         add("ai policy api via @default", m, "ai-work", "@default", "deny", "deny")
-    # Services Qubes redirects from @default to dom0: the A5 deny only sees a
+    # Services Qubes redirects from @default to dom0: the D2 deny only sees a
     # dom0 target, so these are checked as @default requests.
     add("ai desktop notification", "qubes.Notifications", "ai-work", "@default", "deny", "deny")
     add("ai admin via @default", "admin.vm.List", "ai-work", "@default", "deny", "deny")
@@ -372,6 +384,44 @@ def _cases() -> list[Case]:
     add("hub exec in a worker", "qmcp.RunInAIManaged", HUB, "w-p01-a", "allow user=root", "allow user=root")
     add("hub copies into a sink: dialog", "qubes.Filecopy", HUB, "sink-p01", "ask", "ask")
     add("hub exec in a sink", "qmcp.RunInAIManaged", HUB, "sink-p01", "deny", "deny")
+
+    # --- self-hosted models: a lead reaches its own slot's model qube on 11434
+    for s in PROJECT_SLOTS:
+        add(f"{s} lead -> its model qube", "qubes.ConnectTCP+11434", f"lead-{s}", f"model-{s}",
+            "allow", "allow")
+    add("lead -> its model qube, another port", "qubes.ConnectTCP+22", "lead-p01", "model-p01",
+        "deny", "deny")
+    add("lead -> its model qube, any other service", "qubes.Filecopy", "lead-p01", "model-p01",
+        "deny", "deny")
+    add("lead -> another slot's model qube", "qubes.ConnectTCP+11434", "lead-p01", "model-p02",
+        "deny", "deny")
+    add("worker -> its slot's model qube", "qubes.ConnectTCP+11434", "w-p01-a", "model-p01",
+        "deny", "deny")
+    add("p00 qube -> a model qube", "qubes.ConnectTCP+11434", "w-p00-a", "model-p01",
+        "deny", "deny")
+    add("hub -> a model qube", "qubes.ConnectTCP+11434", HUB, "model-p01", "deny", "deny")
+    add("hub exec in a model qube", "qmcp.RunInAIManaged", HUB, "model-p01", "deny", "deny")
+    add("lead -> @default on 11434", "qubes.ConnectTCP+11434", "lead-p01", "@default", "deny", "deny")
+    add("shared model qube, first slot", "qubes.ConnectTCP+11434", "lead-p01", "model-shared",
+        "allow", "allow")
+    add("shared model qube, second slot", "qubes.ConnectTCP+11434", "lead-p02", "model-shared",
+        "allow", "allow")
+    add("shared model qube, a slot it does not serve", "qubes.ConnectTCP+11434", "lead-p03",
+        "model-shared", "deny", "deny")
+    # A model badge where qmcp check fails on it: the order still stops these...
+    add("model badge on a dump sink", "qubes.ConnectTCP+11434", "lead-p01", "sink-model-p01",
+        "deny", "deny")
+    add("model badge on another lead", "qubes.ConnectTCP+11434", "lead-p01",
+        "lead-p03-model-p01", "deny", "deny")
+    # ... and cannot stop these (qmcp check fails on the second; warns on the first).
+    add("RESIDUAL un-guarded model qube still reached", "qubes.ConnectTCP+11434", "lead-p01",
+        "model-p01-open", "allow", "allow")
+    add("RESIDUAL model badge outside AI space reached", "qubes.ConnectTCP+11434", "lead-p01",
+        "model-p01-outside", "allow", "allow")
+    # --- every other TCP connection from AI space is ours to refuse (D4)
+    for src, tgt in (("ai-work", "ai-work2"), ("ai-work", "personal"), ("w-p01-a", "w-p01-b"),
+                     ("lead-p01", "w-p01-a"), ("ai-work", "@default")):
+        add("ai connect-tcp", "qubes.ConnectTCP+22", src, tgt, "deny", "deny")
     return c
 
 
@@ -480,7 +530,7 @@ class PolicyShape(unittest.TestCase):
         slot_lines = {}
         for n, l in self.lines:
             f = l.split()
-            tags = [x for x in (f[2], f[3]) if re.match(r"@tag:qmcp-(lead|proj|dump)-p\d\d$", x)]
+            tags = [x for x in (f[2], f[3]) if re.match(r"@tag:qmcp-(lead|proj|dump|model)-p\d\d$", x)]
             if tags:
                 slots = {x[-3:] for x in tags}
                 self.assertEqual(len(slots), 1, f"line {n} crosses slots: {l}")
@@ -495,8 +545,30 @@ class PolicyShape(unittest.TestCase):
                          f"admin.vm.firewall.Get * {L} {M} allow target=@adminvm",
                          f"admin.vm.firewall.Set * {L} {M} allow target=@adminvm",
                          f"admin.vm.firewall.Reload * {L} {M} allow target=@adminvm",
-                         f"qubes.Filecopy * {L} {M} allow"}
+                         f"qubes.Filecopy * {L} {M} allow",
+                         f"qubes.ConnectTCP +11434 {L} @tag:qmcp-model-{s} allow"}
             self.assertEqual(slot_lines[s], want, s)
+
+    def test_model_lines_sit_between_the_denies_that_guard_them(self):
+        """Above the guarded deny, which would refuse them; below the denies
+        into the hub, the leads and the drop boxes, so a stray model badge on
+        one of those opens nothing."""
+        where = {}
+        for n, l in self.lines:
+            f = l.split()
+            if f[0] == "qubes.ConnectTCP" and f[1] == "+11434":
+                where.setdefault("model", []).append(n)
+            elif f[:5] == ["*", "*", "@tag:ai-managed", "@tag:qmcp-guarded", "deny"]:
+                where["guarded"] = n
+            elif f[:5] == ["*", "*", "@tag:ai-managed", HUB, "deny"]:
+                where["hub"] = n
+            elif f[:5] == ["*", "*", "@tag:ai-managed", "@tag:qmcp-lead", "deny"]:
+                where["lead"] = n
+            elif f[:5] == ["qubes.ConnectTCP", "*", "@tag:ai-managed", "@tag:ai-dump", "deny"]:
+                where["sink"] = n
+        self.assertEqual(len(where["model"]), len(PROJECT_SLOTS))
+        self.assertLess(max(where["model"]), where["guarded"])
+        self.assertGreater(min(where["model"]), max(where["hub"], where["lead"], where["sink"]))
 
     def test_leads_reach_dom0_only_through_the_wrappers(self):
         lead = [(l.split()[0], l.split()[3], l.split()[4]) for n, l in self.lines

@@ -18,19 +18,22 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.21 — gateways and leads' firewalls.** Besides the hub, up to 15
+**Status: 0.9.22 — self-hosted model qubes.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
 Every network an AI qube is given is a gateway the operator enrolled, and a
-lead's firewall, which dom0 writes to allow its model endpoint and DNS, nothing
-else, is the operator's.
+lead's firewall, which dom0 writes to allow its model endpoint (and DNS for a
+host name), nothing else, is the operator's. A lead can instead use a
+self-hosted model in a **model qube** with no network, which, while it is
+guarded, nothing in AI space reaches but the leads it serves (the hub only
+through your dialog); the lead then has no network either.
 The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
 command with forms: every change it makes is a command it shows first. The hub
 may ask for a project, a change to one, a new lead, a lead's new firewall or a
 deletion; nothing happens until the operator accepts it in dom0, in that
-window or with `qmcp proposal accept`. Next: self-hosted model qubes and
-anonymous projects (the rest of M3), other distributions (M4), sealed qubes
+window or with `qmcp proposal accept`. Next: anonymous projects (the rest of
+M3), other distributions (M4), sealed qubes
 (M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
 0.9.0–0.9.16; see `CHANGELOG.md`.
 
@@ -85,8 +88,8 @@ anonymous projects (the rest of M3), other distributions (M4), sealed qubes
   code, refused if the stored proposal is not the one shown. Removing a lead
   or a project, a network AI space does not use yet, promoting one of the
   hub's qubes, an over-committed quota, a model endpoint no project uses,
-  giving a project a different model endpoint and every change to a lead's
-  firewall need a second tick. The hub learns
+  giving a project a different model endpoint, every change to a lead's
+  firewall, and naming a model qube or taking one away need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
 - **Creates** take only names inside the caller's own space under a reserved
@@ -121,7 +124,7 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_spawn_disposable`, `qubes_run_disposable` | disposables, or one command in a fresh disposable |
 | `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's (a lead's is the operator's: propose it) |
 | `qubes_events` | a window of events for qubes in scope |
-| `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use |
+| `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use and its model (an endpoint, or a model qube and its port) |
 | `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_lead_firewall`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a lead's new firewall, a deletion |
 | `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
@@ -155,7 +158,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.21.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.22.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -165,7 +168,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 27 checked claims. It installs the policy last and ends with
+overrides its 32 checked claims. It installs the policy last and ends with
 `qmcp check`. Options: `--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`,
 `--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
@@ -182,6 +185,9 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
+Coming from 0.9.21? Install over it. A lead whose model endpoint is an address
+keeps the DNS rule 0.9.21 gave it until you set its model again (`sudo qmcp
+project firewall NAME --model ADDRESS:PORT`); `qmcp check` warns until you do.
 Coming from 0.9.17 to 0.9.20? Install over it; nothing is retagged. Then enroll
 the gateways AI space uses (step 3): the registry starts empty, and until then
 no AI qube can be given a network and `qmcp check` fails on every one (other
@@ -251,14 +257,14 @@ sudo qmcp project create osint --lead-template ai-debian-13 --lead-netvm sys-ai-
 ```
 
 The lead is born as `ai-osint-lead`, with a firewall that allows its model
-endpoint, DNS and nothing else (`qmcp project firewall osint` shows it, and
+endpoint, DNS (for a host name) and nothing else (`qmcp project firewall osint` shows it, and
 changes it); the qubes it creates will be named `ai-osint-*` (Qubes names
 disposables), built from the approved templates (the lead's own when it is in AI space, plus
 any `--template`), on the listed networks, inside the quota. `--lead-clone
 QUBE` copies one of the hub's own qubes that you prepared as an agent instead,
 and `--lead-promote QUBE` makes one of the hub's qubes the lead in place.
-The lead's firewall lets it reach its model endpoint and DNS only, so it
-cannot fetch software, `git clone` included: its agent and qubes-mcp come from
+The lead's firewall lets it reach its model endpoint and DNS (for a host
+name) only, so it cannot fetch software, `git clone` included: its agent and qubes-mcp come from
 outside. Prepare both in one of the hub's qubes and make the lead with
 `--lead-clone` or `--lead-promote`. Or install the agent in the lead's
 template yourself, and copy qubes-mcp in from dom0, from step 2's tarball (if
@@ -279,6 +285,80 @@ Or let the hub ask: its agent calls `qubes_propose_project` (or another
 the proposal in the window, where the options the hub sent, what accepting
 does now and anything that needs a second tick are shown first.
 
+**6. A self-hosted model (optional).** A lead can use a model that runs in a
+qube of yours instead of a remote API: a **model qube**, guarded and with no
+network, which the leads of the projects it serves reach on port 11434
+through Qubes' `qubes.ConnectTCP`, and, while it is guarded, nothing else in
+AI space (the hub only through your dialog). The lead then has no network either, so a
+project with a self-hosted model, a lead with no network and workers on no
+network is sealed.
+
+Set the model qube up while it still has a network. The hub can, like any
+qube it manages: spawned from a template the hub does not manage (a guarded
+one) that carries the two in-qube services, with room on its private volume
+(`private_size`). A qube you set up yourself outside AI space joins it with
+`sudo qmcp guard QUBE` once it has no network (`qvm-prefs QUBE netvm ''`) or sits
+on an enrolled gateway; `guard` refuses any other network. An AppVM keeps `/usr/local`,
+`/home` and `/rw/config/rc.local` across restarts. With Ollama, as root in
+the model qube:
+
+```sh
+cd /home/user
+V=$(curl -fsSL https://api.github.com/repos/ollama/ollama/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+B=https://github.com/ollama/ollama/releases/download/$V
+curl -fsSL -o sha256sum.txt "$B/sha256sum.txt"
+curl -fsSL -o ollama-linux-amd64.tar.zst "$B/ollama-linux-amd64.tar.zst"
+want=$(awk '$2 ~ /(^|\/)ollama-linux-amd64\.tar\.zst$/ {print $1}' sha256sum.txt)
+got=$(sha256sum ollama-linux-amd64.tar.zst | cut -d' ' -f1)
+if [ -n "$want" ] && [ "$want" = "$got" ]; then
+  tar --zstd -xf ollama-linux-amd64.tar.zst -C /usr/local --exclude='cuda_*' --exclude='rocm*' --exclude='vulkan*'
+else
+  echo "checksum MISMATCH: nothing installed"
+fi
+rm -f ollama-linux-amd64.tar.zst
+cat > /rw/config/rc.local <<'EOF'
+#!/bin/sh
+runuser -u user -- env HOME=/home/user OLLAMA_HOST=127.0.0.1:11434 setsid /usr/local/bin/ollama serve >/home/user/ollama.log 2>&1 < /dev/null &
+EOF
+chmod 0755 /rw/config/rc.local && /rw/config/rc.local
+sleep 5; runuser -u user -- env HOME=/home/user /usr/local/bin/ollama pull qwen2.5:0.5b
+```
+
+A qube has no IPv6 route, so a pull can stop at `network is unreachable` on an
+IPv6 address; run the pull again, and it resumes.
+
+Then, in dom0, make it the project's model qube. One command takes the lead's
+network away, takes the qube out of p00, removes its network, guards it and
+kills it if it runs, and only then lets the lead reach it (`--model-qube` on
+`project create` and `project lead` does the same):
+
+```sh
+sudo qmcp project firewall osint --model-qube ai-hub-model
+```
+
+In the lead, `qvm-connect-tcp 11434:ai-hub-model:11434` (it runs until
+stopped) makes the model answer on the lead's own `localhost:11434`; point
+the agent there. `qubes_get_pool_stats` tells the lead the model qube's name
+and port. To change the model qube later, un-guard it for a while (`sudo qmcp
+manage ai-hub-model`; `qmcp check` warns until you guard it again, and `sudo
+qmcp guard ai-hub-model` kills it if it runs, so no process the hub started in
+it runs on; what it left in `/home`, `/usr/local` or `/rw` stays, and whatever
+is set to start from there runs at its next start). Pulling
+another model needs a network: take the qube off its projects first (`sudo
+qmcp project firewall osint --model-qube none`), because a model qube with a
+network would be its leads' way out, and `qmcp check` fails on one.
+
+**A model qube may serve several projects, and that is a path between
+them:** Ollama's API has no login and lets any client create, copy and delete
+models, so a hijacked lead can change the model another project's lead uses,
+or pass it data. It is safe only behind an API filter that lets inference
+calls through and nothing else, and qmcp ships none: the command and the
+window say so whenever a model qube is shared. One model qube per project
+needs no filter. Several can share one copy of the server and the weights if a
+guarded template holds both in its root filesystem (under `/opt`, say: a qube
+based on a template has its own `/usr/local` and `/home`, never the
+template's).
+
 ## Tests
 
 ```sh
@@ -290,9 +370,10 @@ The policy suite runs every rule through qrexec's real parser (it needs
 rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
 `tests/project_suite.py` run in the hub against a real dom0; the last carries
 `tests/lead_seat.py` into a project's lead and runs it there. On a test
-machine running Qubes 4.3.1 they passed 41 of 41 checks, 35 of 35 probes and
-69 of 69 checks on 2026-10-05, the lead seat inside a lead on an enrolled
-gateway whose firewall dom0 wrote from its model endpoint.
+machine running Qubes 4.3.1 they passed 41 of 41 checks, 39 of 39 probes and
+80 of 80 checks on 2026-10-05, the lead seat inside a lead with no network that
+asked its self-hosted model qube (Ollama, `qwen2.5:0.5b`) a question through
+`qvm-connect-tcp`.
 `tests/test_strict_reads.py` fails qube reads one at a time, at each point a
 call makes them, and requires the restrictive answer: a failed read is never
 taken for "no tags", "no network" or "not a gateway".

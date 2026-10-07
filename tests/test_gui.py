@@ -25,6 +25,11 @@ Four guarantees, each with a test that fails when it breaks:
   and runs only while the view it was opened on still reads the same
   (`FirewallModel`, `Widgets`). The forms offer only enrolled gateways
   (`GatewayModel`, `LeadModel`).
+- **A model qube is placed as the rulebook and the records want it**: under
+  Model qubes when `qmcp check` passes it, under Needs attention for every
+  failure the check has on a model badge, and the forms offer as one only the
+  qubes the command would take. Taking a lead's network for one, and sharing
+  one between projects, are said in red before OK (`ModelQubes`, `Widgets`).
 
 The GTK tests build widgets without showing them, and are skipped where GTK
 cannot start (no PyGObject, or no display).
@@ -48,7 +53,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, cli, firewall, fleet, gateways, projects, proposals  # noqa: E402
+from qmcp import audit, cli, core, firewall, fleet, gateways, projects, proposals  # noqa: E402
 from qmcp import guimodel as gm  # noqa: E402
 from fakequbes import GiB, _qubesd_rule  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
@@ -59,9 +64,11 @@ MODEL_SRC = HERE.parent / "dom0" / "qmcp" / "guimodel.py"
 #: Rules a lead-firewall proposal sets, as the hub sends them.
 RULES = ["action=accept proto=tcp dsthost=example.com dstports=443",
          "action=accept specialtarget=dns", "action=drop"]
+#: A qube the hub set up to serve a model, as `serve()` makes it.
+MODEL = "ai-hub-model"
 #: One proposal of every type the hub can submit, and every option, each
-#: valid on the projects fixture. The delete and the two lead-firewall ones
-#: need the second tick there.
+#: valid on the projects fixture. The delete, the lead-firewall ones and the
+#: ones that name a model qube need the second tick there.
 PROPOSALS = {
     "create": {"type": "project-create", "title": "new project <b>newp</b>", "label": "newp",
                "lead": {"from": "template", "qube": "ai-debian-13"},
@@ -82,8 +89,42 @@ PROPOSALS = {
                 "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_netvm": "ai-net-router",
                 "lead_name": "ai-osint-boss", "keep_old": True, "add_old_network": True,
                 "model": "api.anthropic.com:443"},
+    # A self-hosted model: a new project's, a new lead's, a lead's firewall, and none.
+    "qcreate": {"type": "project-create", "title": "a sealed project", "label": "sealed",
+                "lead": {"from": "template", "qube": "ai-debian-13"}, "networks": ["none"],
+                "quota": 5 * GiB, "model_qube": MODEL},
+    "qlead": {"type": "project-lead", "title": "a sealed lead for other", "project": "other",
+              "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_name": "ai-other-l3",
+              "keep_old": True, "model_qube": MODEL},
+    "qfw": {"type": "project-firewall", "title": "a model qube for osint", "project": "osint",
+            "model_qube": MODEL},
+    "qnone": {"type": "project-firewall", "title": "no model qube for other", "project": "other",
+              "model_qube": "none"},
 }
 HOSTILE = "ai-x\u202egnp.exe\nFAKE ok:true <b>bold</b> &amp; \x00\x7f\u200b\x1b[31m"
+
+
+def model_qube(a, name=MODEL):
+    """`name` as the hub sets a model qube up before the operator takes it:
+    managed, in p00, on the hub's router, on a template outside AI space."""
+    return a.vm(name, template=a.domains["debian-13"], netvm=a.domains["ai-net-router"],
+                tags={"ai-managed", "qmcp-proj-p00", "qmcp-owner_mcp-control"})
+
+
+def serve(a, key="osint", name=MODEL):
+    """`name` made `key`'s model qube by the command itself, as qmcp check
+    passes one; made first when it does not exist."""
+    if name not in a.domains:
+        model_qube(a, name)
+    fleet.set_lead_firewall(a, key, model_qube=name)
+    return a.domains[name]
+
+
+def unseal(a):
+    """other's model made a qube by the command, then its lead given a network
+    by hand in dom0, as nothing in qmcp does."""
+    serve(a, "other")
+    a.domains[OTHER_LEAD].netvm = a.domains["ai-net-router"]
 
 
 def _gtk():
@@ -182,6 +223,20 @@ class GuiBase(ProjectBase):
 
     def show(self, pid):
         return gm.parse_proposal(self.runner.execute(gm.show_proposal(pid)), pid)
+
+    def submit_every_proposal(self):
+        """One proposal of every shape in PROPOSALS, through the real service:
+        `dump` accepted and `lead` rejected as soon as each is in, so a decision
+        with a report is read as well, and the pending ones stay within the
+        cap (`proposals.MAX_PENDING`)."""
+        ids = {}
+        for name in PROPOSALS:
+            ids[name] = self.submit_proposal(name)["id"]
+            if name == "dump":
+                self.runner.execute(gm.accept_proposal(ids[name], self.show(ids[name])["sha256"]))
+            elif name == "lead":
+                self.runner.execute(gm.reject_proposal(ids[name]))
+        return ids
 
     def routers(self):
         """The operator's own routers, outside AI space and not enrolled:
@@ -327,6 +382,8 @@ SAMPLES = {
         dict(label="news", lead_source="template", lead_origin="ai-debian-13",
              lead_netvm="ai-net-router", networks=["none"], quota="1G",
              model="api.anthropic.com:443"),
+        dict(label="newt", lead_source="template", lead_origin="ai-debian-13", lead_netvm="none",
+             networks=["none"], quota="1G", model_qube=MODEL),
     ],
     gm.edit_project: [dict(key="osint", templates=["ai-debian-13"], networks=["none"], quota="30G")],
     gm.remove_lead: [dict(key="osint")],
@@ -336,7 +393,11 @@ SAMPLES = {
                      dict(key="osint", lead_source="promote", lead_origin="ai-work2"),
                      dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
                           lead_name="ai-osint-boss", lead_netvm="ai-net-router", keep_old=True,
-                          model="api.anthropic.com:443", add_old_network=True)],
+                          model="api.anthropic.com:443", add_old_network=True),
+                     dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
+                          lead_netvm="none", model_qube=MODEL),
+                     dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
+                          model_qube="none")],
     gm.add_dump: [dict(key="other", sink_name="other-sink")],
     gm.move: [dict(qube="ai-work2", target="osint", confirm=True)],
     gm.delete_plan: [dict(key="osint")],
@@ -352,6 +413,7 @@ SAMPLES = {
     gm.remove_gateway: [dict(qube="ai-net-router")],
     gm.show_lead_firewall: [dict(key="osint")],
     gm.set_lead_model: [dict(key="osint", model="api.anthropic.com:443")],
+    gm.set_lead_model_qube: [dict(key="osint", model_qube=MODEL), dict(key="p02", model_qube="none")],
     gm.set_lead_rules: [dict(key="osint", rules=RULES)],
     gm.accept_lead_rules: [dict(key="osint")],
 }
@@ -448,9 +510,7 @@ class Parity(GuiBase):
     def test_every_field_of_every_proposal_read_is_shown(self):
         # One proposal of every type, through the real service and the real
         # command; two decided, so a decision with a report is read as well.
-        ids = {name: self.submit_proposal(name)["id"] for name in PROPOSALS}
-        self.runner.execute(gm.accept_proposal(ids["dump"], self.show(ids["dump"])["sha256"]))
-        self.runner.execute(gm.reject_proposal(ids["lead"]))
+        ids = self.submit_every_proposal()
         rows = self.read_json("proposal", "list", "--json")
         self.assertEqual(len(rows), len(PROPOSALS))
         listed = {k for k, _ in gm.PROPOSAL_FIELDS}
@@ -555,6 +615,40 @@ class Model(GuiBase):
             "personal", "outside"),
         "a member badge outside AI space": (
             lambda a: a.domains["personal"].tags.add("qmcp-proj-p02"), "personal", "outside"),
+        # The model badges, each where qmcp check fails on it. The lead's port
+        # 11434 line routes on the badge alone, wherever it is.
+        "a model badge outside AI space": (
+            lambda a: a.domains["personal"].tags.add("qmcp-model-p01"), "personal", "outside"),
+        "a model badge on the hub": (
+            lambda a: a.domains[HUB].tags.add("qmcp-model-p01"), HUB, "outside"),
+        "a model badge on a dump sink": (
+            lambda a: a.domains["osint-dump"].tags.add("qmcp-model-p01"), "osint-dump", "outside"),
+        "a lead wearing a model badge": (
+            lambda a: a.domains[OTHER_LEAD].tags.add("qmcp-model-p01"), OTHER_LEAD, "lead"),
+        "a model badge on a member": (
+            lambda a: a.domains["ai-osint-w1"].tags.add("qmcp-model-p01"), "ai-osint-w1",
+            "model_member"),
+        "a model qube in p00": (
+            lambda a: serve(a).tags.add("qmcp-proj-p00"), MODEL, "model_member"),
+        "a model badge on a template": (
+            lambda a: a.domains["ai-tpl-g"].tags.add("qmcp-model-p02"), "ai-tpl-g", "model_kind"),
+        "a model badge on a disposable template": (
+            lambda a: a.domains["ai-dvm-g"].tags.add("qmcp-model-p01"), "ai-dvm-g", "model_kind"),
+        "a model badge on a gateway": (
+            lambda a: a.domains["ai-net-router"].tags.add("qmcp-model-p01"), "ai-net-router",
+            "model_kind"),
+        "a model badge no record names": (
+            lambda a: a.vm("ai-rogue-model", template=a.domains["debian-13"],
+                           tags={"ai-managed", "qmcp-guarded", "qmcp-model-p05"}),
+            "ai-rogue-model", "model_record"),
+        "a model badge its slot's record does not name": (
+            lambda a: serve(a).tags.add("qmcp-model-p02"), MODEL, "model_record"),
+        "a model qube with a network": (
+            lambda a: setattr(serve(a), "netvm", "ai-net-router"), MODEL, "model_network"),
+        "a model qube on a template the hub manages": (
+            lambda a: setattr(serve(a), "template", "ai-debian-13"), MODEL, "model_template"),
+        "a lead given a network while its model is a qube": (
+            unseal, OTHER_LEAD, "model_lead"),
     }
 
     def test_what_check_fails_on_is_under_needs_attention(self):
@@ -789,9 +883,7 @@ class ProposalModel(GuiBase):
                          [{"id": 4}])
 
     def test_details_show_every_field_of_every_proposal(self):
-        ids = {name: self.submit_proposal(name)["id"] for name in PROPOSALS}
-        self.runner.execute(gm.accept_proposal(ids["dump"], self.show(ids["dump"])["sha256"]))
-        self.runner.execute(gm.reject_proposal(ids["lead"]))
+        ids = self.submit_every_proposal()
         for name, pid in ids.items():
             doc = self.show(pid)
             details = gm.proposal_details(doc)
@@ -1572,12 +1664,13 @@ class FirewallModel(GuiBase):
         self.assertEqual(rows["Live rules are the ones you accepted"],
                          "not known: the rules you accepted or the live ones are missing")
         self.assertNotIn("Live rules not read", rows)
-        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules", "accept_rules"})
+        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules", "accept_rules",
+                                                    "set_model_qube"})
         self.assertEqual(self.runner.execute(gm.accept_lead_rules("osint")).rc, 0)
         doc = self.view()
         self.assertEqual((doc["accepted"], doc["same"]), (["action=accept"], True))
         self.assertEqual(dict(gm.firewall_details(doc))["Live rules are the ones you accepted"], "yes")
-        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules"})   # nothing to accept
+        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules", "set_model_qube"})
         # A change made by hand in dom0: they differ, and check fails on it.
         self.app.domains[LEAD].__dict__["_firewall"] = ["action=drop"]
         doc = self.view()
@@ -1594,15 +1687,17 @@ class FirewallModel(GuiBase):
         rows = dict(gm.firewall_details(doc))
         self.assertEqual(rows["Rules it has now (live)"], "could not be read (Injected)")
         self.assertEqual(rows["Live rules not read"], "Injected")
-        self.assertEqual(gm.firewall_actions(doc), {"set_model", "set_rules"})   # nothing read to accept
+        self.assertEqual(gm.firewall_actions(doc),                  # nothing read to accept
+                         {"set_model", "set_rules", "set_model_qube"})
         self.assertEqual(dict(gm.rules_compare(doc))["Live now"], "could not be read (Injected)")
         self.assertEqual(gm.live_text(dict(doc, live=[], read_error=None)), "(no rules)")  # read: empty
-        # A project without a lead has none to show, and nothing to change.
+        # A project without a lead has none to show, and nothing to change but its
+        # model qube, which the command sets with no lead too.
         self.assertEqual(self.runner.execute(gm.remove_lead("other")).rc, 0)
         doc = self.view("other")
         self.assertEqual(dict(gm.firewall_details(doc))["Rules it has now (live)"],
                          "none: the project has no lead")
-        self.assertEqual(gm.firewall_actions(doc), set())
+        self.assertEqual(gm.firewall_actions(doc), {"set_model_qube"})
         # A read that failed, or answered about something else, is no view.
         for result in (gm.Result(gm.show_lead_firewall("osint"), 1, "", "qmcp project firewall: x"),
                        gm.Result(gm.show_lead_firewall("osint"), 0, json.dumps(dict(self.view(),
@@ -1632,7 +1727,8 @@ class FirewallModel(GuiBase):
         self.assertEqual(pane.actions("osint"), set())                 # reading: nothing yet
         self.assertEqual(pane.note(), "reading: qmcp project firewall osint --json")
         self.assertTrue(pane.answer(seq, read(), "10:00:00"))
-        self.assertEqual(pane.actions("osint"), {"set_model", "set_rules", "accept_rules"})
+        self.assertEqual(pane.actions("osint"), {"set_model", "set_rules", "accept_rules",
+                                                 "set_model_qube"})
         self.assertEqual(pane.actions("other"), set())                 # not the selection's
         self.assertEqual(pane.note(), "read at 10:00:00: qmcp project firewall osint --json")
         good = pane.doc
@@ -1685,7 +1781,8 @@ class FirewallModel(GuiBase):
         doc = self.view("other")
         self.assertIs(gm.lead_on_network(doc, fleet_rows()), False)
         self.assertEqual(gm.model_refusal(doc, fleet_rows()), why)
-        self.assertEqual(gm.firewall_actions(doc, fleet_rows()), {"set_rules", "accept_rules"})
+        self.assertEqual(gm.firewall_actions(doc, fleet_rows()),
+                         {"set_rules", "accept_rules", "set_model_qube"})
         result = self.runner.execute(gm.set_lead_model("other", "api.anthropic.com:443"))
         self.assertEqual(result.rc, 1)
         self.assertIn(why, result.err)
@@ -1698,7 +1795,7 @@ class FirewallModel(GuiBase):
         # The view's pane says why Set lead model is off, and keeps it off.
         pane = gm.FirewallPane()
         pane.answer(pane.select("other"), self.runner.execute(gm.show_lead_firewall("other")), "10:00:00")
-        self.assertEqual(pane.actions("other", fleet_rows()), {"set_rules"})
+        self.assertEqual(pane.actions("other", fleet_rows()), {"set_rules", "set_model_qube"})
         section = dict(gm.firewall_section(pane, "other", fleet_rows()))
         self.assertEqual(section["Set lead model"], f"off: {why}")
         opened = pane.doc
@@ -1784,6 +1881,11 @@ class FirewallModel(GuiBase):
                                         "read_error": None}, None))
         self.assertEqual(rows["Lead firewall now, live"],
                          "not read: the project has no lead, or no qube of that name")
+        # No "after": the change cannot apply, and each line points at the plan.
+        rows = dict(gm.firewall_change({"model": None, "model_qube": "ai-hub-model",
+                                        "accepted": None, "live": None}, None))
+        self.assertEqual(rows["Lead's model, now -> after"], "- -> ? (see Plan)")
+        self.assertEqual(rows["Lead firewall after accepting"], "? (see Plan)")
         live = dict(gm.firewall_change({"live": [HOSTILE, "action=drop"]}, {}))["Lead firewall now, live"]
         self.assertEqual(len(live.split(chr(10))), 2)
         self.assertTrue(live.isascii())
@@ -1810,6 +1912,431 @@ class FirewallModel(GuiBase):
         self.assertEqual(rows["Add the old lead's network to the worker networks"], "yes")
         self.assertTrue(rows["Equivalent command"].endswith(
             "--keep-old --add-old-network --model api.anthropic.com:443"), rows["Equivalent command"])
+
+
+# ======================================================================= model qubes: the model
+
+class ModelQubes(GuiBase):
+    """Self-hosted model qubes: where the tree puts one, what the details and
+    the forms say about it, and the qubes the forms offer, each against the
+    real command and `qmcp check`. `serve()` makes a model qube with the
+    command itself."""
+
+    def rows(self):
+        return self.read_json("list", "--all", "--json")
+
+    def records(self):
+        return {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+
+    def model_findings(self):
+        return {(f["status"], f["detail"]) for f in self.read_json("check", "--json")["findings"]
+                if f["check"] == "model qubes"}
+
+    def run_ok(self, argv):
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 0, (argv, result.out, result.err))
+        return result
+
+    def test_a_model_qube_has_a_place_of_its_own_and_its_project_a_reference(self):
+        serve(self.app)
+        # The control first: the check passes it, so nothing here is a blessed failure.
+        self.assertEqual({s for s, _ in self.model_findings()}, {"pass"})
+        tree = self.tree()
+        groups = {n.key: n for n in tree}
+        self.assertEqual([c.key for c in groups["group:models"].children], [f"qube:{MODEL}"])
+        self.assertEqual(groups["group:models"].cells[:2],
+                         ["Model qubes", "no network; their leads reach them on port 11434"])
+        node = self.node(f"qube:{MODEL}")
+        self.assertEqual((node.data["role"], node.data["attention"]), ("model qube of p01", None))
+        osint = self.node("project:p01")
+        self.assertEqual(osint.children[-1].key, "ref:p01:model")
+        self.assertEqual(osint.children[-1].cells[:2], [MODEL, "model qube (see Model qubes)"])
+        keys = [n.key for n in gm.walk(tree)]
+        self.assertEqual(len(keys), len(set(keys)), "a key names two rows")
+        shown = dict(gm.details(node, self.read_json("project", "list", "--json")))
+        self.assertEqual(shown["Serves"], "p01 osint: its lead reaches it over qubes.ConnectTCP "
+                                          "on port 11434")
+        self.assertTrue(shown["Maintenance"].startswith("guarded: the hub cannot operate it"))
+        self.assertEqual(shown["Model qube of"], "p01")
+        self.assertNotIn("Shared", shown)
+        # Guarded: Manage opens its maintenance window; it moves into no slot.
+        self.assertEqual(gm.actions(node, self.records()) - {"new_project", "add_to_ai_space"},
+                         {"manage", "revoke"})
+        project = dict(gm.details(osint, None, self.rows()))
+        self.assertEqual((project["Lead's model qube"], project["Lead's model endpoint"]),
+                         (MODEL, "-"))
+        self.assertNotIn("Its model qube is shared", project)
+        # The lead lost its network to it, and the window's view of the lead agrees.
+        self.assertEqual(self.node(f"qube:{LEAD}").data["netvm"], None)
+
+    def test_a_shared_model_qube_says_what_sharing_means(self):
+        serve(self.app)
+        serve(self.app, "other")
+        self.assertEqual({s for s, _ in self.model_findings()}, {"pass"})   # sharing is no failure
+        node = self.node(f"qube:{MODEL}")
+        self.assertEqual(node.data["role"], "model qube of p01 and p02, shared")
+        shown = dict(gm.details(node, self.read_json("project", "list", "--json")))
+        self.assertEqual(shown["Shared"], fleet.SHARED_MODEL_WARNING)
+        self.assertEqual(shown["Serves"], "p01 osint, p02 other: the lead of each reaches it over "
+                                          "qubes.ConnectTCP on port 11434")
+        for slot, other in (("p01", "p02"), ("p02", "p01")):
+            project = dict(gm.details(self.node(f"project:{slot}"), None, self.rows()))
+            self.assertEqual(project["Its model qube is shared"],
+                             f"{MODEL} also serves {other}: {fleet.SHARED_MODEL_WARNING}")
+            ref = self.node(f"ref:{slot}:model")
+            self.assertEqual(dict(gm.details(ref))["Shared"],
+                             f"{MODEL} also serves {other}: {fleet.SHARED_MODEL_WARNING}")
+
+    def test_its_maintenance_window_is_managed_and_guard_closes_it(self):
+        serve(self.app)
+        self.assertIn("still the model qube of p01",
+                      self.run_ok(gm.role("manage", MODEL)).out)
+        # The check only warns: it stays a model qube, and says it is not guarded.
+        self.assertEqual({s for s, _ in self.model_findings()}, {"pass", "warn"})
+        node = self.node(f"qube:{MODEL}")
+        self.assertEqual((node.data["role"], node.data["attention"]),
+                         ("model qube of p01, not guarded", None))
+        self.assertIn(f"qube:{MODEL}", {c.key for c in self.node("group:models").children})
+        shown = dict(gm.details(node))
+        self.assertTrue(shown["Maintenance"].startswith("not guarded: the hub may operate it"))
+        self.assertEqual(gm.actions(node, self.records()) - {"new_project", "add_to_ai_space"},
+                         {"guard", "revoke"})
+        self.assertIn("this opens its maintenance window", gm.role_intro("manage", node.data))
+        self.assertIn("its maintenance window closes", gm.role_intro("guard", node.data))
+        self.assertTrue(gm.role_intro("guard", node.data).startswith(
+            f"{MODEL} becomes guarded: it is listed and referenced, never operated."))
+        # A gateway wearing a model badge is no model qube: Guard never kills it.
+        gw = dict(node.data, name="ai-net-router", gateway=True)
+        self.assertEqual(gm.role_intro("guard", gw),
+                         "ai-net-router becomes guarded: it is listed and referenced, never operated.")
+        for kind in ({"klass": "TemplateVM"}, {"dvmt": True}):        # nor a template
+            row = dict(node.data, name="ai-tpl-g", **kind)
+            self.assertEqual(gm.role_intro("guard", row),
+                             "ai-tpl-g becomes guarded: it is listed and referenced, never operated.")
+        self.run_ok(gm.role("guard", MODEL))
+        self.assertEqual(self.node(f"qube:{MODEL}").data["role"], "model qube of p01")
+        self.assertEqual({s for s, _ in self.model_findings()}, {"pass"})
+        # Any other qube's confirmation is as it was.
+        self.assertEqual(gm.role_intro("manage", self.node("qube:ai-tpl-g").data),
+                         "ai-tpl-g becomes managed: the hub may run commands in it as root and "
+                         "change it.")
+        self.assertEqual(gm.revoke_note(self.node("qube:ai-work").data), "")
+        self.assertIn("their leads no longer reach it", gm.revoke_note(node.data))
+
+    def test_a_project_points_to_its_model_qube_wherever_it_is(self):
+        serve(self.app)
+        ref = lambda: self.node("ref:p01:model").cells[1]  # noqa: E731
+        self.app.domains[MODEL].netvm = self.app.domains["ai-net-router"]    # by hand, in dom0
+        self.assertEqual(ref(), "model qube (see Needs attention)")
+        self.app.domains[MODEL].netvm = None
+        self.app.domains[MODEL].tags.discard("qmcp-model-p01")               # check warns
+        self.assertEqual(ref(), "model qube (no badge: its lead cannot reach it)")
+        self.assertIn("warn", {s for s, _ in self.model_findings()})
+        self.app.domains._drop(MODEL)
+        self.assertEqual(ref(), "model qube (missing)")
+        keys = [n.key for n in gm.walk(self.tree())]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_records_never_read_judge_only_what_the_badges_show(self):
+        serve(self.app)
+        self.app.domains[OTHER_LEAD].tags.add("qmcp-model-p01")
+        tree = gm.build_tree(self.rows(), None, self.read_json("settings", "--json"))
+        placed = {n.data.get("name"): n.data for n in gm.walk(tree) if n.kind == "qube"}
+        self.assertEqual((placed[MODEL]["role"], placed[MODEL]["attention"]),
+                         ("model qube of p01 (records not read)", None))
+        # A lead wearing a model badge is judged by its badges alone.
+        self.assertEqual(placed[OTHER_LEAD]["attention"], "lead")
+        self.assertEqual(placed[LEAD]["role"], "lead (records not read)")
+
+    def test_the_forms_offer_what_the_command_takes_and_refuse_it_in_its_words(self):
+        a = self.app
+        model_qube(a)
+        a.vm("ai-m-standalone", klass="StandaloneVM", tags={"ai-managed"})
+        a.vm("ollama", template=a.domains["debian-13"])                     # outside AI space
+        a.vm("ai-m-tpl-managed", template=a.domains["ai-debian-13"], tags={"ai-managed"})
+        rows = self.rows()
+        by_name = {r["name"]: r for r in rows}
+        vms = {vm.name: vm for vm in a.domains}
+        offered = gm.model_qube_choices(rows, HUB)
+        kinds = set()
+        for row in rows:
+            name = row["name"]
+            why = gm._model_why(row, by_name, HUB)
+            command = fleet.model_qube_refusal(vms, name, HUB)
+            with self.subTest(name):
+                self.assertEqual(why[1] if why else None, command)      # in the command's words
+                self.assertEqual(name in offered, why is None)
+                if why:
+                    kinds.add(why[0])
+        self.assertEqual(kinds, {"hub", "kind", "drop_box", "outside", "lead", "member", "template"})
+        self.assertEqual(offered, sorted([MODEL, "ai-m-standalone", "ai-on-operator-tpl"]))
+        for name in (HUB, "ai-debian-13", "ai-dvm", "ai-net-router", "osint-dump", LEAD,
+                     "ai-osint-w1", "ai-m-tpl-managed", "ai-hubq", "ollama", "personal"):
+            self.assertNotIn(name, offered)
+        self.assertEqual(gm._model_why(by_name["ollama"], by_name, HUB),
+                         ("outside", "is outside AI space: guard it first (qmcp guard ollama)"))
+        self.assertEqual(gm.model_qube_text(by_name[MODEL], "p01"),
+                         f"{MODEL} (managed; in p00; on ai-net-router)")
+        # End to end: what the form refuses, the command refuses; what it offers, it takes.
+        for name in ("ai-m-tpl-managed", "ollama"):
+            result = self.runner.execute(gm.set_lead_model_qube("osint", name))
+            self.assertEqual(result.rc, 1, name)
+            self.assertIn(gm._model_why(by_name[name], by_name, HUB)[1], result.err)
+        self.assertEqual(self.tags("ollama"), set())                # never brought in
+        self.run_ok(gm.set_lead_model_qube("osint", "ai-m-standalone"))
+        self.assertIn("qmcp-model-p01", self.tags("ai-m-standalone"))
+        # While the hub is not known, the command refuses every qube, and the
+        # forms offer none, saying why.
+        self.assertEqual(gm.model_qube_choices(rows, None), [])
+        self.assertEqual(gm.no_model_qube(None), gm.NO_HUB)
+        self.assertEqual(gm.no_model_qube(HUB), gm.NO_MODEL_QUBE)
+        pathlib.Path(core.HUB_PATH).unlink()
+        self.assertIn("cannot be read", fleet.model_qube_refusal(vms, MODEL))
+
+    def test_a_row_that_does_not_read_is_never_offered(self):
+        model_qube(self.app)
+        self.assertIn(MODEL, gm.model_qube_choices(self.rows(), HUB))
+        for key in (f"get.netvm:{MODEL}", f"tag.List:{MODEL}", f"get.template:{MODEL}",
+                    "tag.List:debian-13", f"get.provides_network:{MODEL}"):
+            with self.subTest(key):
+                self.app.fail.add(key)
+                try:
+                    rows = self.rows()
+                finally:
+                    self.app.fail.discard(key)
+                self.assertNotIn(MODEL, gm.model_qube_choices(rows, HUB))
+                # The command, reading the same, refuses it.
+                self.app.fail.add(key)
+                try:
+                    result = self.runner.execute(gm.set_lead_model_qube("osint", MODEL))
+                finally:
+                    self.app.fail.discard(key)
+                self.assertEqual(result.rc, 1, key)
+        self.assertNotIn("qmcp-model-p01", self.tags(MODEL))
+
+    def test_what_the_forms_say_before_ok(self):
+        model_qube(self.app)
+        rows = self.rows()
+        loses = (f"{LEAD} loses its network (ai-net-router): a lead whose model is a qube has "
+                 f"none, and going back to a remote model takes a new lead.")
+        self.assertEqual(gm.model_qube_red(MODEL, LEAD, "p01", rows), loses)
+        self.assertEqual(gm.model_qube_red(MODEL, OTHER_LEAD, "p02", rows), "")    # no network
+        for nothing in (None, "", "none"):
+            self.assertEqual(gm.model_qube_red(nothing, LEAD, "p01", rows), "")
+        info = (f"{MODEL} leaves p00, loses its network (ai-net-router), is guarded (the hub can "
+                f"no longer operate it) and is killed if it runs; then it is recorded and wears "
+                f"qmcp-model-p01, and the lead reaches it on port 11434.")
+        self.assertEqual(gm.model_qube_info(MODEL, rows, "p01"), info)
+        # The command does what the form said, in that order.
+        report = self.run_ok(gm.set_lead_model_qube("osint", MODEL)).out
+        for said in (f"{LEAD} lost its network (ai-net-router): a lead whose model is a qube has "
+                     f"none", f"{MODEL} is out of p00", f"{MODEL} lost its network (ai-net-router)",
+                     f"{MODEL} is guarded", f"model qube {MODEL}; the lead reaches it on port 11434"):
+            self.assertIn(said, report)
+        # A second project's: the command's own warning, in red, before OK.
+        rows = self.rows()
+        shared = gm.model_qube_red(MODEL, OTHER_LEAD, "p02", rows)
+        self.assertEqual(shared, f"WARNING: {MODEL} also serves p01: {fleet.SHARED_MODEL_WARNING}")
+        self.assertEqual(gm.model_qube_red(MODEL, LEAD, "p01", rows), "")   # its own: not shared
+        self.assertEqual(gm.model_qube_info(MODEL, rows, "p02"),
+                         f"{MODEL} is recorded and wears qmcp-model-p02, and the lead reaches it "
+                         f"on port 11434.")
+        # One the operator guarded first, serving nothing yet: the command kills it.
+        first = [{"name": "q", "netvm": None, "badges": ["ai-managed", "qmcp-guarded"]}]
+        self.assertEqual(gm.model_qube_info("q", first, "p03"),
+                         "q is killed if it runs; then it is recorded and wears qmcp-model-p03, "
+                         "and the lead reaches it on port 11434.")
+        report = self.run_ok(gm.set_lead_model_qube("other", MODEL)).out
+        self.assertIn(f"WARNING: {MODEL} also serves p01: {fleet.SHARED_MODEL_WARNING}", report)
+        self.assertEqual(gm.model_qube_info("none", rows, "p02", MODEL),
+                         f"{MODEL} loses qmcp-model-p02 and stops serving the project; it stays as "
+                         f"it is otherwise. The lead reaches no model.")
+        # A lead whose network does not read: refused before OK, as the command refuses it.
+        model_qube(self.app, "ai-hub-model2")
+        self.app.fail.add(f"get.netvm:{LEAD}")
+        try:
+            rows = self.rows()
+            doc = self.view()
+            result = self.runner.execute(gm.set_lead_model_qube("osint", "ai-hub-model2"))
+        finally:
+            self.app.fail.discard(f"get.netvm:{LEAD}")
+        why = gm.model_qube_refusal(doc, "ai-hub-model2", rows)
+        self.assertEqual(why, f"the network of {LEAD} cannot be read")
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)
+        self.assertIsNone(gm.model_qube_refusal(doc, "none", rows))   # none leaves the lead be
+        self.assertEqual(gm.model_qube_refusal(doc, None, rows), "choose the model qube, or none")
+
+    def test_the_builders_make_exactly_the_typed_command(self):
+        sudo = [*gm.SUDO, gm.QMCP, "project"]
+        self.assertEqual(gm.create_project("sealed", "template", "ai-debian-13", None, "none", [],
+                                           ["none"], "5G", False, None, MODEL),
+                         sudo + ["create", "sealed", "--lead-template", "ai-debian-13",
+                                 "--lead-netvm", "none", "--model-qube", MODEL, "--network", "none",
+                                 "--quota", "5G"])
+        self.assertEqual(gm.change_lead("osint", "template", "ai-debian-13", lead_netvm="none",
+                                        model_qube="none"),
+                         sudo + ["lead", "osint", "--lead-template", "ai-debian-13", "--lead-netvm",
+                                 "none", "--model-qube", "none"])
+        self.assertEqual(gm.set_lead_model_qube("osint", MODEL),
+                         sudo + ["firewall", "osint", "--model-qube", MODEL])
+        self.assertEqual(gm.set_lead_model_qube("p02", "none"),
+                         sudo + ["firewall", "p02", "--model-qube", "none"])
+        for builder, kw in ((gm.set_lead_model_qube, dict(key="osint", model_qube="-x")),
+                            (gm.set_lead_model_qube, dict(key="osint", model_qube=None)),
+                            (gm.set_lead_model_qube, dict(key="osint", model_qube="")),
+                            (gm.create_project, dict(label="sealed", lead_source="template",
+                                                     lead_origin="ai-debian-13", networks=["none"],
+                                                     quota="1G", model_qube="none"))):
+            with self.assertRaises(gm.FormError, msg=(builder.__name__, kw)):
+                builder(**kw)
+        # Refused before OK in the command's own words, and the command refuses the same.
+        base = ["create", "sealed", "--lead-template", "ai-debian-13", "--network", "none",
+                "--quota", "1G"]
+        for kw, raw in ((dict(model="api.anthropic.com:443"), ["--model", "api.anthropic.com:443"]),
+                        (dict(lead_netvm="ai-net-router"), ["--lead-netvm", "ai-net-router"])):
+            with self.assertRaises(gm.FormError) as cm:
+                gm.create_project("sealed", "template", "ai-debian-13", networks=["none"],
+                                  quota="1G", model_qube=MODEL, **kw)
+            result = self.runner.execute(sudo + base + raw + ["--model-qube", MODEL])
+            self.assertEqual(result.rc, 1, kw)
+            self.assertIn(str(cm.exception), result.err)
+        # Each runs, through the real parser and command.
+        model_qube(self.app)
+        self.run_ok(gm.create_project("sealed", "template", "ai-debian-13", None, "none", [],
+                                      ["none"], "5G", False, None, MODEL))
+        p = projects.find(projects.load(), "sealed")
+        self.assertEqual((p.model, p.model_qube), (None, MODEL))
+        self.assertIsNone(self.app.domains[p.lead].netvm)
+
+    def test_a_proposal_that_names_a_model_qube_shows_it_now_and_after(self):
+        model_qube(self.app)
+        doc = self.show(self.submit_proposal("qfw")["id"])
+        rows = dict(gm.proposal_details(doc))
+        self.assertEqual(rows["Lead's model qube"], MODEL)                        # the option
+        self.assertEqual(rows["Lead's model, now -> after"], "- -> -")
+        self.assertEqual(rows["Lead's model qube, now -> after"], f"- -> {MODEL}")
+        self.assertEqual(rows["Lead firewall after accepting"], "(none: the lead has no network)")
+        self.assertEqual(rows["Equivalent command"], f"qmcp project firewall osint --model-qube {MODEL}")
+        self.assertIn(f"- makes {MODEL} the model qube of osint", gm.second_tick_text(doc))
+        self.assertEqual(gm.proposal_actions(doc), {"reject_proposal"})     # never one click
+        self.run_ok(gm.accept_proposal(doc["id"], doc["sha256"], doc["tick"]))
+        self.assertIn("qmcp-model-p01", self.tags(MODEL))
+        # A second project's names the sharing, with the command's warning, in red.
+        doc = self.show(self.submit_proposal("qfw", project="other")["id"])
+        self.assertIn(f"{MODEL} already serves p01: {fleet.SHARED_MODEL_WARNING}",
+                      gm.second_tick_text(doc))
+        # Taking it away writes nothing to the lead.
+        doc = self.show(self.submit_proposal("qnone", project="osint")["id"])
+        rows = dict(gm.proposal_details(doc))
+        self.assertEqual(rows["Lead's model qube"], "none: the project's model qube is taken away")
+        self.assertEqual(rows["Lead's model qube, now -> after"], f"{MODEL} -> -")
+        self.assertEqual(rows["Lead firewall after accepting"], "(none: nothing is written to the lead)")
+        self.assertIn(f"takes the model qube {MODEL} away from osint", gm.second_tick_text(doc))
+        # A create and a lead change carry it as an option, and in their command.
+        for name in ("qcreate", "qlead"):
+            doc = self.show(self.submit_proposal(name)["id"])
+            rows = dict(gm.proposal_details(doc))
+            self.assertEqual(rows["Lead's model qube"], MODEL, name)
+            self.assertTrue(rows["Equivalent command"].endswith(f"--model-qube {MODEL}"), name)
+        # A proposal stored before 0.9.22 has no model qube in its after: shown as before.
+        self.assertEqual(dict(gm.firewall_change({}, {"model": None, "rules": RULES}))[
+            "Lead firewall after accepting"], chr(10).join(RULES))
+        # None is no "after" at all: the change cannot apply, and the plan says why.
+        self.assertEqual(dict(gm.firewall_change({}, None))["Lead firewall after accepting"],
+                         "? (see Plan)")
+
+    def test_the_lead_firewall_view_names_the_model_qube(self):
+        serve(self.app)
+        view = self.view()
+        shown = dict(gm.firewall_details(view))
+        self.assertEqual((shown["Model qube"], shown["Model endpoint"]), (MODEL, "-"))
+        why = (f"the model of osint is the qube {MODEL}, and its lead has no network: a remote "
+               f"model takes a new lead on a network (qmcp project lead osint ... --lead-netvm NET "
+               f"--model HOST:PORT)")
+        self.assertEqual(gm.model_refusal(view, self.rows()), why)
+        # Its lead has no network, so no firewall to set or accept either: only
+        # its model qube changes, and the view says why the rest is off.
+        self.assertEqual(gm.firewall_actions(view, self.rows()), {"set_model_qube"})
+        result = self.runner.execute(gm.set_lead_model("osint", "api.anthropic.com:443"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(why, result.err)
+        rules_why = (f"the model of osint is the qube {MODEL}, and its lead has no network, so "
+                     f"it has no firewall to set or accept")
+        self.assertEqual(gm.lead_rules_refusal(view), rules_why)
+        for argv in (gm.set_lead_rules("osint", RULES), gm.accept_lead_rules("osint")):
+            result = self.runner.execute(argv)
+            self.assertEqual(result.rc, 1, argv)
+            self.assertIn(rules_why, result.err)
+        pane = gm.FirewallPane()
+        pane.answer(pane.select("osint"), self.runner.execute(gm.show_lead_firewall("osint")), "t")
+        section = dict(gm.firewall_section(pane, "osint", self.rows()))
+        self.assertEqual(section["Lead rules"],
+                         f"Set lead rules and Accept current rules are off: {rules_why}")
+        self.assertEqual(gm.firewall_changed(view, "set_rules", pane, self.rows()), rules_why)
+        self.assertEqual(gm.firewall_changed(view, "accept_rules", pane, self.rows()), rules_why)
+        # An open form whose project's model qube changed since runs nothing.
+        pane = gm.FirewallPane()
+        pane.answer(pane.select("osint"), self.runner.execute(gm.show_lead_firewall("osint")), "t")
+        opened = pane.doc
+        self.assertIsNone(gm.firewall_changed(opened, "set_model_qube", pane, self.rows()))
+        self.run_ok(gm.set_lead_model_qube("osint", "none"))
+        pane.answer(pane.select("osint"), self.runner.execute(gm.show_lead_firewall("osint")), "t")
+        self.assertIn("changed since this form opened",
+                      gm.firewall_changed(opened, "set_model_qube", pane, self.rows()))
+
+    def test_a_lead_with_dns_left_open_says_how_to_close_it(self):
+        old = ["action=accept dst4=192.0.2.5/32 proto=tcp dstports=443-443",
+               "action=accept specialtarget=dns", "action=drop"]
+        self.app.domains[LEAD].__dict__["_firewall"] = list(old)
+        doc = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        doc["slots"]["p01"].update(model="192.0.2.5:443", lead_firewall=old)
+        self.write_records(doc)
+        self.assertIn("warn", {f["status"] for f in self.read_json("check", "--json")["findings"]
+                               if f["check"] == "lead DNS"})
+        pane = gm.FirewallPane()
+        pane.answer(pane.select("osint"), self.runner.execute(gm.show_lead_firewall("osint")), "t")
+        section = dict(gm.firewall_section(pane, "osint", self.rows()))
+        self.assertIn("Set lead model with the same endpoint, 192.0.2.5:443", section["Lead DNS"])
+        self.run_ok(gm.set_lead_model("osint", "192.0.2.5:443"))
+        pane.answer(pane.select("osint"), self.runner.execute(gm.show_lead_firewall("osint")), "t")
+        self.assertNotIn("Lead DNS", dict(gm.firewall_section(pane, "osint", self.rows())))
+        self.assertNotIn("lead DNS", {f["check"] for f in self.read_json("check", "--json")["findings"]})
+
+    def test_a_managed_model_qube_is_no_lead_source(self):
+        serve(self.app)
+        self.run_ok(gm.role("manage", MODEL))
+        rows = self.rows()
+        self.assertNotIn(MODEL, gm.hubs_appvms(rows, HUB))
+        result = self.runner.execute(gm.create_project("x", "clone", MODEL, networks=["none"],
+                                                       quota="1G"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn("is a model qube of p01", result.err)
+
+    def test_every_new_string_is_escaped(self):
+        # A qube named past what Qubes allows still reaches the screen as text.
+        a = self.app
+        a.vm(HOSTILE, tags={"ai-managed", "qmcp-guarded", "qmcp-model-p01"})
+        a.vm("ai-x" + chr(0x202E) + "m", template=a.domains["debian-13"], tags={"ai-managed"})
+        rows = self.rows()
+        by_name = {r["name"]: r for r in rows}
+        node = next(n for n in gm.walk(self.tree()) if n.data.get("name") == HOSTILE)
+        self.assertEqual(node.data["attention"], "model_record")
+        shown = list(node.cells) + [v for _, v in gm.details(node)]
+        texts = [gm.esc(t) for _, t in gm.model_qube_options(rows, HUB)]
+        texts += [gm.esc_lines(gm.model_qube_red("ai-x" + chr(0x202E) + "m", HOSTILE, "p02", rows)),
+                  gm.esc(gm.model_qube_info("ai-x" + chr(0x202E) + "m", rows, "p01")),
+                  gm.esc(gm.lead_info(None, qube=HOSTILE)),
+                  gm.esc(gm.model_qube_text(by_name["ai-x" + chr(0x202E) + "m"]))]
+        for text in shown + texts:
+            self.assertIsInstance(text, gm.Shown)
+            self.assertTrue(all(0x20 <= ord(c) < 0x7f for c in text.replace(chr(10), "")), text)
+        self.assertTrue(any(chr(92) + "u202e" in t for t in texts))
+        doc = {"model": None, "model_qube": HOSTILE}
+        for _, text in gm.firewall_change(doc, {"model": None, "model_qube": HOSTILE, "rules": None}):
+            self.assertTrue(text.isascii() and chr(10) not in text, text)
+        for _, text in gm.firewall_details(dict(self.view(), model_qube=HOSTILE)):
+            self.assertTrue(text.isascii(), text)
 
 
 # ======================================================================= the command's new reads
@@ -2225,7 +2752,8 @@ class Widgets(GuiBase):
                                                      HUB), {
                 "label": "label_entry", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "templates": "templates",
-                "networks": "nets", "quota": "quota", "dump": "dump", "model": "model"}),
+                "networks": "nets", "quota": "quota", "dump": "dump", "model": "model",
+                "model_qube": "model_qube"}),
             gm.edit_project: (self.gui.EditForm(self.win, self.win.fleet, self.win.gateways,
                                                 record), {
                 "key": "record", "templates": "templates", "networks": "nets", "quota": "quota"}),
@@ -2233,7 +2761,7 @@ class Widgets(GuiBase):
                                                record), {
                 "key": "record", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "keep_old": "old_lead",
-                "model": "model", "add_old_network": "add_old"}),
+                "model": "model", "add_old_network": "add_old", "model_qube": "model_qube"}),
             # The registry's forms; the qube and its current values come from the row.
             gm.enroll_gateway: (self.gui.EnrollForm(self.win, self.win.fleet, self.win.gateways,
                                                     HUB), {
@@ -2243,6 +2771,9 @@ class Widgets(GuiBase):
             # A lead firewall's: the project comes from the view the form opened on.
             gm.set_lead_model: (self.gui.ModelForm(self.win, view), {"key": "doc",
                                                                      "model": "model"}),
+            gm.set_lead_model_qube: (self.gui.ModelQubeForm(self.win, view, None, self.win.fleet,
+                                                            HUB), {"key": "doc",
+                                                                   "model_qube": "model_qube"}),
             gm.set_lead_rules: (self.gui.RulesForm(self.win, view), {"key": "doc",
                                                                      "rules": "rules_view"}),
             gm.accept_lead_rules: (self.gui.AcceptRulesForm(self.win, view), {"key": "doc"}),
@@ -2260,7 +2791,7 @@ class Widgets(GuiBase):
                 self.assertTrue(hasattr(form, attr), (builder.__name__, attr))
             form.destroy()
         for ident in ("remove_lead", "delete_project", "add_to_ai_space", "manage", "guard",
-                      "set_model", "set_rules", "accept_rules"):
+                      "set_model", "set_rules", "accept_rules", "set_model_qube"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
         self.assertEqual(set(self.win.gateway_buttons),
                          {"enroll_gateway", "change_gateway", "remove_gateway"})
@@ -2431,8 +2962,7 @@ class Widgets(GuiBase):
         plan_call = self.runner.calls[-1]
         self.assertEqual(plan_call, gm.delete_plan("other"))
         form = self.win.last_form
-        intro = [c.get_text() for c in form.get_content_area().get_children()
-                 if isinstance(c, Gtk.Label)][0]
+        intro = form.intro.get_text()
         self.assertIn(OTHER_LEAD, intro)
         self.assertNotIn("--yes", intro)
         self.assertIsNotNone(projects.find(projects.load(), "other"))   # the plan changed nothing
@@ -2544,6 +3074,8 @@ class Widgets(GuiBase):
         # proves the forms make them, by filling each form every way.
         parser = cli.build_parser()
         argvs = list(gm.READS.values()) + [gm.AUDIT_VERIFY]
+        model_qube(self.app)                    # a qube the hub set up to serve a model
+        self.win.refresh()
         rows = self.win.fleet
 
         gws = self.win.gateways
@@ -2567,6 +3099,11 @@ class Widgets(GuiBase):
             return f
         forms = [project("template", "ai-debian-13", "ai-newp-boss"),
                  project("clone", "ai-work2", "ai-newp-boss"), project("promote", "ai-work2", None)]
+        f = project("template", "ai-debian-13", None)    # its model a self-hosted qube
+        f.model.set_text("")
+        f.model_kind["qube"].set_active(True)
+        f.model_qube.set_active_id(MODEL)
+        forms.append(f)
         self.select("project:p01")
         record = self.win.node().data
         f = self.gui.EditForm(self.win, rows, gws, record)
@@ -2588,6 +3125,12 @@ class Widgets(GuiBase):
             else:
                 f.lead_netvm.set_active_id("none")
             forms.append(f)
+        f = self.gui.LeadForm(self.win, rows, gws, HUB, record)    # a lead with a model qube
+        f.lead_name.set_text("ai-osint-boss")
+        f.old_lead.set_active_id("keep")
+        f.model_kind["qube"].set_active(True)
+        f.model_qube.set_active_id(MODEL)
+        forms.append(f)
         # The registry: enroll a router, change one, remove one no project uses.
         self.routers()
         self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-net")).rc, 0)
@@ -2638,10 +3181,13 @@ class Widgets(GuiBase):
         self.select("project:p01")
         argvs.append(self.runner.calls[-1])
         self.assertEqual(self.runner.calls[-1], gm.show_lead_firewall("osint"))
-        for ident in ("set_model", "set_rules", "accept_rules"):
+        for ident in ("set_model", "set_rules", "accept_rules", "set_model_qube"):
             form = self.win.act(ident)
             if ident == "set_model":
                 form.model.set_text("api.anthropic.com:443")
+            if ident == "set_model_qube":
+                form.model_qube.set_active_id(MODEL)
+            self.one_line(form)
             argvs.append(form.argv())
             form.destroy()
         self.select("project:p02")
@@ -2762,8 +3308,7 @@ class Widgets(GuiBase):
     def test_revoke_says_it_leaves_ai_space(self):
         self.select("qube:ai-work")
         form = self.win.act("revoke")
-        intro = [c.get_text() for c in form.get_content_area().get_children()
-                 if isinstance(c, Gtk.Label)][0]
+        intro = form.intro.get_text()
         self.assertIn("out of AI space", intro)
         self.assertIn("not removed", intro)
 
@@ -2886,6 +3431,42 @@ class Widgets(GuiBase):
         calls = {(r.get("caller"), r.get("service")) for r in self.win.audit_rows}
         self.assertLessEqual({(HUB, "qmcp.SubmitProposal"), ("operator", "qmcp proposal accept")},
                              calls)
+
+    def test_the_second_tick_and_ok_stay_on_the_screen(self):
+        # A shared model qube's reasons are long (the operator's click-through,
+        # 2026-10-07: the tick fell below the screen). The pane's reasons and the
+        # Accept form's body scroll; the tick, the buttons and OK stay in view.
+        # Measured as laid out on this display: a size request does not show it.
+        Gtk = self.gui.Gtk
+
+        def laid_out(window):
+            window.show_all()
+            window.resize(window.get_size()[0], 200)
+            for _ in range(200):
+                if not Gtk.events_pending():
+                    break
+                Gtk.main_iteration()
+            height = window.get_allocated_height()
+            window.hide()
+            return height
+
+        serve(self.app)
+        self.propose("qfw", project="other")
+        warning = self.win.proposal_warning.get_text()
+        self.assertIn(fleet.SHARED_MODEL_WARNING, warning)
+        # Far longer than any reason, so the measure cannot pass by luck.
+        self.gui._set(self.win.proposal_warning, gm.esc(warning * 6))
+        room = self.gui._screen_room(None, 0)
+        self.assertLessEqual(laid_out(self.win), room)
+        self.assertTrue(self.win.proposal_tick.get_visible())
+        self.gui._set(self.win.proposal_warning, gm.esc(warning))
+        self.win.proposal_tick.set_active(True)
+        form = self.win.act("accept_proposal")
+        self.assertIsNotNone(form)
+        self.assertIn(fleet.SHARED_MODEL_WARNING, form.warning.get_text())
+        self.gui._set(form.warning, gm.esc(warning * 6))
+        self.assertLessEqual(laid_out(form), room)
+        form.destroy()
 
     def test_accept_is_off_until_the_tick_when_reasons_exist(self):
         reply = self.propose("delete", project="other")
@@ -3070,8 +3651,7 @@ class Widgets(GuiBase):
         reply = self.propose("create")
         form = self.win.act("reject_proposal")
         self.assertEqual(form.argv(), gm.reject_proposal(reply["id"]))
-        intro = [c.get_text() for c in form.get_content_area().get_children()
-                 if isinstance(c, Gtk.Label)][0]
+        intro = form.intro.get_text()
         self.assertIn("without running anything", intro)
         self.assertEqual(form.warning.get_text(), "")
         result = self.submit(form)
@@ -3187,8 +3767,7 @@ class Widgets(GuiBase):
         form = self.win.act("close_proposal")
         self.assertEqual(form.get_title(), f"Close proposal {reply['id']}")
         self.assertEqual(form.argv(), gm.reject_proposal(reply["id"]))
-        intro = [c.get_text() for c in form.get_content_area().get_children()
-                 if isinstance(c, Gtk.Label)][0]
+        intro = form.intro.get_text()
         self.assertIn("Why: decision file unreadable", intro)
         self.assertIn("records the proposal as failed", intro)
         result = self.submit(form)
@@ -3649,6 +4228,329 @@ class Widgets(GuiBase):
         self.win.refresh()
         self.assertEqual(checks()["lead firewalls"], "FAIL")
         self.assertIn("accept_rules", self.sensitive())
+
+    # ------------------------------------------------------------------ model qubes
+
+    def red(self, form):
+        """A form's red line, and that it is red."""
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        return form.warning.get_text()
+
+    def test_a_project_whose_model_is_a_qube(self):
+        model_qube(self.app)
+        self.win.refresh()
+        form = self.win.act("new_project")
+        form.label_entry.set_text("sealed")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("5G")
+        form.lead_netvm.set_active_id("ai-net-router")
+        form.model.set_text("api.anthropic.com:443")
+        self.one_line(form)
+        # Self-hosted: the lead's network goes to none, and its field and the
+        # endpoint's are off; nothing is chosen yet, so OK is off and says why.
+        form.model_kind["qube"].set_active(True)
+        self.assertEqual(form.lead_netvm.get_active_id(), "none")
+        self.assertFalse(form.lead_netvm.get_sensitive())
+        self.assertFalse(form.model.get_sensitive())
+        self.assertTrue(form.model_qube.get_sensitive())
+        self.assertIsNone(form.model_qube.get_active_id())
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), "choose the model qube, or a remote endpoint")
+        self.assertEqual(form.lead_info.get_text(), "The lead will have no network: a lead whose "
+                                                    "model is a qube has none. Choose its model qube.")
+        offered = [row[1] for row in form.model_qube.get_model()]
+        self.assertEqual(offered, gm.model_qube_choices(self.win.fleet, HUB))
+        form.model_qube.set_active_id(MODEL)
+        self.one_line(form)
+        argv = form.argv()
+        self.assertEqual(argv, gm.create_project("sealed", "template", "ai-debian-13", None, "none",
+                                                 [], ["none"], "5G", False, None, MODEL))
+        self.assertEqual(argv[argv.index("--lead-netvm"):argv.index("--lead-netvm") + 4],
+                         ["--lead-netvm", "none", "--model-qube", MODEL])
+        self.assertEqual(self.red(form), "")                    # a new lead, a qube serving nobody
+        self.assertEqual(form.qube_info.get_text(), gm.model_qube_info(MODEL, self.win.fleet))
+        self.assertIn(f"It reaches {MODEL} on port 11434", form.lead_info.get_text())
+        # Back to remote: the network field is on again, with what it had.
+        form.model_kind["remote"].set_active(True)
+        self.assertEqual(form.lead_netvm.get_active_id(), "ai-net-router")
+        self.assertTrue(form.lead_netvm.get_sensitive())
+        self.assertEqual(form.qube_info.get_text(), "")
+        self.assertEqual(form.argv()[-2:], ["--quota", "5G"])
+        self.assertIn("--model", form.argv())
+        form.model_kind["qube"].set_active(True)
+        result = self.submit(form)
+        self.assertIn(f"model qube {MODEL}; the lead reaches it on port 11434", result.out)
+        p = projects.find(projects.load(), "sealed")
+        self.assertEqual((p.model, p.model_qube), (None, MODEL))
+        self.assertIsNone(self.app.domains[p.lead].netvm)
+        rows = {r[0]: r for r in self.rows(self.win.store)}
+        self.assertEqual(rows[f"qube:{MODEL}"][2], f"model qube of {p.slot}")
+        self.assertEqual(rows[f"ref:{p.slot}:model"][2], "model qube (see Model qubes)")
+
+    def test_a_promoted_lead_with_a_network_loses_it_in_red(self):
+        model_qube(self.app)
+        self.win.refresh()
+        form = self.win.act("new_project")
+        form.label_entry.set_text("prom")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        form.source["promote"].set_active(True)
+        form.origin.set_active_id("ai-hubq")                   # on ai-net-router
+        form.model_kind["qube"].set_active(True)
+        form.model_qube.set_active_id(MODEL)
+        self.one_line(form)
+        self.assertEqual(self.red(form), "ai-hubq loses its network (ai-net-router): a lead whose "
+                                         "model is a qube has none, and going back to a remote "
+                                         "model takes a new lead.")
+        form.origin.set_active_id("ai-work2")                  # no network: nothing to lose
+        self.assertEqual(self.red(form), "")
+        form.destroy()
+
+    def test_a_model_qube_for_a_lead_with_a_network_is_red_before_ok(self):
+        model_qube(self.app)
+        self.win.refresh()
+        self.select("project:p01")                             # its lead is on ai-net-router
+        self.assertIn("set_model_qube", self.sensitive())
+        form = self.win.act("set_model_qube")
+        self.assertIn(f"Makes a qube the self-hosted model of osint: its lead, {LEAD}, reaches it",
+                      form.intro.get_text())
+        ids = [row[1] for row in form.model_qube.get_model()]
+        self.assertEqual(ids, gm.model_qube_choices(self.win.fleet, HUB))   # no none: it has none
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), "choose the model qube, or none")
+        self.assertEqual(self.red(form), "")
+        form.model_qube.set_active_id(MODEL)
+        self.one_line(form)
+        self.assertEqual(self.red(form), f"{LEAD} loses its network (ai-net-router): a lead whose "
+                                         f"model is a qube has none, and going back to a remote "
+                                         f"model takes a new lead.")
+        self.assertEqual(form.info.get_text(), gm.model_qube_info(MODEL, self.win.fleet, "p01"))
+        self.assertEqual(form.argv(), gm.set_lead_model_qube("osint", MODEL))
+        self.submit(form)
+        self.assertIsNone(self.app.domains[LEAD].netvm)
+        self.assertIn("qmcp-model-p01", self.tags(MODEL))
+        # The view says the model is a qube, and why Set lead model is off.
+        self.select("project:p01")
+        details = self.grid(self.win.details)
+        self.assertEqual(details["Lead's model qube"], MODEL)
+        self.assertEqual(details["Model qube"], MODEL)
+        self.assertTrue(details["Set lead model"].startswith(f"off: the model of osint is the qube "
+                                                             f"{MODEL}"))
+        self.assertTrue(details["Lead rules"].startswith("Set lead rules and Accept current rules "
+                                                         "are off: the model of osint is the qube"))
+        self.assertFalse({"set_model", "set_rules", "accept_rules"} & self.sensitive())
+        self.assertIn("set_model_qube", self.sensitive())
+        # Taking it away: offered now, and nothing in red.
+        form = self.win.act("set_model_qube")
+        self.assertEqual([row[1] for row in form.model_qube.get_model()][-1], "none")
+        form.model_qube.set_active_id("none")
+        self.assertEqual(self.red(form), "")
+        self.assertEqual(form.argv(), gm.set_lead_model_qube("osint", "none"))
+        self.submit(form)
+        self.assertNotIn("qmcp-model-p01", self.tags(MODEL))
+        self.assertIsNone(projects.find(projects.load(), "osint").model_qube)
+
+    def test_sharing_a_model_qube_is_said_in_red_before_ok(self):
+        serve(self.app)
+        self.win.refresh()
+        self.select("project:p02")                             # its lead has no network
+        form = self.win.act("set_model_qube")
+        texts = {row[1]: row[0] for row in form.model_qube.get_model()}
+        self.assertEqual(texts[MODEL], f"{MODEL} (guarded; serves p01)")
+        form.model_qube.set_active_id(MODEL)
+        self.assertEqual(self.red(form), f"WARNING: {MODEL} also serves p01: "
+                                         f"{fleet.SHARED_MODEL_WARNING}")
+        result = self.submit(form)
+        self.assertIn(f"WARNING: {MODEL} also serves p01: {fleet.SHARED_MODEL_WARNING}", result.out)
+        self.select(f"qube:{MODEL}")
+        details = self.grid(self.win.details)
+        self.assertEqual(details["Role"], "model qube of p01 and p02, shared")
+        self.assertEqual(details["Shared"], fleet.SHARED_MODEL_WARNING)
+        self.select("project:p02")
+        self.assertEqual(self.grid(self.win.details)["Its model qube is shared"],
+                         f"{MODEL} also serves p01: {fleet.SHARED_MODEL_WARNING}")
+
+    def test_red_text_that_changed_after_the_form_opened_runs_nothing(self):
+        model_qube(self.app)
+        self.win.refresh()
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        # Opened on other, whose lead has no network: no red. Then it gets one.
+        self.select("project:p02")
+        form = self.win.act("set_model_qube")
+        form.model_qube.set_active_id(MODEL)
+        self.assertEqual(self.red(form), "")
+        self.app.domains[OTHER_LEAD].netvm = self.app.domains["ai-net-router"]   # by hand
+        self.win.refresh()
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(writes(), before)
+        self.assertIn("what this form says in red has changed since it opened", form.error.get_text())
+        self.assertIsNone(projects.find(projects.load(), "other").model_qube)
+        form.destroy()
+        # A new project's form, opened on a qube that serves nobody; then it does.
+        form = self.win.act("new_project")
+        form.label_entry.set_text("sealed")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        form.model_kind["qube"].set_active(True)
+        form.model_qube.set_active_id(MODEL)
+        self.assertEqual(self.red(form), "")
+        self.assertEqual(self.runner.execute(gm.set_lead_model_qube("osint", MODEL)).rc, 0)
+        self.win.refresh()
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(writes(), before)
+        self.assertIn("what this form says in red has changed since it opened", form.error.get_text())
+        self.assertIsNone(projects.find(projects.load(), "sealed"))
+        form.destroy()
+        # The control: a refresh that changes nothing in red leaves the form able to run.
+        form = self.win.act("new_project")
+        form.label_entry.set_text("sealed")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        self.win.refresh()
+        self.submit(form)
+        self.assertIsNotNone(projects.find(projects.load(), "sealed"))
+
+    def test_a_new_lead_keeps_or_replaces_the_projects_model_qube(self):
+        serve(self.app, "other")
+        model_qube(self.app, "ai-hub-model2")
+        self.win.refresh()
+        self.select("project:p02")
+        form = self.win.act("change_lead")
+        form.lead_name.set_text("l2")
+        form.old_lead.set_active_id("keep")
+        # Self-hosted, keeping its model qube: chosen for you, and nothing to send for it.
+        self.assertTrue(form.model_kind["qube"].get_active())
+        self.assertEqual(form.model_qube.get_active_id(), "")
+        self.assertEqual([row[1] for row in form.model_qube.get_model()],
+                         ["", "ai-hub-model2", "ai-on-operator-tpl", "none"])
+        self.assertEqual((form.lead_netvm.get_active_id(), form.lead_netvm.get_sensitive()),
+                         ("none", False))
+        self.one_line(form)
+        argv = form.argv()
+        self.assertNotIn("--model-qube", argv)
+        self.assertNotIn("--model", argv)
+        self.assertIn(f"It reaches {MODEL} on port 11434", form.lead_info.get_text())
+        self.assertEqual(form.qube_info.get_text(), f"{MODEL} stays the project's model qube.")
+        # Another qube, or none.
+        form.model_qube.set_active_id("ai-hub-model2")
+        self.assertEqual(form.argv()[-2:], ["--model-qube", "ai-hub-model2"])
+        form.model_qube.set_active_id("none")
+        self.assertEqual(form.argv()[-2:], ["--model-qube", "none"])
+        self.assertIn(f"{MODEL} stops being the project's model qube", form.lead_info.get_text())
+        # A remote model takes a lead on a network, and replaces the model qube.
+        form.model_kind["remote"].set_active(True)
+        self.assertTrue(form.lead_netvm.get_sensitive())
+        form.lead_netvm.set_active_id("ai-net-router")
+        self.one_line(form, ok=False)
+        self.assertIn("needs its model endpoint", form.error.get_text())
+        self.assertIn(f"a remote model replaces the project's model qube {MODEL}",
+                      form.lead_info.get_text())
+        form.model.set_text("api.anthropic.com:443")
+        self.assertEqual(form.argv()[-2:], ["--model", "api.anthropic.com:443"])
+        form.model_kind["qube"].set_active(True)
+        form.model_qube.set_active_id("")
+        self.submit(form)
+        p = projects.find(projects.load(), "other")
+        self.assertEqual((p.lead, p.model_qube), ("ai-other-l2", MODEL))
+        self.assertIsNone(self.app.domains["ai-other-l2"].netvm)
+
+    def test_a_model_qube_in_the_tree_and_its_maintenance(self):
+        serve(self.app)
+        self.win.refresh()
+        self.select(f"qube:{MODEL}")
+        details = self.grid(self.win.details)
+        self.assertEqual(details["Role"], "model qube of p01")
+        self.assertTrue(details["Maintenance"].startswith("guarded: the hub cannot operate it"))
+        self.assertEqual(self.sensitive() - {"new_project", "add_to_ai_space"}, {"manage", "revoke"})
+        form = self.win.act("manage")
+        intro = form.intro.get_text()
+        self.assertIn("this opens its maintenance window", intro)
+        self.submit(form)
+        self.select(f"qube:{MODEL}")
+        self.assertEqual(self.grid(self.win.details)["Role"], "model qube of p01, not guarded")
+        self.assertEqual(self.sensitive() - {"new_project", "add_to_ai_space"}, {"guard", "revoke"})
+        self.assertIn(("WARN", "model qubes"), {(r[1], r[2]) for r in self.rows(self.win.check_store)})
+        form = self.win.act("revoke")
+        intro = form.intro.get_text()
+        self.assertIn("It is the model qube of p01: revoking takes its model badges too", intro)
+        form.destroy()
+        form = self.win.act("guard")
+        intro = form.intro.get_text()
+        self.assertIn("its maintenance window closes: if it runs, it is killed", intro)
+        self.assertIn("Its files stay: what the hub left in /home, /usr/local or /rw", intro)
+        self.app.domains[MODEL].start()
+        self.submit(form)
+        self.assertEqual(self.app.domains[MODEL].get_power_state(), "Halted")
+        self.select(f"qube:{MODEL}")
+        self.assertEqual(self.grid(self.win.details)["Role"], "model qube of p01")
+        self.assertNotIn(("WARN", "model qubes"), {(r[1], r[2]) for r in self.rows(self.win.check_store)})
+
+    def test_a_lead_given_a_network_is_sealed_again_from_its_project(self):
+        # What the Needs attention line says to do, done from the window.
+        unseal(self.app)
+        self.win.refresh()
+        self.assertIn("model-qube leads", {r[2] for r in self.rows(self.win.check_store)
+                                           if r[1] == "FAIL"})
+        node = self.win.nodes[f"qube:{OTHER_LEAD}"]
+        self.assertEqual(node.data["attention"], "model_lead")
+        self.assertEqual(self.win.nodes["ref:p02:lead"].cells[1], "lead (see Needs attention)")
+        self.select("project:p02")
+        self.assertEqual(self.sensitive() & {"set_model", "set_rules", "accept_rules",
+                                             "set_model_qube"}, {"set_model_qube"})
+        form = self.win.act("set_model_qube")
+        self.assertEqual(dict((row[1], row[0]) for row in form.model_qube.get_model())[MODEL],
+                         f"{MODEL} (guarded; p02's model qube now)")
+        form.model_qube.set_active_id(MODEL)
+        self.assertEqual(self.red(form), f"{OTHER_LEAD} loses its network (ai-net-router): a lead "
+                                         f"whose model is a qube has none, and going back to a "
+                                         f"remote model takes a new lead.")
+        result = self.submit(form)
+        self.assertIn(f"{OTHER_LEAD} lost its network (ai-net-router)", result.out)
+        self.assertIsNone(self.app.domains[OTHER_LEAD].netvm)
+        self.assertEqual(self.win.nodes[f"qube:{OTHER_LEAD}"].data["role"], "lead")
+        self.assertNotIn("model-qube leads", {r[2] for r in self.rows(self.win.check_store)
+                                              if r[1] == "FAIL"})
+
+    def test_no_qube_to_choose_says_why(self):
+        # A fleet where no qube can be a model qube: the field is empty, and OK
+        # says what one would be, rather than asking for a choice there is none of.
+        by_name = {r["name"]: r for r in self.win.fleet}
+        rows = [r for r in self.win.fleet if gm._model_why(r, by_name, HUB) is not None]
+        self.assertEqual(gm.model_qube_choices(rows, HUB), [])
+        form = self.gui.ProjectForm(self.win, rows, self.win.gateways, HUB)
+        form.label_entry.set_text("sealed")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        form.model_kind["qube"].set_active(True)
+        self.assertEqual(len(form.model_qube.get_model()), 0)
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), gm.NO_MODEL_QUBE)
+        form.destroy()
+        self.select("project:p01")
+        form = self.gui.ModelQubeForm(self.win, self.win.fw_pane.doc, None, rows, HUB)
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), gm.NO_MODEL_QUBE)
+        form.destroy()
+
+    def test_model_qube_text_on_screen_is_escaped(self):
+        a = self.app
+        a.vm("ai-x" + chr(0x202E) + "m", template=a.domains["debian-13"], tags={"ai-managed"})
+        a.vm(HOSTILE, tags={"ai-managed", "qmcp-guarded", "qmcp-model-p01"})
+        self.win.refresh()
+        for row in self.rows(self.win.store):
+            for cell in row[1:]:
+                self.assertTrue(cell.isascii() and chr(10) not in cell, cell)
+        self.select("project:p01")
+        form = self.win.act("set_model_qube")
+        texts = [row[0] for row in form.model_qube.get_model()]
+        self.assertTrue(any(chr(92) + "u202e" in t for t in texts), texts)
+        form.model_qube.set_active_id("ai-x" + chr(0x202E) + "m")
+        for label in (form.info, form.warning, form.preview, form.error):
+            self.assertTrue(label.get_text().replace(chr(10), "").isascii(), label.get_text())
+        self.assertFalse(form.ok.get_sensitive())               # no such name reaches the command
+        form.destroy()
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,
