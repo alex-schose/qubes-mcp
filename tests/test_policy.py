@@ -133,6 +133,15 @@ FLEET["model-p01-open"] = _dom(tags=[AI, "qmcp-model-p01"])
 FLEET["model-p01-outside"] = _dom(tags=["qmcp-model-p01"])
 FLEET["sink-model-p01"] = _dom(tags=["ai-dump", "qmcp-dump-p01", "qmcp-model-p01"])
 FLEET["lead-p03-model-p01"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p03", "qmcp-model-p01"])
+# Anonymous projects (M3c): a member the gate stopped, and qubes of a hidden
+# project, its lead included.
+FLEET["w-p01-blocked"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-anon", "qmcp-blocked"])
+FLEET["lead-p06-blocked"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p06", "qmcp-anon",
+                                       "qmcp-blocked"])
+FLEET["w-p05-hidden"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubblind"])
+FLEET["lead-p07-hidden"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p07", "qmcp-anon",
+                                      "qmcp-hubblind"])
+FLEET["sink-p07-hidden"] = _dom(tags=["ai-dump", "qmcp-dump-p07", "qmcp-hubblind"])
 SYSINFO = {"domains": FLEET}
 
 
@@ -275,6 +284,38 @@ def _cases() -> list[Case]:
         add("hub ux ask", svc, HUB, "personal", "ask", "ask")
     add("hub raw dispvm exec", "qubes.VMShell", HUB, "@dispvm", "deny", "deny")
     add("hub dispvm of ai template", "qubes.OpenInVM", HUB, "@dispvm:ai-dvm", "deny", "deny")
+
+    # --- anonymous projects: nothing reaches a stopped qube, the hub no hidden one
+    for svc, lead_out in (("qmcp.RunInAIManaged", "allow user=root"),
+                          ("qmcp.CopyToAIManaged", "allow user=root"),
+                          ("admin.vm.firewall.Set", "allow target=@adminvm"),
+                          ("qubes.Filecopy", "allow")):
+        add("lead into its stopped member", svc, "lead-p01", "w-p01-blocked", "deny", "deny")
+        add("hub into a stopped member", svc, HUB, "w-p01-blocked", "deny", "deny")
+        add("hub into a hidden member", svc, HUB, "w-p05-hidden", "deny", "deny")
+        add("hub into a hidden lead", svc, HUB, "lead-p07-hidden", "deny", "deny")
+        # The hidden badge keeps out the hub only: a lead runs its hidden project.
+        add("lead into its hidden member", svc, "lead-p05", "w-p05-hidden", lead_out, lead_out)
+    add("member copy into a stopped member", "qubes.Filecopy", "w-p01-a", "w-p01-blocked",
+        "deny", "deny")
+    add("hub reads a stopped qube's firewall", "admin.vm.firewall.Get", HUB, "w-p01-blocked",
+        "deny", "deny")
+    add("hub reads a hidden qube's firewall", "admin.vm.firewall.Get", HUB, "w-p05-hidden",
+        "deny", "deny")
+    add("hub exec into a stopped lead", "qmcp.RunInAIManaged", HUB, "lead-p06-blocked",
+        "deny", "deny")
+    add("a stopped lead reaches dom0 (the services refuse it)", "qmcp.ListAIManagedQubes",
+        "lead-p06-blocked", "dom0", "allow", "allow")
+    for svc in ("qubes.Filecopy", "qubes.OpenInVM", "qubes.OpenURL", "qubes.ClipboardPaste"):
+        add("hub dialog into a hidden qube", svc, HUB, "w-p05-hidden", "deny", "deny")
+        add("hub dialog into a hidden sink", svc, HUB, "sink-p07-hidden", "deny", "deny")
+    add("hidden member copies to its sink", "qubes.Filecopy", "w-p05-hidden", "sink-p05",
+        "allow", "allow")
+    # An anonymous qube opens nothing elsewhere, not even through a dialog.
+    for svc in ("qubes.OpenURL", "qubes.OpenInVM"):
+        for tgt in ("personal", "@default", "@dispvm:default-dvm", "w-p05-hidden"):
+            add("anonymous qube opens elsewhere", svc, "w-p05-hidden", tgt, "deny", "deny")
+        add("an ordinary member's dialog stays", svc, "w-p05-a", "personal", "ask", "allow")
 
     # --- AI -> dom0: boot services only
     for svc in BOOT_SERVICES:
@@ -513,7 +554,9 @@ class PolicyShape(unittest.TestCase):
                     | {f"@tag:qmcp-proj-{s}" for s in SLOTS})
 
     def test_sources_are_ours(self):
-        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump"} | self.SLOT_SOURCES
+        # `@tag:qmcp-anon` only denies (A0): the next test holds every allow to a principal.
+        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump", "@tag:qmcp-anon"} \
+            | self.SLOT_SOURCES
         bad = [(n, l) for n, l in self.lines if l.split()[2] not in allowed]
         self.assertEqual(bad, [])
 

@@ -21,7 +21,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, birth, budget, core, fleet, gateways, projects, proposals, services  # noqa: E402
+from qmcp import anon, audit, birth, budget, core, fleet, gateways, projects, proposals, services  # noqa: E402
 import fakequbes  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
@@ -53,6 +53,8 @@ class Base(unittest.TestCase):
             (proposals, "PROPOSALS_DIR", self.tmp / "proposals"),
             (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
             (proposals, "BUS_DIR", self.tmp / "no-session"),
+            (anon, "LOCK_PATH", self.tmp / "run" / "gate.lock"),
+            (anon, "HEARTBEAT_PATH", self.tmp / "run" / "gate.last"),
             # The files the fixtures make are this user's group, as tmpfiles makes
             # them the services' group on a real dom0.
             (fleet, "SERVICES_GROUP", grp.getgrgid(os.getegid()).gr_name),
@@ -68,6 +70,9 @@ class Base(unittest.TestCase):
         # As the installer and tmpfiles leave it: present, group-writable.
         (self.tmp / "audit.log").touch(mode=0o660)
         os.chmod(self.tmp / "audit.log", 0o660)
+        for f in ("gate.lock", "gate.last"):        # tmpfiles declares both
+            (self.tmp / "run" / f).touch(mode=0o660)
+            os.chmod(self.tmp / "run" / f, 0o660)
         (self.tmp / "hub").write_text(HUB + "\n")
         (self.tmp / "pool-cap").write_text(str(1000 * GiB) + "\n")
         (self.tmp / "private-cap").write_text(str(20 * GiB) + "\n")
@@ -801,11 +806,17 @@ class AuditFindings(Base):
             ("qmcp.SpawnAIManagedQube", lambda n: {"name": "ai-hub-oracle", "template": n}),
             ("qmcp.AIManagedEvents", lambda n: {"duration": 1, "qube": n}),
         ]
+        # A qube of a hidden anonymous project is the hub's to see no more than
+        # one outside AI space, and costs the same.
+        self.app.vm("ai-hid-w1", tags={"ai-managed", "qmcp-proj-p05", "qmcp-anon",
+                                       "qmcp-hubblind"})
         for svc, make in cases:
             missing = self.trace(svc, make("no-such-qube"))
             outside = self.trace(svc, make("personal"))
+            hidden = self.trace(svc, make("ai-hid-w1"))
             self.assertEqual(missing, outside, svc)
-            self.assertEqual(missing[1], ["admin.vm.tag.Get"], svc)
+            self.assertEqual(missing, hidden, svc)
+            self.assertEqual(missing[1], ["admin.vm.tag.List"], svc)
             self.assertEqual(missing[2], 0, svc)
 
     def test_explicit_netvm_is_checked_by_name(self):

@@ -16,8 +16,20 @@ in two places, and the two must agree:
   templates, the worker networks, the disk quota, the dump sink's name, and,
   once set, the lead's model: a remote endpoint (`model`) or a self-hosted model
   qube (`model_qube`), never both; and the firewall the operator accepted for
-  the lead (`lead_firewall`). Those keys are written only when set, so a record
-  without them stays in the format of 0.9.18 to 0.9.20.
+  the lead (`lead_firewall`); and, for an anonymous project (0.9.23), `anonymous`,
+  `hidden` when the hub may not see it, and the operator's private `note`. Those
+  keys are written only when set, so a record without them stays in the format
+  of 0.9.18 to 0.9.20.
+
+Four more badges carry an anonymous project (0.9.23): `qmcp-anon` on its lead
+and every member (the anonymity gate watches it, `qmcp.anon`),
+`qmcp-hubblind` on every qube of a hidden one (the rulebook keeps the hub out,
+and the services leave it out of the hub's reads), `qmcp-blocked`, which the
+gate puts on the lead and members of a project it stopped (the rulebook
+refuses every call into it), and `qmcp-stopped` on each of those it knows to
+be down. An anonymous project's label is random, picked by dom0, so a name an agent
+leaks links to nothing; the operator tells projects apart by the note, which
+only the window and the `qmcp` command show.
 
 The record file is root-owned. The operator's `qmcp project` commands write
 it, under a lock and by atomic rename (the installer writes it empty); the
@@ -57,6 +69,15 @@ LEAD_PREFIX = "qmcp-lead-"
 DUMP_PREFIX = "qmcp-dump-"
 MODEL_PREFIX = "qmcp-model-"
 DROP_BOX = "ai-dump"
+#: An anonymous project's lead and members (the gate watches them).
+ANON = "qmcp-anon"
+#: Every qube of a hidden anonymous project: the hub may not reach or see it.
+HUBBLIND = "qmcp-hubblind"
+#: A qube the anonymity gate stopped: the rulebook refuses every call into it.
+BLOCKED = "qmcp-blocked"
+#: A blocked qube the gate stopped for a violation and knows to be down: one
+#: running again was started by the operator, by hand, and the gate leaves it.
+STOPPED = "qmcp-stopped"
 #: The port a lead reaches its slot's model qube on (the rulebook's A6 lines).
 MODEL_PORT = 11434
 
@@ -69,6 +90,10 @@ HUB_LABEL = "hub"
 RESERVED_LABELS = frozenset({"none", HUB_LABEL})
 _QUBE_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 
+#: A random label is this long: 36^7 names after its first letter.
+RANDOM_LABEL_LEN = 8
+MAX_NOTE = 80
+_NOTE_RE = re.compile(r"\A[\x20-\x7e]{1,%d}\Z" % MAX_NOTE)
 MAX_TEMPLATES = 16
 MAX_NETWORKS = 8
 #: A quota past any disk (1 EiB): bigger numbers would only overflow arithmetic.
@@ -133,14 +158,37 @@ def valid_qube_name(name) -> bool:
     return isinstance(name, str) and _QUBE_RE.match(name) is not None
 
 
+def note_refusal(note) -> str | None:
+    """None if `note` may be an anonymous project's private note, else why not.
+    Printable ASCII, so no line break or bidi control ever reaches the window."""
+    if not isinstance(note, str) or not _NOTE_RE.match(note):
+        return f"a note is 1-{MAX_NOTE} printable ASCII characters"
+    return None
+
+
+def random_label(taken, prefix: str = "ai-") -> str:
+    """A label no project has, for an anonymous project: a letter, then
+    lowercase letters and digits, so its dump sink `<label>-dump` is a qube
+    name, and never one that starts with the reserved name prefix."""
+    import secrets
+    first, rest = "abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz0123456789"
+    while True:
+        label = secrets.choice(first) + "".join(secrets.choice(rest)
+                                                for _ in range(RANDOM_LABEL_LEN - 1))
+        if label not in taken and label_refusal(label) is None \
+                and not f"{label}-dump".startswith(prefix):
+            return label
+
+
 class Project:
     """One slot's record. p00 carries only `dump`."""
 
     __slots__ = ("slot", "label", "lead", "templates", "networks", "quota", "dump",
-                 "model", "lead_firewall", "model_qube")
+                 "model", "lead_firewall", "model_qube", "anonymous", "hidden", "note")
 
     def __init__(self, slot, label=None, lead=None, templates=(), networks=(), quota=None,
-                 dump=None, model=None, lead_firewall=None, model_qube=None):
+                 dump=None, model=None, lead_firewall=None, model_qube=None,
+                 anonymous=False, hidden=False, note=None):
         self.slot, self.label, self.lead = slot, label, lead
         self.templates = tuple(templates)
         self.networks = tuple(networks)
@@ -148,6 +196,15 @@ class Project:
         self.model = model
         self.lead_firewall = None if lead_firewall is None else tuple(lead_firewall)
         self.model_qube = model_qube
+        self.anonymous = bool(anonymous)
+        self.hidden = bool(anonymous and hidden)
+        self.note = note
+
+    def badges(self) -> set:
+        """The badges every lead and member of this project wears besides its
+        slot badges: `qmcp-anon` for an anonymous one, and `qmcp-hubblind` for
+        a hidden one."""
+        return ({ANON} if self.anonymous else set()) | ({HUBBLIND} if self.hidden else set())
 
     def space(self, prefix: str) -> str:
         """The project's name space, e.g. `ai-osint-`."""
@@ -167,6 +224,12 @@ class Project:
             out["lead_firewall"] = list(self.lead_firewall)
         if self.model_qube is not None:
             out["model_qube"] = self.model_qube
+        if self.anonymous:
+            out["anonymous"] = True
+        if self.hidden:
+            out["hidden"] = True
+        if self.note is not None:
+            out["note"] = self.note
         return out
 
     def __repr__(self):
@@ -189,7 +252,7 @@ def _validate_slot(slot: str, entry) -> Project:
             raise _bad(f"{slot}: bad dump")
         return Project(slot, dump=dump)
     want = {"label", "lead", "templates", "networks", "quota", "dump"}
-    optional = {"model", "lead_firewall", "model_qube"}
+    optional = {"model", "lead_firewall", "model_qube", "anonymous", "hidden", "note"}
     if not want <= set(entry) <= want | optional:
         raise _bad(f"{slot}: keys must be {sorted(want)}, and optionally {sorted(optional)}")
     label = entry["label"]
@@ -229,8 +292,16 @@ def _validate_slot(slot: str, entry) -> Project:
         raise _bad(f"{slot}: bad model_qube")
     if model is not None and model_qube is not None:
         raise _bad(f"{slot}: a lead's model is an endpoint or a model qube, not both")
+    # Written only when true, so a present key is never false.
+    anonymous, hidden, note = entry.get("anonymous"), entry.get("hidden"), entry.get("note")
+    if anonymous is not None and anonymous is not True:
+        raise _bad(f"{slot}: anonymous is true, or absent")
+    if hidden is not None and (hidden is not True or anonymous is not True):
+        raise _bad(f"{slot}: hidden is true, and only on an anonymous project")
+    if note is not None and (anonymous is not True or note_refusal(note)):
+        raise _bad(f"{slot}: note is 1-{MAX_NOTE} printable characters, on an anonymous project")
     return Project(slot, label, lead, templates, networks, quota, dump, model, lead_firewall,
-                   model_qube)
+                   model_qube, anonymous is True, hidden is True, note)
 
 
 def parse(text: str) -> dict:

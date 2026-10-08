@@ -23,7 +23,9 @@
 # qmcp-lead-pNN and no member badge; a slot's optional dump sink wears ai-dump
 # and qmcp-dump-pNN and is never in AI space; a slot's self-hosted model qube,
 # guarded and never a member, wears qmcp-model-pNN (one per slot it serves).
-# Only dom0 writes these badges.
+# An anonymous project's lead and members also wear qmcp-anon; every qube of a
+# hidden one wears qmcp-hubblind; the anonymity gate adds qmcp-blocked to a
+# project it stopped. Only dom0 writes these badges.
 #
 # First match wins, across every file in /etc/qubes/policy.d/ in name order.
 # Order inside this file: A hard denies (with the leads' model lines, which
@@ -37,6 +39,18 @@
 # =========================================================================
 # A. HARD DENIES, AND THE LEADS' MODEL LINES ABOVE THE GUARDED DENY
 # =========================================================================
+
+# A0. Anonymous projects. A qube the anonymity gate stopped wears qmcp-blocked:
+# nothing reaches it, by any service, so qrexec can never wake it; the operator
+# may still start it from dom0, which no rule here governs. Every qube of a
+# hidden anonymous project wears qmcp-hubblind, and the hub reaches none of
+# them, by any service. These sit above every allow in this file.
+*                          *  @anyvm           @tag:qmcp-blocked        deny
+*                          *  mcp-control      @tag:qmcp-hubblind       deny
+# An anonymous project's qubes open nothing in another qube, not even through a
+# dialog: a URL or a file opened in a clearnet qube leaves outside its router.
+qubes.OpenURL              *  @tag:qmcp-anon   @anyvm                   deny
+qubes.OpenInVM             *  @tag:qmcp-anon   @anyvm                   deny
 
 # A1. Disposables: Qubes' raw @dispvm shortcut is closed for AI space.
 # A `@dispvm` rule target matches only the bare keyword. The second line works

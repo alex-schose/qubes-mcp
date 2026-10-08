@@ -4,7 +4,7 @@
 Run it IN the hub qube, from the public tree:
 
     PYTHONPATH=. python3 tests/redteam_suite.py --inside <managed qube> [--peer QUBE]
-        [--lead LEAD] [--model-qube QUBE]
+        [--lead LEAD] [--model-qube QUBE] [--hidden QUBE ... --visible QUBE]
 
 Two vantage points:
 
@@ -24,8 +24,10 @@ import concurrent.futures
 import json
 import os
 import shlex
+import statistics
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from qubes_mcp import tools  # noqa: E402
@@ -68,6 +70,58 @@ def refused_raw(name, target, service, payload=b""):
 def call(tool, **args):
     t = tools.TOOLS[tool]
     return t.handler(tools.validate_arguments(t, args))
+
+
+#: How far apart a hidden qube's answer and a missing name's may be, end to end.
+TIMING_SAMPLES = 40
+TIMING_SLACK_MS = 5.0
+TIMING_SLACK = 0.15
+
+
+def _ms(target_name: str) -> float:
+    req = json.dumps({"name": target_name, "property": "memory"}).encode()
+    t0 = time.monotonic()
+    raw("@adminvm", "qmcp.GetPropertyAIManaged", req)
+    return (time.monotonic() - t0) * 1000
+
+
+def hidden_from_hub(hidden, visible):
+    """A hidden anonymous project's qubes are not the hub's: not listed, not
+    read, not reached by any service, and answered like a missing name at the
+    cost of one. Each probe has a positive control on a visible qube."""
+    print("== the hub against hidden anonymous qubes")
+    list_rc, out = raw("@adminvm", "qmcp.ListAIManagedQubes")
+    listed = {q["name"] for q in json.loads(out or b"{}").get("qubes", [])} if list_rc == 0 else set()
+    check("CONTROL: the hub's list answers", list_rc == 0 and bool(listed), f"rc={list_rc}")
+    if visible:
+        check("CONTROL: a visible anonymous qube is listed", visible in listed)
+        req = json.dumps({"name": visible, "property": "memory"}).encode()
+        rc, out = raw("@adminvm", "qmcp.GetPropertyAIManaged", req)
+        check("CONTROL: a visible anonymous qube is read", b'"ok": true' in out, f"{out[:120]!r}")
+        rc, out = raw(visible, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
+        check("CONTROL: the hub runs a command in a visible anonymous qube", rc == 0, f"rc={rc}")
+    else:
+        not_run("CONTROL: a visible anonymous qube", "name one with --visible QUBE")
+    for name in hidden:
+        check(f"a hidden qube is not listed ({name})", list_rc == 0 and name not in listed)
+        req = json.dumps({"name": name, "property": "memory"}).encode()
+        rc, out = raw("@adminvm", "qmcp.GetPropertyAIManaged", req)
+        check(f"a hidden qube reads as a missing name ({name})",
+              out.strip() == b'{"ok": false, "error": "not found"}', f"{out[:120]!r}")
+        refused_raw(f"exec into a hidden qube ({name})", name, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
+        refused_raw(f"copy into a hidden qube, no dialog ({name})", name, "qubes.Filecopy")
+        refused_raw(f"read a hidden qube's firewall ({name})", name, "admin.vm.firewall.Get")
+    if hidden:
+        # Measured at the boundary the hub sees: the whole qrexec call.
+        missing = [_ms("ai-hub-no-such-qube") for _ in range(TIMING_SAMPLES)]
+        secret = [_ms(hidden[0]) for _ in range(TIMING_SAMPLES)]
+        outside = [_ms(OUTSIDE_QUBE) for _ in range(TIMING_SAMPLES)]
+        m, h, o = (statistics.median(x) for x in (missing, secret, outside))
+        gap = abs(h - m)
+        print(f"   timing, median of {TIMING_SAMPLES}: missing {m:.1f} ms, hidden {h:.1f} ms, "
+              f"outside AI space {o:.1f} ms")
+        check("a hidden qube answers in the time a missing name does",
+              gap <= max(TIMING_SLACK_MS, TIMING_SLACK * m), f"{gap:.1f} ms apart")
 
 
 def from_hub(inside, lead=None, model=None):
@@ -193,13 +247,17 @@ def from_inside(inside, peer, model=None):
 def main() -> int:
     if "--inside" not in sys.argv:
         print("usage: redteam_suite.py --inside <managed qube> [--peer <managed qube>] [--lead LEAD] "
-              "[--model-qube QUBE]")
+              "[--model-qube QUBE] [--hidden QUBE ... --visible QUBE]")
         return 2
     inside = sys.argv[sys.argv.index("--inside") + 1]
     peer = sys.argv[sys.argv.index("--peer") + 1] if "--peer" in sys.argv else inside
     lead = sys.argv[sys.argv.index("--lead") + 1] if "--lead" in sys.argv else None
     model = sys.argv[sys.argv.index("--model-qube") + 1] if "--model-qube" in sys.argv else None
+    hidden = [sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--hidden"]
+    visible = sys.argv[sys.argv.index("--visible") + 1] if "--visible" in sys.argv else None
     from_hub(inside, lead, model)
+    if hidden or visible:
+        hidden_from_hub(hidden, visible)
     r = call("qubes_start", name=inside)
     from_inside(inside, peer, model)
     fails = [x for x in results if x[0] == "FAIL"]

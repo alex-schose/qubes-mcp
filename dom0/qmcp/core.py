@@ -67,6 +67,7 @@ _QUBE_NAME_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 
 NOT_FOUND = {"ok": False, "error": "not found"}
 GUARDED_REFUSAL = {"ok": False, "error": "guarded: reference only"}
+BLOCKED_REFUSAL = {"ok": False, "error": "stopped by the anonymity gate"}
 NOT_AUTHORIZED = {"ok": False, "error": "caller is not a qmcp principal"}
 
 
@@ -145,9 +146,12 @@ class Principal:
 
 def lead_badges_agree(tags, slot: str) -> bool:
     """A lead wears the umbrella, `qmcp-lead` and exactly its own slot's lead
-    badge, no member badge and no model badge, and is not guarded."""
+    badge, no member badge and no model badge, and is not guarded. A lead the
+    anonymity gate stopped (`qmcp-blocked`) is no principal: the operator may
+    start it by hand to look at it, and it acts on nothing."""
     tags = set(tags)
     return (UMBRELLA in tags and projects.LEAD in tags and GUARDED not in tags
+            and projects.BLOCKED not in tags
             and projects.lead_slots(tags) == {slot} and not projects.member_slots(tags)
             and not projects.model_slots(tags))
 
@@ -312,6 +316,18 @@ def template_of(vm):
         raise Unreadable(f"cannot read the template of {name_of(vm)}") from None
 
 
+def netvm_of(vm):
+    """The qube's network's name, or None for none (dom0 and a RemoteVM have no
+    network). Raises `Unreadable`: a failed read is never "no network"."""
+    if klass_of(vm) in NO_NETWORK_CLASSES:
+        return None
+    try:
+        ref = vm.netvm
+    except Exception:
+        raise Unreadable(f"cannot read the network of {name_of(vm)}") from None
+    return None if ref is None else str(getattr(ref, "name", ref))
+
+
 def default_dispvm_of(vm):
     """The qube's default disposable template, or None. Every local class has
     the property, so a failed read is never an absence: it raises
@@ -355,35 +371,45 @@ def lookup(app, name):
         return None
 
 
-def in_ai_space_by_name(app, name) -> bool:
-    """Is the qube called `name` in AI space? One qubesd round trip either way.
+def in_ai_space_by_name(app, name, hub: bool = False) -> bool:
+    """Is the qube called `name` in AI space (and, for the hub, not hidden
+    from it)? One qubesd round trip either way.
 
     A qube outside AI space must cost exactly what a missing one costs, or the
     response time says which names exist. Answering a missing
     name from the domain list and an existing one with a tag read was measured
     on 2026-10-01 at ~0.7 ms apart. `admin.vm.tag.Get` answers "1"/"0" for a
-    qube and fails for a missing one, after the same single call.
+    qube and fails for a missing one, after the same single call. For the hub
+    the one call is `admin.vm.tag.List`, so a qube of a hidden anonymous project
+    (`qmcp-hubblind`) costs what a missing one costs too.
     """
     if not valid_qube_name(name):
         return False
     try:
+        if hub:
+            tags = set(app.qubesd_call(name, "admin.vm.tag.List").decode(errors="replace").split())
+            return UMBRELLA in tags and projects.HUBBLIND not in tags
         return app.qubesd_call(name, "admin.vm.tag.Get", UMBRELLA).strip() == b"1"
     except Exception:
         return False
 
 
-def _resolve(app, name, refusal: "Refusal"):
-    """The VM object for `name`, which must be in AI space, else `refusal`.
+def _resolve(app, name, refusal: "Refusal", hub: bool = False):
+    """The VM object for `name`, which must be in AI space, else `refusal`;
+    for the hub, not of a hidden anonymous project either.
 
     The by-name check decides; the object is fetched only for a qube already
     known to be in AI space, and re-checked, since its tags may have changed
     in between.
     """
-    if not in_ai_space_by_name(app, name):
+    if not in_ai_space_by_name(app, name, hub):
         raise refusal
     vm = lookup(app, name)
     try:
-        if vm is None or not in_scope(vm):
+        if vm is None:
+            raise refusal
+        tags = tags_of(vm)
+        if UMBRELLA not in tags or (hub and projects.HUBBLIND in tags):
             raise refusal
     except Unreadable:
         raise refusal from None
@@ -438,7 +464,8 @@ def visible(vm, who: "Principal | None", tags=None) -> bool:
     if UMBRELLA not in tags:
         return False
     if who is None or who.is_hub():
-        return True
+        # A hidden anonymous project is not the hub's to see, nor any reference to it.
+        return projects.HUBBLIND not in tags
     p = who.project
     name = name_of(vm)
     return (projects.member_badge(p.slot) in tags and projects.LEAD not in tags) \
@@ -454,15 +481,23 @@ def operand(app, name, who: Principal):
     hub is never in AI space and a lead is never a member, so that refusal
     fires only on a misconfigured fleet, which `qmcp check` reports. A guarded
     qube gets its own refusal: it is already visible in the list, so saying
-    why costs nothing.
+    why costs nothing. So does a qube the anonymity gate stopped
+    (`qmcp-blocked`): no service starts, changes or clones one, as the rulebook
+    lets nothing reach one; only the operator starts one, by hand.
     """
     if who.is_hub():
-        vm = _resolve(app, name, Refusal(NOT_FOUND))
+        vm = _resolve(app, name, Refusal(NOT_FOUND), hub=True)
     else:
         vm = _resolve_member(app, name, who.slot, Refusal(NOT_FOUND))
     if name == who.name:
         raise Refusal(NOT_FOUND)
-    if is_guarded(vm):
+    try:
+        tags = tags_of(vm)
+    except Unreadable:
+        raise Refusal(GUARDED_REFUSAL) from None
+    if projects.BLOCKED in tags:
+        raise Refusal(BLOCKED_REFUSAL)
+    if is_guarded(vm, tags):
         raise Refusal(GUARDED_REFUSAL)
     return vm
 
@@ -472,7 +507,7 @@ def readable(app, name, who: Principal):
     member, or one of its approved templates or worker networks (names it
     already knows, so looking them up reveals nothing)."""
     if who.is_hub():
-        return _resolve(app, name, Refusal(NOT_FOUND))
+        return _resolve(app, name, Refusal(NOT_FOUND), hub=True)
     p = who.project
     if name in p.templates or name in p.named_networks():
         return _resolve(app, name, Refusal(NOT_FOUND))
@@ -489,7 +524,8 @@ def reference(app, name, what: str, who: Principal):
     """
     if not who.is_hub() and name not in who.project.templates:
         raise refuse(f"{what} is not on this project's approved list")
-    return _resolve(app, name, refuse(f"{what} must reference an ai-managed qube"))
+    return _resolve(app, name, refuse(f"{what} must reference an ai-managed qube"),
+                    hub=who.is_hub())
 
 
 # ------------------------------------------------------------------ the funnel

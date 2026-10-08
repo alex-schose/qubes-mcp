@@ -1251,6 +1251,11 @@ PAYLOAD_CASES = [
         # with a quota in bytes. ProposalContractTests runs each of these
         # through dom0's own normalise().
         ("qubes_propose_project", "project-create", MINIMAL_PROPOSALS["qubes_propose_project"]),
+        # An anonymous one: no label, a lead from a template; dom0 picks the label.
+        ("qubes_propose_project", "project-create", {
+            "title": "Anonymous research", "anonymous": True, "hub_sees": True,
+            "lead": {"from": "template", "qube": "ai-tpl-g"}, "lead_netvm": "ai-tor",
+            "model": "api.example.org:443", "networks": ["ai-tor"], "quota": 1024 ** 3}),
         ("qubes_propose_project", "project-create", {
             "title": "OSINT scraping", "label": "osint",
             "lead": {"from": "clone", "qube": "ai-agent"}, "lead_name": "ai-osint-boss",

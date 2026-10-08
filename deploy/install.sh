@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.21.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.23.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -22,6 +22,8 @@
 #   --birth-egress QUBE  written to /etc/qmcp/birth-egress if that file is absent
 #   --pool-cap BYTES     written to /etc/qmcp/pool-cap if absent (default 50 GiB)
 #   --private-cap BYTES  written to /etc/qmcp/private-cap if absent (default 10 GiB)
+#   --gate-user NAME     the dom0 user the anonymity gate's timer runs as (default: the
+#                        user who ran this with sudo, else the qubes group's one member)
 #   --dry-run            run every check, change nothing
 #
 # What it installs:
@@ -41,6 +43,9 @@
 #   /etc/qmcp/{hub,pool-cap,private-cap,birth-egress}   only when absent
 #   /etc/qmcp/projects.json          the project records, empty, only when absent;
 #                                    `qmcp project` writes it (as root)
+#   /etc/systemd/system/qmcp-gate.{service,timer}   the anonymity gate every 15 s, as the
+#                                    dom0 user the services run as (never root: it notifies
+#                                    the operator's desktop), enabled and started
 # It changes no qube's tags: managed qubes from an older release stay in no
 # project slot until `qmcp project move` puts them in one.
 # It removes everything v0.9.16 installed that this release no longer has, and
@@ -62,9 +67,11 @@ BIRTH_EGRESS=""
 POOL_CAP=$((50 * 1024 * 1024 * 1024))
 PRIVATE_CAP=$((10 * 1024 * 1024 * 1024))
 DRY_RUN=0
+GATE_USER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
+        --gate-user) GATE_USER="$2"; shift 2 ;;
         --birth-egress) BIRTH_EGRESS="$2"; shift 2 ;;
         --pool-cap) POOL_CAP="$2"; shift 2 ;;
         --private-cap) PRIVATE_CAP="$2"; shift 2 ;;
@@ -95,7 +102,8 @@ say() { echo "==> $*"; }
 for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py \
          dom0/qmcp/proposals.py dom0/qmcp/gateways.py dom0/qmcp/firewall.py dom0/rpc/qmcp-service \
          dom0/bin/qmcp policy/30-mcp-control.policy deploy/qmcp-tmpfiles.conf pyproject.toml \
-         dom0/qmcp/gui.py dom0/qmcp/guimodel.py dom0/bin/qmcp-gui deploy/qubes-mcp.desktop; do
+         dom0/qmcp/gui.py dom0/qmcp/guimodel.py dom0/bin/qmcp-gui deploy/qubes-mcp.desktop \
+         dom0/qmcp/anon.py deploy/qmcp-gate.service deploy/qmcp-gate.timer; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
 done
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/pyproject.toml")"
@@ -103,7 +111,7 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/pyproject.toml")"
 # An empty or truncated pull passes "parses clean", so check for a known rule.
 grep -qE '^\*[[:space:]]+\*[[:space:]]+mcp-control[[:space:]]+@anyvm[[:space:]]+deny' \
     "$SRC/policy/30-mcp-control.policy" || die "the staged policy is not the qubes-mcp rulebook"
-PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel, qmcp.proposals' \
+PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel, qmcp.proposals, qmcp.anon' \
     || die "the staged library does not import"
 
 # The hub: fixed at the first install. Read with the same function the services
@@ -119,6 +127,22 @@ fi
 HUB="${HUB:-mcp-control}"
 [[ "$HUB" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,30}$ ]] || die "'$HUB' is not a qube name"
 qvm-check -q "$HUB" 2>/dev/null || die "the hub qube '$HUB' does not exist"
+
+# The anonymity gate's user: the one who ran this with sudo, else the qubes
+# group's one member. Never root: the gate notifies the operator's desktop,
+# whose bus refuses root. It must be in `qubes`, as the services' user is.
+if [ -z "$GATE_USER" ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
+    GATE_USER="$SUDO_USER"
+fi
+if [ -z "$GATE_USER" ]; then
+    MEMBERS="$(getent group qubes | cut -d: -f4 | tr ',' '\n' | grep -v -e '^$' -e '^root$' || true)"
+    [ "$(printf '%s\n' "$MEMBERS" | grep -c .)" -eq 1 ] \
+        || die "say which dom0 user the anonymity gate runs as: --gate-user NAME (a member of qubes)"
+    GATE_USER="$MEMBERS"
+fi
+[[ "$GATE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "'$GATE_USER' is not a user name"
+[ "$(id -u "$GATE_USER" 2>/dev/null || echo 0)" -ne 0 ] || die "the gate's user '$GATE_USER' does not exist, or is root"
+id -nG "$GATE_USER" | tr ' ' '\n' | grep -qx qubes || die "the gate's user '$GATE_USER' is not in the qubes group"
 
 # The values written to /etc/qmcp. Checked here, so a typo stops the install
 # instead of surfacing as a failed `qmcp check` once the new policy is live.
@@ -216,7 +240,7 @@ finally:
 PYEOF
 [ "$POLICY_STATUS" -eq 0 ] || die "the rendered policy does not load on this box, or a file sorting earlier overrides it; nothing was changed"
 
-say "preflight passed: qubes-mcp $VERSION, hub '$HUB'"
+say "preflight passed: qubes-mcp $VERSION, hub '$HUB', gate user '$GATE_USER'"
 if [ "$DRY_RUN" -eq 1 ]; then
     say "dry run: nothing was changed"
     exit 0
@@ -232,6 +256,9 @@ for f in "$RPC"/qmcp.* "$RPC"/qmcp_*.py; do [ -e "$f" ] && cp -a "$f" "$BACKUP/"
 [ -d "$ETC_QMCP" ] && cp -a "$ETC_QMCP" "$BACKUP/etc-qmcp"
 [ -d "$LIB" ] && cp -a "$LIB" "$BACKUP/usr-local-lib-qmcp"
 [ -f /etc/tmpfiles.d/qmcp.conf ] && cp -a /etc/tmpfiles.d/qmcp.conf "$BACKUP/"
+for f in /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer; do
+    [ -f "$f" ] && cp -a "$f" "$BACKUP/"
+done
 say "backed up to $BACKUP (root-only)"
 
 # --- v0.9.16 leftovers
@@ -297,6 +324,15 @@ chown root:root "$ETC_QMCP/projects.json"
 touch "$AUDIT_LOG"
 chown root:qubes "$AUDIT_LOG"
 chmod 0660 "$AUDIT_LOG"
+
+# --- the anonymity gate's timer, as the services' user
+sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-gate.service" > "$SCRATCH/qmcp-gate.service"
+grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-gate.service" || die "the gate's unit did not render"
+install -m 0644 "$SCRATCH/qmcp-gate.service" /etc/systemd/system/qmcp-gate.service
+install -m 0644 "$SRC/deploy/qmcp-gate.timer" /etc/systemd/system/qmcp-gate.timer
+systemctl daemon-reload
+systemctl enable --now qmcp-gate.timer >/dev/null
+say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 
 # --- the policy, last: until it is in place no AI caller reaches the new code
 install -m 0644 -o root -g root "$RENDERED" "$POLICY_DST"

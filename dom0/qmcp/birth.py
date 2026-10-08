@@ -142,24 +142,37 @@ def is_restriction(tag: str) -> bool:
     return tag in RESTRICTION_TAGS
 
 
-def expected_tags(source_tags, principal: str, slot_badge: str | None = None) -> set:
-    want = {UMBRELLA, owner_tag(principal)}
+def expected_tags(source_tags, principal: str, slot_badge: str | None = None,
+                  extra=()) -> set:
+    want = {UMBRELLA, owner_tag(principal)} | set(extra)
     if slot_badge is not None:
         want.add(slot_badge)
     want |= {t for t in set(source_tags) if is_restriction(t)}
     return want
 
 
-def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None) -> set:
+#: Badges that take authority away, which a child gets before anything else:
+#: `qmcp-hubblind` before `ai-managed`, so no moment of a hidden project's new
+#: qube is open to the hub's AI-space lines.
+FIRST = ("qmcp-blocked", "qmcp-hubblind", "qmcp-anon")
+
+
+def _add_order(tag: str) -> tuple:
+    return (FIRST.index(tag), tag) if tag in FIRST else (len(FIRST), tag)
+
+
+def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None,
+          extra=()) -> set:
     """Make the child's controlled tags exactly `expected_tags`, or raise.
+    `extra`: an anonymous project's badges, for a qube its lead creates.
 
     Add before remove: a failure in between leaves an over-badged qube that
     the caller's rollback can still find, never an umbrella-less one it
-    cannot.
+    cannot. The badges that take authority away go on first (`FIRST`).
     """
-    want = expected_tags(source_tags, principal, slot_badge)
+    want = expected_tags(source_tags, principal, slot_badge, extra)
     have = set(io.read())
-    for tag in sorted(want - have):
+    for tag in sorted(want - have, key=_add_order):
         io.add(tag)
     for tag in sorted(t for t in have - want if controlled(t) and not is_restriction(t)):
         io.remove(tag)

@@ -41,7 +41,9 @@ qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
 qmcp.AIManagedEvents qmcp.GetPoolStats qmcp.SubmitProposal qmcp.ProposalStatus"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
+UNITS="qmcp-gate.timer qmcp-gate.service"
 OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
+/etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer
 /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
 /etc/systemd/system/qmcp-consent.service /etc/systemd/system/qmcp-tombstone-reaper.service
 /etc/systemd/system/qmcp-tombstone-reaper.timer
@@ -76,7 +78,7 @@ if [ "$MODE" != check ]; then
         systemctl restart qubes-qrexec-policy-daemon || die "policy removed, but the daemon did not restart"
         say "removed $POLICY and restarted the policy daemon"
     fi
-    for unit in $LEGACY_UNITS; do
+    for unit in $UNITS $LEGACY_UNITS; do
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
     done
     for f in $LEGACY_RPC "$RPC"/qmcp_*.py; do
@@ -107,8 +109,9 @@ for f in "$RPC"/qmcp_*.py; do [ -e "$f" ] && report "$f"; done
 for path in $OTHER_PATHS "$LIB"; do
     { [ -e "$path" ] || [ -L "$path" ]; } && report "$path"
 done
-for unit in $LEGACY_UNITS; do
+for unit in $UNITS $LEGACY_UNITS; do
     systemctl is-enabled --quiet "$unit" 2>/dev/null && report "enabled unit $unit"
+    systemctl is-active --quiet "$unit" 2>/dev/null && report "active unit $unit"
 done
 if [ "$MODE" = purge ]; then
     [ -e /etc/qmcp ] && report /etc/qmcp

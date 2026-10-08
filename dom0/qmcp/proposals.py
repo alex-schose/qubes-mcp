@@ -46,6 +46,12 @@ lead a network by itself.
 - **The hub learns a state word only**: pending, accepted, rejected, expired or
   failed, plus its own stored proposal. Never the command's report, which
   holds dom0's exception classes and the operator's view of the fleet.
+- **An anonymous project** (0.9.23) may be proposed: `anonymous: true`, and
+  `hub_sees: true` for one the hub may see. It carries no label and no lead
+  name, since dom0 picks the label at random and the hub is never told what
+  was created; its lead comes from a template; it always takes the second
+  tick. After that only the operator changes a hidden one: accepting a
+  proposal that names it fails as for a project that does not exist.
 - **At most 10 pending, each for 7 days.** Expiry is read, not run: a pending
   proposal older than that is expired whenever it is looked at. No timer.
 - **Announced** by a desktop notification whose text is fixed (the number,
@@ -271,7 +277,7 @@ def _model_qube(value, allow_none: bool) -> str:
 
 
 #: Per type, the fields that join the normal form only when given (see below).
-OPTIONAL = {"project-create": frozenset({"model", "model_qube"}),
+OPTIONAL = {"project-create": frozenset({"model", "model_qube", "anonymous", "hub_sees"}),
             "project-lead": frozenset({"model", "add_old_network", "model_qube"}),
             "project-firewall": frozenset({"model", "rules", "model_qube"})}
 
@@ -315,19 +321,39 @@ def _sink_refusal(key: str, prefix) -> str | None:
 
 
 def _create(req: dict, prefix) -> dict:
-    _fields(req, {"label", "lead", "networks", "quota"},
-            {"lead_netvm", "lead_name", "templates", "dump", "model", "model_qube"})
-    label = req["label"]
-    why = projects.label_refusal(label)
-    if why:
-        raise Invalid(f"label: {why}")
-    dump = _bool(req.get("dump", False), "dump")
-    if dump and _sink_refusal(label, prefix):
-        raise Invalid(f"dump: {_sink_refusal(label, prefix)}: choose another label, or propose "
-                      f"the sink with a name once the project exists")
+    _fields(req, {"lead", "networks", "quota"},
+            {"label", "lead_netvm", "lead_name", "templates", "dump", "model", "model_qube",
+             "anonymous", "hub_sees"})
+    anonymous = _bool(req.get("anonymous", False), "anonymous")
+    hub_sees = _bool(req.get("hub_sees", False), "hub_sees")
     lead = _lead(req["lead"])
-    space = None if prefix is None else f"{prefix}{label}-"
-    return {"label": label, "lead": lead,
+    dump = _bool(req.get("dump", False), "dump")
+    if anonymous:
+        # dom0 picks the label, and the hub is never told what was created.
+        if req.get("label") is not None:
+            raise Invalid("label: an anonymous project's label is picked by dom0; leave it out")
+        if req.get("lead_name") is not None:
+            raise Invalid("lead_name: an anonymous project's lead is named by dom0; leave it out")
+        if lead["from"] != "template":
+            raise Invalid('lead.from: an anonymous project\'s lead is made fresh: "template"')
+        label = None
+    else:
+        if hub_sees:
+            raise Invalid("hub_sees: goes with anonymous: true")
+        if "label" not in req:
+            raise Invalid("label: missing")
+        label = req["label"]
+        why = projects.label_refusal(label)
+        if why:
+            raise Invalid(f"label: {why}")
+        if dump and _sink_refusal(label, prefix):
+            raise Invalid(f"dump: {_sink_refusal(label, prefix)}: choose another label, or "
+                          f"propose the sink with a name once the project exists")
+    space = None if prefix is None or label is None else f"{prefix}{label}-"
+    extra = {"anonymous": True} if anonymous else {}
+    if hub_sees:
+        extra["hub_sees"] = True
+    return extra | {"label": label, "lead": lead,
             "lead_netvm": _lead_netvm(req.get("lead_netvm"), lead),
             "lead_name": _lead_name(req.get("lead_name"), lead, prefix, space),
             # The lead's own template joins the list at accept when it is in AI
@@ -338,6 +364,13 @@ def _create(req: dict, prefix) -> dict:
                               _list_network),
             "quota": _quota(req["quota"]),
             "dump": dump} | _optional({}, req)
+
+
+def _hidden(records: dict, key) -> bool:
+    """Is the project `key` names hidden from the hub? Then no proposal may
+    name it."""
+    target = projects.find(records, key) if isinstance(key, str) else None
+    return target is not None and target.hidden
 
 
 def _edit(req: dict, prefix) -> dict:
@@ -793,8 +826,12 @@ def command(p: dict) -> str | None:
     t = p["type"]
     argv = None
     if t == "project-create":
-        argv = ["qmcp", "project", "create", p["label"], f"--lead-{p['lead']['from']}",
-                p["lead"]["qube"]]
+        argv = ["qmcp", "project", "create"] + ([p["label"]] if p["label"] else [])
+        if p.get("anonymous"):
+            argv.append("--anonymous")
+        if p.get("hub_sees"):
+            argv.append("--hub-sees")
+        argv += [f"--lead-{p['lead']['from']}", p["lead"]["qube"]]
         if p["lead_netvm"] is not None:
             argv += ["--lead-netvm", p["lead_netvm"]]
         if p["lead_name"] is not None:
@@ -922,7 +959,7 @@ def _model_qube_reasons(app, p: dict, target) -> list:
             out.append(f"the model qube {current} stops serving {target.label}: a remote model "
                        f"replaces it")
         return out
-    who = p.get("label") or p.get("project")
+    who = p.get("label") or p.get("project") or "the new anonymous project"
     out.append(f"makes {q} the model qube of {who}: dom0 takes it out of p00, removes its "
                f"network, guards it and kills it if it runs (unless it is already a guarded "
                f"model qube), and the lead has no network")
@@ -942,6 +979,18 @@ def second_tick(app, p: dict, records: dict) -> list:
     from qmcp import fleet
     t, reasons = p["type"], []
     target = projects.find(records, p["project"]) if "project" in p else None
+    if target is not None and target.hidden:
+        # The hub may not name a hidden project: accepting fails, as for a
+        # project that does not exist, so nothing here is said about it.
+        target = None
+    if t == "project-create" and p.get("anonymous"):
+        reasons.append("creates an anonymous project: dom0 picks its label and the hub is "
+                       "never told what was created; after this only you change it"
+                       if not p.get("hub_sees") else
+                       "creates an anonymous project the hub may see and operate: hidden from "
+                       "the network, not from the hub or its model provider")
+        if not p.get("hub_sees"):
+            reasons.append(f"WARNING: {fleet.HIDDEN_WARNING}")
     if t == "project-delete":
         reasons.append(f"deletes the project {p['project']}: its lead and every worker are removed "
                        f"with everything in them; its dump sink is kept")
@@ -1008,14 +1057,19 @@ def second_tick(app, p: dict, records: dict) -> list:
 
 
 def _execute(app, p: dict) -> list:
-    """Run the command a proposal is the options of; returns its report."""
+    """Run the command a proposal is the options of; returns its report. One
+    that names a hidden anonymous project fails as one naming a project that
+    does not exist."""
     from qmcp import fleet
     t = p["type"]
+    if "project" in p and _hidden(projects.load(), p["project"]):
+        raise fleet.ProjectError(f"no project '{p['project']}'")
     if t == "project-create":
         return fleet.create_project(app, p["label"], p["lead"]["from"], p["lead"]["qube"],
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
                                     p["dump"], p["lead_name"], p.get("model"),
-                                    p.get("model_qube"))
+                                    p.get("model_qube"), bool(p.get("anonymous")),
+                                    bool(p.get("hub_sees")))
     if t == "project-edit":
         return fleet.edit_project_changes(app, p["project"], p["add_templates"],
                                           p["remove_templates"], p["add_networks"],
@@ -1364,8 +1418,19 @@ def announce(pid: int, uid: int | None = None) -> bool:
     """Put a desktop notification in front of the operator. Its text is fixed,
     with the proposal's number only, never the hub's words: notification servers
     render markup in the body. Best-effort: False when it could not be shown,
-    and it never raises. The services run as the operator's dom0 user, so the
-    desktop session's bus is that user's; without a session there is none."""
+    and it never raises."""
+    try:
+        return notify_text(NOTICE.format(int(pid)), uid)
+    except Exception:
+        return False
+
+
+def notify_text(text: str, uid: int | None = None) -> bool:
+    """A desktop notification with text dom0 wrote (never AI's words), as
+    `announce`. The services and the anonymity gate's timer run as the
+    operator's dom0 user, so the desktop session's bus is that user's: a root
+    process cannot reach it (measured on Qubes 4.3.1: the bus closes the
+    connection). Without a session there is none. Never raises."""
     import subprocess
     try:
         uid = os.getuid() if uid is None else uid
@@ -1375,7 +1440,6 @@ def announce(pid: int, uid: int | None = None) -> bool:
             return False
         env = {"PATH": "/usr/bin:/bin", "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
                "XDG_RUNTIME_DIR": runtime}
-        text = NOTICE.format(int(pid))
         for program in NOTIFIERS:
             if os.access(program, os.X_OK):
                 # stdout must never be inherited: it is the qrexec reply channel.

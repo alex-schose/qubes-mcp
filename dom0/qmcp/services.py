@@ -143,6 +143,12 @@ def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False, source_
     return projects.member_badge(projects.HUB_SLOT) if new_klass == "AppVM" else None
 
 
+def _project_badges(who) -> set:
+    """What a lead's new qube wears besides its slot badge: its project's
+    anonymous badges. The hub's creates join no anonymous project."""
+    return set() if who.is_hub() else who.project.badges()
+
+
 def _recheck(app, call, template=None, netvm=None) -> None:
     """Under the create lock, the caller must still be what it was: a project
     command holds the same lock, so a create that waited for one must not run
@@ -284,10 +290,12 @@ def svc_pool_stats(app, call, req):
         mq = p.model_qube
         if mq is not None and not core.in_ai_space_by_name(app, mq):
             mq = scope.OUT_OF_SCOPE
+        # Never the operator's note: it is for the window and the command only.
         out.update({"project": p.label, "name_prefix": p.space(prefix),
                     "templates": list(p.templates), "networks": list(p.networks),
                     "dump": p.dump, "model": p.model, "model_qube": mq,
-                    "model_port": projects.MODEL_PORT if p.model_qube else None})
+                    "model_port": projects.MODEL_PORT if p.model_qube else None,
+                    "anonymous": p.anonymous, "hub_sees": not p.hidden})
     return out
 
 
@@ -329,7 +337,8 @@ def _project_rows(app):
             continue
         if core.UMBRELLA not in tags:
             continue
-        in_scope.add(vm.name)
+        if projects.HUBBLIND not in tags:
+            in_scope.add(vm.name)
         for slot in projects.member_slots(tags):
             try:
                 used[slot] = used.get(slot, 0) + budget.persistent_bytes(vm)
@@ -340,12 +349,15 @@ def _project_rows(app):
                           else scope.OUT_OF_SCOPE)
     out = []
     for slot, p in sorted(records.items()):
+        if p.hidden:
+            continue                        # a hidden anonymous project is not the hub's to see
         out.append({"slot": slot, "label": p.label, "lead": shown(p.lead),
                     "templates": [shown(t) for t in p.templates],
                     "networks": [shown(n) for n in p.networks], "quota": p.quota,
                     "used": None if slot in unreadable else used.get(slot, 0),
                     "has_dump": p.dump is not None, "model": p.model,
-                    "model_qube": None if p.model_qube is None else shown(p.model_qube)})
+                    "model_qube": None if p.model_qube is None else shown(p.model_qube),
+                    "anonymous": p.anonymous})
     return out
 
 
@@ -422,6 +434,10 @@ def svc_lifecycle(app, call, req):
     # A lead is a project's identity: removing one takes the operator's approval.
     if action == "remove" and projects.LEAD in core.tags_of(vm):
         raise refuse("removing a lead takes the operator's approval")
+    # The gate may stop the qube between the check above and the start: read
+    # again right before waking it.
+    if action in ("start", "unpause") and projects.BLOCKED in core.tags_of(vm):
+        raise core.Refusal(core.BLOCKED_REFUSAL)
     try:
         if action == "remove":
             del app.domains[name]
@@ -671,7 +687,8 @@ def svc_spawn(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
-                    _slot_badge(who, create_klass, klass == "DispVMTemplate"))
+                    _slot_badge(who, create_klass, klass == "DispVMTemplate"),
+                    _project_badges(who))
         if klass == "DispVMTemplate":
             step = "disposable template flag"
             vm.template_for_dispvms = True
@@ -731,7 +748,8 @@ def svc_clone(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
-                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags))
+                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags),
+                    _project_badges(who))
         step = "network check"
         if core.is_gateway(vm):
             raise RuntimeError("the new qube provides network")
@@ -810,7 +828,7 @@ def svc_spawn_disposable(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
-                    _slot_badge(who, "DispVM"))
+                    _slot_badge(who, "DispVM"), _project_badges(who))
         step = "network check"
         if _prop_direct(app, disp, "provides_network")[1] == "True":
             raise RuntimeError("the new qube provides network")
@@ -885,10 +903,11 @@ def svc_events(app, call, req, dispatcher_factory=None):
     snapshot = set()
     for vm in app.domains:
         try:
-            if core.in_scope(vm):
+            tags = core.tags_of(vm)
+            if core.UMBRELLA in tags and projects.HUBBLIND not in tags:
                 snapshot.add(vm.name)
-        except core.Gone:
-            pass                            # removed since the list was read
+        except core.Unreadable:
+            pass                            # removed since the list was read, or unread: left out
 
     collected: list = []
     warning: list = [None]
@@ -900,7 +919,8 @@ def svc_events(app, call, req, dispatcher_factory=None):
         if base == "domain-tag-delete" and tag == core.UMBRELLA:
             return subject_name in snapshot
         try:
-            return core.UMBRELLA in set(app.domains[subject_name].tags)
+            now = set(app.domains[subject_name].tags)
+            return core.UMBRELLA in now and projects.HUBBLIND not in now
         except KeyError:
             return subject_name in snapshot
         except Exception:

@@ -486,3 +486,136 @@ label (`p03 t6`); below, `pT6`, `pT7` and `pT8` stand for the slots of `t6`,
     `guarded`. *Revoke...* it, OK; then `qvm-remove -f ai-hub-llm`
     (`qvm-shutdown --wait ai-hub-llm` first if it runs). Expect: `qmcp check`
     GREEN.
+
+Steps 38 to 46 cover anonymous projects. Start them with `qmcp check` GREEN,
+and `systemctl is-active qmcp-gate.timer` printing `active` in a dom0
+terminal (the check fails while an anonymous project exists and the timer
+does not run). Besides `<template>`, `<gateway>`, `<router-template>` and
+`<model>` as above, they need Whonix's `sys-whonix`, whose `qvm-tags
+sys-whonix` lists `anon-gateway`, and a TemplateVM outside AI space for the
+lead, `<anon-template>` (such as your default template): an anonymous
+project's templates must be ones the hub cannot change, and `<template>` is
+usually one it manages. dom0's update policy must send `<anon-template>`'s
+updates to `sys-whonix` (Qubes Global Config, *Updates*): the gate judges a
+template whose updates go anywhere else unsound, and step 40's *Anonymity gate*
+line then says so. The name `sys-ai-tor` must not exist yet, and one slot must
+be free, with 1 GiB of room under *Pool cap (all of AI space)*. The label of
+the project step 40 makes is picked by dom0; below, `<label>` stands for it
+and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
+
+38. **Enroll an anonymising router.** Make it, behind Whonix:
+    `qvm-create --class AppVM --template <router-template> --label purple sys-ai-tor`,
+    then `qvm-prefs sys-ai-tor provides_network True` and
+    `qvm-prefs sys-ai-tor netvm sys-whonix`. Press Refresh. On the Gateways tab,
+    *Enroll...*, choose `sys-ai-tor`. Expect *Its upstream* `sys-ai-tor is on
+    sys-whonix now`. Tick *Anonymising*: the line adds `; ticked, that is
+    recorded as its upstream`, and the command reads
+    `/usr/bin/sudo -n /usr/local/bin/qmcp gateway enroll sys-ai-tor --anonymising`.
+    OK. Expect a report ending `sys-ai-tor: enrolled (anonymising, on
+    sys-whonix)`. Select `sys-ai-tor`: *Upstream recorded when marked
+    anonymising* `sys-whonix, where it is now`, and *Notes* `its own firewall
+    rules have no effect upstream`.
+39. **The Anonymity tab, empty.** Open the Anonymity tab. Expect its label
+    `Anonymity (0)`, an empty list, and the line above it ending `No anonymous
+    project: the gate has nothing to judge. New project... makes one with
+    Anonymous ticked.`
+40. **A hidden project.** On the Qubes tab, *New project...*. Type `t9` into
+    *Label*. Expect *The hub may see it* and *Note (dom0 only)* greyed out.
+    Tick *Anonymous*: *Label* empties, greys out and reads `picked by dom0 at
+    random`; *The hub may see it* and *Note (dom0 only)* come on; under *The
+    lead is*, only *a fresh qube from a template* is on, and chosen; *Lead
+    name* is greyed out, reading `named by dom0`, with `ai-<picked by dom0>-`
+    in front (those words: dom0 picks the label when OK runs). Expect one red paragraph,
+    `WARNING: a hidden project is safe from the hub only if the hub never
+    operated what it runs on: a template or model qube the hub edited before
+    it was guarded can harm it, since guarding removes nothing the hub left
+    there, and qmcp keeps no record of who operated a qube`. Untick
+    *Anonymous*: `t9` is back in *Label* and the red paragraph is gone; tick
+    it again. Choose *Made from* `<template>`, tick `none` under *Worker
+    networks*, type `1G` into *Workers' disk quota*: OK greys out, saying
+    `the lead's template '<template>' is managed, so the hub can change it:
+    guard it first (qmcp guard <template>), or use another`. Choose *Made from*
+    `<anon-template>`: OK comes on. Tick `<gateway>` (an enrolled gateway not
+    marked anonymising) under *Worker networks*: OK greys out, saying `'<gateway>' is not an anonymising gateway: an
+    anonymous project's networks are anonymising gateways, or none`. Untick
+    it and `none`; tick `sys-ai-tor`, listed as `sys-ai-tor (anonymising; its
+    own firewall rules have no effect upstream)`. Choose *Lead network*
+    `sys-ai-tor`, type `<model>` into *Lead's model endpoint* and
+    `t9 checklist` into *Note (dom0 only)*. Expect the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp project create --anonymous --note
+    't9 checklist' --lead-template <anon-template> --lead-netvm sys-ai-tor
+    --model <model> --network sys-ai-tor --quota 1G`, and still the one red
+    paragraph. OK. Expect a report holding `pA: project '<label>' recorded;
+    workers are named ai-<label>-*; anonymous, hidden from the hub` and
+    `pA: WARNING: a hidden project is safe ...`. In the tree, `pA <label>: t9
+    checklist`, *Role* `anonymous project, hidden from the hub`, and under it
+    `ai-<label>-lead`, *Role* `lead, anonymous, hidden from the hub`. Select
+    the project: *Anonymous* `yes`, *Hidden from the hub* `yes`, *Note (dom0
+    only)* `t9 checklist`, *Stopped by the anonymity gate* `no`, *Anonymity
+    gate* `green: sound`. On the Anonymity tab, one row: `<label>`,
+    `t9 checklist`, `pA`, `hidden`, `green: sound`, *Stopped* `no`, *Failing
+    conditions* `-`; the label still `Anonymity (0)`. The light stays `GREEN`.
+41. **A shared router, in red.** On the Qubes tab, *New project...*, tick
+    *Anonymous*, choose *Made from* `<anon-template>`, tick `sys-ai-tor` under
+    *Worker networks*. Expect a second red paragraph under the first:
+    `WARNING: it shares sys-ai-tor with another project or the hub: projects
+    behind one anonymising router share its exit, so a destination can tie
+    them together; a second router of the kind keeps them apart`. Tick *The
+    hub may see it*: both red paragraphs go (they are about a hidden
+    project). Cancel.
+42. **The gate stops it.** Move the router to clearnet, as a mistake outside
+    qmcp would: `qvm-prefs sys-ai-tor netvm sys-firewall`. Press Refresh.
+    Expect a desktop notification `qubes-mcp stopped the anonymous project
+    <label> (pA): its networks.` On the Anonymity tab: its label
+    `Anonymity (1)`; the row's *Gate* `RED: not anonymous`, *Stopped* `yes`,
+    *Failing conditions* `its networks`. Select it: red text starting
+    `RED: not anonymous: its networks (networks: sys-ai-tor is on
+    sys-firewall, not on sys-whonix as recorded`. *What this run did* holds
+    `ai-<label>-lead: blocked` (and `ai-<label>-lead: killed`, if it was
+    running) when this refresh's gate run stopped it; when the timer's run,
+    every 15 seconds, got there first, it reads `nothing`, *Stopped, after this
+    run* still reads `yes`, and the notification came from the timer. On the Qubes tab, the project's *Role* `anonymous project,
+    hidden from the hub, BLOCKED by the gate, gate RED: its networks`, and the
+    lead's `lead, anonymous, hidden from the hub, BLOCKED by the gate`,
+    followed by `, stopped by the gate`; selected, the lead's
+    details say *BLOCKED by the gate* `wears qmcp-blocked: ...` (and *Stopped by
+    the gate* `wears qmcp-stopped: ...`). On the Gateways tab, `sys-ai-tor`'s *Notes* start
+    `MOVED: it is on sys-firewall, not on sys-whonix as recorded: the gate
+    stops every anonymous project on it.` The light is `FAILED`, and the Check
+    tab's *anonymity gate* FAIL reads `<label> (pA) is not anonymous (...); it
+    was stopped`. In a dom0 terminal, `qvm-tags ai-<label>-lead` lists
+    `qmcp-blocked`, and `qvm-prefs ai-<label>-lead autostart` prints `False`.
+43. **Unblock refuses while it is unsound.** Select the project on the Qubes
+    tab: *Unblock...* is on. Press it. Expect OK greyed out, saying `the gate
+    still finds <label> unsound, so it stays blocked: sys-ai-tor is on
+    sys-firewall, not on sys-whonix as recorded` and the rest of the reasons.
+    Cancel. The same from its row on the Anonymity tab.
+44. **Put back, then unblock.** `qvm-prefs sys-ai-tor netvm sys-whonix`, and
+    Refresh. On the Anonymity tab, the row's *Gate* `green: sound`, *Stopped*
+    still `yes`, the label still `Anonymity (1)`; the Check tab's *anonymity
+    gate* WARN `<label> (pA) was stopped and is sound again: clear it with sudo
+    qmcp project unblock <label>`, and the light `GREEN` (a warning is not a
+    failure). Select the row, *Unblock...*. Expect the form to say the gate
+    judges it again first and that autostart stays off, and the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp project unblock <label>`. OK. Expect a
+    report `pA: ai-<label>-lead unblocked (autostart stays off)`; the row's
+    *Stopped* `no`, the label `Anonymity (0)`, and `BLOCKED by the gate` gone
+    from the Qubes tab. `qvm-prefs ai-<label>-lead autostart` still prints
+    `False`.
+45. **Its other forms.** Select the project, *Change lead...*. Expect *a clone
+    of one of the hub's AppVMs* and *one of the hub's AppVMs, promoted in
+    place* greyed out, *Lead name* greyed out reading `named by dom0`, with
+    `ai-<label>-` in front, and the form's text saying dom0 names the new lead.
+    Cancel.
+    *Set model qube...*: expect the red paragraph `WARNING: a hidden project
+    is safe from the hub only if ...` before anything is chosen. Cancel. On
+    the Gateways tab, select `sys-ai-tor`, *Change...*. Expect a tick *record
+    its network again: it is on sys-whonix now, and sys-whonix is recorded*.
+    Set *Anonymising* to *no*: the tick greys out, and OK greys out, saying
+    `'sys-ai-tor' carries the anonymous project(s) <label>; they would be
+    stopped. Delete them, or give them other networks, first`. Cancel.
+46. **Clean up.** Select the project, *Delete project...*, OK. On the Gateways
+    tab select `sys-ai-tor`, *Remove...*, OK: expect `sys-ai-tor: no longer
+    enrolled`. Then `qvm-remove -f sys-ai-tor` (`qvm-shutdown --wait
+    sys-ai-tor` first if it runs). Expect the Anonymity tab `Anonymity (0)`
+    with `No anonymous project`, and `qmcp check` GREEN.

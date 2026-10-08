@@ -9,7 +9,11 @@ firewall is read with `qmcp project firewall NAME --json` when the project or
 its lead is selected, and the forms that change it show its rules now and
 after, side by side. A lead's model is a remote endpoint or a self-hosted
 model qube; a form that takes a lead's network away for one says so in red
-before OK, and so does one that shares a model qube between projects.
+before OK, and so does one that shares a model qube between projects. An
+anonymous project is judged by the anonymity gate on every refresh (`qmcp
+gate --json`); the Anonymity tab lists its verdicts, the tree marks every
+qube by its anonymity badges, and the forms that make or change a hidden
+project say in red what its safety rests on.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()`,
@@ -266,6 +270,8 @@ class Form(Gtk.Dialog):
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.body = _bounded(body, _screen_room(parent, 260))
         box.pack_start(self.body, True, True, 0)
+        self._fitting = False
+        self.body.connect("size-allocate", self._fit_later)
         self.intro = None
         if intro is not None:
             self.intro = _label(intro if isinstance(intro, gm.Shown) else esc(intro),
@@ -293,6 +299,28 @@ class Form(Gtk.Dialog):
         box.pack_start(self.error, False, False, 0)
         for line in (self.preview, self.error):
             line.set_no_show_all(True)
+
+    def _fit_later(self, *_):
+        if not self._fitting:
+            self._fitting = True
+            GLib.idle_add(self._fit)
+
+    def _fit(self):
+        """The scrolled part as tall as what it holds, up to the screen's room.
+        Without this a form opened shorter than its text (measured on Qubes
+        4.3.1): GTK sizes a dialog for another width than it gets, and grows it
+        only to its minimum when a refusal gets longer, so a line was cut in
+        half and a red paragraph sat below the fold. Runs after each layout,
+        never inside one."""
+        self._fitting = False
+        child, width = self.body.get_child(), self.body.get_allocated_width()
+        if child is None or width <= 1:
+            return False
+        want = min(child.get_preferred_height_for_width(width)[1],
+                   self.body.get_max_content_height())
+        if want != self.body.get_min_content_height():
+            self.body.set_min_content_height(want)
+        return False
 
     def row(self, heading, widget):
         self.grid.attach(_label(esc(heading)), 0, self.rows, 1, 1)
@@ -420,6 +448,7 @@ class LeadFields:
         self._fleet, self._gateways, self._hub, self._space = fleet_rows, gw_rows, hub, space
         self._slot, self._current_qube = slot, current_qube
         self._netvm_before = None
+        self._fresh_only = False
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.source = {}
         group = None
@@ -445,7 +474,8 @@ class LeadFields:
         self.lead_netvm = self.combo(
             "Lead network",
             [("", esc("not set: a new lead gets none, a promoted one keeps its own"))]
-            + [(n, esc(gm.network_text(n, gw_rows))) for n in gm.network_choices(gw_rows)])
+            + [(n, esc(gm.network_text(n, gw_rows, anonymising=True)))
+               for n in gm.network_choices(gw_rows)])
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.model_kind = {}
         group = None
@@ -535,6 +565,25 @@ class LeadFields:
     def lead_source(self):
         return next((k for k, rb in self.source.items() if rb.get_active()), None)
 
+    def set_fresh_only(self, fresh: bool) -> None:
+        """An anonymous project's lead: only ever made fresh from a template,
+        and named by dom0, so the other sources and the name field are off."""
+        self._fresh_only = fresh
+        for ident, rb in self.source.items():
+            rb.set_sensitive(not fresh or ident == "template")
+        if fresh and not self.source["template"].get_active():
+            self.source["template"].set_active(True)        # runs _source_changed
+        self._name_field()
+        self.update()
+
+    def _name_field(self):
+        """The lead name: typed for a fresh or cloned lead; a promoted lead
+        keeps its own, and an anonymous project's is named by dom0."""
+        named = self.lead_source() != "promote" and not self._fresh_only
+        self.lead_name.set_sensitive(named)
+        self.lead_space.set_sensitive(named)
+        _placeholder(self.lead_name, esc("named by dom0" if self._fresh_only else "lead"))
+
     def _source_changed(self, *_):
         source = self.lead_source()
         names = (gm.lead_templates(self._fleet) if source == "template"
@@ -542,8 +591,7 @@ class LeadFields:
         _fill(self.origin, [(n, esc(n)) for n in names])
         if names:
             self.origin.set_active(0)
-        self.lead_name.set_sensitive(source != "promote")
-        self.lead_space.set_sensitive(source != "promote")
+        self._name_field()
         self.update()
 
     def lead_values(self):
@@ -553,7 +601,7 @@ class LeadFields:
         netvm = self.lead_netvm.get_active_id() or None
         space = self._space()
         _set(self.lead_space, esc(space))
-        typed = self.lead_name.get_text() if source != "promote" else ""
+        typed = self.lead_name.get_text() if source != "promote" and not self._fresh_only else ""
         return (source, self.origin.get_active_id(), gm.lead_name_from(typed, space), netvm,
                 self.model.get_text())
 
@@ -577,7 +625,8 @@ class NetworkFields:
 
     def add_network_fields(self, choices, ticked=(), default=None, gw_rows=()):
         self.nets = self.checks("Worker networks", choices, ticked,
-                                {n: gm.network_text(n, gw_rows) for n in choices})
+                                {n: gm.network_text(n, gw_rows, anonymising=True)
+                                 for n in choices})
         self.default_net = self.combo("Default worker network", [])
         for cb in self.nets.values():
             cb.connect("toggled", self._nets_changed)
@@ -600,7 +649,17 @@ class NetworkFields:
 
 
 class ProjectForm(Form, LeadFields, NetworkFields):
-    def __init__(self, parent, fleet_rows, gw_rows, hub, prefix="ai-"):
+    """A new project. Ticking Anonymous makes one under the anonymity gate:
+    dom0 picks its label, its lead comes fresh from a template and dom0 names
+    it, and the fields refuse what the command refuses for one (networks not
+    marked anonymising or off their recorded upstream, templates the hub
+    manages). A hidden one, which the hub may not see, carries in red the
+    command's warning about what its safety rests on, and one about a router
+    it would share with another project or the hub."""
+
+    LABEL_HINT = "1-8 lowercase letters or digits"
+
+    def __init__(self, parent, fleet_rows, gw_rows, hub, prefix="ai-", project_rows=()):
         super().__init__(parent, "New project", "Create project",
                          "A project is a lead, the workers it creates, and optionally a dump "
                          "sink. The lead's own template is approved first when it is in AI space. "
@@ -610,9 +669,24 @@ class ProjectForm(Form, LeadFields, NetworkFields):
                          "allow that endpoint, DNS when it is a host name, and nothing else; a "
                          "lead with no network takes none. A lead whose model is a qube has no "
                          "network, and reaches the qube on port 11434: the qube leaves p00, loses "
-                         "its network and is guarded.")
+                         "its network and is guarded. An anonymous project gets a random label "
+                         "from dom0, uses only gateways marked anonymising (or none) and "
+                         "templates the hub cannot change, and its lead is made fresh from a "
+                         "template; the anonymity gate judges it from then on and stops it when "
+                         "it is not sound. It is hidden from the hub unless you tick that the hub "
+                         "may see it; the note is yours, to tell it apart.")
         self.prefix = prefix
-        self.label_entry = self.entry("Label", "1-8 lowercase letters or digits")
+        self._projects = list(project_rows or ())
+        self._typed_label = ""
+        self.label_entry = self.entry("Label", self.LABEL_HINT)
+        self.anonymous = _check(esc("anonymous: under the anonymity gate, and dom0 picks its label"))
+        self.row("Anonymous", self.anonymous)
+        self.hub_sees = _check(esc("the hub may see and operate it: hidden from the network, not "
+                                   "from the hub"))
+        self.hub_sees.connect("toggled", self.update)
+        self.row("The hub may see it", self.hub_sees)
+        self.note = self.entry("Note (dom0 only)", "optional, up to 80 characters: shown only "
+                                                   "here and by the qmcp command")
         self.add_lead_fields(fleet_rows, gw_rows, hub, self.space,
                              "host:port, e.g. api.anthropic.com:443")
         self.templates = self.checks("More approved templates",
@@ -622,22 +696,83 @@ class ProjectForm(Form, LeadFields, NetworkFields):
         self.dump = _check(esc("also create its dump sink"))
         self.dump.connect("toggled", self.update)
         self.row("Dump sink", self.dump)
+        self.anonymous.connect("toggled", self._anonymous_changed)
+        self._anonymous_changed()
         self.done_building()
 
+    def _anonymous_changed(self, *_):
+        """Anonymous: the label is dom0's (the field keeps what was typed for
+        when it is unticked), the lead fresh and named by dom0, and the hub's
+        tick and the note on. Unticked, both are off and the hub's tick
+        cleared, so nothing greyed out is ever sent."""
+        anonymous = self.anonymous.get_active()
+        if anonymous:
+            self._typed_label = self.label_entry.get_text()
+            _set(self.label_entry, esc(""))
+            _placeholder(self.label_entry, esc("picked by dom0 at random"))
+        else:
+            _placeholder(self.label_entry, esc(self.LABEL_HINT))
+            if self._typed_label and not self.label_entry.get_text():
+                _set(self.label_entry, esc(self._typed_label))
+            self.hub_sees.set_active(False)
+        self.label_entry.set_sensitive(not anonymous)
+        self.hub_sees.set_sensitive(anonymous)
+        self.note.set_sensitive(anonymous)
+        self.set_fresh_only(anonymous)
+        self.update()
+
+    def hidden(self) -> bool:
+        return self.anonymous.get_active() and not self.hub_sees.get_active()
+
     def space(self) -> str:
+        if self.anonymous.get_active():
+            return f"{self.prefix}<picked by dom0>-"
         label = self.label_entry.get_text().strip()
         return f"{self.prefix}{label or '<label>'}-"
 
+    def routers(self) -> set:
+        """The gateways the project would be on: its worker networks and its
+        lead's."""
+        nets = {n for n in self.network_values() if n not in (None, "none")}
+        lead = self.lead_netvm.get_active_id()
+        if lead not in (None, "", "none"):
+            nets.add(lead)
+        return nets
+
+    def red_text(self, fleet_rows) -> str:
+        """What the model choice does that is said in red; for a hidden
+        project, the command's warning about it, and one about a router it
+        shares with another project or the hub."""
+        lines = self.model_red_lines(fleet_rows)
+        if self.hidden():
+            lines += [gm.hidden_warning(), gm.shared_router_warning(gm.routers_shared(
+                self.routers(), None, self._projects, fleet_rows, self._hub))]
+        return "\n".join(line for line in lines if line)
+
     def build(self):
+        anonymous = self.anonymous.get_active()
         _set(self.warning, esc_lines(self.red_text(self._fleet)))
-        gm.check_label(self.label_entry.get_text().strip())   # the label first: it makes the space
+        label = self.label_entry.get_text().strip()
+        if not anonymous:
+            gm.check_label(label)                       # the label first: it makes the space
+        note = (self.note.get_text().strip() or None) if anonymous else None
+        if note is not None:
+            gm.check_note(note)
         source, origin, name, netvm, typed = self.lead_values()
+        if anonymous:
+            gm.anonymous_lead(source, origin, netvm, self._fleet, self._gateways)
         model, qube = self.lead_model_values(source, origin, netvm, typed)
+        templates = [n for n, cb in self.templates.items() if cb.get_active()]
+        if anonymous:
+            gm.anonymous_networks(self.network_values(), self._gateways)
+            for t in templates:
+                gm.not_managed(t, self._fleet, "the template")
+        gm.anonymous_model_qube(qube, None, anonymous, self._fleet, self._projects)
         return gm.create_project(
-            self.label_entry.get_text().strip(), source, origin, name, netvm,
-            [n for n, cb in self.templates.items() if cb.get_active()],
+            None if anonymous else label, source, origin, name, netvm, templates,
             gm.check_networks(self.network_values(), self._gateways), self.quota.get_text(),
-            self.dump.get_active(), model, qube)
+            self.dump.get_active(), model, qube, anonymous,
+            anonymous and self.hub_sees.get_active(), note)
 
 
 class EditForm(Form, NetworkFields):
@@ -649,6 +784,7 @@ class EditForm(Form, NetworkFields):
                          "one marked NOT USABLE can be taken off it, not kept on it.")
         self.record = record
         self._gateways = gw_rows
+        self._fleet = list(fleet_rows or ())
         current_t = list(record.get("templates") or ())
         names = sorted(set(gm.approved_template_choices(fleet_rows)) | set(current_t))
         self.templates = self.checks("Approved templates", names, current_t)
@@ -668,15 +804,25 @@ class EditForm(Form, NetworkFields):
         current_n = ["none" if n is None else n for n in rec.get("networks") or ()]
         same_networks = (networks[:1] == current_n[:1] and set(networks) == set(current_n))
         quota = self.quota.get_text().strip()
+        templates = None if set(templates) == set(rec.get("templates") or ()) else templates
+        if rec.get("anonymous"):
+            # As the command refuses them for an anonymous project, before it saves.
+            for t in templates or ():
+                gm.not_managed(t, self._fleet, "the template")
+            if not same_networks:
+                gm.anonymous_networks(networks, self._gateways)
         return gm.edit_project(
-            rec.get("label"),
-            templates=None if set(templates) == set(rec.get("templates") or ()) else templates,
+            rec.get("label"), templates=templates,
             networks=None if same_networks else gm.check_networks(networks, self._gateways),
             quota=None if quota == gm.quota_text(rec.get("quota")) else quota)
 
 
 class LeadForm(Form, LeadFields):
-    def __init__(self, parent, fleet_rows, gw_rows, hub, record, prefix="ai-"):
+    """A project's new lead. An anonymous project's is made fresh from a
+    template the hub cannot change, on an anonymising gateway or none, and
+    dom0 names it (`<label>-lead2` while the old one is kept)."""
+
+    def __init__(self, parent, fleet_rows, gw_rows, hub, record, prefix="ai-", project_rows=()):
         old = record.get("lead")
         carried, qube = record.get("model"), record.get("model_qube")
         super().__init__(
@@ -693,9 +839,14 @@ class LeadForm(Form, LeadFields):
                " A new lead with a network takes the model endpoint you give, or else the "
                f"project's ({carried or 'none on record'}); dom0 writes its firewall to allow "
                "that endpoint, DNS when it is a host name, and nothing else. A new lead whose "
-               "model is a qube has no network."))
+               "model is a qube has no network.")
+            + (" The project is anonymous: its new lead is made fresh from a template the hub "
+               "cannot change, on a gateway marked anonymising or none, and dom0 names it "
+               "(<label>-lead, or <label>-lead2 while the old one is kept)."
+               if record.get("anonymous") else ""))
         self.record = record
         self.prefix = prefix
+        self._projects = list(project_rows or ())
         self.add_lead_fields(fleet_rows, gw_rows, hub, self.space,
                              f"empty: the project's, {carried}" if carried else
                              "host:port; the project has none on record",
@@ -717,6 +868,8 @@ class LeadForm(Form, LeadFields):
             self.old_info = _label(esc(""), wrap=True)
             self.row("Kept as a worker", self.old_info)
             self.old_lead.connect("changed", self._old_changed)
+        if record.get("anonymous"):
+            self.set_fresh_only(True)
         self.done_building()
 
     def space(self) -> str:
@@ -729,11 +882,17 @@ class LeadForm(Form, LeadFields):
         self.add_old.set_sensitive(keep)
 
     def red_text(self, fleet_rows) -> str:
-        """A removal, then what the model choice does that the form says in red."""
+        """A removal, then what the model choice does that the form says in red,
+        and for a hidden project choosing a model qube, the command's warning
+        about what it runs on."""
         old = self.record.get("lead")
         lines = ([f"{old} will be removed, with everything in it. This cannot be undone."]
                  if old and self.old_lead.get_active_id() == "remove" else [])
-        return "\n".join(lines + self.model_red_lines(fleet_rows))
+        lines += self.model_red_lines(fleet_rows)
+        kind, qube = self.model_choice()
+        if self.record.get("hidden") and kind == "qube" and qube not in (None, "", "none"):
+            lines += [gm.hidden_warning()]
+        return "\n".join(lines)
 
     def build(self):
         old = self.record.get("lead")
@@ -747,15 +906,24 @@ class LeadForm(Form, LeadFields):
             keep = choice == "keep"
             add = self.add_old.get_active()
         source, origin, name, netvm, typed = self.lead_values()
+        anonymous = bool(self.record.get("anonymous"))
         default = f"{self.space()}lead"
-        if keep and source != "promote" and not name and old == default:
+        # An anonymous project's new lead is named by dom0, never the kept one's name.
+        if keep and source != "promote" and not name and old == default and not anonymous:
             raise gm.FormError(f"the old lead keeps the name {default}: type a lead name "
                                "for the new one")
+        if anonymous:
+            gm.anonymous_lead(source, origin, netvm, self._fleet, self._gateways)
         if old:
             _set(self.old_info, esc(gm.old_lead_network(self.record, self._fleet,
                                                         self._gateways, keep, add)))
+            old_net = gm.qube_network(self._fleet, old)
+            if anonymous and keep and add and old_net not in (self.record.get("networks") or ()):
+                gm.anonymous_networks([old_net], self._gateways)
         model, qube = self.lead_model_values(source, origin, netvm, typed,
                                              self.record.get("model"), change=True)
+        gm.anonymous_model_qube(qube, self.record.get("slot"), anonymous, self._fleet,
+                                self._projects)
         return gm.change_lead(self.record.get("label"), source, origin, name, netvm, keep,
                               model, add, qube)
 
@@ -907,50 +1075,93 @@ class EnrollForm(Form):
                          "it uses (sys-firewall, sys-whonix, a VPN qube). The command also checks "
                          "what this form cannot see: that it is not a Whonix gateway itself, "
                          "that Qubes' qubes-firewall feature is on for it (its own value, else "
-                         "its template's), and that no template the hub manages builds it. The "
-                         "qube itself does not change.")
+                         "its template's), and that no template the hub manages builds it. "
+                         "Marking it anonymising records the network it is on now as its "
+                         "upstream: an anonymous project on it stays sound only while it stays "
+                         "there, and after moving it you mark it again. The qube itself does not "
+                         "change.")
         self._rows = {r["name"]: r for r in fleet_rows
                       if isinstance(r, dict) and isinstance(r.get("name"), str)}
         self._hub = hub
         self.qube = self.combo("Qube", [(n, esc(gm.enroll_text(self._rows[n], hub)))
                                         for n in gm.enroll_choices(fleet_rows, gw_rows, hub)],
                                preselect=False)
-        self.anonymising = _check(esc("it reaches the network anonymously (Tor)"))
+        self.anonymising = _check(esc("it reaches the network anonymously (Tor); records the "
+                                      "network it is on now"))
         self.anonymising.connect("toggled", self.update)
         self.row("Anonymising", self.anonymising)
+        self.upstream = _label(esc(""), wrap=True)
+        self.row("Its upstream", self.upstream)
         self.label_entry = self.entry("Label", "optional, up to 40 characters, e.g. a jurisdiction")
         self.done_building()
 
     def build(self):
         name = self.qube.get_active_id()
-        why = gm.enroll_refusal(self._rows.get(name), self._hub) if name else None
+        row = self._rows.get(name) if name else None
+        net = row.get("netvm") if row else None
+        _set(self.upstream, esc("" if row is None else
+                                f"{name} is on {net or 'no network'} now"
+                                + ("; ticked, that is recorded as its upstream"
+                                   if self.anonymising.get_active() else "")))
+        why = gm.enroll_refusal(row, self._hub) if name else None
         if why:
             raise gm.FormError(why)
+        if self.anonymising.get_active() and row is not None:
+            why = gm.anonymising_refusal(name, net)
+            if why:
+                raise gm.FormError(why)
         return gm.enroll_gateway(name, self.anonymising.get_active(), self.label_entry.get_text())
 
 
 class GatewayForm(Form):
-    """Change an enrolled gateway's flag or label: only what changed is sent."""
+    """Change an enrolled gateway's flag or label: only what changed is sent.
+    Marking it anonymising records the network it is on now; for one marked
+    already, the tick records it again, after it was moved on purpose."""
 
-    def __init__(self, parent, row):
+    def __init__(self, parent, row, fleet_rows=(), project_rows=()):
         super().__init__(parent, f"Change gateway {row.get('name')}", "Apply",
-                         "Only what you change is sent. The qube itself does not change.")
+                         "Only what you change is sent. Marking it anonymising records the network "
+                         "it is on now as its upstream: the anonymity gate stops every anonymous "
+                         "project on it once it is anywhere else, so after moving it on purpose, "
+                         "mark it again. Taking the mark off one an anonymous project uses is "
+                         "refused. The qube itself does not change.")
         self.row_data = row
+        self._fleet, self._projects = list(fleet_rows or ()), list(project_rows or ())
         self.anonymising = self.combo("Anonymising", [
             ("yes", esc("yes: it reaches the network anonymously (Tor)")), ("no", esc("no"))],
             active="yes" if row.get("anonymising") is True else "no")
+        self.remark = _check(esc(f"record its network again: it is on "
+                                 f"{row.get('upstream') or 'no network'} now, and "
+                                 f"{row.get('recorded_upstream') or 'none'} is recorded"))
+        self.remark.connect("toggled", self.update)
+        self.row("Its upstream", self.remark)
+        self.remark.set_sensitive(row.get("anonymising") is True)
         self.label_entry = self.entry("Label", "up to 40 characters; empty: no label",
                                       row.get("label") or "")
         self.done_building()
 
     def build(self):
         row = self.row_data
+        name = row.get("name")
+        was = row.get("anonymising") is True
         anonymising = self.anonymising.get_active_id() == "yes"
+        # Only an anonymising gateway that stays so is marked again.
+        self.remark.set_sensitive(was and anonymising)
+        if not (was and anonymising) and self.remark.get_active():
+            self.remark.set_active(False)
+        mark = anonymising and (not was or self.remark.get_active())
         label = self.label_entry.get_text()
+        if mark:
+            why = gm.anonymising_refusal(name, row.get("upstream"))
+            if why:
+                raise gm.FormError(why)
+        if was and not anonymising:
+            why = gm.unmark_refusal(name, self._projects, self._fleet)
+            if why:
+                raise gm.FormError(why)
         # The field shows the label escaped: left as shown, it is unchanged.
         return gm.change_gateway(
-            row.get("name"),
-            None if anonymising == (row.get("anonymising") is True) else anonymising,
+            name, True if mark else (None if anonymising == was else anonymising),
             None if label == gm.esc(row.get("label") or "") else label)
 
 
@@ -1040,11 +1251,15 @@ class ModelQubeForm(FirewallForm):
     the command's warning, in red too. Both are worked out from the fleet the
     form opened on, and OK refuses once they read differently."""
 
-    def __init__(self, parent, doc, read_at=None, fleet_rows=(), hub=None):
+    def __init__(self, parent, doc, read_at=None, fleet_rows=(), hub=None, record=None,
+                 project_rows=()):
+        """`record`: the project's record, which says whether it is anonymous
+        or hidden (the firewall read does not)."""
         super().__init__(parent, f"The lead's model qube, {doc.get('project')}", "Set model qube",
                          gm.model_qube_intro(doc), doc)
         self.set_default_size(620, -1)              # no rules side by side: nothing is written
         self._fleet, self._hub = list(fleet_rows or ()), hub
+        self._record, self._projects = record or {}, list(project_rows or ())
         options = gm.model_qube_options(self._fleet, hub, doc.get("slot"), doc.get("model_qube"))
         self.model_qube = self.combo("Model qube", [(i, esc(t)) for i, t in options],
                                      preselect=False)
@@ -1053,8 +1268,13 @@ class ModelQubeForm(FirewallForm):
         self.done_building()
 
     def red_text(self, fleet_rows) -> str:
-        return gm.model_qube_red(self.model_qube.get_active_id(), self.doc.get("lead"),
-                                 self.doc.get("slot"), fleet_rows)
+        """The lead that loses its network, a qube shared with another project,
+        and for a hidden project the command's warning about what it runs on."""
+        choice = self.model_qube.get_active_id()
+        text = gm.model_qube_red(choice, self.doc.get("lead"), self.doc.get("slot"), fleet_rows)
+        if self._record.get("hidden") and choice != "none":
+            text = "\n".join(t for t in (text, gm.hidden_warning()) if t)
+        return text
 
     def red_changed(self, fleet_rows):
         if self.red_text(fleet_rows) != self.red_text(self._fleet):
@@ -1072,6 +1292,8 @@ class ModelQubeForm(FirewallForm):
         why = gm.model_qube_refusal(self.doc, choice, self._fleet)
         if why:
             raise gm.FormError(why)
+        gm.anonymous_model_qube(choice, self.doc.get("slot"), self._record.get("anonymous"),
+                                self._fleet, self._projects)
         return gm.set_lead_model_qube(self.key, choice)
 
 
@@ -1079,9 +1301,9 @@ class ModelQubeForm(FirewallForm):
 
 class Window(Gtk.Window):
     """The tree of AI space and projects with each lead's firewall, the hub's
-    proposals, the gateway registry, the check light, the audit log and the
-    settings; every command that changes something, but `migrate`, is a
-    button and a form."""
+    proposals, the gateway registry, the anonymity gate's verdicts, the check
+    light, the audit log and the settings; every command that changes
+    something, but `migrate`, is a button and a form."""
 
     ACTIONS = (
         ("new_project", "New project..."), ("edit_project", "Edit project..."),
@@ -1091,6 +1313,7 @@ class Window(Gtk.Window):
         ("guard", "Guard..."), ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
         ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
+        ("unblock", "Unblock..."),
     )
     #: The forms that change a lead's firewall or model: action -> (form, title).
     FIREWALL_FORMS = {"set_model": (ModelForm, "Set lead model"),
@@ -1129,6 +1352,12 @@ class Window(Gtk.Window):
         self.gateways: list = []
         self.gateways_read = False
         self.gateway_selected = None
+        #: The anonymity gate's verdicts (`gate --json`), as the last complete
+        #: refresh read them, and the slot selected on the Anonymity tab.
+        self.gate_verdicts: list = []
+        self.gate_read = False
+        self.gate_selected = None
+        self._gate_filling = False
         #: The selected proposal, as its last `show` read it.
         self.pane = gm.ProposalPane()
         #: The selected project's lead firewall, as its last read gave it.
@@ -1181,6 +1410,8 @@ class Window(Gtk.Window):
         self.proposals_tab = _label(esc(gm.proposals_tab(None)))
         self.notebook.append_page(self._proposals_page(), self.proposals_tab)
         self.notebook.append_page(self._gateways_page(), _label(esc("Gateways")))
+        self.gate_tab = _label(esc(gm.gate_tab([], False)))
+        self.notebook.append_page(self._gate_page(), self.gate_tab)
         self.notebook.append_page(self._check_page(), _label(esc("Check")))
         self.notebook.append_page(self._audit_page(), _label(esc("Audit")))
         self.notebook.append_page(self._settings_page(), _label(esc("Settings")))
@@ -1297,6 +1528,43 @@ class Window(Gtk.Window):
         paned.set_position(780)
         return paned
 
+    def _gate_page(self):
+        """The anonymity gate: a row per anonymous project, with what the last
+        refresh's gate run found and did, and Unblock for one it stopped."""
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.gate_store = Gtk.ListStore(*([str] * (1 + len(gm.GATE_COLUMNS))))
+        view = Gtk.TreeView(model=self.gate_store)
+        for i, (key, heading) in enumerate(gm.GATE_COLUMNS):
+            _column(view, esc(heading), i + 1, expand=(key == "fails"),
+                    wrap=(300 if key == "fails" else 0))
+        _named(view, esc("anonymous projects"))
+        view.get_selection().connect("changed", self._on_gate_select)
+        self.gate_list = view
+        paned.pack1(_scrolled(view), True, False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(right, f"set_margin_{side}")(8)
+        self.gate_note = _label(esc(gm.gate_note([], False)), wrap=True)
+        _named(self.gate_note, esc("anonymity gate status"))
+        right.pack_start(self.gate_note, False, False, 0)
+        self.gate_details = Gtk.Grid(column_spacing=12, row_spacing=4)
+        right.pack_start(_scrolled(self.gate_details, 260), True, True, 0)
+        # What the gate found wrong with the selected project, in red.
+        self.gate_warning = _label(esc(""), wrap=True, selectable=True)
+        self.gate_warning.get_style_context().add_class("qmcp-FAILED")
+        _named(self.gate_warning, esc("gate verdict"))
+        right.pack_start(_bounded(self.gate_warning, _screen_room(None, 0) // 5), False, False, 0)
+        bar = Gtk.Box(spacing=6, homogeneous=True)
+        self.gate_buttons = {"gate_unblock": _button(esc("Unblock..."),
+                                                     lambda _b: self.act("gate_unblock"))}
+        bar.pack_start(self.gate_buttons["gate_unblock"], True, True, 0)
+        right.pack_start(bar, False, False, 0)
+        right.set_size_request(420, -1)
+        paned.pack2(right, False, False)
+        paned.set_position(780)
+        return paned
+
     def _check_page(self):
         self.check_store = Gtk.ListStore(*([str] * 4))
         view = Gtk.TreeView(model=self.check_store)
@@ -1358,13 +1626,23 @@ class Window(Gtk.Window):
         self.pending = len(gm.READS)
         self.spinner.start()
         self.reads = {}
-        for name, argv in gm.READS.items():
-            self.runner.run(argv, lambda result, name=name: self._read_done(name, result),
+        self._start_reads(gm.FIRST_READS)
+
+    def _start_reads(self, names):
+        for name in names:
+            self.runner.run(gm.READS[name],
+                            lambda result, name=name: self._read_done(name, result),
                             timeout=READ_TIMEOUT_S)
 
     def _read_done(self, name, result):
+        """One read answered. Once the first ones have (the gate, which acts),
+        the others start, so they read the fleet as it left it."""
         self.reads[name] = result
         self.pending -= 1
+        if name in gm.FIRST_READS:
+            if all(n in self.reads for n in gm.FIRST_READS):
+                self._start_reads([n for n in gm.READS if n not in gm.FIRST_READS])
+            return
         if self.pending:
             return
         self._absorb()
@@ -1376,8 +1654,8 @@ class Window(Gtk.Window):
             self.refresh()
 
     def _absorb(self):
-        """Take the qubes, records, proposals, gateways, audit lines and
-        settings of a refresh together, or not at all. Once a refresh has read
+        """Take the qubes, records, proposals, gateways, the gate's verdicts,
+        audit lines and settings of a refresh together, or not at all. Once a refresh has read
         everything, a later one with a failed read keeps those from the last
         complete one (never fresh qubes judged against old records, nor fresh
         records against an old registry) and turns changes off.
@@ -1408,6 +1686,7 @@ class Window(Gtk.Window):
         audit_rows = parsed("audit", gm.parse_audit, list)
         proposal_rows = parsed("proposals", gm.parse_json, list)
         gateways = parsed("gateways", gm.parse_json, list)
+        gate = parsed("gate", gm.parse_gate, list)
         self.check_doc = check            # a light from a failed read would be a guess
         self.complete = not self.errors
         if self.view_time is not None and not self.complete:
@@ -1429,6 +1708,9 @@ class Window(Gtk.Window):
         if gateways is not None:
             self.gateways = gateways
             self.gateways_read = True
+        if gate is not None:
+            self.gate_verdicts = gate
+            self.gate_read = True
         if self.complete:
             self.view_time = time.strftime("%H:%M:%S")
 
@@ -1441,7 +1723,7 @@ class Window(Gtk.Window):
             self.store.clear()
             self.nodes = {}
             tree = gm.build_tree(self.fleet, self.project_rows if self.records_read else None,
-                                 self.settings)
+                                 self.settings, self.gate_view())
 
             def add(parent, nodes):
                 for node in nodes:
@@ -1489,6 +1771,7 @@ class Window(Gtk.Window):
         self.settings_grid.show_all()
         self._render_proposals()
         self._render_gateways()
+        self._render_gate()
 
         if self.errors:
             shown = (f"Showing the qubes and records read at {self.view_time}. "
@@ -1528,7 +1811,8 @@ class Window(Gtk.Window):
         node = self.node()
         if node is None:
             return
-        rows = gm.details(node, self.project_rows, self.fleet)
+        rows = gm.details(node, self.project_rows, self.fleet, self.gate_view(),
+                          self.settings.get("hub"))
         rows += gm.firewall_section(self.fw_pane, gm.firewall_key(node, self.records), self.fleet)
         for i, (heading, text) in enumerate(rows):
             self.details.attach(_label(esc(heading)), 0, i, 1, 1)
@@ -1593,6 +1877,65 @@ class Window(Gtk.Window):
         self.gateway_details.show_all()
         _set(self.gateway_warning, esc("; ".join(gm.gateway_notes(row)) if row else ""))
         self._sync()
+
+    def gate_view(self):
+        """The anonymity gate's verdicts on show; None when it was never read."""
+        return self.gate_verdicts if self.gate_read else None
+
+    def gate_rows(self) -> list:
+        return gm.gate_rows(self.gate_view(), self.project_rows if self.records_read else None)
+
+    def gate_row(self):
+        """The row selected on the Anonymity tab."""
+        return next((r for r in self.gate_rows() if r["slot"] == self.gate_selected), None)
+
+    def _render_gate(self):
+        rows = self.gate_rows()
+        slot = self.gate_selected
+        self._gate_filling = True
+        try:
+            self.gate_store.clear()
+            for row in rows:
+                it = _list_append(self.gate_store, row["slot"], gm.gate_cells(row))
+                if row["slot"] == slot:
+                    self.gate_list.get_selection().select_iter(it)
+        finally:
+            self._gate_filling = False
+        if not any(r["slot"] == slot for r in rows):
+            self.gate_selected = None
+        _set(self.gate_tab, esc(gm.gate_tab(rows, self.gate_read)))
+        _set(self.gate_note, esc(gm.gate_note(rows, self.gate_read, self.records_read,
+                                              self.errors.get("gate"), self.view_time)))
+        self._render_gate_row()
+
+    def _on_gate_select(self, selection):
+        if self._gate_filling:
+            return
+        model, it = selection.get_selected()
+        self.gate_selected = model[it][0] if it is not None else None
+        self._render_gate_row()
+
+    def _render_gate_row(self):
+        _clear(self.gate_details)
+        row = self.gate_row()
+        for i, (heading, text) in enumerate(gm.gate_details(row)):
+            self.gate_details.attach(_label(esc(heading)), 0, i, 1, 1)
+            value = _label(text, selectable=True, wrap=True)
+            _named(value, esc(heading))
+            self.gate_details.attach(value, 1, i, 1, 1)
+        self.gate_details.show_all()
+        bad = row is not None and row.get("status") in ("red", "unreadable")
+        _set(self.gate_warning, esc(gm.gate_status_text(row) if bad else ""))
+        self._sync()
+
+    def _gate_actions(self) -> set:
+        """What the Anonymity tab allows now: Unblock for the selected project
+        while the gate has it stopped, and changes are on."""
+        if not self.complete or self.busy:
+            return set()
+        rec = self.records.get(self.gate_selected) if self.gate_selected else None
+        return {"gate_unblock"} if (isinstance(rec, dict) and rec.get("anonymous")
+                                    and rec.get("blocked") is True) else set()
 
     def _on_audit_select(self, selection):
         model, it = selection.get_selected()
@@ -1675,6 +2018,9 @@ class Window(Gtk.Window):
         registry = self._registry_actions()
         for ident, button in self.gateway_buttons.items():
             button.set_sensitive(ident in registry)
+        gate = self._gate_actions()
+        for ident, button in self.gate_buttons.items():
+            button.set_sensitive(ident in gate)
 
     def _registry_actions(self) -> set:
         """What the Gateways tab allows now: Enroll, and Change and Remove for
@@ -1753,7 +2099,7 @@ class Window(Gtk.Window):
         hub = self.settings.get("hub")
         prefix = self.settings.get("name_prefix") or "ai-"
         if ident == "new_project":
-            form = ProjectForm(self, self.fleet, self.gateways, hub, prefix)
+            form = ProjectForm(self, self.fleet, self.gateways, hub, prefix, self.project_rows)
             return self._open(form, "Create project", check=lambda: form.red_changed(self.fleet))
         if ident == "add_to_ai_space":
             sinks = [r.get("dump") for r in self.records.values() if r.get("dump")]
@@ -1769,12 +2115,15 @@ class Window(Gtk.Window):
             return self.registry(ident)
         if ident in self.FIREWALL_FORMS:
             return self.lead_firewall(ident)
+        if ident in ("unblock", "gate_unblock"):
+            return self.unblock(ident)
         if node is None:
             return None
         if ident == "edit_project":
             return self._open(EditForm(self, self.fleet, self.gateways, node.data), "Edit project")
         if ident == "change_lead":
-            form = LeadForm(self, self.fleet, self.gateways, hub, node.data, prefix)
+            form = LeadForm(self, self.fleet, self.gateways, hub, node.data, prefix,
+                            self.project_rows)
             return self._open(form, "Change lead", check=lambda: form.red_changed(self.fleet))
         if ident == "remove_lead":
             lead = node.data.get("lead")
@@ -1837,6 +2186,32 @@ class Window(Gtk.Window):
                           check=lambda: gm.proposal_changed(doc, ident, self.pane,
                                                             self.proposal_tick.get_active()))
 
+    def unblock(self, ident):
+        """Take the gate's stop off the selected project, or the one whose lead
+        or member is selected, or the one selected on the Anonymity tab: a
+        form that shows the command, and refuses while the gate's verdict on
+        show is not green, as the command refuses then."""
+        if ident == "gate_unblock":
+            if ident not in self._gate_actions():
+                return None
+            rec = self.records.get(self.gate_selected)
+        else:
+            if not self.complete or self.busy:
+                return None
+            rec = gm.blocked_project(self.node(), self.records)
+        if rec is None:
+            return None
+        verdict = gm.verdict_for(rec.get("slot"), self.gate_view())
+        slot = rec.get("slot")
+        # Asked again at OK, against the gate's verdict as the latest refresh read
+        # it: a refresh may have landed while the form was open.
+        return self._open(ConfirmForm(self, f"Unblock {rec.get('label')}", "Unblock",
+                                      gm.unblock_intro(rec), gm.unblock_project(rec.get("label")),
+                                      refusal=gm.unblock_refusal(rec, verdict)), "Unblock project",
+                          check=lambda: gm.unblock_refusal(
+                              self.records.get(slot, rec),
+                              gm.verdict_for(slot, self.gate_view())))
+
     def registry(self, ident):
         """Enroll a gateway, or change or remove the selected one, through a
         form that shows the command first; only what the tab allows now."""
@@ -1847,7 +2222,8 @@ class Window(Gtk.Window):
                                          self.settings.get("hub")), "Enroll a gateway")
         row = self.gateway_row()
         if ident == "change_gateway":
-            return self._open(GatewayForm(self, row), "Change gateway")
+            return self._open(GatewayForm(self, row, self.fleet, self.project_rows),
+                              "Change gateway")
         # It removes authority, never a qube: no red line. The command refuses
         # a gateway still in use, and so does the form, from the row on show.
         return self._open(ConfirmForm(self, f"Remove gateway {row['name']}", "Remove",
@@ -1864,7 +2240,8 @@ class Window(Gtk.Window):
         doc = self.fw_pane.doc
         form_class, title = self.FIREWALL_FORMS[ident]
         if form_class is ModelQubeForm:
-            form = form_class(self, doc, self.fw_pane.read_at, self.fleet, self.settings.get("hub"))
+            form = form_class(self, doc, self.fw_pane.read_at, self.fleet, self.settings.get("hub"),
+                              self.records.get(doc.get("slot")), self.project_rows)
             return self._open(form, title, check=lambda: (
                 gm.firewall_changed(doc, ident, self.fw_pane, self.fleet)
                 or form.red_changed(self.fleet)))

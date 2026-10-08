@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.22 — self-hosted model qubes.** Besides the hub, up to 15
+**Status: 0.9.23 — anonymous projects.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -28,12 +28,18 @@ host name), nothing else, is the operator's. A lead can instead use a
 self-hosted model in a **model qube** with no network, which, while it is
 guarded, nothing in AI space reaches but the leads it serves (the hub only
 through your dialog); the lead then has no network either.
+A project can be **anonymous**: its qubes sit only on anonymising routers (Tor,
+a VPN), its templates update only through the qube above one, and a gate in
+dom0 checks that every 15 seconds and after every `qmcp` change, and stops the
+project when it is not so. One hidden from
+the hub (the default) is out of the hub's reach, its names are random, and the
+hub's services answer about them as about names that do not exist.
 The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
 command with forms: every change it makes is a command it shows first. The hub
 may ask for a project, a change to one, a new lead, a lead's new firewall or a
 deletion; nothing happens until the operator accepts it in dom0, in that
-window or with `qmcp proposal accept`. Next: anonymous projects (the rest of
-M3), other distributions (M4), sealed qubes
+window or with `qmcp proposal accept`. Next: an installation-wide anonymous
+mode (the rest of M3), other distributions (M4), sealed qubes
 (M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
 0.9.0–0.9.16; see `CHANGELOG.md`.
 
@@ -92,6 +98,21 @@ M3), other distributions (M4), sealed qubes
   firewall, and naming a model qube or taking one away need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
+- **Anonymous projects.** dom0's anonymity gate judges each one every 15
+  seconds and after every `qmcp` command that changes qubes, projects or gateways: its networks
+  and its lead's are anonymising gateways still on the network recorded for
+  them, no qube of it has an update proxy around its router, its self-hosted
+  model qube (if any) has no way out, its templates are guarded or outside AI
+  space, a TemplateVM has no network and its updates go only to the qube
+  directly above an anonymising gateway (or nowhere), and its qubes wear its
+  badges. When one condition breaks, the gate badges the project's lead and
+  every member `qmcp-blocked` (the rulebook and the dom0 services then refuse
+  every call that would reach or wake one), then kills them, turns their autostart off, logs it and tells you (a desktop notification, or the
+  command's output when a `qmcp` command broke it); it removes
+  nothing, and only you clear it. An anonymous qube opens no URL or file in
+  another qube, not even through a dialog. A hidden one has a random label, its
+  qubes are out of the hub's reach by the rulebook, and the services answer the
+  hub about them as about names that do not exist.
 - **Creates** take only names inside the caller's own space under a reserved
   prefix (default `ai-`: the hub's `ai-hub-`, a lead's `ai-<label>-`; Qubes
   names disposables itself), strip the qmcp badges a new
@@ -158,7 +179,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.22.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.23.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -168,9 +189,10 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 32 checked claims. It installs the policy last and ends with
-`qmcp check`. Options: `--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`,
-`--private-cap BYTES`, `--dry-run`. `deploy/uninstall.sh` removes the policy
+overrides its 38 checked claims. It starts the anonymity gate's timer as your
+dom0 user, installs the policy last and ends with `qmcp check`. Options:
+`--hub NAME`, `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`,
+`--gate-user NAME`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
 keeps.
 
@@ -179,12 +201,19 @@ under Settings > Qubes Tools, or `qmcp-gui` in a dom0 terminal, run as your own
 user. It shows AI
 space and the projects as a tree, the gateways AI space may use, each lead's
 model endpoint and firewall, the `qmcp check` light, the audit log and the
-settings, and offers every command that changes something, but `migrate`, as
-a form. Each form shows the command it will run (`sudo -n qmcp ...`); the
+settings, each anonymous project with what the anonymity gate found, and
+offers every command that changes something, but `migrate`, as a form. Each form shows the command it will run (`sudo -n qmcp ...`); the
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
+Coming from 0.9.22? Install over it; nothing changes until you create an
+anonymous project (step 7). Rolling back to 0.9.22 needs every anonymous
+project deleted first, then the `upstream` keys removed from
+`/etc/qmcp/gateways.json`: 0.9.22 refuses both, and has nothing that keeps the
+hub out of a hidden project. Then run this release's `uninstall.sh` (it keeps
+`/etc/qmcp`) before installing 0.9.22, or 0.9.22 leaves `qmcp-gate.timer`
+running a command it does not have.
 Coming from 0.9.21? Install over it. A lead whose model endpoint is an address
 keeps the DNS rule 0.9.21 gave it until you set its model again (`sudo qmcp
 project firewall NAME --model ADDRESS:PORT`); `qmcp check` warns until you do.
@@ -359,6 +388,41 @@ guarded template holds both in its root filesystem (under `/opt`, say: a qube
 based on a template has its own `/usr/local` and `/home`, never the
 template's).
 
+**7. Anonymous projects (optional).** Put a plain router of yours in front of
+`sys-whonix` (or a VPN qube) and enroll it as anonymising: dom0 records the
+network it sits on, and the gate stops any anonymous project on it if that ever
+changes. In Qubes' Global Config (Updates), send your templates' updates
+through `sys-whonix`, the qube directly above the router. Give the project a
+template the hub never touched, guarded so it never can:
+
+```sh
+# in dom0
+qvm-create --class AppVM --template "$(qubes-prefs default_template)" --label red sys-ai-tor
+qvm-prefs sys-ai-tor provides_network True
+qvm-prefs sys-ai-tor netvm sys-whonix
+sudo qmcp gateway enroll sys-ai-tor --anonymising --label tor
+qvm-clone <a Debian template of yours> anon-debian-13   # one the hub never touched
+for s in qmcp.RunInAIManaged qmcp.CopyToAIManaged; do
+  qvm-run --pass-io -u root anon-debian-13 \
+    "cat > /etc/qubes-rpc/$s && chmod 0755 /etc/qubes-rpc/$s" < /tmp/qubes-mcp/template-rpc/$s
+done
+qvm-shutdown --wait anon-debian-13
+sudo qmcp guard anon-debian-13
+sudo qmcp project create --anonymous --lead-template anon-debian-13 --lead-netvm sys-ai-tor \
+  --model api.anthropic.com:443 --network sys-ai-tor --quota 20G --note "what it is for"
+```
+
+dom0 picks the label and prints it with the lead's name; the note is yours
+alone. `qmcp project list` shows each anonymous project, its kind and whether
+it is stopped; `qmcp gate` and the window's Anonymity tab show what the gate
+found; `sudo qmcp project unblock NAME` clears a
+stop once the gate finds the project sound again. `--hub-sees` makes one the
+hub may see and operate (hidden from the network, not from the hub). A model
+qube or a template the hub operated before you guarded it can harm a hidden
+project, since guarding removes nothing the hub left; projects behind one
+router share its exit. Mark no anonymous qube to start at boot: the gate's
+first run after boot is not ordered before Qubes' autostart.
+
 ## Tests
 
 ```sh
@@ -380,7 +444,10 @@ taken for "no tags", "no network" or "not a gateway".
 `tests/test_proposals.py` covers proposals: who may submit, the store, the
 second tick, accepting and rejecting through the real commands.
 `tests/test_gateways.py` covers the gateway registry, the networks AI qubes may
-be given and leads' firewalls.
+be given and leads' firewalls. `tests/test_anon.py` covers anonymous projects:
+each gate condition broken on its own, with dom0's update question asked of
+qrexec's real parser, the block and its order, a read that fails once and
+twice, unblock, and what the hub can no longer see.
 `tests/test_gui.py` drives the window's forms through the real `qmcp` command
 and fails if the command has a command, option or field the window neither
 offers nor exempts; `tests/GUI-CHECKLIST.md` is the click-through for a
@@ -404,8 +471,9 @@ Where this has been discussed:
 
 This is operator-grade infrastructure for one use case: AI agents working in
 Qubes-isolated qubes. It is not a hardened product. The hub is itself part of
-the trust boundary: a compromised hub controls all of AI space, and the audit
-log records what it does through the dom0 services.
+the trust boundary: a compromised hub controls all of AI space but hidden
+anonymous projects, and the audit log records what it does through the dom0
+services.
 
 ## License
 

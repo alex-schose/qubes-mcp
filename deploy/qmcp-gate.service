@@ -1,0 +1,33 @@
+# /etc/systemd/system/qmcp-gate.service -- qubes-mcp
+#
+# The anonymity gate: judge every anonymous project, and stop one that is not
+# (`qmcp gate`). qmcp-gate.timer starts it every 15 seconds, and once soon
+# after boot.
+#
+# deploy/install.sh renders a dom0 user in `qubes` into User=: --gate-user if
+# given, else the one who ran it with sudo, else the qubes group's only member;
+# normally the user the qmcp.* services run as. So the gate needs no root, and
+# its desktop notification reaches the operator: a root process cannot reach
+# the session's bus (measured on Qubes 4.3.1).
+
+[Unit]
+Description=qubes-mcp anonymity gate: judge the anonymous projects, stop one that is not
+After=qubesd.service
+Wants=qubesd.service
+
+[Service]
+Type=oneshot
+User=@GATE_USER@
+ExecStart=/usr/local/bin/qmcp gate
+# Only the timer's runs leave the heartbeat `qmcp check` requires recent: a
+# check or a window refresh runs the gate too, and must not hide a dead timer.
+Environment=QMCP_GATE_HEARTBEAT=1
+# 1: a project is not anonymous (the gate stopped it, on this run or an
+# earlier one); 3: a
+# project could not be judged, or the run could not (the gate's lock held, the
+# records unreadable): `qmcp check` reports both, and the next run tries again.
+SuccessExitStatus=1 3
+# A run takes well under a second; one that hangs would hold the gate's lock
+# and keep every later run out. `qmcp check` fails when no run completes.
+TimeoutStartSec=60
+NoNewPrivileges=yes

@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import stat
 
-from qmcp import audit, birth, budget, core, firewall, gateways, projects, proposals
+from qmcp import anon, audit, birth, budget, core, firewall, gateways, projects, proposals
 
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_NAME = "30-mcp-control.policy"
@@ -124,6 +124,12 @@ POLICY_RUN_DIR = "/run/qubes/policy.d"
 #: sorts earlier, matching first, would silently override it, and parsing
 #: alone never shows that.
 PRECEDENCE_CLAIMS = (
+    ("anything into a qube the anonymity gate stopped", "qubes.Filecopy", "member", "blocked"),
+    ("the hub's exec into a stopped qube", "qmcp.RunInAIManaged", "hub", "blocked"),
+    ("the hub reaching a hidden anonymous project", "qmcp.RunInAIManaged", "hub", "hidden"),
+    ("the hub's copy into a hidden anonymous project", "qubes.Filecopy", "hub", "hidden"),
+    ("an anonymous qube opening a URL elsewhere", "qubes.OpenURL", "anon", "outside"),
+    ("an anonymous qube opening a file elsewhere", "qubes.OpenInVM", "anon", "outside"),
     ("raw @dispvm from AI space", "qubes.VMShell", "ai", "@dispvm"),
     ("exec into another qube from AI space", "qubes.VMExec", "ai", "peer"),
     ("AI space reaching the hub", "qubes.OpenURL", "ai", "hub"),
@@ -161,7 +167,8 @@ _PROBES = {"ai": "qmcp-probe-ai", "peer": "qmcp-probe-peer",
            "guarded": "qmcp-probe-guarded", "outside": "qmcp-probe-outside",
            "lead": "qmcp-probe-lead", "member": "qmcp-probe-member",
            "other": "qmcp-probe-other", "sink": "qmcp-probe-sink",
-           "model": "qmcp-probe-model"}
+           "model": "qmcp-probe-model", "blocked": "qmcp-probe-blocked",
+           "hidden": "qmcp-probe-hidden", "anon": "qmcp-probe-anon"}
 #: Synthetic project p01 (lead, member, sink, model qube) and a member of p02.
 _PROBE_TAGS = {
     "ai": [core.UMBRELLA], "peer": [core.UMBRELLA], "guarded": [core.UMBRELLA, core.GUARDED],
@@ -171,6 +178,9 @@ _PROBE_TAGS = {
     "other": [core.UMBRELLA, projects.member_badge("p02")],
     "sink": [projects.DROP_BOX, projects.dump_badge("p01")],
     "model": [core.UMBRELLA, core.GUARDED, projects.model_badge("p01")],
+    "blocked": [core.UMBRELLA, projects.member_badge("p01"), projects.ANON, projects.BLOCKED],
+    "hidden": [core.UMBRELLA, projects.member_badge("p03"), projects.ANON, projects.HUBBLIND],
+    "anon": [core.UMBRELLA, projects.member_badge("p04"), projects.ANON],
 }
 
 
@@ -196,7 +206,8 @@ def precedence(policy, system_info, hub: str) -> list:
     si = {"domains": domains}
     ai_sources = sorted({n for n, d in domains.items()
                          if not n.startswith("uuid:") and core.UMBRELLA in d.get("tags", [])
-                         and n not in (_PROBES["peer"], _PROBES["guarded"], _PROBES["model"])})
+                         and n not in (_PROBES["peer"], _PROBES["guarded"], _PROBES["model"],
+                                       _PROBES["blocked"], _PROBES["hidden"], _PROBES["anon"])})
     problems = []
     for label, service, role, target in PRECEDENCE_CLAIMS:
         service, _, argument = service.partition("+")
@@ -363,10 +374,12 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     # 5. stray badges outside AI space. Slot badges are judged by the project
     # checks below, which fail on a misplaced one; a dump sink's badge belongs
     # outside AI space.
+    # `qmcp-hubblind` outside AI space is a hidden project's sink, or one kept
+    # after its project was deleted: it only takes the hub's reach away.
     stray = sorted(vm.name for vm in vms if core.UMBRELLA not in T(vm)
                    and any(t == core.GUARDED or t.startswith(birth.NAMESPACE)
                            for t in T(vm) if not t.startswith(TOMBSTONE_PREFIX)
-                           and not projects.is_slot_tag(t)))
+                           and not projects.is_slot_tag(t) and t != projects.HUBBLIND))
     add("warn" if stray else "pass", "stray badges",
         f"qmcp badges outside AI space: {', '.join(stray)}" if stray else "none")
 
@@ -493,6 +506,11 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("fail", "runtime dir", f"{budget.LOCK_PATH} is not writable by the services group: "
                                    f"every create refuses (systemd-tmpfiles --create "
                                    f"/etc/tmpfiles.d/qmcp.conf)")
+    elif not all(shared(st) for st in (_safe(lambda: os.stat(anon.LOCK_PATH)),
+                                       _safe(lambda: os.stat(anon.HEARTBEAT_PATH)))):
+        add("fail", "runtime dir", f"{anon.LOCK_PATH} or {anon.HEARTBEAT_PATH} is missing or not "
+                                   f"writable by the services group: the anonymity gate's timer "
+                                   f"cannot run (systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
     else:
         add("pass", "runtime dir", calls)
     # The services cannot create a file in /var/log: a missing log, like one
@@ -577,6 +595,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     out.extend(project_findings(vms, by_name, records, prefix, registry, tags_by))
     out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub))
     out.extend(lead_firewall_findings(app, by_name, records))
+    out.extend(anonymity_findings(app, vms, records, tags_by))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
     if cap is not None and quotas > cap:
@@ -709,8 +728,11 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
                 vm = by_name.get(p.lead)
                 if vm is None:
                     lead_bad.append(f"{p.label}: {p.lead}")
-                elif vm.name in tags_by and (not core.lead_badges_agree(tags_by[vm.name], p.slot)
-                                             or role(vm)):
+                # A lead the anonymity gate stopped is judged by the gate's own
+                # item: its record and badges still agree.
+                elif vm.name in tags_by and (not core.lead_badges_agree(
+                        tags_by[vm.name] - {projects.BLOCKED, projects.STOPPED}, p.slot)
+                        or role(vm)):
                     lead_bad.append(f"{p.label}: {p.lead}")
             for t in p.templates:
                 vm = by_name.get(t)
@@ -791,6 +813,74 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
             f"(that project's lead can detect them through a create collision)")
     if unread:
         add("error", "project checks", "; ".join(sorted(set(unread))))
+    return out
+
+
+def anonymity_findings(app, vms, records: dict, tags_by: dict) -> list:
+    """The anonymity gate, run as every check runs it (it acts on what it
+    finds), with its timer; the anonymous badges where no anonymous project
+    puts them; and a hidden project sharing a router."""
+    out = []
+    add = lambda *a: out.append(Finding(*a))  # noqa: E731
+    anonymous = {p.slot: p for p in records.values() if p.anonymous}
+    stray = []
+    for vm in vms:
+        tags = tags_by[vm.name]
+        slots = projects.member_slots(tags) | projects.lead_slots(tags)
+        ours = any(s in anonymous for s in slots)
+        if tags & {projects.ANON, projects.BLOCKED, projects.STOPPED} and not ours:
+            stray.append(vm.name)
+    if stray:
+        add("warn", "anonymous badges", f"qmcp-anon, qmcp-blocked or qmcp-stopped on qubes of no "
+                                        f"anonymous project: {', '.join(sorted(stray))}")
+    if not anonymous:
+        return out
+    # Only the timer's runs touch the heartbeat: this check's own run below does not.
+    age = anon.heartbeat_age()
+    if age is None or age > anon.HEARTBEAT_MAX_S:
+        add("fail", "gate heartbeat", ("no run of the anonymity gate has completed" if age is None
+                                       else f"the anonymity gate last completed a run "
+                                            f"{age:.0f} s ago")
+            + f": anonymous projects are not being judged every 15 seconds (journalctl -u "
+              f"qmcp-gate.service)")
+    else:
+        add("pass", "gate heartbeat", f"last completed run {age:.0f} s ago")
+    try:
+        verdicts = anon.run(app, records=records)
+    except Exception as e:
+        add("error", "anonymity gate", f"could not run ({type(e).__name__}: {e})")
+        verdicts = []
+    if verdicts is None:
+        add("error", "anonymity gate", "another run held the gate past its wait, so nothing was "
+                                       "judged; one that hangs stops the timer's runs too")
+    for v in verdicts or ():
+        name = f"{v.label} ({v.slot})"
+        if v.status == anon.GREEN and not v.blocked:
+            add("pass", "anonymity gate", f"{name} is sound")
+        elif v.status == anon.GREEN:
+            add("warn", "anonymity gate", f"{name} was stopped and is sound again: clear it with "
+                                          f"sudo qmcp project unblock {v.label}")
+        elif v.status == anon.UNREADABLE:
+            add("error", "anonymity gate", f"{name}: {v.problems[0][1]}"
+                                           + ("; blocked" if v.blocked or v.acted else ""))
+        else:
+            add("fail", "anonymity gate", f"{name} is not anonymous ("
+                + "; ".join(d for _, d in v.problems) + ")"
+                + ("; it was stopped" if v.blocked or v.acted else ""))
+    active = anon.timer_active()
+    if active is None:
+        add("error", "gate timer", f"cannot tell whether {anon.TIMER} runs")
+    elif not active:
+        add("fail", "gate timer", f"{anon.TIMER} is not running, so anonymous projects are "
+                                  f"judged only when a qmcp command runs (sudo systemctl enable "
+                                  f"--now {anon.TIMER})")
+    else:
+        add("pass", "gate timer", f"{anon.TIMER} judges anonymous projects every 15 seconds")
+    for p in sorted(anonymous.values(), key=lambda p: p.slot):
+        shared = shared_routers(app, records, p)
+        if shared:
+            add("warn", "shared routers", f"{p.label} ({p.slot}) shares {', '.join(shared)} with "
+                                          f"another project or the hub: {SHARED_ROUTER_WARNING}")
     return out
 
 
@@ -960,6 +1050,7 @@ def gateway_rows(app) -> list:
         # A qube whose tags or network cannot be read may be on it: counted.
         users = sorted(n for n, net in on if net in (name, UNREADABLE))
         rows.append({"name": name, "anonymising": g.anonymising, "label": g.label,
+                     "recorded_upstream": g.upstream,
                      "problem": gateway_refusal(by_name, name),
                      "in_ai_space": vm is not None and _shown(lambda: core.in_scope(vm)),
                      "upstream": upstream,
@@ -970,6 +1061,36 @@ def gateway_rows(app) -> list:
                      "projects": sorted(p.label for p in records.values()
                                         if p.label and name in p.named_networks())})
     return rows
+
+
+def _recorded_upstream(app, name: str) -> str:
+    """An anonymising gateway's own network, as it is now, to record. One
+    with no network carries nothing anonymously, and is refused."""
+    vm = _vm(app, name)
+    try:
+        up = None if vm is None else _netvm(vm)
+    except NetvmUnreadable:
+        raise RoleError(f"the network of '{name}' cannot be read; try again") from None
+    if up is None:
+        raise RoleError(f"'{name}' has no network of its own, so it cannot carry anything "
+                        f"anonymously; give it its upstream (sys-whonix, a VPN qube) first")
+    return up
+
+
+def _anonymous_users(app, name: str) -> list:
+    """The anonymous projects that list gateway `name` or whose lead sits on it."""
+    out = []
+    for p in _load_records().values():
+        if not p.anonymous:
+            continue
+        lead = _vm(app, p.lead) if p.lead else None
+        try:
+            on_it = lead is not None and _netvm(lead) == name
+        except NetvmUnreadable:
+            on_it = True                    # cannot tell: counts as on it
+        if name in p.named_networks() or on_it:
+            out.append(p.label)
+    return sorted(out)
 
 
 def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "") -> str:
@@ -985,12 +1106,17 @@ def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "") -
         why = gateway_refusal({vm.name: vm for vm in app.domains}, name)
         if why:
             raise RoleError(f"'{name}' cannot be enrolled: {why}")
-        registry[name] = gateways.Gateway(name, bool(anonymising), label)
+        upstream = _recorded_upstream(app, name) if anonymising else None
+        registry[name] = gateways.Gateway(name, bool(anonymising), label, upstream)
         gateways.save(registry)
-    return f"{name}: enrolled{' (anonymising)' if anonymising else ''}"
+    return f"{name}: enrolled" + (f" (anonymising, on {upstream})" if anonymising else "")
 
 
 def set_gateway(app, name: str, anonymising=None, label=None) -> str:
+    """Change a gateway's flag or label. Marking it anonymising records its
+    network as it is now, so after moving an anonymising router to a new
+    upstream the operator marks it again. Taking the flag off one an anonymous
+    project uses is refused: the gate would stop that project."""
     if label is not None and gateways.label_refusal(label):
         raise RoleError(gateways.label_refusal(label))
     with _Exclusive():
@@ -998,12 +1124,20 @@ def set_gateway(app, name: str, anonymising=None, label=None) -> str:
         g = registry.get(name)
         if g is None:
             raise RoleError(f"'{name}' is not enrolled")
-        if anonymising is not None:
-            g.anonymising = bool(anonymising)
+        if anonymising is True:
+            g.anonymising, g.upstream = True, _recorded_upstream(app, name)
+        elif anonymising is False and g.anonymising:
+            users = _anonymous_users(app, name)
+            if users:
+                raise RoleError(f"'{name}' carries the anonymous project(s) {', '.join(users)}; "
+                                f"they would be stopped. Delete them, or give them other "
+                                f"networks, first")
+            g.anonymising, g.upstream = False, None
         if label is not None:
             g.label = label
         gateways.save(registry)
-    return f"{name}: {'anonymising' if g.anonymising else 'not anonymising'}, label '{g.label}'"
+    return (f"{name}: " + (f"anonymising, on {g.upstream}" if g.anonymising else "not anonymising")
+            + f", label '{g.label}'")
 
 
 def remove_gateway(app, name: str) -> str:
@@ -1942,6 +2076,109 @@ def _lead_rules(app, source: str, origin: str, lead_netvm, model):
     return model, firewall.endpoint_rules(model)
 
 
+# Anonymous projects (M3c). An anonymous project's networks are anonymising
+# gateways that still sit where they were recorded, its templates are
+# outside AI space or guarded, its lead is only ever made fresh from such a
+# template, and its model qube serves it alone. The commands refuse what
+# would break the gate up front; the gate (`qmcp.anon`) catches what changes
+# outside qmcp.
+
+HIDDEN_WARNING = (
+    "a hidden project is safe from the hub only if the hub never operated what it runs on: a "
+    "template or model qube the hub edited before it was guarded can harm it, since guarding "
+    "removes nothing the hub left there, and qmcp keeps no record of who operated a qube")
+SHARED_ROUTER_WARNING = (
+    "projects behind one anonymising router share its exit, so a destination can tie them "
+    "together; a second router of the kind keeps them apart")
+
+
+def _not_managed(app, name, what: str) -> None:
+    """A template an anonymous project's qubes come from: outside AI space or
+    guarded, so the hub cannot change it."""
+    vm = _vm(app, name)
+    if vm is None:
+        raise ProjectError(f"no {what} '{name}'")
+    tags = _read_tags(vm)
+    if core.UMBRELLA in tags and core.GUARDED not in tags:
+        raise ProjectError(f"{what} '{name}' is managed, so the hub can change it: guard it "
+                           f"first (qmcp guard {name}), or use another")
+
+
+def _anonymous_network(app, registry: dict, net: str) -> None:
+    """A network an anonymous project may use: an enrolled anonymising gateway
+    that still sits on the network recorded when it was marked."""
+    _usable_gateway(app, registry, net)
+    g = registry[net]
+    if not g.anonymising:
+        raise ProjectError(f"'{net}' is not an anonymising gateway: an anonymous project's "
+                           f"networks are anonymising gateways, or none")
+    if g.upstream is None:
+        raise ProjectError(f"'{net}' has no recorded network: mark it again (qmcp gateway set "
+                           f"{net} --anonymising yes)")
+    try:
+        now = _netvm(_vm(app, net))
+    except NetvmUnreadable:
+        raise ProjectError(f"the network of '{net}' cannot be read; try again") from None
+    if now != g.upstream:
+        raise ProjectError(f"'{net}' is on {now or 'no network'}, not on {g.upstream} as "
+                           f"recorded: put it back, or mark it again (qmcp gateway set {net} "
+                           f"--anonymising yes)")
+
+
+def _anonymous_networks(app, names) -> None:
+    registry = _registry()
+    for name in names:
+        if name not in (None, "none"):
+            _anonymous_network(app, registry, name)
+
+
+def _anonymous_lead(app, source: str, origin: str, lead_netvm) -> None:
+    """An anonymous project's lead is only ever made fresh, from a template the
+    hub cannot change, on an anonymising gateway or on none."""
+    if source != "template":
+        raise ProjectError("an anonymous project's lead is only ever made fresh from a template "
+                           "(--lead-template), never a clone or a promoted qube with a past")
+    _lead_template(app, origin)
+    _not_managed(app, origin, "the lead's template")
+    _anonymous_networks(app, [lead_netvm])
+
+
+def _hide_disposable_templates(report, app, p) -> None:
+    """A hidden project's approved disposable templates wear `qmcp-hubblind`:
+    every disposable is born with its template's tags, so one made from an
+    unhidden template would sit in the hub's view until its own stamp hid it,
+    and a preloaded one indefinitely. The hub, which cannot operate a guarded
+    template anyway, no longer sees these."""
+    for t in p.templates:
+        vm = _vm(app, t)
+        if vm is None or not core.is_dvmt(vm) or projects.HUBBLIND in _read_tags(vm):
+            continue
+        _set_tags(vm, add={projects.HUBBLIND})
+        report.append(f"{p.slot}: the disposable template {t} is hidden from the hub now")
+
+
+def _qube_network(app, name):
+    """A qube's network, None when it has none or cannot be read: for a warning."""
+    try:
+        vm = _vm(app, name) if name else None
+        return None if vm is None else _netvm(vm)
+    except (core.Unreadable, NetvmUnreadable):
+        return None
+
+
+def shared_routers(app, records: dict, p) -> list:
+    """The anonymising routers a hidden project shares with another project or
+    the hub: its worker networks and its lead's, against theirs."""
+    if not p.hidden:
+        return []
+    mine = set(p.named_networks()) | {_qube_network(app, p.lead)}
+    theirs = {_qube_network(app, core.read_hub())}
+    for q in records.values():
+        if q.slot != p.slot and q.label:
+            theirs |= set(q.named_networks()) | {_qube_network(app, q.lead)}
+    return sorted(n for n in (mine & theirs) if n)
+
+
 def _hubs_own_appvm(app, name, what: str):
     """A managed AppVM of the hub's (p00 or no slot): a lead's clone source or a
     qube to promote. Never a template, gateway, guarded qube, lead, drop box
@@ -2076,14 +2313,17 @@ def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
 _UNCHANGED = object()
 
 
-def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, model=None):
+def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, model=None,
+               badges=frozenset()):
     """Make `name` the lead of `slot`, as planned by `_plan_lead`. Returns
     (name, created, badges the qube had, accepted rules, rules it had, network
     it had) so a later failure can undo exactly. A fresh lead is born on
     `lead_netvm`; a promoted one keeps its network unless given none. A lead
     with a network gets "model endpoint only", written once it wears
     `qmcp-lead`, which already bars the hub's firewall writes, and before its
-    slot's lead badge, which the rulebook routes on; its network is set or
+    slot's lead badge, which the rulebook routes on; `badges`, an anonymous
+    project's, go on a fresh lead at its birth stamp, before `ai-managed`
+    (an anonymous project's lead is never promoted). Its network is set or
     cleared before that badge too. So a lead never holds the slot's badge with
     a wider firewall or the network it is leaving. On failure it undoes what it
     did (`_undo_lead`: a fresh lead is removed; a promoted one gets back its
@@ -2134,7 +2374,7 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
         vm = app.clone_vm(_hubs_own_appvm(app, origin, "a lead's clone source"), name)
     stored = None
     try:
-        birth.stamp(birth.TagIO.for_vm(vm), _tags(vm), "dom0", None)
+        birth.stamp(birth.TagIO.for_vm(vm), _tags(vm), "dom0", None, badges)
         # `qmcp-lead` before the rules (see promote above), the slot's badge last.
         _set_tags(vm, add={projects.LEAD})
         if rules:
@@ -2247,16 +2487,19 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
     return True
 
 
-def create_project(app, label: str, lead_source: str, lead_origin: str, templates=(),
+def create_project(app, label: str | None, lead_source: str, lead_origin: str, templates=(),
                    networks=(), quota=None, lead_netvm=None, dump: bool = False,
                    lead_name: str | None = None, model: str | None = None,
-                   model_qube: str | None = None) -> list:
+                   model_qube: str | None = None, anonymous: bool = False,
+                   hub_sees: bool = False, note: str | None = None) -> list:
     """Make a project; returns the report lines. The record is written last, so
     the lead is no principal until everything else is in place. With
     `model_qube` the lead has no network, and the qube becomes the project's
-    model qube once the project is recorded (`_set_model_qube`)."""
+    model qube once the project is recorded (`_set_model_qube`). An
+    `anonymous` project gets a random label from dom0 (none is given), is
+    hidden from the hub unless `hub_sees`, and may carry the operator's `note`."""
     return _run(_create_project, app, label, lead_source, lead_origin, templates, networks,
-                quota, lead_netvm, dump, lead_name, model, model_qube)
+                quota, lead_netvm, dump, lead_name, model, model_qube, anonymous, hub_sees, note)
 
 
 def _model_qube_lead_netvm(model, model_qube, lead_netvm):
@@ -2273,17 +2516,36 @@ def _model_qube_lead_netvm(model, model_qube, lead_netvm):
 
 
 def _create_project(report, app, label, lead_source, lead_origin, templates, networks, quota,
-                    lead_netvm, dump, lead_name, model=None, model_qube=None):
-    err = projects.label_refusal(label)
-    if err:
-        raise ProjectError(err)
+                    lead_netvm, dump, lead_name, model=None, model_qube=None, anonymous=False,
+                    hub_sees=False, note=None):
+    prefix = birth.read_name_prefix()
+    if anonymous:
+        if label:
+            raise ProjectError("an anonymous project's label is picked by dom0 at random, so a "
+                               "name an agent leaks links to nothing: leave the label out")
+        if lead_name is not None:
+            raise ProjectError("an anonymous project's lead is named by dom0 (<label>-lead): "
+                               "leave --lead-name out")
+        if note is not None and projects.note_refusal(note):
+            raise ProjectError(projects.note_refusal(note))
+    elif hub_sees or note is not None:
+        raise ProjectError("--hub-sees and --note go with --anonymous")
     if model_qube == "none":
         model_qube = None
     lead_netvm = _model_qube_lead_netvm(model, model_qube, lead_netvm)
-    prefix = birth.read_name_prefix()
+    if anonymous:
+        _anonymous_lead(app, lead_source, lead_origin, lead_netvm)
+        _anonymous_networks(app, networks)
+        for t in templates:
+            _not_managed(app, t, "the template")
+    records = _load_records()
+    if anonymous:
+        label = projects.random_label({p.label for p in records.values() if p.label}, prefix)
+    err = projects.label_refusal(label)
+    if err:
+        raise ProjectError(err)
     space = f"{prefix}{label}-"
     quota = _quota(quota)
-    records = _load_records()
     if projects.by_label(records, label):
         raise ProjectError(f"label '{label}' is taken")
     free = projects.free_slots(records)
@@ -2313,20 +2575,26 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         tpls.insert(0, lead_tpl)
     tpls = _check_templates(app, tpls)
     nets = _check_networks(app, networks)
+    new = projects.Project(slot, label, None, tpls, nets, quota, sink, model, None,
+                           anonymous=anonymous, hidden=anonymous and not hub_sees, note=note)
     if model_qube is not None:
         if lead_source == "promote" and model_qube == lead_origin:
             raise ProjectError(f"'{model_qube}' cannot be both the lead and its model qube")
-        _plan_model_qube(app, slot, model_qube)
+        _plan_model_qube(app, slot, model_qube, records, new)
+    if new.hidden:
+        _hide_disposable_templates(report, app, new)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, slot, lead_source,
                                                                  lead_origin, name, lead_netvm,
-                                                                 model)
+                                                                 model, new.badges())
     report.append(f"{slot}: lead {lead} ({'created' if fresh else 'promoted'})"
                   + (f", firewall: {firewall.endpoint_summary(model)}" if stored else ""))
     try:
         if sink:
-            _make_sink(app, slot, sink)
+            _make_sink(app, slot, sink, new.hidden)
             report.append(f"{slot}: dump sink {sink} created (no network)")
-        records[slot] = projects.Project(slot, label, lead, tpls, nets, quota, sink, model, stored)
+        new.lead = lead
+        new.lead_firewall = None if stored is None else tuple(stored)
+        records[slot] = new
         projects.save(records)
     except Exception:
         left = [err for err in ((_remove_qube(app, sink) if sink else ""),
@@ -2337,13 +2605,22 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         else:
             report.append(f"{slot}: undone")
         raise
-    report.append(f"{slot}: project '{label}' recorded; workers are named {space}*")
+    report.append(f"{slot}: project '{label}' recorded; workers are named {space}*"
+                  + ("" if not anonymous else
+                     f"; anonymous, {'hidden from' if new.hidden else 'visible to'} the hub"))
     if model_qube is not None:
         _set_model_qube(report, app, records, records[slot], model_qube)
+    if new.hidden:
+        report.append(f"{slot}: WARNING: {HIDDEN_WARNING}")
+        shared = shared_routers(app, records, new)
+        if shared:
+            report.append(f"{slot}: WARNING: it shares {', '.join(shared)} with another project "
+                          f"or the hub: {SHARED_ROUTER_WARNING}")
 
 
-def _make_sink(app, slot: str, name: str):
-    """A fresh drop box: ai-dump + the slot's dump badge, no network, outside AI space."""
+def _make_sink(app, slot: str, name: str, hidden: bool = False):
+    """A fresh drop box: ai-dump + the slot's dump badge, no network, outside AI
+    space; a hidden project's also `qmcp-hubblind`, first."""
     if _vm(app, name) is not None:
         raise ProjectError(f"'{name}' exists; a dump sink is always a fresh qube")
     try:
@@ -2354,6 +2631,8 @@ def _make_sink(app, slot: str, name: str):
         raise ProjectError("Qubes has no default template for the dump sink")
     vm = app.add_new_vm("AppVM", name, SINK_LABEL, template=tpl)
     try:
+        if hidden:
+            _set_tags(vm, add={projects.HUBBLIND})
         _set_tags(vm, add={projects.DROP_BOX, projects.dump_badge(slot)})
         vm.netvm = None
         vm.default_dispvm = None
@@ -2413,6 +2692,14 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
     records = _load_records()
     p = _project(records, key)
     lead_netvm = _model_qube_lead_netvm(model, model_qube, lead_netvm)
+    if p.anonymous:
+        if lead_name is not None:
+            raise ProjectError("an anonymous project's lead is named by dom0 (<label>-lead, or "
+                               "<label>-lead2 while the old one is kept): leave --lead-name out")
+        _anonymous_lead(app, lead_source, lead_origin, lead_netvm)
+        if keep_old and _vm(app, f"{p.space(prefix)}lead") is not None:
+            lead_name = next(f"{p.space(prefix)}lead{n}" for n in range(2, 100)
+                             if _vm(app, f"{p.space(prefix)}lead{n}") is None)
     old_vm = _recorded_lead(app, p)
     old_net, disconnect = None, False
     if add_old_network and not keep_old:
@@ -2427,6 +2714,8 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                 if len(p.networks) >= projects.MAX_NETWORKS:
                     raise ProjectError(f"the project lists {projects.MAX_NETWORKS} networks already; "
                                        f"take one off before adding the old lead's")
+                if p.anonymous:
+                    _anonymous_networks(app, [old_net])
                 p.networks = tuple(_check_networks(app, p.networks + (old_net,)))
             else:
                 disconnect = True
@@ -2442,7 +2731,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
     if model_qube not in (None, "none"):
         if lead_source == "promote" and model_qube == lead_origin:
             raise ProjectError(f"'{model_qube}' cannot be both the lead and its model qube")
-        _plan_model_qube(app, p.slot, model_qube)
+        _plan_model_qube(app, p.slot, model_qube, records, p)
     elif model is not None and p.model_qube is not None:
         _model_badge_holders(app, p.slot)
     try:
@@ -2480,7 +2769,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                 _not_removed(report, p.slot, old, err)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, p.slot, lead_source,
                                                                  lead_origin, name, lead_netvm,
-                                                                 model)
+                                                                 model, p.badges())
     try:
         tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead))
         if tpl and tpl not in p.templates and (vm := _vm(app, tpl)) is not None \
@@ -2542,6 +2831,11 @@ def _networks_in_use(app, p, gone) -> list:
 
 
 def _apply_edit(report, app, records, p, templates, networks, quota):
+    if p.anonymous:
+        # Refused here rather than stopped by the gate after it is saved.
+        for t in templates or ():
+            _not_managed(app, t, "the template")
+        _anonymous_networks(app, networks or ())
     if templates is not None:
         p.templates = tuple(_check_templates(app, templates))
     if networks is not None:
@@ -2553,6 +2847,8 @@ def _apply_edit(report, app, records, p, templates, networks, quota):
         p.networks = new
     if quota is not None:
         p.quota = _quota(quota)
+    if p.hidden:
+        _hide_disposable_templates(report, app, p)
     projects.save(records)
     report.append(f"{p.slot}: templates {list(p.templates)}, networks "
                   f"{[n or 'none' for n in p.networks]}, quota {p.quota}")
@@ -2723,13 +3019,23 @@ def _model_badge_holders(app, slot: str) -> list:
     return sorted(out)
 
 
-def _plan_model_qube(app, slot: str, name) -> None:
+def _plan_model_qube(app, slot: str, name, records=None, p=None) -> None:
     """Check `name` (or None: no model qube) as `slot`'s model qube, changing
-    nothing."""
+    nothing. An anonymous project's model qube serves it alone, and no other
+    project may share one that serves an anonymous project."""
     if name is not None:
         why = model_qube_refusal({vm.name: vm for vm in app.domains}, name)
         if why:
             raise ProjectError(f"'{name}' cannot be a model qube: {why}")
+        others = projects.model_slots(_read_tags(_vm(app, name))) - {slot}
+        records = _load_records() if records is None else records
+        anonymous_others = sorted(s for s in others if s in records and records[s].anonymous)
+        if others and p is not None and p.anonymous:
+            raise ProjectError(f"'{name}' already serves {', '.join(sorted(others))}: an "
+                               f"anonymous project's model qube serves it alone")
+        if anonymous_others:
+            raise ProjectError(f"'{name}' serves the anonymous project(s) "
+                               f"{', '.join(anonymous_others)}, which it serves alone")
     _model_badge_holders(app, slot)
 
 
@@ -2740,15 +3046,19 @@ def _set_model_qube(report, app, records, p, name) -> None:
     the model qube leaves p00, loses its network, is guarded and is killed if
     it runs (unless it is already a guarded model qube); the record names it;
     and only then does it wear the slot's model badge, which is what
-    lets the lead reach it. Checked again here, against the fleet as it is
+    lets the lead reach it; a hidden project's wears `qmcp-hubblind` before
+    the badge, and keeps it when it stops serving (it holds the project's
+    conversations). Checked again here, against the fleet as it is
     now. A failure part-way leaves less authority than the command meant,
     never more, and the report says how far it got."""
-    _plan_model_qube(app, p.slot, name)
+    _plan_model_qube(app, p.slot, name, records, p)
     badge = projects.model_badge(p.slot)
     for holder in _model_badge_holders(app, p.slot):
         if holder != name and (vm := _vm(app, holder)) is not None:
             _set_tags(vm, remove={badge})
-            report.append(f"{p.slot}: {holder} is no longer its model qube")
+            report.append(f"{p.slot}: {holder} is no longer its model qube"
+                          + (" (it stays hidden from the hub: it holds the project's "
+                             "conversations)" if p.hidden else ""))
     if name is None:
         p.model_qube = None
         projects.save(records)
@@ -2802,6 +3112,9 @@ def _set_model_qube(report, app, records, p, name) -> None:
         _kill_model_qube(report, p.slot, vm, name, managed)
     p.model, p.model_qube, p.lead_firewall = None, name, None
     projects.save(records)
+    if p.hidden:
+        _set_tags(vm, add={projects.HUBBLIND})
+        report.append(f"{p.slot}: {name} is hidden from the hub")
     _set_tags(vm, add={badge})
     report.append(f"{p.slot}: model qube {name}; the lead reaches it on port {MODEL_PORT}")
     shared = sorted(projects.model_slots(_tags(vm)) - {p.slot})
@@ -2824,7 +3137,7 @@ def _add_dump(report, app, key, name):
     name = name or (f"{p.label}-dump" if p.label else "hub-dump")
     if name.startswith(prefix) or not core.valid_qube_name(name):
         raise ProjectError(f"a dump sink's name must be a qube name outside '{prefix}'")
-    _make_sink(app, p.slot, name)
+    _make_sink(app, p.slot, name, p.hidden)
     p.dump = name
     try:
         projects.save(records)
@@ -2855,12 +3168,20 @@ def _move(report, app, name, target, confirm):
         raise ProjectError(f"'{name}' is a lead; use qmcp project lead")
     if projects.model_slots(tags) and target != "none":
         raise ProjectError(f"'{name}' is a model qube; a model qube joins no slot")
+    if tags & {projects.ANON, projects.HUBBLIND, projects.BLOCKED} or any(
+            s in records and records[s].anonymous for s in projects.member_slots(tags)):
+        raise ProjectError(f"'{name}' is a qube of an anonymous project: it never moves out "
+                           f"(it would carry the project's content to the hub)")
     if target == "none":
         slot = None
     elif target == projects.HUB_SLOT:
         slot = projects.HUB_SLOT
     else:
         p = _project(records, target)
+        if p.anonymous:
+            raise ProjectError(f"'{p.label}' is anonymous: no qube moves into it (the hub has "
+                               f"had root in every qube it could move); its lead creates its "
+                               f"workers")
         slot = p.slot
         try:
             net = _netvm(vm)
@@ -2983,9 +3304,12 @@ def _delete_project(report, app, key):
                     report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}, "
                                   f"but {e}; read again below")
                     continue
+            hidden = projects.HUBBLIND in tags
             report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}"
                           + (" (the dump sink, kept)" if name == p.dump else
-                             " (the model qube, kept)" if name == p.model_qube else ""))
+                             " (the model qube, kept)" if name == p.model_qube else "")
+                          + (": still hidden from the hub, since it holds the project's "
+                             "output" if hidden else ""))
         except Exception as e:
             report.fail(f"{p.slot}: could NOT strip badges from {name} ({type(e).__name__})")
     left, unread = _badges_of_slot(app, p.slot)
@@ -2996,6 +3320,21 @@ def _delete_project(report, app, key):
         report.append(f"{p.slot}: free")
 
 
+def unblock(app, key: str) -> list:
+    """Take `qmcp-blocked` off an anonymous project's lead and members once a
+    fresh gate run finds it sound; `autostart` stays off."""
+    return _run(_unblock, app, key)
+
+
+def _unblock(report, app, key):
+    records = _load_records()
+    p = _project(records, key)
+    try:
+        report.extend(anon.unblock(app, records, p.slot))
+    except ValueError as e:
+        raise ProjectError(str(e)) from None
+
+
 def project_rows(app, records: dict) -> list:
     rows = []
     for slot in projects.SLOTS:
@@ -3003,15 +3342,20 @@ def project_rows(app, records: dict) -> list:
         if p is None:
             continue
         badge = projects.member_badge(slot)
-        members = 0
+        members, blocked = 0, False
         for vm in app.domains:
             try:
-                members += core.is_member(vm, slot)
+                tags = core.tags_of(vm)
             except core.Gone:
-                pass
+                continue
             except core.Unreadable:
                 members = None      # not known, never a count that skipped a qube
                 break
+            member = _member(tags, slot)
+            members += member
+            if projects.BLOCKED in tags and (member or (vm.name == p.lead and
+                                                        projects.lead_badge(slot) in tags)):
+                blocked = True
         try:
             used = budget.persistent_sum(app, badge)
         except Exception:
@@ -3020,5 +3364,7 @@ def project_rows(app, records: dict) -> list:
                      "used": used, "quota": p.quota, "templates": list(p.templates),
                      "networks": list(p.networks), "dump": p.dump, "model": p.model,
                      "model_qube": p.model_qube,
-                     "lead_firewall": None if p.lead_firewall is None else list(p.lead_firewall)})
+                     "lead_firewall": None if p.lead_firewall is None else list(p.lead_firewall),
+                     "anonymous": p.anonymous, "hidden": p.hidden, "note": p.note,
+                     "blocked": None if members is None else blocked})
     return rows

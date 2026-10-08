@@ -869,7 +869,8 @@ def _qubes_events(args: dict) -> dict:
     "reserved_prefix", the prefix reserved for the names AI creates, which
     a project's names build on (<reserved_prefix><label>-...), and
     "projects": one entry per slot in use, {slot, label, lead, templates,
-    networks, quota, used, has_dump, model, model_qube}, starting with p00,
+    networks, quota, used, has_dump, model, model_qube, anonymous}, starting
+    with p00 (a project hidden from the hub is not listed),
     the hub's own qubes, which has no label, lead, templates, networks or
     quota. model is the lead's remote model endpoint (host:port) and
     model_qube the project's self-hosted model qube; at most one is set. In networks null
@@ -888,8 +889,11 @@ def _qubes_events(args: dict) -> dict:
     be born; null is "none", the first entry is the default), "dump" (its
     dump sink, or null), "model" (its remote model endpoint, host:port, or
     null), "model_qube" (its self-hosted model qube, "<out-of-scope>" once
-    that has left AI space, or null) and "model_port" (11434 with a model
-    qube, else null). A lead with a model qube has no network: it reaches the
+    that has left AI space, or null), "model_port" (11434 with a model
+    qube, else null), "anonymous" (true when the project must stay
+    anonymous: its networks are anonymising and dom0 stops it within about
+    15 seconds of that ceasing to hold) and "hub_sees" (false when the hub cannot see or
+    reach it). A lead with a model qube has no network: it reaches the
     model qube's port "model_port" through Qubes' qubes.ConnectTCP, e.g. by
     running `qvm-connect-tcp 11434:<model_qube>:11434` in the lead, after
     which the model answers on the lead's own localhost:11434. No other qube
@@ -992,7 +996,15 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
     disposables, and a promoted lead keeps its own name.
 
     - label: 1-8 lowercase letters or digits, not one that reads as a slot
-      ("p03") or a keyword ("none", "hub").
+      ("p03") or a keyword ("none", "hub"). Omitted for an anonymous project.
+    - anonymous: true for a project that must stay anonymous. Its lead comes
+      from a template ("from": "template"), its networks are anonymising
+      gateways or "none", and its templates are guarded. dom0 picks its label
+      at random, so give no label and no lead_name; you are never told what
+      was created, and unless hub_sees is true you cannot see or reach it,
+      and no later proposal may name it.
+    - hub_sees: with anonymous, true for an anonymous project you may see and
+      operate: hidden from the network, not from you.
     - lead: {"from": ..., "qube": NAME}. "template": a fresh lead built on the
       TemplateVM NAME. "clone": a copy of NAME, one of the hub's own managed
       AppVMs (in p00 or in no slot). "promote": NAME itself, one of the hub's
@@ -1025,14 +1037,19 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
       or would be no qube name (a label starting with a digit): then propose
       the sink with a name once the project exists.
 
-    It needs the operator's second tick, an extra confirmation, when the lead
+    It needs the operator's second tick, an extra confirmation, when it is
+    anonymous, when the lead
     is promoted, when lead_netvm or a worker network is one AI space does not
     use today, when the model is one no project uses today, when it names a
     model qube (it guards that qube), or when the quota makes the projects'
     quotas add up to more than the pool cap.
     """), {
         "title": _TITLE,
-        "label": _prop("string", "The new project's label: 1-8 lowercase letters or digits."),
+        "label": _prop("string", "The new project's label: 1-8 lowercase letters or digits. "
+                                 "Omit it for an anonymous project: dom0 picks one."),
+        "anonymous": _prop("boolean", "A project that must stay anonymous; omit for false."),
+        "hub_sees": _prop("boolean", "With anonymous: a project you may see and operate; "
+                                     "omit for false (hidden from you)."),
         "lead": _LEAD,
         "lead_name": _LEAD_NAME,
         "lead_netvm": _LEAD_NETVM,
@@ -1045,7 +1062,7 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
                           items={"type": ["string", "null"]}),
         "quota": _prop(["integer", "string"], "The project's quota: " + _QUOTA_TEXT),
         "dump": _prop("boolean", "Also make the project's dump sink; omit for false."),
-    }, required=("title", "label", "lead", "networks", "quota"), prepare=_quota_in_bytes)
+    }, required=("title", "lead", "networks", "quota"), prepare=_quota_in_bytes)
 def _qubes_propose_project(args: dict) -> dict:
     return _submit("project-create", args)
 

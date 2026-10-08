@@ -30,6 +30,13 @@ Four guarantees, each with a test that fails when it breaks:
   failure the check has on a model badge, and the forms offer as one only the
   qubes the command would take. Taking a lead's network for one, and sharing
   one between projects, are said in red before OK (`ModelQubes`, `Widgets`).
+- **An anonymous project is shown as the gate judged it**: each verdict of
+  `qmcp gate --json`, the conditions it fails, whether the gate stopped it,
+  and a gate that did not answer keeps its last verdicts, never "no anonymous
+  project". The forms refuse what the command refuses for one, and a hidden
+  one's warnings are in red before OK (`AnonModel`, `Widgets`). The gate runs
+  here against qrexec's real policy parser, as `test_anon.py` runs it, and
+  never touches this machine's own lock or policy.
 
 The GTK tests build widgets without showing them, and are skipped where GTK
 cannot start (no PyGObject, or no display).
@@ -53,9 +60,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, cli, core, firewall, fleet, gateways, projects, proposals  # noqa: E402
+from qmcp import anon, audit, cli, core, firewall, fleet, gateways, projects, proposals  # noqa: E402
 from qmcp import guimodel as gm  # noqa: E402
 from fakequbes import GiB, _qubesd_rule  # noqa: E402
+from test_anon import policy_view  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, OTHER_LEAD, ProjectBase  # noqa: E402
 
@@ -67,8 +75,8 @@ RULES = ["action=accept proto=tcp dsthost=example.com dstports=443",
 #: A qube the hub set up to serve a model, as `serve()` makes it.
 MODEL = "ai-hub-model"
 #: One proposal of every type the hub can submit, and every option, each
-#: valid on the projects fixture. The delete, the lead-firewall ones and the
-#: ones that name a model qube need the second tick there.
+#: valid on the projects fixture. The delete, the lead-firewall ones, the
+#: ones that name a model qube and the anonymous one need the second tick there.
 PROPOSALS = {
     "create": {"type": "project-create", "title": "new project <b>newp</b>", "label": "newp",
                "lead": {"from": "template", "qube": "ai-debian-13"},
@@ -80,6 +88,10 @@ PROPOSALS = {
     "lead": {"type": "project-lead", "title": "a new lead for other", "project": "other",
              "lead": {"from": "clone", "qube": "ai-work2"}, "lead_name": "ai-other-boss",
              "keep_old": True},
+    # An anonymous project the hub may see: no label and no lead name, dom0 picks both.
+    "anon": {"type": "project-create", "title": "an anonymous project", "anonymous": True,
+             "hub_sees": True, "lead": {"from": "template", "qube": "ai-tpl-g"},
+             "networks": ["none"], "quota": GiB},
     "delete": {"type": "project-delete", "title": "remove osint", "project": "osint"},
     "rules": {"type": "project-firewall", "title": "example.com for osint's lead",
               "project": "osint", "rules": RULES},
@@ -199,6 +211,49 @@ class GuiBase(ProjectBase):
     def setUp(self):
         super().setUp()
         self.runner = CliRunner(self.app)
+        # Every refresh runs the anonymity gate (`gate --json`, and the check):
+        # here it takes a lock in this test's directory, asks qrexec's real
+        # parser where updates go, as test_anon.py has it, and notifies nobody.
+        self.notices = []
+        for mod, attr, value in [
+            (anon, "LOCK_PATH", str(self.tmp / "run" / "gate.lock")),
+            (anon, "HEARTBEAT_PATH", str(self.tmp / "run" / "gate.last")),
+            (anon, "RETRY_WAIT_S", 0.0),
+            (anon, "load_policy", lambda: policy_view(self.app, "sys-whonix")),
+            (anon, "notify", lambda text: self.notices.append(text) or True),
+            (anon, "TIMER_CHECK", lambda: True),
+        ]:
+            self._saved.append((mod, attr, getattr(mod, attr)))
+            setattr(mod, attr, value)
+
+    def tor(self, name="ai-net-tor"):
+        """An anonymising router of the operator's, as test_anon.py's fixture
+        has one: in AI space and guarded, behind Whonix's sys-whonix, and
+        enrolled anonymising, which records sys-whonix as its upstream."""
+        a = self.app
+        if "sys-whonix" not in a.domains:
+            a.vm("sys-whonix", provides_network=True, netvm=a.domains["sys-firewall"],
+                 tags={"anon-gateway"}, features={"qubes-firewall": "1"})
+        a.vm(name, provides_network=True, netvm=a.domains["sys-whonix"], power="Running",
+             tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
+        fleet.enroll_gateway(a, name, anonymising=True)
+
+    def anonymous(self, hub_sees=False, note=None, net="ai-net-tor"):
+        """An anonymous project the gate finds sound, made by the command: its
+        lead fresh from the guarded ai-tpl-g, on `net` with a model endpoint.
+        Returns its record."""
+        if net not in gateways.load():
+            self.tor(net)
+        before = set(projects.load())
+        fleet.create_project(self.app, None, "template", "ai-tpl-g", networks=[net], quota="5G",
+                             lead_netvm=net, model="api.example.org:443", anonymous=True,
+                             hub_sees=hub_sees, note=note)
+        slot = (set(projects.load()) - before).pop()
+        return projects.load()[slot]
+
+    def gate(self):
+        """`qmcp gate --json`, as the window reads it."""
+        return gm.parse_gate(self.runner.execute(gm.READS["gate"]))
 
     def read(self, *args):
         result = self.runner.execute(gm.read_cmd(*args))
@@ -226,15 +281,15 @@ class GuiBase(ProjectBase):
 
     def submit_every_proposal(self):
         """One proposal of every shape in PROPOSALS, through the real service:
-        `dump` accepted and `lead` rejected as soon as each is in, so a decision
-        with a report is read as well, and the pending ones stay within the
-        cap (`proposals.MAX_PENDING`)."""
+        `dump` accepted and `lead` and `anon` rejected as soon as each is in, so
+        a decision with a report is read as well, and the pending ones stay
+        within the cap (`proposals.MAX_PENDING`)."""
         ids = {}
         for name in PROPOSALS:
             ids[name] = self.submit_proposal(name)["id"]
             if name == "dump":
                 self.runner.execute(gm.accept_proposal(ids[name], self.show(ids[name])["sha256"]))
-            elif name == "lead":
+            elif name in ("lead", "anon"):
                 self.runner.execute(gm.reject_proposal(ids[name]))
         return ids
 
@@ -384,6 +439,11 @@ SAMPLES = {
              model="api.anthropic.com:443"),
         dict(label="newt", lead_source="template", lead_origin="ai-debian-13", lead_netvm="none",
              networks=["none"], quota="1G", model_qube=MODEL),
+        # Anonymous: no label, dom0 picks it; one the hub may see, with a note.
+        dict(label=None, lead_source="template", lead_origin="ai-tpl-g", networks=["none"],
+             quota="1G", anonymous=True),
+        dict(label=None, lead_source="template", lead_origin="ai-tpl-g", networks=["none"],
+             quota="1G", anonymous=True, hub_sees=True, note="-the Tor one, for case 12"),
     ],
     gm.edit_project: [dict(key="osint", templates=["ai-debian-13"], networks=["none"], quota="30G")],
     gm.remove_lead: [dict(key="osint")],
@@ -416,6 +476,7 @@ SAMPLES = {
     gm.set_lead_model_qube: [dict(key="osint", model_qube=MODEL), dict(key="p02", model_qube="none")],
     gm.set_lead_rules: [dict(key="osint", rules=RULES)],
     gm.accept_lead_rules: [dict(key="osint")],
+    gm.unblock_project: [dict(key="osint")],
 }
 
 
@@ -533,7 +594,7 @@ class Parity(GuiBase):
             self.assertEqual(set(doc["before"]) | set(doc["after"]), {k for k, _ in table},
                              doc["type"])
         decisions = [doc["decision"] for doc in docs if doc["decision"] is not None]
-        self.assertEqual(len(decisions), 2)
+        self.assertEqual(len(decisions), 3)             # dump accepted, lead and anon rejected
         fields = set().union(*(d.keys() for d in decisions))
         self.assertEqual(fields - {k for k, _ in gm.DECISION_FIELDS}, set(gm.DECISION_NOT_SHOWN))
         self.assertLessEqual({k for k, _ in gm.DECISION_FIELDS}, fields)
@@ -1267,10 +1328,14 @@ class GatewayModel(GuiBase):
         self.assertEqual(gm.gateway_notes(net), [])
         self.assertEqual(dict(gm.gateway_details(net))["Its upstream ignores its firewall rules"], "no")
         self.assertEqual(gm.network_text("sys-ai-net", gws), "sys-ai-net")
-        # The mark follows the upstream.
+        # The mark follows the upstream. sys-ai-tor is anonymising, and was on
+        # sys-whonix when it was marked: moved, it is marked for that instead.
         self.app.domains["sys-ai-tor"].netvm = self.app.domains["sys-firewall"]
-        self.assertEqual(gm.gateway_notes(next(r for r in self.gateways() if r["name"] == "sys-ai-tor")),
-                         [])
+        notes = gm.gateway_notes(next(r for r in self.gateways() if r["name"] == "sys-ai-tor"))
+        self.assertNotIn(MARK, notes)
+        self.assertEqual(notes, ["MOVED: it is on sys-firewall, not on sys-whonix as recorded: the "
+                                 "gate stops every anonymous project on it. Put it back, or mark "
+                                 "it again (Change...)"])
         # Whether it does cannot be read, through the upstream's tags or the
         # gateway's own network: said so, never "no".
         unread = "whether its upstream ignores its firewall rules cannot be read now; refresh"
@@ -2339,6 +2404,356 @@ class ModelQubes(GuiBase):
             self.assertTrue(text.isascii(), text)
 
 
+# ======================================================================= anonymous projects: the model
+
+class AnonModel(GuiBase):
+    """Anonymous projects in the window, against the real command and the real
+    gate: what `qmcp gate --json` says is what the window shows, and each
+    refusal the window makes before OK is the command's, in its words."""
+
+    def refused(self, argv):
+        """The command's own refusal of `argv`, from its stderr."""
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 1, (argv, result.out))
+        return result.err
+
+    def break_router(self, net="ai-net-tor"):
+        """The router moved to clearnet, outside qmcp: the gate's networks condition."""
+        self.app.domains[net].netvm = self.app.domains["sys-firewall"]
+
+    def test_every_field_of_a_gate_verdict_is_shown(self):
+        p = self.anonymous(note="the tor one")
+        self.break_router()
+        verdicts = self.gate()                              # red: it acts, and says so
+        self.assertEqual([v["slot"] for v in verdicts], [p.slot])
+        v = verdicts[0]
+        self.assertEqual(set(v), {k for k, _ in gm.GATE_FIELDS})
+        self.assertEqual(set().union(*(set(q) for q in v["problems"])), set(gm.GATE_PROBLEM_FIELDS))
+        self.assertTrue(v["acted"] and v["problems"])
+        rows = gm.gate_rows(verdicts, self.read_json("project", "list", "--json"))
+        shown = dict(gm.gate_details(rows[0]))
+        self.assertLessEqual({h for _, h in gm.GATE_FIELDS} | {"Note (dom0 only)"}, set(shown))
+        self.assertEqual(shown["Note (dom0 only)"], "the tor one")
+        self.assertTrue(shown["Gate status"].startswith("RED: not anonymous: its networks ("))
+        for line in v["acted"]:
+            self.assertIn(line, shown["What this run did"].split("\n"))
+        for problem in v["problems"]:
+            self.assertIn(f"its networks: {problem['detail']}", shown["What fails"].split("\n"))
+        self.assertLessEqual({k for k, _ in gm.GATE_COLUMNS} - {"note", "kind", "fails"},
+                             {k for k, _ in gm.GATE_FIELDS})
+        for value in list(shown.values()) + gm.gate_cells(rows[0]):
+            self.assertIsInstance(value, gm.Shown)
+
+    def test_the_gate_read_takes_every_answer_the_command_gives(self):
+        # 0 sound, 1 not, 3 not judged: each with its verdicts on stdout. A
+        # read without them failed, and is never "no anonymous project".
+        self.assertEqual(self.gate(), [])                    # none to judge
+        p = self.anonymous()
+        result = self.runner.execute(gm.READS["gate"])
+        self.assertEqual(result.rc, 0)
+        self.assertEqual([v["status"] for v in gm.parse_gate(result)], ["green"])
+        self.break_router()
+        result = self.runner.execute(gm.READS["gate"])
+        self.assertEqual(result.rc, 1)
+        self.assertEqual([(v["slot"], v["status"]) for v in gm.parse_gate(result)], [(p.slot, "red")])
+        self.app.fail.add(f"tag.List:{p.lead}")             # a read the gate cannot make
+        try:
+            result = self.runner.execute(gm.READS["gate"])
+        finally:
+            self.app.fail.clear()
+        self.assertEqual(result.rc, 3)
+        self.assertEqual([v["status"] for v in gm.parse_gate(result)], ["unreadable"])
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        result = self.runner.execute(gm.READS["gate"])
+        self.assertEqual((result.rc, result.out), (3, ""))
+        with self.assertRaises(gm.ReadError):
+            gm.parse_gate(result)
+        for out in ('{"slot": "p03"}', '[{"slot": "p03", "status": "maybe", "problems": [], '
+                                       '"acted": []}]', '[1]', 'not json'):
+            with self.assertRaises(gm.ReadError, msg=out):
+                gm.parse_gate(gm.Result(gm.READS["gate"], 0, out))
+        with self.assertRaises(gm.ReadError):                # an exit it never uses
+            gm.parse_gate(gm.Result(gm.READS["gate"], 2, "[]"))
+
+    def test_a_project_the_gate_did_not_judge_is_never_left_out(self):
+        # A project made after the gate's run is not in its answer: the records
+        # still say it is anonymous, so it is listed, not judged.
+        p = self.anonymous(hub_sees=True)
+        records = self.read_json("project", "list", "--json")
+        rows = gm.gate_rows([], records)
+        self.assertEqual([(r["slot"], r["status"]) for r in rows], [(p.slot, None)])
+        self.assertEqual(gm.gate_cells(rows[0])[[k for k, _ in gm.GATE_COLUMNS].index("status")],
+                         "not judged")
+        self.assertIn(gm.NOT_JUDGED, gm.gate_note(rows, True))
+        self.assertEqual(gm.gate_tab(rows, True), "Anonymity (1)")
+        self.assertEqual(gm.gate_status_text(None), gm.NOT_JUDGED)
+        node = self.node(f"project:{p.slot}")
+        self.assertEqual(dict(gm.details(node, records, gate=[]))["Anonymity gate"], gm.NOT_JUDGED)
+        self.assertIn("not known", dict(gm.details(node, records, gate=None))["Anonymity gate"])
+        # Never read, or answered with none and records that hold none: said as such.
+        self.assertEqual((gm.gate_rows(None, records), gm.gate_tab([], False)), ([], "Anonymity (?)"))
+        self.assertEqual(gm.gate_note([], False), "The anonymity gate has not been read.")
+        self.assertIn("No anonymous project", gm.gate_note([], True))
+        self.assertNotIn("No anonymous project", gm.gate_note([], True, records_read=False))
+        self.assertIn("did not answer", gm.gate_note(rows, True, error="gate: no answer",
+                                                     read_at="10:00:00"))
+
+    def test_the_tree_marks_an_anonymous_project_and_its_qubes(self):
+        hidden = self.anonymous(note="osint, the Tor one")
+        seen = self.anonymous(hub_sees=True)
+        tree = gm.build_tree(self.read_json("list", "--all", "--json"),
+                             self.read_json("project", "list", "--json"),
+                             self.read_json("settings", "--json"), self.gate())
+        nodes = {n.key: n for n in gm.walk(tree)}
+        role = [k for k, _ in gm.COLUMNS].index("role")
+        h, s = nodes[f"project:{hidden.slot}"], nodes[f"project:{seen.slot}"]
+        self.assertEqual(h.cells[0], f"{hidden.slot} {hidden.label}: osint, the Tor one")
+        self.assertEqual(h.cells[role], "anonymous project, hidden from the hub")
+        self.assertEqual(s.cells[role], "anonymous project, visible to the hub")
+        lead = nodes[f"qube:{hidden.lead}"]
+        self.assertEqual(lead.data["role"], "lead")          # what the window acts on
+        self.assertEqual(lead.cells[role], "lead, anonymous, hidden from the hub")
+        self.assertEqual(nodes[f"qube:{seen.lead}"].cells[role], "lead, anonymous")
+        self.assertEqual(gm.firewall_key(lead, {r["slot"]: r for r in
+                                                self.read_json("project", "list", "--json")}),
+                         hidden.label)
+        # Stopped: the project, and every qube that wears the badge.
+        self.break_router()
+        verdicts = self.gate()
+        tree = gm.build_tree(self.read_json("list", "--all", "--json"),
+                             self.read_json("project", "list", "--json"),
+                             self.read_json("settings", "--json"), verdicts)
+        nodes = {n.key: n for n in gm.walk(tree)}
+        self.assertEqual(nodes[f"project:{hidden.slot}"].cells[role],
+                         "anonymous project, hidden from the hub, BLOCKED by the gate, "
+                         "gate RED: its networks")
+        killed = ", stopped by the gate" if projects.STOPPED in self.tags(hidden.lead) else ""
+        self.assertEqual(nodes[f"qube:{hidden.lead}"].cells[role],
+                         "lead, anonymous, hidden from the hub, BLOCKED by the gate" + killed)
+        pane = dict(gm.details(nodes[f"qube:{hidden.lead}"]))
+        self.assertIn("qmcp-blocked", pane["BLOCKED by the gate"])
+        self.assertIn("qmcp-hubblind", pane["Hidden from the hub"])
+        pane = dict(gm.details(nodes[f"project:{hidden.slot}"], gate=verdicts))
+        self.assertTrue(pane["Stopped by the anonymity gate"].startswith("yes: "))
+        self.assertTrue(pane["Anonymity gate"].startswith("RED: not anonymous: its networks"))
+        self.assertEqual(pane["Note (dom0 only)"], "osint, the Tor one")
+        # A badge is marked wherever it is: the rulebook refuses every call into it.
+        self.app.domains["ai-work2"].tags.add(projects.BLOCKED)
+        self.assertIn("BLOCKED by the gate", self.node("qube:ai-work2").cells[role])
+        self.app.domains["ai-work2"].tags.add(projects.STOPPED)
+        self.assertTrue(self.node("qube:ai-work2").cells[role].endswith(
+            "BLOCKED by the gate, stopped by the gate"))
+        self.assertIn("qmcp-stopped", dict(gm.details(self.node("qube:ai-work2")))[
+            "Stopped by the gate"])
+        # Members whose tags cannot be read: never "not stopped".
+        self.app.fail.add("tag.List:ai-work")
+        try:
+            row = next(r for r in self.read_json("project", "list", "--json")
+                       if r["slot"] == hidden.slot)
+        finally:
+            self.app.fail.clear()
+        self.assertIsNone(row["blocked"])
+        self.assertEqual(gm.field_text("blocked", None), "not known: its members could not be read")
+        self.assertIn("blocked: not known", gm.project_role(row))
+
+    def test_unblock_is_offered_on_a_stopped_project_and_its_qubes(self):
+        p = self.anonymous()
+        other = self.anonymous(hub_sees=True)
+        records = lambda: {r["slot"]: r for r in self.read_json("project", "list", "--json")}  # noqa: E731
+        self.assertNotIn("unblock", gm.actions(self.node(f"project:{p.slot}"), records()))
+        self.break_router()
+        verdicts = self.gate()                               # both on ai-net-tor: both stopped
+        self.assertEqual({v["status"] for v in verdicts}, {"red"})
+        recs = records()
+        for key in (f"project:{p.slot}", f"qube:{p.lead}"):
+            self.assertIn("unblock", gm.actions(self.node(key), recs), key)
+        self.assertEqual(gm.blocked_project(self.node(f"qube:{p.lead}"), recs)["slot"], p.slot)
+        for key in ("project:p01", "qube:ai-osint-w1", "slot:p00"):
+            self.assertNotIn("unblock", gm.actions(self.node(key), recs), key)
+        # While the gate still finds it unsound, the form refuses in the command's words.
+        why = gm.unblock_refusal(recs[p.slot], gm.verdict_for(p.slot, verdicts))
+        self.assertIn(why, self.refused(gm.unblock_project(p.label)))
+        self.assertIn(gm.unblock_refusal(recs["p01"], None), self.refused(gm.unblock_project("osint")))
+        self.assertIn("did not judge", gm.unblock_refusal(recs[p.slot], None))
+        # Sound again: the form runs, and the badge comes off; autostart stays off.
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        verdict = gm.verdict_for(p.slot, self.gate())
+        self.assertEqual((verdict["status"], verdict["blocked"]), ("green", True))
+        self.assertIsNone(gm.unblock_refusal(records()[p.slot], verdict))
+        result = self.runner.execute(gm.unblock_project(p.label))
+        self.assertEqual(result.rc, 0, result.err)
+        self.assertNotIn(projects.BLOCKED, self.tags(p.lead))
+        self.assertFalse(self.app.domains[p.lead].autostart)
+        self.assertFalse(records()[p.slot]["blocked"])
+        self.assertTrue(records()[other.slot]["blocked"])
+        self.assertEqual(gm.unblock_project(p.label),
+                         [*gm.SUDO, gm.QMCP, "project", "unblock", p.label])
+
+    def test_the_create_builder_for_an_anonymous_project(self):
+        argv = gm.create_project(None, "template", "ai-tpl-g", lead_netvm="ai-net-tor",
+                                 networks=["ai-net-tor"], quota="5G", model="api.example.org:443",
+                                 anonymous=True, hub_sees=True, note="-a note")
+        self.assertEqual(argv, [*gm.SUDO, gm.QMCP, "project", "create", "--anonymous",
+                                "--hub-sees", "--note=-a note", "--lead-template", "ai-tpl-g",
+                                "--lead-netvm", "ai-net-tor", "--model", "api.example.org:443",
+                                "--network", "ai-net-tor", "--quota", "5G"])
+        self.tor()
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 0, result.err)
+        p = next(p for p in projects.load().values() if p.anonymous)
+        self.assertEqual((p.hidden, p.note, len(p.label)), (False, "-a note", 8))
+        # Refused before anything runs, as the command refuses them, in its words.
+        base = dict(lead_source="template", lead_origin="ai-tpl-g", networks=["none"], quota="1G")
+        sudo = [*gm.SUDO, gm.QMCP, "project", "create"]
+        cases = [
+            (dict(base, label="newp", anonymous=True),
+             sudo + ["newp", "--anonymous", "--lead-template", "ai-tpl-g", "--network", "none",
+                     "--quota", "1G"]),
+            (dict(base, label=None, anonymous=True, lead_name="ai-x-boss"),
+             sudo + ["--anonymous", "--lead-template", "ai-tpl-g", "--lead-name", "ai-x-boss",
+                     "--network", "none", "--quota", "1G"]),
+            (dict(base, label="newp", hub_sees=True),
+             sudo + ["newp", "--hub-sees", "--lead-template", "ai-tpl-g", "--network", "none",
+                     "--quota", "1G"]),
+            (dict(base, label="newp", note="x"),
+             sudo + ["newp", "--note", "x", "--lead-template", "ai-tpl-g", "--network", "none",
+                     "--quota", "1G"]),
+            (dict(base, label=None, anonymous=True, note="a" * 81),
+             sudo + ["--anonymous", "--note", "a" * 81, "--lead-template", "ai-tpl-g",
+                     "--network", "none", "--quota", "1G"]),
+            (dict(base, label=None, anonymous=True, lead_source="clone", lead_origin="ai-work2"),
+             sudo + ["--anonymous", "--lead-clone", "ai-work2", "--network", "none",
+                     "--quota", "1G"]),
+        ]
+        for kw, raw in cases:
+            with self.subTest(kw):
+                with self.assertRaises(gm.FormError) as cm:
+                    gm.create_project(**kw)
+                self.assertIn(str(cm.exception), self.refused(raw))
+        with self.assertRaises(gm.FormError):               # no label and not anonymous
+            gm.create_project(**dict(base, label=None))
+
+    def test_the_form_checks_refuse_in_the_commands_words(self):
+        self.tor()
+        self.enroll("ai-net-router", anonymising=True)         # an old entry: nothing recorded
+        self.tor("ai-net-tor2")
+        self.break_router("ai-net-tor2")                        # moved since it was marked
+        self.enroll("sys-firewall")
+        rows, gws = self.read_json("list", "--all", "--json"), self.gateways()
+
+        def create(*extra, lead="ai-tpl-g", net="none"):
+            return [*gm.SUDO, gm.QMCP, "project", "create", "--anonymous", "--lead-template", lead,
+                    "--network", net, "--quota", "1G", *extra]
+        cases = [
+            (lambda: gm.anonymous_networks(["sys-firewall"], gws), create(net="sys-firewall")),
+            (lambda: gm.anonymous_networks(["ai-net-router"], gws), create(net="ai-net-router")),
+            (lambda: gm.anonymous_networks(["ai-net-tor2"], gws), create(net="ai-net-tor2")),
+            (lambda: gm.anonymous_lead("template", "ai-debian-13", None, rows, gws),
+             create(lead="ai-debian-13")),
+            (lambda: gm.not_managed("ai-dvm", rows, "the template"),
+             create("--template", "ai-dvm")),
+        ]
+        for check, raw in cases:
+            with self.subTest(raw):
+                with self.assertRaises(gm.FormError) as cm:
+                    check()
+                self.assertIn(str(cm.exception), self.refused(raw))
+        gm.anonymous_networks(["none", "ai-net-tor"], gws)       # sound: nothing to say
+        gm.anonymous_lead("template", "ai-tpl-g", "ai-net-tor", rows, gws)
+        gm.not_managed("debian-13", rows, "the template")        # outside AI space
+        # A model qube serves an anonymous project alone, and one that serves one is no other's.
+        p = self.anonymous()
+        serve(self.app, "osint")
+        rows, records = self.read_json("list", "--all", "--json"), self.read_json("project", "list", "--json")
+        with self.assertRaises(gm.FormError) as cm:
+            gm.anonymous_model_qube(MODEL, p.slot, True, rows, records)
+        self.assertIn(str(cm.exception), self.refused(gm.set_lead_model_qube(p.label, MODEL)))
+        gm.anonymous_model_qube(MODEL, "p01", False, rows, records)    # its own project's
+        self.runner.execute(gm.set_lead_model_qube("osint", "none"))
+        self.assertEqual(self.runner.execute(gm.set_lead_model_qube(p.label, MODEL)).rc, 0)
+        rows = self.read_json("list", "--all", "--json")
+        with self.assertRaises(gm.FormError) as cm:
+            gm.anonymous_model_qube(MODEL, "p02", False, rows, records)
+        self.assertIn(str(cm.exception), self.refused(gm.set_lead_model_qube("other", MODEL)))
+
+    def test_shared_routers_are_the_commands(self):
+        hidden = self.anonymous()
+        records = lambda: self.read_json("project", "list", "--json")  # noqa: E731
+
+        def both():
+            rows = {r["slot"]: r for r in records()}
+            mine = gm.shared_routers(rows[hidden.slot], records(),
+                                     self.read_json("list", "--all", "--json"), HUB)
+            theirs = fleet.shared_routers(self.app, projects.load(), projects.load()[hidden.slot])
+            self.assertEqual(mine, theirs)
+            return mine
+        self.assertEqual(both(), [])
+        self.app.domains[HUB].netvm = self.app.domains["ai-net-tor"]      # the hub on it
+        self.assertEqual(both(), ["ai-net-tor"])
+        self.app.domains[HUB].netvm = self.app.domains["sys-firewall"]
+        self.anonymous(hub_sees=True)                                      # another project on it
+        self.assertEqual(both(), ["ai-net-tor"])
+        node = self.node(f"project:{hidden.slot}")
+        pane = dict(gm.details(node, records(), self.read_json("list", "--all", "--json"),
+                               hub=HUB))
+        self.assertEqual(pane["Shares a router"], gm.shared_router_warning(["ai-net-tor"]))
+        self.assertTrue(pane["Shares a router"].startswith("WARNING: it shares ai-net-tor with "))
+        self.assertIn(fleet.SHARED_ROUTER_WARNING, pane["Shares a router"])
+        # A project the hub sees is warned about nothing: the warning is a hidden one's.
+        seen = next(r for r in records() if r["anonymous"] and not r["hidden"])
+        self.assertEqual(gm.shared_routers(seen, records(), [], HUB), [])
+
+    def test_the_gateways_registry_shows_the_recorded_upstream(self):
+        self.tor()
+        self.enroll("sys-firewall", anonymising=True)         # an old entry: none recorded
+        rows = {r["name"]: r for r in self.gateways()}
+        tor = dict(gm.gateway_details(rows["ai-net-tor"]))
+        self.assertEqual(tor["Upstream recorded when marked anonymising"],
+                         "sys-whonix, where it is now")
+        self.assertEqual(dict(gm.gateway_details(rows["ai-net-router"]))[
+            "Upstream recorded when marked anonymising"], "- (not anonymising)")
+        self.assertIn("no upstream recorded", gm.gateway_cells(rows["sys-firewall"])[-1])
+        self.assertIn("anonymising", gm.network_text("ai-net-tor", self.gateways(), anonymising=True))
+        self.assertEqual(gm.network_text("ai-net-router", self.gateways(), anonymising=True),
+                         "ai-net-router")
+        self.break_router()
+        row = next(r for r in self.gateways() if r["name"] == "ai-net-tor")
+        self.assertTrue(gm.gateway_cells(row)[-1].startswith("MOVED: it is on sys-firewall, not "
+                                                             "on sys-whonix as recorded"))
+        self.app.fail.add("get.netvm:ai-net-tor")
+        try:
+            row = next(r for r in self.gateways() if r["name"] == "ai-net-tor")
+        finally:
+            self.app.fail.clear()
+        self.assertIn("whether it is still on sys-whonix, as recorded, cannot be read now; "
+                      "refresh", gm.gateway_notes(row))
+        # Marking and unmarking, refused as the command refuses them.
+        self.app.vm("sys-bare", provides_network=True, netvm=None,
+                    tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
+        why = gm.anonymising_refusal("sys-bare", None)
+        self.assertIn(why, self.refused(gm.enroll_gateway("sys-bare", anonymising=True)))
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        p = self.anonymous()
+        why = gm.unmark_refusal("ai-net-tor", self.read_json("project", "list", "--json"),
+                                self.read_json("list", "--all", "--json"))
+        self.assertIn(p.label, why)
+        self.assertIn(why, self.refused(gm.change_gateway("ai-net-tor", anonymising=False)))
+        self.assertIsNone(gm.unmark_refusal("ai-net-router", [], []))
+        self.assertIsNone(gm.anonymising_refusal("ai-net-tor", "sys-whonix"))
+        self.assertIn("cannot be read", gm.anonymising_refusal("x", gm.UNREADABLE))
+
+    def test_an_anonymous_proposal_reads_as_one(self):
+        reply = self.submit_proposal("anon")
+        doc = self.show(reply["id"])
+        pane = dict(gm.proposal_details(doc))
+        self.assertEqual(pane["Anonymous (dom0 picks its label; the hub is never told it)"], "yes")
+        self.assertEqual(pane["The hub may see it"], "yes")
+        self.assertEqual(pane["Label"], "-")
+        self.assertIn("a new anonymous project", gm.accept_intro(doc))
+        self.assertIn("a new anonymous project", gm.reject_intro(doc))
+        self.assertTrue(gm.second_tick_text(doc))           # it always takes the second tick
+
+
 # ======================================================================= the command's new reads
 
 class CliReads(GuiBase):
@@ -2753,7 +3168,8 @@ class Widgets(GuiBase):
                 "label": "label_entry", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "templates": "templates",
                 "networks": "nets", "quota": "quota", "dump": "dump", "model": "model",
-                "model_qube": "model_qube"}),
+                "model_qube": "model_qube", "anonymous": "anonymous", "hub_sees": "hub_sees",
+                "note": "note"}),
             gm.edit_project: (self.gui.EditForm(self.win, self.win.fleet, self.win.gateways,
                                                 record), {
                 "key": "record", "templates": "templates", "networks": "nets", "quota": "quota"}),
@@ -2805,7 +3221,7 @@ class Widgets(GuiBase):
             # runs before the delete form. The others are confirmations.
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
                                              "audit_rotate", "show_proposal", "remove_gateway",
-                                             "show_lead_firewall"},
+                                             "show_lead_firewall", "unblock_project"},
                           "a builder without a form")
 
     def test_refresh_fills_every_page_from_the_command(self):
@@ -3104,6 +3520,14 @@ class Widgets(GuiBase):
         f.model_kind["qube"].set_active(True)
         f.model_qube.set_active_id(MODEL)
         forms.append(f)
+        f = self.gui.ProjectForm(self.win, rows, gws, HUB)  # anonymous, seen by the hub, a note
+        f.anonymous.set_active(True)
+        f.hub_sees.set_active(True)
+        f.note.set_text("-a note")
+        f.origin.set_active_id("ai-tpl-g")
+        f.nets["none"].set_active(True)
+        f.quota.set_text("1G")
+        forms.append(f)
         self.select("project:p01")
         record = self.win.node().data
         f = self.gui.EditForm(self.win, rows, gws, record)
@@ -3202,6 +3626,17 @@ class Widgets(GuiBase):
             form = self.win.act(ident)
             argvs.append(form.argv())
             form.destroy()
+        # Unblock: an anonymous project the gate stopped, and finds sound again.
+        p = self.anonymous()
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.win.refresh()                                  # the gate stops it
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        self.win.refresh()                                  # sound again, still stopped
+        self.select(f"project:{p.slot}")
+        form = self.win.act("unblock")
+        self.one_line(form)
+        argvs.append(form.argv())
+        form.destroy()
         covered = set()
         for argv in argvs:
             covered |= covered_by(parser, argv)
@@ -3466,6 +3901,56 @@ class Widgets(GuiBase):
         self.assertIn(fleet.SHARED_MODEL_WARNING, form.warning.get_text())
         self.gui._set(form.warning, gm.esc(warning * 6))
         self.assertLessEqual(laid_out(form), room)
+        form.destroy()
+
+    def shown_whole(self, form, change=None):
+        """Shown as the window shows a form, then laid out; `change` runs on it
+        after it is on the screen, as a click would. True when its scrolled part
+        shows all of its content, or takes all the room the screen gives it."""
+        Gtk = self.gui.Gtk
+
+        def settle():
+            for _ in range(50):
+                while Gtk.events_pending():
+                    Gtk.main_iteration()
+                time.sleep(0.01)
+        form.show_all()
+        settle()
+        if change is not None:
+            change(form)
+            settle()
+        adj = form.body.get_vadjustment()
+        room = self.gui._screen_room(form, 260)
+        whole = adj.get_upper() <= adj.get_page_size() + 1
+        return whole or form.body.get_allocated_height() >= room - 1, (
+            form.get_title(), adj.get_upper(), adj.get_page_size(), room)
+
+    def test_a_form_opens_tall_enough_for_what_it_says(self):
+        # On the dev box (2026-10-08) forms opened shorter than their scrolled
+        # part: a line of the intro cut in half, a row sliced, a hidden project's
+        # red paragraph below the fold. Up to the screen's room it all shows; only
+        # beyond that does it scroll. Also after a change makes a refusal longer.
+        p = self.anonymous()
+        model_qube(self.app)
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.win.refresh()
+        self.select(f"project:{p.slot}")
+        for ident, change in (
+                ("unblock", None),
+                ("set_model_qube", None),
+                ("change_lead", None),
+                ("edit_project", None),
+                ("add_to_ai_space", None)):
+            self.select(f"project:{p.slot}")
+            form = self.win.act(ident)
+            self.assertIsNotNone(form, ident)
+            ok, why = self.shown_whole(form, change)
+            self.assertTrue(ok, why)
+            form.destroy()
+        self.gateway_select("ai-net-tor")
+        form = self.win.act("change_gateway")
+        ok, why = self.shown_whole(form, lambda f: f.anonymising.set_active_id("no"))
+        self.assertTrue(ok, why)
         form.destroy()
 
     def test_accept_is_off_until_the_tick_when_reasons_exist(self):
@@ -4551,6 +5036,362 @@ class Widgets(GuiBase):
             self.assertTrue(label.get_text().replace(chr(10), "").isascii(), label.get_text())
         self.assertFalse(form.ok.get_sensitive())               # no such name reaches the command
         form.destroy()
+
+    # ------------------------------------------------------------------ anonymous projects
+    def gate_select(self, slot):
+        def visit(model, path, it):
+            if model[it][0] == slot:
+                self.win.gate_list.get_selection().select_iter(it)
+                return True
+            return False
+        self.win.gate_store.foreach(visit)
+        self.assertEqual(self.win.gate_selected, slot)
+
+    def gate_on(self):
+        """The Anonymity tab's buttons that are on."""
+        return {k for k, b in self.win.gate_buttons.items() if b.get_sensitive()}
+
+    def gate_cells(self, slot):
+        row = next(r for r in self.rows(self.win.gate_store) if r[0] == slot)
+        return dict(zip([k for k, _ in gm.GATE_COLUMNS], row[1:]))
+
+    def test_the_anonymity_tab(self):
+        # No anonymous project: said in words, never only an empty list.
+        self.assertEqual(self.rows(self.win.gate_store), [])
+        self.assertEqual(self.win.gate_tab.get_text(), "Anonymity (0)")
+        self.assertIn("No anonymous project", self.win.gate_note.get_text())
+        p = self.anonymous(note="the tor one")
+        self.win.refresh()
+        self.assertEqual([r[0] for r in self.rows(self.win.gate_store)], [p.slot])
+        cells = self.gate_cells(p.slot)
+        self.assertEqual((cells["label"], cells["note"], cells["kind"], cells["status"],
+                          cells["blocked"], cells["fails"]),
+                         (p.label, "the tor one", "hidden", "green: sound", "no", "-"))
+        self.assertTrue(self.win.gate_note.get_text().startswith("Judged at "))
+        self.gate_select(p.slot)
+        self.assertEqual(list(self.grid(self.win.gate_details))[:3],
+                         ["Project", "Note (dom0 only)", "Slot"])
+        self.assertEqual((self.gate_on(), self.win.gate_warning.get_text()), (set(), ""))
+        # Its router moved to clearnet, outside qmcp: the refresh's own gate run stops it.
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.win.refresh()
+        self.assertIn(projects.BLOCKED, self.tags(p.lead))
+        cells = self.gate_cells(p.slot)
+        self.assertEqual((cells["status"], cells["blocked"], cells["fails"]),
+                         ("RED: not anonymous", "yes", "its networks"))
+        self.assertEqual(self.win.gate_tab.get_text(), "Anonymity (1)")
+        self.assertEqual(self.win.gate_selected, p.slot)                 # kept across a refresh
+        pane = self.grid(self.win.gate_details)
+        self.assertIn(f"{p.lead}: blocked", pane["What this run did"].split("\n"))
+        self.assertTrue(pane["What fails"].startswith("its networks: ai-net-tor is on sys-firewall"))
+        warning = self.win.gate_warning
+        self.assertTrue(warning.get_text().startswith("RED: not anonymous: its networks ("))
+        self.assertTrue(warning.get_style_context().has_class("qmcp-FAILED"))
+        # Unblock is on for a stopped project; its form says why the command refuses.
+        self.assertEqual(self.gate_on(), {"gate_unblock"})
+        form = self.win.act("gate_unblock")
+        self.one_line(form, ok=False)
+        self.assertIn(f"the gate still finds {p.label} unsound", form.error.get_text())
+        form.destroy()
+        # The Qubes tab marks it, and Unblock's form there refuses in the command's words.
+        role = [k for k, _ in gm.COLUMNS].index("role") + 1
+        tree = {r[0]: r for r in self.rows(self.win.store)}
+        self.assertIn("BLOCKED by the gate", tree[f"project:{p.slot}"][role])
+        self.assertIn("BLOCKED by the gate", tree[f"qube:{p.lead}"][role])
+        self.select(f"qube:{p.lead}")
+        self.assertIn("unblock", self.sensitive())
+        form = self.win.act("unblock")
+        self.one_line(form, ok=False)
+        self.assertIn(f"the gate still finds {p.label} unsound, so it stays blocked",
+                      form.error.get_text())
+        form.destroy()
+        # Put back: sound, still stopped. Unblock from the tab runs the command.
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        self.win.refresh()
+        self.assertEqual(self.gate_cells(p.slot)["status"], "green: sound")
+        self.assertEqual(self.win.gate_tab.get_text(), "Anonymity (1)")      # still stopped
+        self.assertEqual(self.gate_on(), {"gate_unblock"})
+        form = self.win.act("gate_unblock")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.unblock_project(p.label))
+        self.assertIn("autostart stays off", form.intro.get_text())
+        self.submit(form)
+        self.assertNotIn(projects.BLOCKED, self.tags(p.lead))
+        self.assertEqual(self.gate_cells(p.slot)["blocked"], "no")
+        self.assertEqual((self.win.gate_tab.get_text(), self.gate_on()), ("Anonymity (0)", set()))
+        for row in self.rows(self.win.gate_store):
+            for cell in row[1:]:
+                self.assertTrue(cell.isascii() and "\n" not in cell, cell)
+
+    def test_the_gate_runs_first_and_alone_so_the_reads_after_it_show_what_it_did(self):
+        # On a real runner the reads answer in any order. The gate acts (the
+        # badge, the kill), so nothing else is read until it has answered: a
+        # list read beside it could show a project it just stopped as running.
+        self.runner.hold = True
+        self.win.refresh()
+        self.assertEqual([c for c, _ in self.runner.held], [gm.READS["gate"]])
+        self.runner.release()
+        self.assertEqual(sorted(map(tuple, (c for c, _ in self.runner.held))),
+                         sorted(tuple(v) for k, v in gm.READS.items() if k != "gate"))
+        self.release_all()
+        self.runner.hold = False
+        self.assertTrue(self.win.complete)
+        self.assertEqual(gm.FIRST_READS, ("gate",))
+
+    def test_a_failed_gate_read_keeps_the_last_verdicts_and_turns_changes_off(self):
+        p = self.anonymous()
+        self.win.refresh()
+        self.runner.fail.add(tuple(gm.READS["gate"]))
+        self.win.refresh()
+        self.assertFalse(self.win.complete)
+        self.assertEqual([r[0] for r in self.rows(self.win.gate_store)], [p.slot])   # last good
+        self.assertIn("did not answer on this refresh", self.win.gate_note.get_text())
+        self.assertIn("gate --json failed", self.win.status.get_text())
+        self.assertEqual((self.sensitive(), self.gate_on()), (set(), set()))
+        # Never read: never "no anonymous project", and no project's status is guessed.
+        runner = CliRunner(self.app)
+        runner.fail.add(tuple(gm.READS["gate"]))
+        win = self.gui.Window(runner=runner, show_forms=False, report=lambda *a: None)
+        self.addCleanup(win.destroy)
+        win.refresh()
+        self.assertEqual(win.gate_tab.get_text(), "Anonymity (?)")
+        self.assertTrue(win.gate_note.get_text().startswith("The anonymity gate did not answer"))
+        self.assertNotIn("No anonymous project", win.gate_note.get_text())
+        self.assertEqual(self.rows(win.gate_store), [])
+        details = gm.details(win.nodes[f"project:{p.slot}"], win.project_rows, win.fleet,
+                             win.gate_view())
+        self.assertEqual(dict(details)["Anonymity gate"],
+                         "not known: the anonymity gate has not been read")
+
+    def test_the_new_project_form_for_an_anonymous_project(self):
+        self.tor()
+        self.win.refresh()
+        form = self.win.act("new_project")
+        form.label_entry.set_text("typed")
+        self.assertFalse(form.hub_sees.get_sensitive() or form.note.get_sensitive())
+        form.anonymous.set_active(True)
+        self.assertEqual((form.label_entry.get_text(), form.label_entry.get_sensitive()),
+                         ("", False))
+        self.assertEqual(form.label_entry.get_placeholder_text(), "picked by dom0 at random")
+        self.assertTrue(form.hub_sees.get_sensitive() and form.note.get_sensitive())
+        self.assertTrue(form.source["template"].get_active())
+        self.assertFalse(form.source["clone"].get_sensitive() or form.source["promote"].get_sensitive())
+        self.assertFalse(form.lead_name.get_sensitive())
+        self.assertEqual(form.lead_space.get_text(), "ai-<picked by dom0>-")
+        # The one red warning of a hidden project, the command's own; none for one the hub sees.
+        self.assertEqual(form.warning.get_text(), gm.hidden_warning())
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        form.hub_sees.set_active(True)
+        self.assertEqual(form.warning.get_text(), "")
+        form.hub_sees.set_active(False)
+        # Refused where the fields show why, in the command's words (AnonModel compares them).
+        form.origin.set_active_id("ai-debian-13")              # a template the hub manages
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        self.one_line(form, ok=False)
+        self.assertIn("the lead's template 'ai-debian-13' is managed", form.error.get_text())
+        form.origin.set_active_id("ai-tpl-g")
+        self.one_line(form)
+        form.nets["ai-net-router"].set_active(True)
+        self.assertIn("'ai-net-router' is not an anonymising gateway", form.error.get_text())
+        form.nets["ai-net-router"].set_active(False)
+        form.templates["ai-debian-13"].set_active(True)
+        self.assertIn("the template 'ai-debian-13' is managed", form.error.get_text())
+        form.templates["ai-debian-13"].set_active(False)
+        form.note.set_text("x" * 81)
+        self.assertEqual(form.error.get_text(), projects.note_refusal("x" * 81))
+        # Marked anonymising in the form; behind Whonix, so its own rules do nothing upstream.
+        self.assertEqual(form.nets["ai-net-tor"].get_label(),
+                         f"ai-net-tor (anonymising; {MARK})")
+        form.nets["ai-net-tor"].set_active(True)
+        form.lead_netvm.set_active_id("ai-net-tor")
+        form.model.set_text("api.example.org:443")
+        form.note.set_text("osint, the Tor one")
+        self.one_line(form)
+        argv = form.argv()
+        self.assertEqual(argv[:6], [*gm.SUDO, gm.QMCP, "project", "create", "--anonymous"])
+        self.assertEqual(argv[argv.index("--note") + 1], "osint, the Tor one")
+        self.assertNotIn("--hub-sees", argv)
+        self.assertNotIn("--lead-name", argv)
+        result = self.submit(form)
+        self.assertIn(f"WARNING: {fleet.HIDDEN_WARNING}", result.out)
+        p = next(p for p in projects.load().values() if p.anonymous)
+        self.assertEqual((p.hidden, p.note, p.lead), (True, "osint, the Tor one",
+                                                      f"ai-{p.label}-lead"))
+        self.select(f"project:{p.slot}")
+        pane = self.grid(self.win.details)
+        self.assertEqual((pane["Anonymous"], pane["Hidden from the hub"], pane["Anonymity gate"]),
+                         ("yes", "yes", "green: sound"))
+        # Unticked, the typed label comes back, and nothing greyed out is sent.
+        form = self.win.act("new_project")
+        form.label_entry.set_text("typed")
+        form.anonymous.set_active(True)
+        form.hub_sees.set_active(True)
+        form.note.set_text("kept")
+        form.anonymous.set_active(False)
+        self.assertEqual(form.label_entry.get_text(), "typed")
+        self.assertFalse(form.hub_sees.get_active() or form.hub_sees.get_sensitive())
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        self.assertFalse({"--anonymous", "--hub-sees", "--note"} & set(form.argv()))
+
+    def test_a_hidden_project_sharing_a_router_is_warned_in_red(self):
+        self.anonymous(hub_sees=True)                    # another project on ai-net-tor
+        self.win.refresh()
+        form = self.win.act("new_project")
+        form.anonymous.set_active(True)
+        form.origin.set_active_id("ai-tpl-g")
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        self.assertEqual(form.warning.get_text(), gm.hidden_warning())
+        form.nets["ai-net-tor"].set_active(True)
+        self.assertEqual(form.warning.get_text().split("\n"),
+                         [gm.hidden_warning(), gm.shared_router_warning(["ai-net-tor"])])
+        form.hub_sees.set_active(True)                   # a visible one is warned about nothing
+        self.assertEqual(form.warning.get_text(), "")
+        form.hub_sees.set_active(False)
+        result = self.submit(form)
+        self.assertIn(f"WARNING: it shares ai-net-tor with another project or the hub: "
+                      f"{fleet.SHARED_ROUTER_WARNING}", result.out)
+        hidden = next(p for p in projects.load().values() if p.hidden)
+        self.select(f"project:{hidden.slot}")
+        self.assertEqual(self.grid(self.win.details)["Shares a router"],
+                         gm.shared_router_warning(["ai-net-tor"]))
+        # What the red text said is checked again at OK: the hub moved onto a
+        # router no project uses meanwhile, so it says something else now.
+        self.tor("ai-net-tor2")
+        self.win.refresh()
+        form = self.win.act("new_project")
+        form.anonymous.set_active(True)
+        form.origin.set_active_id("ai-tpl-g")
+        form.nets["ai-net-tor2"].set_active(True)
+        form.quota.set_text("1G")
+        self.assertEqual(form.warning.get_text(), gm.hidden_warning())
+        self.app.domains[HUB].netvm = self.app.domains["ai-net-tor2"]
+        self.win.refresh()
+        before = len(self.reports)
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(len(self.reports), before)
+        self.assertIn("what this form says in red has changed", form.error.get_text())
+        form.destroy()
+        form = self.win.act("new_project")                 # opened again: it says so before OK
+        form.anonymous.set_active(True)
+        form.origin.set_active_id("ai-tpl-g")
+        form.nets["ai-net-tor2"].set_active(True)
+        self.assertEqual(form.warning.get_text().split("\n")[-1],
+                         gm.shared_router_warning(["ai-net-tor2"]))
+
+    def test_the_model_qube_form_of_a_hidden_project_warns_in_red(self):
+        p = self.anonymous()
+        model_qube(self.app)
+        self.win.refresh()
+        self.select(f"project:{p.slot}")
+        form = self.win.act("set_model_qube")
+        self.assertEqual(form.warning.get_text(), gm.hidden_warning())
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        form.model_qube.set_active_id(MODEL)
+        lines = form.warning.get_text().split("\n")
+        self.assertTrue(lines[0].startswith(f"{p.lead} loses its network (ai-net-tor)"), lines)
+        self.assertEqual((lines[-1], lines.count(gm.hidden_warning())), (gm.hidden_warning(), 1))
+        form.destroy()
+        self.select("project:p01")                       # not hidden: no such warning
+        form = self.win.act("set_model_qube")
+        form.model_qube.set_active_id(MODEL)
+        self.assertNotIn(gm.hidden_warning(), form.warning.get_text())
+
+    def test_the_lead_and_edit_forms_of_an_anonymous_project(self):
+        p = self.anonymous()
+        self.win.refresh()
+        self.select(f"project:{p.slot}")
+        form = self.win.act("change_lead")
+        self.assertTrue(form.source["template"].get_active())
+        self.assertFalse(form.source["clone"].get_sensitive() or form.source["promote"].get_sensitive())
+        self.assertFalse(form.lead_name.get_sensitive())
+        self.assertIn("dom0 names it", form.intro.get_text())
+        form.origin.set_active_id("ai-debian-13")
+        form.old_lead.set_active_id("keep")
+        self.one_line(form, ok=False)
+        self.assertIn("the lead's template 'ai-debian-13' is managed", form.error.get_text())
+        form.origin.set_active_id("ai-tpl-g")
+        form.lead_netvm.set_active_id("ai-net-router")
+        self.assertIn("'ai-net-router' is not an anonymising gateway", form.error.get_text())
+        form.lead_netvm.set_active_id("ai-net-tor")
+        self.one_line(form)                               # kept: dom0 names the new one
+        self.assertNotIn("--lead-name", form.argv())
+        self.submit(form)
+        rec = projects.find(projects.load(), p.label)
+        self.assertEqual(rec.lead, f"ai-{p.label}-lead2")
+        self.assertIn(projects.member_badge(p.slot), self.tags(p.lead))   # kept as a worker
+        self.select(f"project:{p.slot}")
+        form = self.win.act("edit_project")
+        form.nets["ai-net-router"].set_active(True)
+        self.one_line(form, ok=False)
+        self.assertIn("'ai-net-router' is not an anonymising gateway", form.error.get_text())
+        form.nets["ai-net-router"].set_active(False)
+        form.templates["ai-debian-13"].set_active(True)
+        self.assertIn("the template 'ai-debian-13' is managed", form.error.get_text())
+
+    def test_the_gateway_forms_record_the_upstream(self):
+        p = self.anonymous()
+        self.win.refresh()
+        self.gateway_select("ai-net-tor")
+        pane = self.grid(self.win.gateway_details)
+        self.assertEqual(pane["Upstream recorded when marked anonymising"],
+                         "sys-whonix, where it is now")
+        form = self.win.act("change_gateway")
+        self.assertIn("records the network it is on now", form.intro.get_text())
+        self.assertTrue(form.remark.get_sensitive())
+        self.assertEqual(form.error.get_text(), "nothing changed")
+        form.remark.set_active(True)
+        self.assertEqual(form.argv(), gm.change_gateway("ai-net-tor", anonymising=True))
+        form.anonymising.set_active_id("no")
+        self.assertFalse(form.remark.get_sensitive() or form.remark.get_active())
+        self.one_line(form, ok=False)
+        self.assertIn(f"carries the anonymous project(s) {p.label}", form.error.get_text())
+        form.destroy()
+        # Moved on purpose, marked on its row, then marked again: the record follows.
+        self.app.vm("sys-vpn", provides_network=True, netvm=self.app.domains["sys-firewall"])
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-vpn"]
+        self.win.refresh()
+        row = next(r for r in self.rows(self.win.gateway_store) if r[0] == "ai-net-tor")
+        self.assertTrue(row[-1].startswith("MOVED: it is on sys-vpn, not on sys-whonix"))
+        self.gateway_select("ai-net-tor")
+        form = self.win.act("change_gateway")
+        form.remark.set_active(True)
+        self.submit(form)
+        self.assertEqual(gateways.load()["ai-net-tor"].upstream, "sys-vpn")
+        # Enroll: marking a router with no network anonymising is refused.
+        self.app.vm("sys-bare", provides_network=True, netvm=None,
+                    tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
+        self.win.refresh()
+        form = self.win.act("enroll_gateway")
+        self.assertIn("records the network it is on now", form.intro.get_text())
+        form.qube.set_active_id("sys-bare")
+        self.one_line(form)
+        self.assertEqual(form.upstream.get_text(), "sys-bare is on no network now")
+        form.anonymising.set_active(True)
+        self.one_line(form, ok=False)
+        self.assertIn("'sys-bare' has no network of its own", form.error.get_text())
+
+    def test_no_qube_moves_into_or_out_of_an_anonymous_project(self):
+        p = self.anonymous(hub_sees=True)
+        worker = f"ai-{p.label}-w1"
+        r = self.lcall("qmcp.SpawnAIManagedQube", {"name": worker, "template": "ai-tpl-g"},
+                       lead=p.lead)
+        self.assertTrue(r["ok"], r)
+        self.win.refresh()
+        self.select(f"qube:{worker}")
+        self.assertNotIn("move", self.sensitive())
+        self.assertIn("revoke", self.sensitive())
+        self.select("qube:ai-work2")
+        form = self.win.act("move")
+        self.assertNotIn(p.label, [row[1] for row in form.target.get_model()])
+        self.assertIn("osint", [row[1] for row in form.target.get_model()])
+        # The command refuses both, as the window has it.
+        result = self.runner.execute(gm.move("ai-work2", p.label, confirm=True))
+        self.assertIn("no qube moves into it", result.err)
+        result = self.runner.execute(gm.move(worker, "none"))
+        self.assertIn("it never moves out", result.err)
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,

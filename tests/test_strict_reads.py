@@ -95,7 +95,9 @@ class Services(StrictBase):
             self.assertTrue(self.exists("ai-gw-unbadged"), why)
 
     def test_a_guarded_qube_stays_guarded_whichever_tag_read_fails(self):
-        for key in ("tag.List:ai-dvm-g", "tag.Get:ai-dvm-g"):
+        # The hub's lookups read tag.List twice (the by-name check, then the
+        # re-check on the object): the sweep fails each read in turn.
+        for key in ("tag.List:ai-dvm-g",):
             for i, why in enumerate(self.each_failure(key)):
                 name = f"ai-hub-c{i}"
                 r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-dvm-g", "name": name})
@@ -109,21 +111,25 @@ class Services(StrictBase):
         self.assertTrue(self.exists("ai-dvm-g"))
 
     def test_a_recheck_that_fails_refuses_even_a_managed_qube(self):
-        # tag.Get is the by-name check; tag.List the re-check on the object,
-        # there because its tags may have changed in between. Either read
-        # failing alone refuses the qube, as a qube outside AI space is refused.
-        for key in ("tag.List:ai-work2", "tag.Get:ai-work2"):
-            self.app.fail_reads(key, "fail")
+        # The hub's first tag.List is the by-name check, its second the re-check
+        # on the object, there because its tags may have changed in between.
+        # Either read failing alone refuses the qube, as a qube outside AI
+        # space is refused.
+        for key, plan in (("tag.List:ai-work2", "fail"), ("tag.List:ai-work2", "ok fail")):
+            self.app.fail_reads(key, plan)
             r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "start"})
+            fired = self.app.failed[key]
             self.disarm()
-            self.assertEqual(r, core.NOT_FOUND, key)
+            self.assertEqual(r, core.NOT_FOUND, f"{key} {plan}")
+            self.assertGreater(fired, 0, f"{key} {plan}: the planned failure never fired")
+            self.app.failed.clear()
             self.assertEqual(self.app.domains["ai-work2"]._power, "Halted", key)
 
     def test_the_hub_never_removes_a_lead_on_a_failed_read(self):
         self.app.domains._vms[LEAD].__dict__["_power"] = "Halted"
         req = {"name": LEAD, "action": "remove"}
         self.assertFalse(self.call("qmcp.LifecycleAIManaged", req)["ok"])
-        for key in (f"tag.List:{LEAD}", f"tag.Get:{LEAD}"):
+        for key in (f"tag.List:{LEAD}",):
             for why in self.each_failure(key):
                 self.assertFalse(self.call("qmcp.LifecycleAIManaged", req)["ok"], why)
                 self.assertTrue(self.exists(LEAD), why)
@@ -131,7 +137,7 @@ class Services(StrictBase):
     def test_a_clone_never_joins_p00_on_a_failed_read(self):
         # The hub's clone of a project's qube, or of a disposable template,
         # joins no slot: in p00 it could drop files into the hub's qubes.
-        cases = [("ai-osint-w1", ["tag.List:ai-osint-w1", "tag.Get:ai-osint-w1"]),
+        cases = [("ai-osint-w1", ["tag.List:ai-osint-w1"]),
                  ("ai-dvm", ["get.template_for_dispvms:ai-dvm", "tag.List:ai-dvm"])]
         i = 0
         for source, keys in cases:
@@ -196,7 +202,8 @@ class Services(StrictBase):
         r = self.call("qmcp.GetPropertyAIManaged", {"name": "ai-work", "property": "tags"})
         self.assertFalse(r["ok"])                   # never [] for tags it could not read
         self.app.fail.clear()
-        self.app.fail_reads("tag.List:ai-work", "ok fail")    # in AI space, then the read fails
+        # In AI space (the by-name check and the re-check), then the read fails.
+        self.app.fail_reads("tag.List:ai-work", "ok ok fail")
         r = self.call("qmcp.GetPropertyAIManaged", {"name": "ai-work", "property": "tags"})
         self.assertEqual(r, {"ok": False, "error": "read failed"})
         self.app.fail.clear()
@@ -763,6 +770,8 @@ QUBE_PROPERTIES = frozenset({
 #: (module, function) whose `try` reads a qube property and does not re-raise,
 #: with the reason its answer on failure is the restrictive one, or is reported.
 ALLOWED_TRY = {
+    ("anon.py", "_tag"): "a badge write; its failure is returned and goes in the gate's report",
+    ("anon.py", "block"): "autostart off is a write; its failure goes in the gate's report",
     ("birth.py", "resolve_egress"): "a failed read answers 'unresolved', which refuses the create",
     ("budget.py", "_vol_size"): "only KeyError: the qube has no such volume, or is gone",
     ("cli.py", "cmd_gateway"): "the command's own error handler: it prints the error, exits 1",

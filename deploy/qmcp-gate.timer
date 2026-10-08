@@ -1,0 +1,19 @@
+# /etc/systemd/system/qmcp-gate.timer -- qubes-mcp
+#
+# Runs qmcp-gate.service every 15 seconds, 10 seconds after boot, and 10
+# seconds after the timer itself starts (when the installer starts it). The
+# boot run is not ordered before Qubes' own autostart: a qube of an anonymous
+# project marked to start at boot may run for those seconds first, so mark
+# none to start at boot.
+
+[Unit]
+Description=qubes-mcp anonymity gate, every 15 seconds
+
+[Timer]
+OnBootSec=10s
+OnActiveSec=10s
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

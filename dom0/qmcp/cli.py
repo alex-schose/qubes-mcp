@@ -6,7 +6,8 @@
     qmcp manage|guard|revoke QUBE  role actions
     qmcp gateway ...               the networks AI space may use: list, enroll, set, remove
     qmcp project ...               projects: list, show, create, edit, lead, firewall, dump,
-                                   move, delete
+                                   move, delete, unblock
+    qmcp gate [--json]             judge the anonymous projects, and stop one that is not
     qmcp proposal ...              the hub's proposals: list, show, accept, reject
     qmcp migrate [--apply] ...     move a v0.9.16 tiered fleet to two states
     qmcp audit verify|tail [N]|rotate   the hash-chained record of state changes
@@ -33,7 +34,7 @@ import json
 import os
 import sys
 
-from qmcp import audit, fleet, projects, proposals
+from qmcp import anon, audit, fleet, projects, proposals
 
 EXIT = {"GREEN": 0, "FAILED": 1, "INCOMPLETE": 3}
 
@@ -123,6 +124,9 @@ def cmd_gateway(args) -> int:
                     "anonymising" if r["anonymising"] else "",
                     f"label '{r['label']}'" if r["label"] else "",
                     f"upstream {r['upstream'] or 'none'}",
+                    "" if not r["anonymising"] else
+                    f"recorded on {r['recorded_upstream']}" if r["recorded_upstream"]
+                    else "no recorded network (mark it again)",
                     "upstream ignores its firewall rules" if r["upstream_ignores_firewall"] is True
                     else "whether its upstream ignores its firewall rules cannot be read"
                     if r["upstream_ignores_firewall"] == fleet.UNREADABLE
@@ -172,10 +176,15 @@ def cmd_project(args) -> int:
             for r in rows:
                 used = "?" if r["used"] is None else f"{r['used'] / 1024 ** 3:.1f}"
                 quota = "-" if r["quota"] is None else f"{r['quota'] / 1024 ** 3:.1f}"
+                kind = "" if not r["anonymous"] else \
+                    f"  anonymous, {'hidden' if r['hidden'] else 'visible'}" + \
+                    ("  BLOCKED" if r["blocked"] else "  blocked=?" if r["blocked"] is None
+                     else "") + \
+                    (f"  note: {json.dumps(r['note'])}" if r["note"] else "")
                 print(f"{r['slot']}  {r['label'] or '(hub)':8s}  lead={r['lead'] or '-'}  "
                       f"members={'?' if r['members'] is None else r['members']}  "
                       f"disk={used}/{quota} GiB  sink={r['dump'] or '-'}  "
-                      f"model={r['model'] or r['model_qube'] or '-'}")
+                      f"model={r['model'] or r['model_qube'] or '-'}{kind}")
             return 0
         if what == "show":
             p = projects.find(fleet._load_records(), args.name)
@@ -224,10 +233,14 @@ def cmd_project(args) -> int:
             if source is None:
                 raise fleet.ProjectError("say where the lead comes from: --lead-template, "
                                          "--lead-clone or --lead-promote")
+            if args.name is None and not args.anonymous:
+                raise fleet.ProjectError("give the project a LABEL (an anonymous project's is "
+                                         "picked by dom0)")
             report = fleet.create_project(app, args.name, source, origin, args.template or (),
                                           args.network or (), args.quota, args.lead_netvm,
                                           args.dump, args.lead_name, args.model,
-                                          args.model_qube)
+                                          args.model_qube, args.anonymous, args.hub_sees,
+                                          args.note)
         elif what == "edit":
             report = fleet.edit_project(app, args.name, args.template, args.network, args.quota)
         elif what == "lead":
@@ -248,6 +261,8 @@ def cmd_project(args) -> int:
             report = fleet.add_dump(app, args.name, args.sink_name)
         elif what == "move":
             report = fleet.move(app, args.name, args.target, confirm=args.yes)
+        elif what == "unblock":
+            report = fleet.unblock(app, args.name)
         elif what == "delete":
             p = projects.find(fleet._load_records(), args.name)
             if (p is not None and p.slot == projects.HUB_SLOT) or \
@@ -268,6 +283,59 @@ def cmd_project(args) -> int:
     # A failed step is recorded as one; a line's text holds names, and a name
     # may hold any word.
     return 1 if getattr(report, "failed", None) else 0
+
+
+def cmd_gate(args) -> int:
+    """Judge every anonymous project now, and stop one that is not (the timer
+    runs this). Prints only what is not sound, or what it did, unless --json.
+    Exit 0 all sound, 1 one is not, 3 one could not be judged, or another run
+    held the gate so nothing was."""
+    try:
+        verdicts = anon.run(_app(), beat=os.environ.get(anon.HEARTBEAT_ENV) == "1")
+    except projects.ProjectsUnreadable as e:
+        print(f"qmcp gate: {e}; the anonymous projects were not judged", file=sys.stderr)
+        return 3
+    except Exception as e:
+        print(f"qmcp gate: {type(e).__name__}; the anonymous projects were not judged",
+              file=sys.stderr)
+        return 3
+    if verdicts is None:
+        print("qmcp gate: another run held the gate past its wait; nothing was judged",
+              file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps([v.to_json() for v in verdicts], indent=2))
+    else:
+        for v in verdicts:
+            if v.status == anon.GREEN and not v.acted:
+                continue
+            print(f"{v.slot} {v.label}: {v.status}{' (blocked)' if v.blocked else ''}")
+            for _, detail in v.problems:
+                print(f"  {detail}")
+            for line in v.acted:
+                print(f"  {line}")
+    if any(v.status == anon.RED for v in verdicts):
+        return 1
+    return 3 if any(v.status == anon.UNREADABLE for v in verdicts) else 0
+
+
+def _gate_after(args) -> None:
+    """After a command that changed something, judge the anonymous projects:
+    a change the command made that breaks one stops it now, not up to 15
+    seconds later. Only what was stopped is printed."""
+    try:
+        verdicts = anon.run(_app())
+    except Exception as e:
+        print(f"qmcp: the anonymity gate could not run after this command "
+              f"({type(e).__name__}); its timer runs it within about 15 seconds", file=sys.stderr)
+        return
+    if verdicts is None:
+        print("qmcp: the anonymity gate was busy after this command; its timer judges the "
+              "anonymous projects within about 15 seconds", file=sys.stderr)
+    for v in verdicts or ():
+        if v.acted:
+            print(f"qmcp: the anonymity gate stopped {v.label} ({v.slot}): "
+                  + "; ".join(d for _, d in v.problems), file=sys.stderr)
 
 
 def cmd_proposal(args) -> int:
@@ -440,7 +508,15 @@ def build_parser() -> argparse.ArgumentParser:
     q = psub.add_parser("show", help="one project's record")
     q.add_argument("name", help="label or slot")
     q = psub.add_parser("create", help="a new project (root)")
-    q.add_argument("name", metavar="LABEL", help="1-8 lowercase letters or digits")
+    q.add_argument("name", metavar="LABEL", nargs="?",
+                   help="1-8 lowercase letters or digits (none for --anonymous: dom0 picks one)")
+    q.add_argument("--anonymous", action="store_true",
+                   help="under the anonymity gate: anonymising networks, guarded templates, a "
+                        "fresh lead; hidden from the hub unless --hub-sees")
+    q.add_argument("--hub-sees", action="store_true",
+                   help="an anonymous project the hub may see and operate")
+    q.add_argument("--note", metavar="TEXT",
+                   help="an anonymous project's private note: dom0 only, shown in the window")
     _add_lead_options(q)
     q.add_argument("--template", action="append", metavar="TEMPLATE",
                    help="an approved template besides the lead's (repeatable)")
@@ -486,10 +562,15 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("target", help="p00, a project's label or slot, or none")
     q.add_argument("--yes", action="store_true",
                    help="confirm moving a qube out of one slot into another")
+    q = psub.add_parser("unblock", help="clear the anonymity gate's stop once it finds the "
+                                        "project sound (root)")
+    q.add_argument("name", help="label or slot")
     q = psub.add_parser("delete", help="remove a project's lead and members, keep its sink "
                                          "(root; without --yes, the plan only)")
     q.add_argument("name", help="label or slot; a slot with no record finishes a delete")
     q.add_argument("--yes", action="store_true")
+    p = sub.add_parser("gate", help="judge the anonymous projects now, and stop one that is not")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("proposal", help="the hub's proposals: what it asks you to do")
     psub = p.add_subparsers(dest="what", required=True)
     q = psub.add_parser("list", help="every proposal, newest first")
@@ -555,7 +636,7 @@ def operator_line(args):
              and not args.accept_current and args.model_qube is None):
         return None
     w = args.what
-    summary = {"project": str(args.name)[:128]}
+    summary = {"project": str(args.name)[:128] if args.name is not None else None}
     if w in ("create", "lead"):
         source, origin = _lead_source(args)
         if source:
@@ -566,6 +647,13 @@ def operator_line(args):
     if w == "create":
         summary.update({"templates": _names(args.template), "networks": _names(args.network),
                         "dump": bool(args.dump)})
+        # Only when given, so the line of an ordinary create keeps its shape.
+        if args.anonymous:
+            summary["anonymous"] = True
+        if args.hub_sees:
+            summary["hub_sees"] = True
+        if args.note is not None:
+            summary["note"] = "set"
         if args.quota is not None:
             summary["quota"] = "set"
     elif w == "edit":
@@ -603,18 +691,23 @@ def main(argv=None) -> int:
     handler = {"check": cmd_check, "list": cmd_list, "settings": cmd_settings,
                "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
                "gateway": cmd_gateway, "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
-               "audit": cmd_audit}[args.cmd]
+               "audit": cmd_audit, "gate": cmd_gate}[args.cmd]
     line = operator_line(args)
     if line is None:
-        return handler(args)
+        rc = handler(args)
+        if args.cmd == "proposal" and args.what == "accept":
+            _gate_after(args)
+        return rc
     try:
         rc = handler(args)
     except SystemExit:
         raise                   # refused before it ran: not root, or a malformed --map
     except BaseException:
         _record(line, 1)
+        _gate_after(args)
         raise
     _record(line, rc)
+    _gate_after(args)
     return rc
 
 
