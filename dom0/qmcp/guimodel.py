@@ -445,23 +445,30 @@ def audit_rotate() -> list:
     return write_cmd("audit", "rotate")
 
 
-def enroll_gateway(qube, anonymising=False, label=None) -> list:
-    """Let AI space use `qube` as a network. An empty label is no label."""
+def enroll_gateway(qube, anonymising=False, label=None, updates=False) -> list:
+    """Let AI space use `qube` as a network. An empty label is no label.
+    `updates`: the qube above it carries templates' updates anonymously."""
     argv = write_cmd("gateway", "enroll", _qube(qube, "the gateway"))
+    if updates and not anonymising:
+        raise FormError("templates' updates count only through an anonymising gateway")
     if anonymising:
         argv.append("--anonymising")
+    if updates:
+        argv.append("--updates")
     if label:
         argv += _option("--label", _gateway_label(label))
     return argv
 
 
-def change_gateway(qube, anonymising=None, label=None) -> list:
+def change_gateway(qube, anonymising=None, label=None, updates=None) -> list:
     """Only what changed: None leaves a part as it is; an empty label clears it."""
     argv = write_cmd("gateway", "set", _qube(qube, "the gateway"))
-    if anonymising is None and label is None:
+    if anonymising is None and label is None and updates is None:
         raise FormError("nothing changed")
     if anonymising is not None:
         argv += ["--anonymising", "yes" if anonymising else "no"]
+    if updates is not None:
+        argv += ["--updates", "yes" if updates else "no"]
     if label is not None:
         argv += _option("--label", _gateway_label(label))
     return argv
@@ -591,8 +598,17 @@ SETTINGS_FIELDS = (
     ("name_prefix", "Reserved name prefix"), ("pool_cap", "Pool cap (all of AI space)"),
     ("ai_space_bytes", "AI space disk used"), ("private_cap", "Private-volume cap (one qube)"),
     ("birth_egress", "Birth egress"), ("gateways_enrolled", "Gateways enrolled"),
-    ("version", "qubes-mcp version"),
+    ("mode", "Mode (fixed at install)"), ("version", "qubes-mcp version"),
 )
+#: How the Settings tab says the mode.
+MODE_TEXT = {
+    "anonymous": ("anonymous: every project is anonymous, and the anonymity gate judges the hub "
+                  "and the rest of AI space too. qmcp cannot check whose account the hub's model "
+                  "uses, nor what the hub qube did before the mode. No qmcp command turns it "
+                  "off; uninstall.sh --purge does"),
+    "normal": "normal: anonymous projects are a per-project choice (install.sh --anonymous "
+              "turns on anonymous mode)",
+}
 #: Every field of a `check --json` finding, and of the document.
 CHECK_FIELDS = (("status", "Status"), ("check", "Check"), ("detail", "Detail"))
 CHECK_DOC_FIELDS = ("result", "findings")
@@ -630,6 +646,9 @@ def field_text(key, value) -> Shown:
         return rules_text(value, "none on record")
     if key == "gateways_enrolled" and value is None:
         return esc("not known: the registry cannot be read")
+    if key == "mode":
+        return esc(MODE_TEXT.get(value, f"{value}: /etc/qmcp/mode cannot be read, so the gate "
+                                        f"blocks the hub"))
     if key == "blocked":
         return esc(BLOCKED_TEXT.get(value, value))
     return esc(value)
@@ -1210,7 +1229,7 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         if attention or state is None:
             return out
         if (role in ("worker", "hub's qube", "hub's qube, no slot")
-                and node.data.get("klass") == "AppVM" and not anonymous_qube(node.data, records)):
+                and node.data.get("klass") == "AppVM" and not stopped_qube(node.data)):
             out.add("move")
         if state == "guarded" and role != "gateway":
             out.add("manage")
@@ -1740,6 +1759,7 @@ GATEWAY_FIELDS = (
     ("problem", "Problem"), ("in_ai_space", "In AI space"),
     ("upstream", "Upstream (its own network)"),
     ("recorded_upstream", "Upstream recorded when marked anonymising"),
+    ("updates", "Templates' updates may go to that upstream"),
     ("upstream_ignores_firewall", "Its upstream ignores its firewall rules"),
     ("used_by", "AI qubes on it"), ("projects", "Projects that list it"),
 )
@@ -1843,6 +1863,13 @@ def gateway_details(row) -> list:
         elif key == "recorded_upstream":
             value = ("- (not anonymising)" if row.get("anonymising") is not True else
                      moved_note(row) or f"{value}, where it is now")
+        elif key == "updates":
+            value = ("- (not anonymising)" if row.get("anonymising") is not True else
+                     f"yes: you said {row.get('recorded_upstream')} carries them anonymously"
+                     if value is True else
+                     "no: a template whose updates go there stops an anonymous project (tick it "
+                     "with Change... when the qube above this router is the anonymiser itself, "
+                     "never sys-firewall)")
         out.append((heading, esc(value)))
     return out
 
@@ -1906,6 +1933,15 @@ def anonymising_refusal(name, netvm) -> str | None:
         return (f"'{name}' has no network of its own, so it cannot carry anything anonymously; "
                 f"give it its upstream (sys-whonix, a VPN qube) first")
     return None
+
+
+def mode_clearnet_refusal(mode) -> str:
+    """Why a form refuses a gateway that is not anonymising, in the command's
+    words (`fleet.MODE_CLEARNET`), or why it cannot tell."""
+    if mode == "anonymous":
+        return fleet.MODE_CLEARNET
+    return ("whether anonymous mode is on is not known (Settings: Mode); a clearnet gateway is "
+            "refused until it is")
 
 
 def unmark_refusal(name, project_rows, fleet_rows) -> str | None:
@@ -2788,11 +2824,32 @@ def anonymous_users(name, project_rows, fleet_rows) -> list:
     return sorted(out)
 
 
+def hub_record(verdict) -> dict | None:
+    """What the Anonymity tab's Unblock works on for the hub's verdict
+    (anonymous mode): p00, standing for the hub and every qube under its
+    check, stopped while any of them wears qmcp-blocked. None for any other
+    verdict."""
+    if not isinstance(verdict, dict) or not verdict.get("hub"):
+        return None
+    return {"slot": "p00", "label": "p00", "anonymous": True, "hub": True,
+            "blocked": verdict.get("blocked") is True}
+
+
 def unblock_refusal(record, verdict) -> str | None:
     """Why the command refuses `project unblock` where the window can see it,
     in its words (`anon.unblock`): not an anonymous project, and a gate
     verdict on show that is not green. The command judges the project again
     when it runs; the verdict on show is this refresh's."""
+    if record.get("hub"):
+        if verdict is None or verdict.get("status") not in ("green", "red", "unreadable"):
+            return "the gate did not judge the hub on this refresh: Refresh, then unblock it"
+        details = "; ".join(str(p.get("detail")) for p in verdict.get("problems") or ()
+                            if isinstance(p, dict))
+        if verdict["status"] == "unreadable":
+            return f"the gate could not judge the hub ({details}); it stays blocked"
+        if verdict["status"] != "green":
+            return f"the gate still finds the hub unsound, so it stays blocked: {details}"
+        return None
     label = record.get("label")
     if not record.get("anonymous"):
         return f"'{label}' is not an anonymous project"
@@ -2808,6 +2865,13 @@ def unblock_refusal(record, verdict) -> str | None:
 
 
 def unblock_intro(record) -> str:
+    if record.get("hub"):
+        return ("Takes qmcp-blocked off the hub and every qube under its check (p00, and the "
+                "templates, disposable templates and disposables it made) once a fresh run of "
+                "the anonymity gate finds them sound: the command judges them again, and refuses "
+                "while they are not. Their autostart stays off. The gate stopped them because a "
+                "condition failed; make sure whatever broke it is fixed, not only that it reads "
+                "sound now.")
     note = f" ({record['note']})" if record.get("note") else ""
     return (f"Takes qmcp-blocked off the lead and members of {record.get('label')}{note}, "
             f"{record.get('slot')}, once a fresh run of the anonymity gate finds the project "
@@ -2827,6 +2891,8 @@ GATE_FIELDS = (
     ("status", "Gate status"), ("blocked", "Stopped, after this run"),
     ("problems", "What fails"), ("acted", "What this run did"),
 )
+#: The fields only the hub's verdict has (anonymous mode).
+GATE_HUB_FIELDS = (("hub", "The hub's check"), ("offenders", "Qubes in violation"))
 #: Every field of one of its problems.
 GATE_PROBLEM_FIELDS = ("condition", "detail")
 #: The list's columns: (key, heading); `note`, `kind` and `fails` are composed.
@@ -2864,7 +2930,7 @@ def gate_rows(verdicts, project_rows) -> list:
     out = {}
     for v in verdicts:
         if isinstance(v, dict) and isinstance(v.get("slot"), str):
-            rec = records.get(v["slot"])
+            rec = None if v.get("hub") else records.get(v["slot"])
             out[v["slot"]] = dict(v, note=(rec or {}).get("note"),
                                   blocked_now=rec.get("blocked") if rec else v.get("blocked"))
     for slot, p in records.items():
@@ -2880,7 +2946,8 @@ def _yes_no(value) -> str:
 
 
 def gate_cells(row) -> list:
-    values = {"kind": "hidden" if row.get("hidden") else "visible to the hub",
+    values = {"kind": "the hub and the rest of AI space (anonymous mode)" if row.get("hub")
+              else "hidden" if row.get("hidden") else "visible to the hub",
               "status": GATE_STATUS.get(row.get("status"), row.get("status")),
               "fails": _condition_words(row) or "-",
               "blocked": _yes_no(row.get("blocked_now"))}
@@ -2893,13 +2960,22 @@ def gate_details(row) -> list:
     if not isinstance(row, dict):
         return []
     out = []
-    for key, heading in GATE_FIELDS:
+    for key, heading in GATE_FIELDS + (GATE_HUB_FIELDS if row.get("hub") else ()):
         value = row.get(key)
         if key == "label" and row.get("note"):
             out.append((heading, esc(value)))
             out.append(("Note (dom0 only)", esc(row["note"])))
             continue
-        if key == "hidden":
+        if key == "hub":
+            text = esc("yes: in anonymous mode the gate judges the hub qube, its qubes in p00 "
+                       "and every other qube in AI space that is not an anonymous project's "
+                       "lead, member or model qube, guarded routers aside")
+        elif key == "offenders":
+            text = (esc_items(str(n) for n in value) if value else esc("none")) \
+                if isinstance(value, list) else esc(value)
+        elif key == "hidden" and row.get("hub"):
+            text = esc("- (the hub's own check)")
+        elif key == "hidden":
             text = esc("yes: the hub can neither see nor reach its qubes" if value else
                        "no: the hub may see and operate it; it is hidden from the network, not "
                        "from the hub")
@@ -2988,13 +3064,40 @@ def outside_choices(fleet_rows, hub=None, sinks=()) -> list:
 
 
 def move_targets(records: dict) -> list:
-    """(command target, shown text): p00, each project, or no slot. Never an
-    anonymous project: the command moves no qube into one, since the hub has
-    had root in every qube it could move."""
+    """(command target, shown text): p00, each project, or no slot. An
+    anonymous project is marked: a move into one needs the second tick."""
     out = [("p00", "p00, the hub's own qubes")]
     for slot in projects.PROJECT_SLOTS:
         rec = records.get(slot)
-        if rec is not None and rec.get("label") and not rec.get("anonymous"):
-            out.append((rec["label"], f"{slot} {rec['label']}"))
+        if rec is not None and rec.get("label"):
+            kind = "" if not rec.get("anonymous") else \
+                (", anonymous, hidden from the hub" if rec.get("hidden") else ", anonymous")
+            out.append((rec["label"], f"{slot} {rec['label']}{kind}"))
     out.append(("none", "no slot (hub-only, copies by dialog)"))
+    return out
+
+
+def stopped_qube(row) -> bool:
+    """Wears qmcp-blocked or qmcp-stopped: the command moves it only once the
+    gate's stop is cleared."""
+    tags = row.get("badges") if isinstance(row, dict) else None
+    return isinstance(tags, list) and bool({projects.BLOCKED, projects.STOPPED} & set(tags))
+
+
+def move_warnings(records: dict, current, target_slot) -> list:
+    """What the command says before a move into, out of or between anonymous
+    projects (`fleet.move_warnings`), from the records on show; empty for a
+    move inside clear space."""
+    def anonymous(s):
+        rec = records.get(s) if s is not None else None
+        return isinstance(rec, dict) and bool(rec.get("anonymous")) and s != projects.HUB_SLOT
+
+    def hidden(s):
+        return anonymous(s) and bool(records[s].get("hidden"))
+    current = [s for s in ([current] if isinstance(current, str) else current or ()) if s]
+    if not any(anonymous(s) for s in current) and not anonymous(target_slot):
+        return []
+    out = [fleet.MOVE_PAST_WARNING]
+    if any(hidden(s) for s in current) and not hidden(target_slot):
+        out.append(fleet.MOVE_HIDDEN_WARNING)
     return out

@@ -26,6 +26,153 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.24] — 2026-10-09
+
+**Networks, part four (M3d): anonymous mode.** `install.sh --anonymous` makes
+an installation in which every project is anonymous and the anonymity gate
+judges the hub too: the hub qube and every qube in AI space that is not an
+anonymous project's lead, member or model qube, guarded routers aside: its
+qubes in p00, the templates, disposable templates and disposables it made, and
+anything else in AI space. Each of them wears `qmcp-anon`, so the rulebook
+refuses it any `qubes.OpenURL` or `qubes.OpenInVM` into another qube, dialog or
+not. Each that is not a TemplateVM sits on an anonymising gateway or on none;
+a TemplateVM has no network, and every TemplateVM their systems come from sends
+its updates only to an upstream you ticked for updates, or nowhere. A
+violation by the hub or one of its p00 qubes stops the hub and p00; a
+violation by any other of them stops that qube alone: the block refuses the
+hub every use of it, a call into it, a start, a clone and a create from it.
+qmcp cannot check whose account the hub's model uses, nor what the hub qube
+did before the mode: use a hub qube and a model account that never ran on
+clearnet. No qmcp command turns the mode off; `uninstall.sh --purge` does.
+Also in this release: you now say which anonymising gateways' upstreams carry
+template updates anonymously, a stopped qube is refused as a caller as well as a
+target, and a qube may move into or out of an anonymous project behind a
+warning.
+
+### Added
+
+- **`install.sh --anonymous`.** Refused, before anything changes, while an
+  ordinary project exists or a gateway that is not anonymising is enrolled, and
+  unless the gate finds the hub sound. It lists every qube already in AI space
+  that the hub's check will cover ("a qube has a past": what it holds and what
+  it was used for come with it). After the policy, it puts `qmcp-anon` on the
+  hub and on each of them, writes `/etc/qmcp/mode`, and puts it on once more,
+  for a qube the hub made meanwhile. An update keeps the mode without the
+  option; an install over a mode file that does not read is refused.
+- **The hub's check, in anonymous mode** (`dom0/qmcp/anon.py`). Its subjects:
+  the hub, and every qube in AI space or wearing p00's badge that is not an
+  anonymous project's lead, member or model qube, but a guarded router (an
+  enrolled gateway, or another qube that provides network, wearing
+  `qmcp-guarded`), which nothing in AI space operates. An unguarded one is
+  judged: the rulebook cannot see `provides_network`, so the hub may run
+  commands in it. Each
+  wears `qmcp-anon`; each that is not a TemplateVM is on an enrolled
+  anonymising gateway still on its recorded network, or on none, and dom0's
+  policy gives it no `qubes.UpdatesProxy`; each TemplateVM it judges or that a
+  subject's system comes from has no network of its own and sends its updates
+  only to a ticked upstream (below), and a disposable template a subject comes
+  from is on an anonymising gateway still on its recorded network, or on
+  none. A template the hub manages may
+  stay managed. A violation by the hub or a p00 qube blocks and kills the hub,
+  every p00 qube and every other offender; one by any other subject, that qube
+  alone. A mode file
+  that does not read blocks the hub and p00 without a kill, as a read that
+  fails twice does. The verdict carries `hub` and `offenders`; the timer runs
+  it every 15 seconds, also when there is no anonymous project.
+- **`qmcp project unblock p00`** (or `hub`) clears the hub's stop once a fresh
+  run finds the hub sound; autostart stays off. In normal mode it takes off
+  whatever `qmcp-blocked` and `qmcp-stopped` a mode left.
+- **In anonymous mode**: the hub's spawns, clones and disposables wear
+  `qmcp-anon`, and a disposable template passes it to its disposables; `qmcp
+  manage` and `qmcp guard` put it on a qube joining AI space (not a gateway)
+  before `ai-managed`, and a qube made a project's model qube wears it too, so
+  it is still sound under the hub's check once its project goes (the
+  installer stamps an anonymous project's model qube as well); the hub's create onto
+  a gateway that is not anonymising is refused; `qmcp project create` makes an
+  anonymous project without `--anonymous` and refuses a label; the hub's
+  proposal for an ordinary project is refused when it is submitted; `qmcp
+  gateway enroll` refuses a clearnet gateway and `gateway set --anonymising no`
+  is refused. A service whose call depends on the mode and cannot read the
+  mode file refuses, and makes nothing.
+- **The updates tick.** `qmcp gateway enroll NAME --anonymising --updates`,
+  `qmcp gateway set NAME --updates yes|no`, and `updates` in
+  `gateways.json`: your word that the qube above an anonymising gateway
+  carries templates' updates anonymously. Only a ticked upstream counts for a
+  template's updates. That closes 0.9.23's known gap: a VPN qube enrolled with
+  no router in front has `sys-firewall` above it, which dom0 cannot tell from
+  `sys-whonix` above a router. Marking a gateway again keeps the tick only when
+  the recorded network is the same. Taking the tick off is refused where the
+  gate would then stop a project or the hub. `qmcp gateway list` shows it.
+- **`install.sh --updates-via GATEWAY`** (repeatable) ticks an enrolled
+  anonymising gateway as part of the install, before the gate's timer runs the
+  new code.
+- **`qmcp check`** fails while the mode file does not read, and in anonymous
+  mode on an ordinary project or a clearnet gateway; the hub may wear
+  `qmcp-anon`, `qmcp-blocked` and `qmcp-stopped` in the mode, and the gate's
+  heartbeat is required while the mode is on. `qmcp settings` shows `mode`.
+- **The window.** Settings shows the mode. The Anonymity tab shows the hub's
+  verdict with the qubes in violation, and Unblock runs `qmcp project unblock
+  p00`. In anonymous mode *New project*'s Anonymous tick is on and stays on,
+  and the gateway forms refuse a clearnet gateway. *Enroll* and *Change
+  gateway* have the updates tick. Move offers the anonymous projects, marked,
+  and shows the command's warning in red.
+- **`tests/test_mode.py`**: the mode file, the tick, the hub's check and what
+  each violation stops, creates and proposals in the mode, and moves.
+
+### Changed
+
+- **BREAKING, for anonymous projects: a template's updates count only through
+  a ticked gateway.** A gateway entry from 0.9.23 is unticked, so an anonymous
+  project whose templates update through its upstream would be stopped by the
+  first run of this release. `install.sh` names each such project and changes
+  nothing; run it again with `--updates-via GATEWAY` for each gateway whose
+  upstream is the anonymiser itself (`sys-whonix`, a VPN qube), never
+  `sys-firewall`.
+- **A `qmcp-blocked` qube is refused as a caller too**: two lines at the top of
+  the rulebook, to `@adminvm` and to `@anyvm` (which does not match `@adminvm`).
+  A stopped lead or worker that you start by hand to look at reaches nothing,
+  by any service, dom0 and its own model qube included; before, only the
+  services refused a stopped lead. In anonymous mode this is what keeps a
+  stopped hub out of AI space. The gate asks where a stopped qube's updates
+  would go once it is cleared, since the rulebook now denies it its updates
+  too. Two more claims are checked for precedence (40 in all).
+- **A qube may move into, out of or between anonymous projects** (0.9.23
+  refused it). The move needs `--yes` and says first that the qube has a past
+  and may link the projects it has been in, and, out of a hidden project, that
+  it hands the hub the qube's contents. The gate judges the project the qube
+  goes into, and in anonymous mode the hub, as the move would leave them: the
+  move is refused if the project would be unsound, or if the hub's check would
+  stop more qubes or the moved qube itself; a qube the gate stopped does not
+  move. A qube moved in wears the project's anonymous badges, which
+  go on before its slot badge; the hidden badge comes off last.
+- **The installer stops `qmcp-gate.timer`** while it changes things, after a
+  run already going has finished, so the timer starts no run while files are
+  replaced (a `qmcp` command you run meanwhile still runs the gate), and
+  starts it again at the end, then runs the gate once, so the heartbeat is
+  this release's. An install that fails part-way starts the timer again over what
+  it left, so the anonymous projects stay judged; `qmcp check` says what is
+  missing. An update in anonymous mode puts `qmcp-anon` back on every qube
+  under the hub's check that lacks it.
+- **Nothing is made from a qube the gate stopped**: the services refuse a
+  stopped template or disposable template as the base of a spawn or a
+  disposable (`stopped by the anonymity gate`), as they already refused to
+  clone or start one. In anonymous mode the hub's create is also refused on a
+  router that is no longer on the network recorded for it, which the gate is
+  about to stop.
+- **The services refuse a stopped hub**, as they refuse a stopped lead: they
+  read the hub's own `qmcp-blocked` on every call, and again under the create
+  lock, besides the rulebook's line. The read is the same whatever qube the
+  call names, so it tells nothing about names.
+- **`qmcp gateway remove`** of a gateway ticked for updates is refused where
+  the gate would then stop a project or the hub, as taking the tick off is.
+- `gateways.json` entries may carry `updates`. 0.9.23 refuses a registry in
+  which an entry carries it: to roll back, take the tick off every gateway
+  (refused where the gate would then stop a project, or the hub, that is
+  sound now: send their templates' updates elsewhere, or delete the project,
+  first), then run this release's `uninstall.sh` (it keeps `/etc/qmcp`)
+  before 0.9.23's installer. An installation in anonymous mode rolls back only
+  through `uninstall.sh --purge`.
+
 ## [0.9.23] — 2026-10-08
 
 **Networks, part three (M3c): anonymous projects.** A project can be made

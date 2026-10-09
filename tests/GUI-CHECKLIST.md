@@ -619,3 +619,54 @@ and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
     enrolled`. Then `qvm-remove -f sys-ai-tor` (`qvm-shutdown --wait
     sys-ai-tor` first if it runs). Expect the Anonymity tab `Anonymity (0)`
     with `No anonymous project`, and `qmcp check` GREEN.
+
+### Anonymous mode and the updates tick (0.9.24)
+
+47. **The updates tick.** Make and enroll the Tor router as in step 38, but in
+    the window: Gateways tab, *Enroll...*, `sys-ai-tor`. Expect *Updates*
+    (`templates' updates may go to its upstream: ...`) greyed out until you
+    tick *Anonymising*. Tick both: the command reads `... gateway enroll
+    sys-ai-tor --anonymising --updates`. OK. Select it: *Templates' updates may
+    go to that upstream* reads `yes: you said sys-whonix carries them
+    anonymously`. Make a hidden project on it (step 40), then *Change...* on
+    `sys-ai-tor`, untick *Updates*, OK: expect the command to refuse, `without
+    the updates tick on 'sys-ai-tor' the anonymity gate would stop <label>`.
+48. **A move into an anonymous project.** Select a qube of the hub's in p00
+    with no network, or on `sys-ai-tor` (on any other the command refuses
+    first: `is on X, which is not one of <label>'s worker networks`),
+    *Move...*. Expect the project listed as `pA <label>, anonymous, hidden from
+    the hub`. Choose it: the red line `A qube has a past: what it holds and
+    what it was used for come with it, and it may link the projects it has been
+    in.` and OK greyed out until *Confirm* is ticked. Tick it, OK. Expect the
+    command to refuse with `the anonymity gate would stop <label> with '<qube>'
+    in it: ...` when the qube's template is one the hub manages, and `nothing
+    was moved`. Delete the project.
+49. **Turn anonymous mode on.** With no project left and only anonymising
+    gateways enrolled, the hub on `sys-ai-tor`, and Global Config sending
+    template updates through `sys-whonix`, run in dom0 `sudo bash
+    /tmp/qubes-mcp/deploy/install.sh --anonymous`. Expect it to list each qube
+    already in AI space with `a qube has a past`, say what qmcp cannot check,
+    and end GREEN. Refresh the window. Expect the Settings tab's *Mode (fixed
+    at install)* to start `anonymous: every project is anonymous`, and the Anonymity tab a row
+    *the hub*, kind `the hub and the rest of AI space (anonymous mode)`, `green:
+    sound`.
+50. **New project in the mode.** *New project...*: expect *Anonymous* ticked
+    and greyed out, the label field reading `picked by dom0 at random`. Cancel.
+    On the Gateways tab, *Enroll...* `sys-firewall` without *Anonymising*:
+    OK greyed out, saying `anonymous mode: AI space uses only anonymising
+    gateways, so a clearnet one is never enrolled`. Cancel.
+51. **The hub stopped.** In dom0, `qvm-prefs mcp-control netvm sys-firewall`,
+    wait 20 seconds, Refresh. Expect the hub's row `RED: not anonymous`, its
+    *Qubes in violation* `mcp-control`, the hub halted, and a desktop
+    notification `qubes-mcp stopped the hub and its qubes in p00 (anonymous
+    mode): its networks.` *Unblock...* on the row: OK greyed out, `the gate still
+    finds the hub unsound, so it stays blocked: ...`. Cancel. Put it back
+    (`qvm-prefs mcp-control netvm sys-ai-tor`), Refresh, *Unblock...*: the
+    command `/usr/bin/sudo -n /usr/local/bin/qmcp project unblock p00`. OK.
+    Expect `p00: mcp-control unblocked (autostart stays off)`.
+52. **Turn it off.** `sudo bash /tmp/qubes-mcp/deploy/uninstall.sh --purge`,
+    then the normal install, which ends FAILED on `hub 'mcp-control' carries
+    AI-space badges ['qmcp-anon']`. `qvm-tags mcp-control del qmcp-anon`, then
+    enroll your routers again (`sys-ai-tor` with `--anonymising --updates`):
+    until they are, a qube in AI space on one of them fails the check too.
+    Expect `qmcp check` GREEN.

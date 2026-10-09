@@ -229,14 +229,15 @@ class GuiBase(ProjectBase):
     def tor(self, name="ai-net-tor"):
         """An anonymising router of the operator's, as test_anon.py's fixture
         has one: in AI space and guarded, behind Whonix's sys-whonix, and
-        enrolled anonymising, which records sys-whonix as its upstream."""
+        enrolled anonymising, which records sys-whonix as its upstream, and
+        ticked for updates."""
         a = self.app
         if "sys-whonix" not in a.domains:
             a.vm("sys-whonix", provides_network=True, netvm=a.domains["sys-firewall"],
                  tags={"anon-gateway"}, features={"qubes-firewall": "1"})
         a.vm(name, provides_network=True, netvm=a.domains["sys-whonix"], power="Running",
              tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
-        fleet.enroll_gateway(a, name, anonymising=True)
+        fleet.enroll_gateway(a, name, anonymising=True, updates=True)
 
     def anonymous(self, hub_sees=False, note=None, net="ai-net-tor"):
         """An anonymous project the gate finds sound, made by the command: its
@@ -468,8 +469,10 @@ SAMPLES = {
     gm.show_proposal: [dict(pid=1)],
     gm.accept_proposal: [dict(pid=1, sha256="0" * 64), dict(pid=2, sha256="ab" * 32, tick="cd" * 32)],
     gm.reject_proposal: [dict(pid=1)],
-    gm.enroll_gateway: [dict(qube="sys-ai-tor", anonymising=True, label="Tor, CH")],
-    gm.change_gateway: [dict(qube="ai-net-router", anonymising=False, label="clearnet")],
+    gm.enroll_gateway: [dict(qube="sys-ai-tor", anonymising=True, label="Tor, CH"),
+                        dict(qube="sys-ai-tor", anonymising=True, updates=True)],
+    gm.change_gateway: [dict(qube="ai-net-router", anonymising=False, label="clearnet"),
+                        dict(qube="ai-net-tor", updates=True)],
     gm.remove_gateway: [dict(qube="ai-net-router")],
     gm.show_lead_firewall: [dict(key="osint")],
     gm.set_lead_model: [dict(key="osint", model="api.anthropic.com:443")],
@@ -2421,6 +2424,32 @@ class AnonModel(GuiBase):
         """The router moved to clearnet, outside qmcp: the gate's networks condition."""
         self.app.domains[net].netvm = self.app.domains["sys-firewall"]
 
+    def test_the_hubs_verdict_shows_every_field_and_unblocks_p00(self):
+        # Anonymous mode: the gate judges the hub, and its verdict carries two
+        # fields a project's does not.
+        v = anon.Verdict(anon.HUB)
+        v.fail("networks", "the hub mcp-control is on sys-firewall, which is not an enrolled "
+                           "anonymising gateway", "mcp-control")
+        v.names, v.blocked, v.acted = ["mcp-control"], True, ["mcp-control: blocked"]
+        doc = v.to_json()
+        self.assertEqual(set(doc), {k for k, _ in gm.GATE_FIELDS + gm.GATE_HUB_FIELDS})
+        rows = gm.gate_rows([doc], self.read_json("project", "list", "--json"))
+        self.assertEqual(rows[0]["blocked_now"], True)                   # the verdict's, not p00's
+        shown = dict(gm.gate_details(rows[0]))
+        self.assertLessEqual({h for _, h in gm.GATE_FIELDS + gm.GATE_HUB_FIELDS}, set(shown))
+        self.assertEqual(shown["Qubes in violation"], "mcp-control")
+        cells = dict(zip([k for k, _ in gm.GATE_COLUMNS], gm.gate_cells(rows[0])))
+        self.assertEqual(cells["kind"], "the hub and the rest of AI space (anonymous mode)")
+        rec = gm.hub_record(doc)
+        self.assertEqual((rec["slot"], rec["blocked"]), ("p00", True))
+        self.assertIn("still finds the hub unsound", gm.unblock_refusal(rec, doc))
+        self.assertIsNone(gm.unblock_refusal(rec, dict(doc, status="green", problems=[])))
+        self.assertIn("the hub and every qube under its check", gm.unblock_intro(rec))
+        self.assertEqual(gm.unblock_project(rec["label"])[-2:], ["unblock", "p00"])
+        # A project's verdict has neither field, and shows neither.
+        self.assertNotIn("Qubes in violation", dict(gm.gate_details(dict(doc, hub=None))))
+        self.assertIsNone(gm.hub_record(dict(doc, hub=None)))
+
     def test_every_field_of_a_gate_verdict_is_shown(self):
         p = self.anonymous(note="the tor one")
         self.break_router()
@@ -3181,9 +3210,11 @@ class Widgets(GuiBase):
             # The registry's forms; the qube and its current values come from the row.
             gm.enroll_gateway: (self.gui.EnrollForm(self.win, self.win.fleet, self.win.gateways,
                                                     HUB), {
-                "qube": "qube", "anonymising": "anonymising", "label": "label_entry"}),
+                "qube": "qube", "anonymising": "anonymising", "label": "label_entry",
+                "updates": "updates"}),
             gm.change_gateway: (self.gui.GatewayForm(self.win, self.win.gateways[0]), {
-                "qube": "row_data", "anonymising": "anonymising", "label": "label_entry"}),
+                "qube": "row_data", "anonymising": "anonymising", "label": "label_entry",
+                "updates": "updates"}),
             # A lead firewall's: the project comes from the view the form opened on.
             gm.set_lead_model: (self.gui.ModelForm(self.win, view), {"key": "doc",
                                                                      "model": "model"}),
@@ -3563,10 +3594,12 @@ class Widgets(GuiBase):
         f = self.gui.EnrollForm(self.win, rows, gws, HUB)
         f.qube.set_active_id("sys-ai-tor")
         f.anonymising.set_active(True)
+        f.updates.set_active(True)
         f.label_entry.set_text("Tor")
         forms.append(f)
         f = self.gui.GatewayForm(self.win, next(r for r in gws if r["name"] == "ai-net-router"))
         f.anonymising.set_active_id("yes")
+        f.updates.set_active(True)
         f.label_entry.set_text("clearnet")
         forms.append(f)
         f = self.gui.DumpForm(self.win, "other", "other-dump")
@@ -3866,6 +3899,46 @@ class Widgets(GuiBase):
         calls = {(r.get("caller"), r.get("service")) for r in self.win.audit_rows}
         self.assertLessEqual({(HUB, "qmcp.SubmitProposal"), ("operator", "qmcp proposal accept")},
                              calls)
+
+    def test_the_settings_tab_wraps_a_long_value(self):
+        # Drawn on the dev box (2026-10-09): the mode's line ran off the right
+        # edge and the note under it too, behind a sideways scrollbar. Measured
+        # as laid out: the grid is no wider than the scrolled part showing it.
+        Gtk = self.gui.Gtk
+        pathlib.Path(core.MODE_PATH).write_text("anonymous\n")
+        self.win.refresh()
+        nb = self.win.notebook
+        nb.set_current_page(next(i for i in range(nb.get_n_pages())
+                                 if nb.get_tab_label(nb.get_nth_page(i)).get_text() == "Settings"))
+        self.win.show_all()
+        self.win.resize(900, 600)
+        for _ in range(300):
+            if not Gtk.events_pending():
+                break
+            Gtk.main_iteration()
+        sw = self.win.settings_scroll
+        grid = self.win.settings_grid
+        row = next(i for i in range(len(grid.get_children()) // 2)
+                   if grid.get_child_at(0, i).get_text() == "Mode (fixed at install)")
+        value = grid.get_child_at(1, row)
+        try:
+            self.assertEqual(value.get_text(), gm.MODE_TEXT["anonymous"])
+            self.assertGreater(sw.get_allocated_width(), 100)         # it was laid out
+            self.assertLessEqual(grid.get_allocated_width(), sw.get_allocated_width())
+            self.assertGreater(value.get_layout().get_line_count(), 1)  # it wrapped
+        finally:
+            self.win.hide()
+
+    def test_the_move_form_says_a_qube_with_no_network_fits_anywhere(self):
+        # Drawn on the dev box: it said the command would refuse a qube with no
+        # network for a project that does not list none. The command takes it.
+        self.select("qube:ai-work2")                       # no network
+        form = self.win.act("move")
+        form.target.set_active_id("osint")
+        self.assertIn("has no network: any project takes it", form.netinfo.get_text())
+        form.destroy()
+        report = fleet.move(self.app, "ai-work2", "osint", confirm=True)
+        self.assertIn("ai-work2: p01", report)
 
     def test_the_second_tick_and_ok_stay_on_the_screen(self):
         # A shared model qube's reasons are long (the operator's click-through,
@@ -5055,6 +5128,45 @@ class Widgets(GuiBase):
         row = next(r for r in self.rows(self.win.gate_store) if r[0] == slot)
         return dict(zip([k for k, _ in gm.GATE_COLUMNS], row[1:]))
 
+    def test_anonymous_mode_in_the_window(self):
+        self.routers()
+        self.tor()
+        pathlib.Path(core.MODE_PATH).write_text("anonymous\n")
+        self.win.refresh()
+        self.assertTrue(self.grid(self.win.settings_grid)["Mode (fixed at install)"]
+                        .startswith("anonymous: every project is anonymous"))
+        # The hub is on clearnet and wears no qmcp-anon here: the refresh's gate
+        # run stops it, and the tab shows the hub's verdict with Unblock on.
+        cells = self.gate_cells("p00")
+        self.assertEqual((cells["label"], cells["kind"], cells["status"]),
+                         ("the hub", "the hub and the rest of AI space (anonymous mode)",
+                          "RED: not anonymous"))
+        self.assertIn(projects.BLOCKED, self.tags(HUB))
+        self.gate_select("p00")
+        self.assertIn("mcp-control", self.grid(self.win.gate_details)["Qubes in violation"])
+        self.assertEqual(self.gate_on(), {"gate_unblock"})
+        form = self.win.act("gate_unblock")
+        self.one_line(form, ok=False)
+        self.assertIn("the gate still finds the hub unsound", form.error.get_text())
+        form.destroy()
+        # Every project is anonymous: the tick is on and cannot come off.
+        form = self.gui.ProjectForm(self.win, self.win.fleet, self.win.gateways, HUB,
+                                    mode=self.win.settings.get("mode"))
+        self.assertTrue(form.anonymous.get_active())
+        self.assertFalse(form.anonymous.get_sensitive())
+        form.destroy()
+        # A clearnet gateway is refused, in the command's words.
+        form = self.gui.EnrollForm(self.win, self.win.fleet, self.win.gateways, HUB,
+                                   self.win.settings.get("mode"))
+        form.qube.set_active_id("sys-ai-net")
+        self.one_line(form, ok=False)
+        self.assertIn(fleet.MODE_CLEARNET, form.error.get_text())
+        form.anonymising.set_active(True)
+        form.updates.set_active(True)
+        self.one_line(form)
+        self.assertIn("--updates", form.argv())
+        form.destroy()
+
     def test_the_anonymity_tab(self):
         # No anonymous project: said in words, never only an empty list.
         self.assertEqual(self.rows(self.win.gate_store), [])
@@ -5373,7 +5485,7 @@ class Widgets(GuiBase):
         self.one_line(form, ok=False)
         self.assertIn("'sys-bare' has no network of its own", form.error.get_text())
 
-    def test_no_qube_moves_into_or_out_of_an_anonymous_project(self):
+    def test_a_move_into_or_out_of_an_anonymous_project_warns_and_needs_the_tick(self):
         p = self.anonymous(hub_sees=True)
         worker = f"ai-{p.label}-w1"
         r = self.lcall("qmcp.SpawnAIManagedQube", {"name": worker, "template": "ai-tpl-g"},
@@ -5381,17 +5493,31 @@ class Widgets(GuiBase):
         self.assertTrue(r["ok"], r)
         self.win.refresh()
         self.select(f"qube:{worker}")
-        self.assertNotIn("move", self.sensitive())
-        self.assertIn("revoke", self.sensitive())
+        self.assertIn("move", self.sensitive())
+        form = self.win.act("move")
+        form.target.set_active_id("none")
+        self.assertIn(fleet.MOVE_PAST_WARNING, form.warning.get_text().lower())
+        self.assertFalse(form.ok.get_sensitive())                       # the tick first
+        form.confirm.set_active(True)
+        self.assertTrue(form.ok.get_sensitive())
+        self.assertEqual(form.argv(), gm.move(worker, "none", confirm=True))
+        form.destroy()
+        # Into one: offered and marked; the command still refuses what the gate
+        # would stop (here, a template the hub manages), and says so.
         self.select("qube:ai-work2")
         form = self.win.act("move")
-        self.assertNotIn(p.label, [row[1] for row in form.target.get_model()])
-        self.assertIn("osint", [row[1] for row in form.target.get_model()])
-        # The command refuses both, as the window has it.
+        self.assertIn(p.label, [row[1] for row in form.target.get_model()])
+        self.assertIn(f"{p.slot} {p.label}, anonymous", [row[0] for row in form.target.get_model()])
+        form.destroy()
         result = self.runner.execute(gm.move("ai-work2", p.label, confirm=True))
-        self.assertIn("no qube moves into it", result.err)
+        self.assertIn("the anonymity gate would stop", result.err)
+        self.assertIn("ai-debian-13 is managed", result.err)
+        self.assertIn("nothing was moved", result.err)
+        # Without the tick the command refuses, with the same warning.
         result = self.runner.execute(gm.move(worker, "none"))
-        self.assertIn("it never moves out", result.err)
+        self.assertIn(fleet.MOVE_PAST_WARNING, result.err)
+        self.assertEqual(self.runner.execute(gm.move(worker, "none", confirm=True)).rc, 0)
+        self.assertNotIn(projects.ANON, self.tags(worker))
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,

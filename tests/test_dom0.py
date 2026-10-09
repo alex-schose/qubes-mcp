@@ -35,6 +35,7 @@ class Base(unittest.TestCase):
         self._saved = []
         for mod, attr, value in [
             (core, "HUB_PATH", self.tmp / "hub"),
+            (core, "MODE_PATH", self.tmp / "mode"),
             (core, "RUN_DIR", self.tmp / "run"),
             (budget, "CAP_PATH", self.tmp / "pool-cap"),
             (budget, "PRIVATE_CAP_PATH", self.tmp / "private-cap"),
@@ -816,7 +817,9 @@ class AuditFindings(Base):
             hidden = self.trace(svc, make("ai-hid-w1"))
             self.assertEqual(missing, outside, svc)
             self.assertEqual(missing, hidden, svc)
-            self.assertEqual(missing[1], ["admin.vm.tag.List"], svc)
+            # The first read is the caller's own: the services refuse a hub the
+            # anonymity gate stopped. It is the same for every name.
+            self.assertEqual(missing[1], ["admin.vm.tag.Get", "admin.vm.tag.List"], svc)
             self.assertEqual(missing[2], 0, svc)
 
     def test_explicit_netvm_is_checked_by_name(self):

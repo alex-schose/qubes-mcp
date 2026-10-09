@@ -126,6 +126,8 @@ POLICY_RUN_DIR = "/run/qubes/policy.d"
 PRECEDENCE_CLAIMS = (
     ("anything into a qube the anonymity gate stopped", "qubes.Filecopy", "member", "blocked"),
     ("the hub's exec into a stopped qube", "qmcp.RunInAIManaged", "hub", "blocked"),
+    ("a stopped qube calling a qmcp service", "qmcp.ListAIManagedQubes", "blocked", "dom0"),
+    ("a stopped qube reaching another qube", "qubes.Filecopy", "blocked", "member"),
     ("the hub reaching a hidden anonymous project", "qmcp.RunInAIManaged", "hub", "hidden"),
     ("the hub's copy into a hidden anonymous project", "qubes.Filecopy", "hub", "hidden"),
     ("an anonymous qube opening a URL elsewhere", "qubes.OpenURL", "anon", "outside"),
@@ -297,7 +299,11 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     elif hub not in tags_by:
         add("error", "hub", f"cannot read the tags of the hub '{hub}'")
     else:
-        bad = {t for t in tags_by[hub] if birth.controlled(t)}
+        # In anonymous mode the hub wears `qmcp-anon`, and the gate may stop
+        # it; a mode that cannot be read fails its own item below.
+        mode_badges = {projects.ANON, projects.BLOCKED, projects.STOPPED} \
+            if anon.mode_state()[0] is not False else set()
+        bad = {t for t in tags_by[hub] if birth.controlled(t)} - mode_badges
         if bad:
             add("fail", "hub", f"hub '{hub}' carries AI-space badges {sorted(bad)}; "
                                f"remove them with: qvm-tags {hub} del <tag>")
@@ -376,10 +382,15 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     # outside AI space.
     # `qmcp-hubblind` outside AI space is a hidden project's sink, or one kept
     # after its project was deleted: it only takes the hub's reach away.
+    # In anonymous mode the hub wears `qmcp-anon`, and the gate may stop it:
+    # item 1 judges those.
+    hub_badges = {projects.ANON, projects.BLOCKED, projects.STOPPED} \
+        if anon.mode_state()[0] is not False else set()
     stray = sorted(vm.name for vm in vms if core.UMBRELLA not in T(vm)
                    and any(t == core.GUARDED or t.startswith(birth.NAMESPACE)
                            for t in T(vm) if not t.startswith(TOMBSTONE_PREFIX)
-                           and not projects.is_slot_tag(t) and t != projects.HUBBLIND))
+                           and not projects.is_slot_tag(t) and t != projects.HUBBLIND
+                           and not (vm.name == hub and t in hub_badges)))
     add("warn" if stray else "pass", "stray badges",
         f"qmcp badges outside AI space: {', '.join(stray)}" if stray else "none")
 
@@ -595,7 +606,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     out.extend(project_findings(vms, by_name, records, prefix, registry, tags_by))
     out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub))
     out.extend(lead_firewall_findings(app, by_name, records))
-    out.extend(anonymity_findings(app, vms, records, tags_by))
+    out.extend(anonymity_findings(app, vms, records, tags_by, registry, hub))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
     if cap is not None and quotas > cap:
@@ -816,24 +827,55 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
     return out
 
 
-def anonymity_findings(app, vms, records: dict, tags_by: dict) -> list:
-    """The anonymity gate, run as every check runs it (it acts on what it
-    finds), with its timer; the anonymous badges where no anonymous project
-    puts them; and a hidden project sharing a router."""
+def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hub=None) -> list:
+    """Anonymous mode; the anonymity gate, run as every check runs it (it acts
+    on what it finds), with its timer; the anonymous badges where neither an
+    anonymous project nor the mode puts them; and a hidden project sharing a
+    router."""
     out = []
     add = lambda *a: out.append(Finding(*a))  # noqa: E731
     anonymous = {p.slot: p for p in records.values() if p.anonymous}
+    mode, why = anon.mode_state()
+    if mode is None:
+        add("fail", "anonymous mode", f"{why}: whether the hub is judged cannot be told, so the "
+                                      f"gate blocks it (write the one word anonymous, or remove "
+                                      f"the file on an installation in normal mode)")
+    elif mode:
+        ordinary = sorted(p.label for p in records.values() if p.label and not p.anonymous)
+        clearnet = sorted(n for n, g in (registry or {}).items() if not g.anonymising)
+        if ordinary:
+            add("fail", "anonymous mode", f"projects that are not anonymous: "
+                                          f"{', '.join(ordinary)} (delete them)")
+        if clearnet:
+            add("fail", "anonymous mode", f"gateways that are not anonymising: "
+                                          f"{', '.join(clearnet)} (qmcp gateway remove)")
+        if not ordinary and not clearnet:
+            add("pass", "anonymous mode", "every project is anonymous, and the gate judges the "
+                                          "hub and the rest of AI space")
+    # In anonymous mode the hub and the rest of AI space wear `qmcp-anon`, and
+    # the gate may stop any of them.
+    expected = set()
+    if mode is not False and hub is not None and hub in tags_by:
+        expected = set(anon.hub_candidates(hub, records, registry or {}, tags_by))
+        try:
+            expected = set(anon.hub_subjects(hub, records, registry or {},
+                                             {vm.name: vm for vm in vms}, tags_by))
+        except core.Unreadable:
+            pass                    # a read the gate's own item reports; no badge called stray
+        # And the anonymous projects' model qubes, which wear it in the mode too.
+        expected |= {p.model_qube for p in anonymous.values() if p.model_qube}
     stray = []
     for vm in vms:
         tags = tags_by[vm.name]
         slots = projects.member_slots(tags) | projects.lead_slots(tags)
         ours = any(s in anonymous for s in slots)
-        if tags & {projects.ANON, projects.BLOCKED, projects.STOPPED} and not ours:
+        if tags & {projects.ANON, projects.BLOCKED, projects.STOPPED} and not ours \
+                and vm.name not in expected:
             stray.append(vm.name)
     if stray:
         add("warn", "anonymous badges", f"qmcp-anon, qmcp-blocked or qmcp-stopped on qubes of no "
                                         f"anonymous project: {', '.join(sorted(stray))}")
-    if not anonymous:
+    if not anonymous and mode is False:
         return out
     # Only the timer's runs touch the heartbeat: this check's own run below does not.
     age = anon.heartbeat_age()
@@ -841,7 +883,7 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict) -> list:
         add("fail", "gate heartbeat", ("no run of the anonymity gate has completed" if age is None
                                        else f"the anonymity gate last completed a run "
                                             f"{age:.0f} s ago")
-            + f": anonymous projects are not being judged every 15 seconds (journalctl -u "
+            + f": nothing anonymous is being judged every 15 seconds (journalctl -u "
               f"qmcp-gate.service)")
     else:
         add("pass", "gate heartbeat", f"last completed run {age:.0f} s ago")
@@ -859,7 +901,8 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict) -> list:
             add("pass", "anonymity gate", f"{name} is sound")
         elif v.status == anon.GREEN:
             add("warn", "anonymity gate", f"{name} was stopped and is sound again: clear it with "
-                                          f"sudo qmcp project unblock {v.label}")
+                                          f"sudo qmcp project unblock "
+                                          f"{v.slot if v.is_hub else v.label}")
         elif v.status == anon.UNREADABLE:
             add("error", "anonymity gate", f"{name}: {v.problems[0][1]}"
                                            + ("; blocked" if v.blocked or v.acted else ""))
@@ -871,12 +914,13 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict) -> list:
     if active is None:
         add("error", "gate timer", f"cannot tell whether {anon.TIMER} runs")
     elif not active:
-        add("fail", "gate timer", f"{anon.TIMER} is not running, so anonymous projects are "
-                                  f"judged only when a qmcp command runs (sudo systemctl enable "
-                                  f"--now {anon.TIMER})")
+        add("fail", "gate timer", f"{anon.TIMER} is not running, so the gate judges only when "
+                                  f"a qmcp command runs (sudo systemctl enable --now {anon.TIMER})")
     else:
-        add("pass", "gate timer", f"{anon.TIMER} judges anonymous projects every 15 seconds")
+        add("pass", "gate timer", f"{anon.TIMER} runs the gate every 15 seconds")
     for p in sorted(anonymous.values(), key=lambda p: p.slot):
+        if p.slot == projects.HUB_SLOT:
+            continue
         shared = shared_routers(app, records, p)
         if shared:
             add("warn", "shared routers", f"{p.label} ({p.slot}) shares {', '.join(shared)} with "
@@ -1050,7 +1094,7 @@ def gateway_rows(app) -> list:
         # A qube whose tags or network cannot be read may be on it: counted.
         users = sorted(n for n, net in on if net in (name, UNREADABLE))
         rows.append({"name": name, "anonymising": g.anonymising, "label": g.label,
-                     "recorded_upstream": g.upstream,
+                     "recorded_upstream": g.upstream, "updates": g.updates,
                      "problem": gateway_refusal(by_name, name),
                      "in_ai_space": vm is not None and _shown(lambda: core.in_scope(vm)),
                      "upstream": upstream,
@@ -1093,10 +1137,64 @@ def _anonymous_users(app, name: str) -> list:
     return sorted(out)
 
 
-def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "") -> str:
+MODE_CLEARNET = ("anonymous mode: AI space uses only anonymising gateways, so a clearnet one "
+                 "is never enrolled")
+
+
+def anonymous_mode() -> bool:
+    """Whether anonymous mode is on; a mode file that cannot be read refuses
+    the command that asked (each caller's restrictive answer)."""
+    try:
+        return core.anonymous_mode()
+    except core.ModeUnreadable as e:
+        raise RoleError(f"{e}; whether anonymous mode is on cannot be told, so this is "
+                        f"refused") from None
+
+
+def _gateway_text(g) -> str:
+    if not g.anonymising:
+        return f"not anonymising, label '{g.label}'"
+    return (f"anonymising, on {g.upstream}; templates' updates "
+            + (f"may go to {g.upstream}" if g.updates else "do not count there")
+            + f"; label '{g.label}'")
+
+
+def _would_stop(app, registry_after: dict) -> list:
+    """What the gate judges sound now and would not with `registry_after`:
+    the labels, the hub's as "the hub". A read that fails counts as a stop."""
+    try:
+        records = _load_records()
+        subjects = anon.subjects(records)
+    except (ProjectError, core.ModeUnreadable) as e:
+        return [f"(cannot tell: {e})"]
+    out = []
+    for p in subjects:
+        try:
+            before = anon.judge(app, p, records=records)
+            if before.status != anon.GREEN:
+                continue
+            after = anon.judge(app, p, records=records, registry=registry_after)
+        except (core.Unreadable, anon.PolicyUnreadable) as e:
+            out.append(f"{p.label} (cannot tell: {e})")
+            continue
+        if after.status != anon.GREEN:
+            out.append(p.label)
+    return out
+
+
+def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "",
+                   updates: bool = False) -> str:
+    """Let AI space use a gateway. `updates`: the operator's word that the qube
+    above it carries templates' updates anonymously (an anonymising one only).
+    In anonymous mode only an anonymising gateway is enrolled."""
     err = gateways.label_refusal(label)
     if err:
         raise RoleError(err)
+    if updates and not anonymising:
+        raise RoleError("--updates is for an anonymising gateway: it says the qube above it "
+                        "carries updates anonymously")
+    if not anonymising and anonymous_mode():
+        raise RoleError(MODE_CLEARNET)
     with _Exclusive():
         registry = gateways.load()
         if name in registry:
@@ -1107,37 +1205,57 @@ def enroll_gateway(app, name: str, anonymising: bool = False, label: str = "") -
         if why:
             raise RoleError(f"'{name}' cannot be enrolled: {why}")
         upstream = _recorded_upstream(app, name) if anonymising else None
-        registry[name] = gateways.Gateway(name, bool(anonymising), label, upstream)
+        g = registry[name] = gateways.Gateway(name, bool(anonymising), label, upstream, updates)
         gateways.save(registry)
-    return f"{name}: enrolled" + (f" (anonymising, on {upstream})" if anonymising else "")
+    return f"{name}: enrolled" + (f" ({_gateway_text(g)})" if anonymising else "")
 
 
-def set_gateway(app, name: str, anonymising=None, label=None) -> str:
-    """Change a gateway's flag or label. Marking it anonymising records its
-    network as it is now, so after moving an anonymising router to a new
-    upstream the operator marks it again. Taking the flag off one an anonymous
-    project uses is refused: the gate would stop that project."""
+def set_gateway(app, name: str, anonymising=None, label=None, updates=None) -> str:
+    """Change a gateway's flag, label or updates tick. Marking it anonymising
+    records its network as it is now, so after moving an anonymising router to
+    a new upstream the operator marks it again; the updates tick stays only
+    while the recorded network is the same, since it was given for that one.
+    Taking the flag off one an anonymous project uses is refused (and in
+    anonymous mode taking it off at all), as is taking the tick off where the
+    gate would then stop a project or the hub."""
     if label is not None and gateways.label_refusal(label):
         raise RoleError(gateways.label_refusal(label))
+    if anonymising is False and anonymous_mode():
+        raise RoleError(MODE_CLEARNET)
     with _Exclusive():
         registry = gateways.load()
         g = registry.get(name)
         if g is None:
             raise RoleError(f"'{name}' is not enrolled")
+        before = gateways.Gateway(g.name, g.anonymising, g.label, g.upstream, g.updates)
         if anonymising is True:
-            g.anonymising, g.upstream = True, _recorded_upstream(app, name)
+            upstream = _recorded_upstream(app, name)
+            keep = g.anonymising and g.updates and upstream == g.upstream
+            g.anonymising, g.upstream, g.updates = True, upstream, keep
         elif anonymising is False and g.anonymising:
             users = _anonymous_users(app, name)
             if users:
                 raise RoleError(f"'{name}' carries the anonymous project(s) {', '.join(users)}; "
                                 f"they would be stopped. Delete them, or give them other "
                                 f"networks, first")
-            g.anonymising, g.upstream = False, None
+            g.anonymising, g.upstream, g.updates = False, None, False
+        if updates is True:
+            if not g.anonymising or g.upstream is None:
+                raise RoleError(f"'{name}' is not anonymising with a recorded network; mark it "
+                                f"(--anonymising yes) to tick its updates")
+            g.updates = True
+        elif updates is False:
+            g.updates = False
         if label is not None:
             g.label = label
+        if before.updates and not g.updates:
+            stopped = _would_stop(app, registry)
+            if stopped:
+                raise RoleError(f"without the updates tick on '{name}' the anonymity gate would "
+                                f"stop {', '.join(stopped)}: their templates' updates go to "
+                                f"{before.upstream}. Send them elsewhere first")
         gateways.save(registry)
-    return (f"{name}: " + (f"anonymising, on {g.upstream}" if g.anonymising else "not anonymising")
-            + f", label '{g.label}'")
+    return f"{name}: {_gateway_text(g)}"
 
 
 def remove_gateway(app, name: str) -> str:
@@ -1169,6 +1287,14 @@ def remove_gateway(app, name: str) -> str:
         if listing_projects or users:
             raise RoleError(f"'{name}' is in use: projects {listing_projects or '-'}, qubes "
                             f"{users or '-'}; take it off their lists and clear their networks first")
+        # Its updates tick goes with it: refused where the gate would then stop
+        # a project or the hub, as taking the tick off is.
+        after = {n: g for n, g in registry.items() if n != name}
+        stopped = _would_stop(app, after) if registry[name].updates else []
+        if stopped:
+            raise RoleError(f"without '{name}' the anonymity gate would stop "
+                            f"{', '.join(stopped)}: their templates' updates go to "
+                            f"{registry[name].upstream}. Send them elsewhere first")
         del registry[name]
         gateways.save(registry)
     return f"{name}: no longer enrolled"
@@ -1570,11 +1696,23 @@ def _network_enrolled(vm, name) -> None:
                             f"(qmcp gateway enroll {net}) or clear the qube's network first")
 
 
+def _mode_badge(vm, name) -> None:
+    """In anonymous mode a qube wears `qmcp-anon` before it joins AI space, so
+    no moment of it in AI space is outside the rulebook's anonymous denies."""
+    if anonymous_mode():
+        try:
+            vm.tags.add(projects.ANON)
+        except Exception as e:
+            raise RoleError(f"'{name}' could not be given {projects.ANON} ({type(e).__name__}), "
+                            f"so it was not added to AI space") from None
+
+
 def manage(app, name) -> str:
     vm = _target(app, name)
     if _is_gateway(vm):
         raise RoleError(f"'{name}' provides network; gateways are always guarded (qmcp guard)")
     _network_enrolled(vm, name)
+    _mode_badge(vm, name)
     pinned = _pin_dispvm(vm, name)          # before it joins AI space
     try:
         vm.tags.add(core.UMBRELLA)
@@ -1613,6 +1751,7 @@ def guard(app, name) -> str:
     vm = _target(app, name)
     before = _not_in_a_slot(vm, name, "guard")
     _network_enrolled(vm, name)
+    mode = anonymous_mode()                 # read before anything is written
     serves = sorted(projects.model_slots(before))
     # A model qube's maintenance window closes (managed to guarded): nothing
     # the hub started in it while it was managed runs on. It is killed right
@@ -1651,6 +1790,8 @@ def guard(app, name) -> str:
                         + (f"; {unknown}" if unknown else "")
                         + f"; run qmcp guard {name} again") from None
     tail = _kill_after_guard(vm, name, serves) if window else ""
+    if mode and core.UMBRELLA not in before and not _is_gateway(vm):
+        _mode_badge(vm, name)
     if unknown:
         # Right after the guard lands, before any other read or write can fail
         # and hide it. The umbrella is already on (a candidate is in AI space);
@@ -1823,6 +1964,7 @@ def settings(app) -> dict:
         "ai_space_bytes": used,
         "birth_egress": _read_word(birth.BIRTH_EGRESS_PATH) or None,
         "gateways_enrolled": _safe(lambda: len(gateways.load())),
+        "mode": {True: "anonymous", False: "normal", None: UNREADABLE}[anon.mode_state()[0]],
     }
 
 
@@ -2519,6 +2661,11 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
                     lead_netvm, dump, lead_name, model=None, model_qube=None, anonymous=False,
                     hub_sees=False, note=None):
     prefix = birth.read_name_prefix()
+    if not anonymous and anonymous_mode():
+        if label:
+            raise ProjectError("anonymous mode: every project is anonymous, and dom0 picks its "
+                               "label: leave the label out")
+        anonymous = True
     if anonymous:
         if label:
             raise ProjectError("an anonymous project's label is picked by dom0 at random, so a "
@@ -3115,6 +3262,11 @@ def _set_model_qube(report, app, records, p, name) -> None:
     if p.hidden:
         _set_tags(vm, add={projects.HUBBLIND})
         report.append(f"{p.slot}: {name} is hidden from the hub")
+    if anonymous_mode():
+        # Under the hub's check once it serves no anonymous project (the
+        # project deleted, or its model qube taken away): it wears the mode's
+        # badge from now on, as everything there does.
+        _set_tags(vm, add={projects.ANON})
     _set_tags(vm, add={badge})
     report.append(f"{p.slot}: model qube {name}; the lead reaches it on port {MODEL_PORT}")
     shared = sorted(projects.model_slots(_tags(vm)) - {p.slot})
@@ -3147,16 +3299,45 @@ def _add_dump(report, app, key, name):
     report.append(f"{p.slot}: dump sink {name} created (no network)")
 
 
+MOVE_PAST_WARNING = ("a qube has a past: what it holds and what it was used for come with it, "
+                     "and it may link the projects it has been in")
+MOVE_HIDDEN_WARNING = "moving it out of a hidden project hands the hub its contents"
+
+
+def move_warnings(records: dict, current: set, slot) -> list:
+    """What a move into or out of anonymous space says before it runs: into,
+    out of, or between anonymous projects. Empty for any other move. Needs
+    `--yes`, like any move from one slot into another."""
+    def anonymous(s):
+        return s is not None and s in records and records[s].anonymous \
+            and s != projects.HUB_SLOT
+
+    def hidden(s):
+        return anonymous(s) and records[s].hidden
+    if not any(anonymous(s) for s in current) and not anonymous(slot):
+        return []
+    out = [MOVE_PAST_WARNING]
+    if any(hidden(s) for s in current) and not hidden(slot):
+        out.append(MOVE_HIDDEN_WARNING)
+    return out
+
+
 def move(app, name: str, target: str, confirm: bool = False) -> list:
     """Move one of AI space's AppVMs into p00, a project, or no slot. Its network
     is not changed, so a project takes it only on one of its worker networks.
     Taking a qube out of one slot into another carries that slot's content
-    across a trust boundary, and needs `confirm`."""
+    across a trust boundary, and needs `confirm`; so does a move into, out of
+    or between anonymous projects, which says first that the qube has a past.
+    The anonymity gate judges the project a qube moves into, and the hub in
+    anonymous mode, as the move would leave them: the move is refused if the
+    project would be unsound, or if the hub's check would stop more qubes or
+    the moved qube itself."""
     return _run(_move, app, name, target, confirm)
 
 
 def _move(report, app, name, target, confirm):
     records = _load_records()
+    mode = anonymous_mode()
     vm = _vm(app, name)
     tags = set() if vm is None else _tags(vm)
     if core.UMBRELLA not in tags:
@@ -3168,20 +3349,15 @@ def _move(report, app, name, target, confirm):
         raise ProjectError(f"'{name}' is a lead; use qmcp project lead")
     if projects.model_slots(tags) and target != "none":
         raise ProjectError(f"'{name}' is a model qube; a model qube joins no slot")
-    if tags & {projects.ANON, projects.HUBBLIND, projects.BLOCKED} or any(
-            s in records and records[s].anonymous for s in projects.member_slots(tags)):
-        raise ProjectError(f"'{name}' is a qube of an anonymous project: it never moves out "
-                           f"(it would carry the project's content to the hub)")
+    if tags & {projects.BLOCKED, projects.STOPPED}:
+        raise ProjectError(f"'{name}' was stopped by the anonymity gate; clear it first (qmcp "
+                           f"project unblock)")
     if target == "none":
-        slot = None
+        slot, p = None, None
     elif target == projects.HUB_SLOT:
-        slot = projects.HUB_SLOT
+        slot, p = projects.HUB_SLOT, None
     else:
         p = _project(records, target)
-        if p.anonymous:
-            raise ProjectError(f"'{p.label}' is anonymous: no qube moves into it (the hub has "
-                               f"had root in every qube it could move); its lead creates its "
-                               f"workers")
         slot = p.slot
         try:
             net = _netvm(vm)
@@ -3190,30 +3366,91 @@ def _move(report, app, name, target, confirm):
         if net is not None and net not in p.named_networks():
             raise ProjectError(f"'{name}' is on {net}, which is not one of {p.label}'s worker networks")
     current = projects.member_slots(tags)
-    if slot is not None and current and current != {slot} and not confirm:
-        raise ProjectError(f"'{name}' is in {', '.join(sorted(current))}: moving it carries that "
-                           f"slot's content into {slot}; re-run with --yes")
-    # Remove before add: a moment in no slot is less authority, never more.
-    if current:
+    moving = current != ({slot} if slot is not None else set())
+    warnings = move_warnings(records, current, slot) if moving else []
+    if moving and not confirm:
+        if warnings:
+            raise ProjectError(f"'{name}' moves into or out of anonymous space: "
+                               + "; ".join(warnings) + "; re-run with --yes")
+        if slot is not None and current:
+            raise ProjectError(f"'{name}' is in {', '.join(sorted(current))}: moving it carries "
+                               f"that slot's content into {slot}; re-run with --yes")
+    # The badges it wears after: its new slot's, the anonymous project's, and
+    # in anonymous mode `qmcp-anon` wherever it goes.
+    anon_badges = {projects.ANON, projects.HUBBLIND}
+    want_anon = (p.badges() if p is not None and p.anonymous else set()) \
+        | ({projects.ANON} if mode else set())
+    after = (tags - {projects.member_badge(s) for s in current} - anon_badges) \
+        | ({projects.member_badge(slot)} if slot is not None else set()) | want_anon
+    _gate_the_move(app, records, name, after, p if p is not None and p.anonymous else None, mode)
+    for line in warnings:
+        report.append(f"{name}: {line}")
+    # Authority comes off and goes on in the order that is never more than
+    # either end: the badges that keep the hub out go on first, the old slot's
+    # badge comes off before the new one goes on, and the hidden badge comes
+    # off last.
+    add_first = want_anon - tags
+    remove_last = (tags & anon_badges) - want_anon
+    leaving = current - ({slot} if slot is not None else set())
+    if add_first:
         try:
-            _set_tags(vm, remove={projects.member_badge(s) for s in current})
+            _set_tags(vm, add=add_first)
         except core.Unreadable as e:
-            report.fail(f"{name}: taken out of {', '.join(sorted(current))}, but {e}; it was "
+            report.fail(f"{name}: given {', '.join(sorted(add_first))}, but {e}; it was moved "
+                        f"nowhere (qmcp check shows what is left)")
+            return
+    if leaving:
+        try:
+            _set_tags(vm, remove={projects.member_badge(s) for s in leaving})
+        except core.Unreadable as e:
+            report.fail(f"{name}: taken out of {', '.join(sorted(leaving))}, but {e}; it was "
                         f"moved into nothing (qmcp check shows what is left)")
             return
-        report.append(f"{name}: out of {', '.join(sorted(current))}")
-    if slot is not None:
+        report.append(f"{name}: out of {', '.join(sorted(leaving))}")
+    if slot is not None and slot not in current:
         try:
             _set_tags(vm, add={projects.member_badge(slot)})
         except core.Unreadable as e:
             report.fail(f"{name}: put in {slot}, but {e} (qmcp check shows what is left)")
             return
+    if remove_last:
+        try:
+            _set_tags(vm, remove=remove_last)
+        except core.Unreadable as e:
+            report.fail(f"{name}: put in {slot or 'no slot'}, and {', '.join(sorted(remove_last))} "
+                        f"taken off, but {e} (qmcp check shows what is left)")
+            return
     report.append(f"{name}: {'no slot' if slot is None else slot}")
     prefix = birth.read_name_prefix()
-    for p in records.values():
-        if p.label and p.slot != slot and name.startswith(p.space(prefix)):
-            report.append(f"{name}: its name stays inside '{p.space(prefix)}', so {p.label}'s lead "
+    for q in records.values():
+        if q.label and q.slot != slot and name.startswith(q.space(prefix)):
+            report.append(f"{name}: its name stays inside '{q.space(prefix)}', so {q.label}'s lead "
                           f"can still detect it by name")
+
+
+def _gate_the_move(app, records: dict, name: str, after: set, p, mode: bool) -> None:
+    """Refuse a move the anonymity gate would stop: the anonymous project it
+    goes into, and in anonymous mode the hub, judged as if the qube already
+    wore `after`. A judgement that cannot be made refuses too."""
+    hub = core.read_hub()
+    for subject in ([p] if p is not None else []) + ([anon.HUB] if mode else []):
+        try:
+            before = anon.judge(app, subject, records=records)
+            v = anon.judge(app, subject, records=records, overlay={name: after})
+        except (core.Unreadable, anon.PolicyUnreadable) as e:
+            raise ProjectError(f"the anonymity gate could not judge {subject.label} with "
+                               f"'{name}' in it ({e}); nothing was moved") from None
+        if v.status == anon.GREEN:
+            continue
+        # Judged by what would be stopped, not by the words: a project is
+        # stopped whole, so it must be sound; the hub's check stops by qube,
+        # so the move may not add to what it stops, nor be among it.
+        if subject is anon.HUB:
+            more = set(anon.hub_stop_set(v, hub)) - set(anon.hub_stop_set(before, hub))
+            if not more and name not in v.offenders:
+                continue
+        raise ProjectError(f"the anonymity gate would stop {subject.label} with '{name}' in "
+                           f"it: " + "; ".join(d for _, d in v.problems) + "; nothing was moved")
 
 
 def delete_plan(app, records: dict, key: str) -> tuple:
@@ -3322,15 +3559,16 @@ def _delete_project(report, app, key):
 
 def unblock(app, key: str) -> list:
     """Take `qmcp-blocked` off an anonymous project's lead and members once a
-    fresh gate run finds it sound; `autostart` stays off."""
+    fresh gate run finds it sound; `autostart` stays off. `p00` (or `hub`)
+    clears the hub and every qube under the hub's check in anonymous mode."""
     return _run(_unblock, app, key)
 
 
 def _unblock(report, app, key):
     records = _load_records()
-    p = _project(records, key)
+    slot = projects.HUB_SLOT if key in (projects.HUB_SLOT, "hub") else _project(records, key).slot
     try:
-        report.extend(anon.unblock(app, records, p.slot))
+        report.extend(anon.unblock(app, records, slot))
     except ValueError as e:
         raise ProjectError(str(e)) from None
 

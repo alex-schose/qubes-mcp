@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.23.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.24.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -24,6 +24,15 @@
 #   --private-cap BYTES  written to /etc/qmcp/private-cap if absent (default 10 GiB)
 #   --gate-user NAME     the dom0 user the anonymity gate's timer runs as (default: the
 #                        user who ran this with sudo, else the qubes group's one member)
+#   --anonymous          turn on anonymous mode: every project anonymous, and the gate
+#                        judges the hub and the rest of AI space. Refused unless no
+#                        ordinary project exists, no clearnet gateway is enrolled and the
+#                        gate finds the hub sound. No qmcp command turns it off;
+#                        uninstall.sh --purge does. An update keeps it without the option.
+#   --updates-via GATEWAY  tick an enrolled anonymising gateway for templates' updates
+#                        (qmcp gateway set GATEWAY --updates yes), before the gate's timer
+#                        runs the new code (repeatable): an entry written before 0.9.24 is
+#                        unticked
 #   --dry-run            run every check, change nothing
 #
 # What it installs:
@@ -45,9 +54,18 @@
 #                                    `qmcp project` writes it (as root)
 #   /etc/systemd/system/qmcp-gate.{service,timer}   the anonymity gate every 15 s, as the
 #                                    dom0 user the services run as (never root: it notifies
-#                                    the operator's desktop), enabled and started
-# It changes no qube's tags: managed qubes from an older release stay in no
-# project slot until `qmcp project move` puts them in one.
+#                                    the operator's desktop), enabled and started. The timer
+#                                    is stopped while this script changes things, after a run
+#                                    already going has finished, and started again at the end,
+#                                    also when it fails part-way, so the anonymous projects stay
+#                                    judged; a qmcp command run meanwhile still runs the gate
+#   /etc/qmcp/mode                   with --anonymous: the word anonymous, written after the
+#                                    policy, once qmcp-anon is on the hub and on every qube
+#                                    under the hub's check; then they are stamped once more
+# It changes no qube's tags, but anonymous mode puts qmcp-anon on the hub and on every
+# qube in AI space that is not an anonymous project's lead, member or model qube,
+# guarded routers aside: managed qubes from an older release stay in no project slot
+# until `qmcp project move` puts them in one.
 # It removes everything v0.9.16 installed that this release no longer has, and
 # backs up what it replaces under /var/lib/qmcp-rollback/<timestamp>/.
 #
@@ -68,9 +86,13 @@ POOL_CAP=$((50 * 1024 * 1024 * 1024))
 PRIVATE_CAP=$((10 * 1024 * 1024 * 1024))
 DRY_RUN=0
 GATE_USER=""
+ANONYMOUS=0
+UPDATES_VIA=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
+        --anonymous) ANONYMOUS=1; shift ;;
+        --updates-via) UPDATES_VIA="$UPDATES_VIA $2"; shift 2 ;;
         --gate-user) GATE_USER="$2"; shift 2 ;;
         --birth-egress) BIRTH_EGRESS="$2"; shift 2 ;;
         --pool-cap) POOL_CAP="$2"; shift 2 ;;
@@ -89,7 +111,16 @@ AUDIT_LOG=/var/log/qmcp-audit.log
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP=/var/lib/qmcp-rollback/$TS
 SCRATCH="$(mktemp -d /tmp/qmcp-install.XXXXXX)"
-trap 'rm -rf "$SCRATCH"' EXIT
+TIMER_STOPPED=0
+cleanup() {
+    rm -rf "$SCRATCH"
+    # A run that stopped the gate's timer starts it again, whatever happened.
+    if [ "$TIMER_STOPPED" -eq 1 ]; then
+        systemctl start qmcp-gate.timer >/dev/null 2>&1 \
+            || echo "install.sh: could NOT start qmcp-gate.timer again: sudo systemctl enable --now qmcp-gate.timer" >&2
+    fi
+}
+trap cleanup EXIT
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
@@ -240,6 +271,97 @@ finally:
 PYEOF
 [ "$POLICY_STATUS" -eq 0 ] || die "the rendered policy does not load on this box, or a file sorting earlier overrides it; nothing was changed"
 
+for g in $UPDATES_VIA; do
+    [[ "$g" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,30}$ ]] || die "--updates-via: '$g' is not a qube name"
+done
+
+# The anonymity gate, as the staged code will judge: every anonymous project, and
+# the hub in anonymous mode (on now, or with --anonymous), with the --updates-via
+# ticks applied. An entry written before 0.9.24 is not ticked for updates, so a
+# project whose templates update through it would be stopped by the first run of
+# the new code: name it here, before anything changes. Turning anonymous mode on
+# needs no ordinary project, no clearnet gateway, and the hub sound.
+MODE_STATUS=0
+PYTHONPATH="$SRC/dom0" QMCP_HUB="$HUB" QMCP_ANONYMOUS="$ANONYMOUS" QMCP_UPDATES_VIA="$UPDATES_VIA" \
+    python3 - <<'PYEOF' || MODE_STATUS=$?
+import os, sys
+from qmcp import anon, core, gateways, projects
+import qubesadmin.app
+hub = os.environ["QMCP_HUB"]
+core.read_hub = lambda path=None: hub
+turn_on = os.environ["QMCP_ANONYMOUS"] == "1"
+try:
+    mode_on = core.anonymous_mode()
+except core.ModeUnreadable as e:
+    print(f"    {e}: write the one word anonymous, or run uninstall.sh --purge", file=sys.stderr)
+    sys.exit(1)
+records = projects.load()
+registry = gateways.load()
+for name in os.environ["QMCP_UPDATES_VIA"].split():
+    g = registry.get(name)
+    if g is None or not g.anonymising or g.upstream is None:
+        print(f"    --updates-via {name}: not an enrolled anonymising gateway with a recorded "
+              f"network", file=sys.stderr)
+        sys.exit(1)
+    g.updates = True
+turning = turn_on and not mode_on
+if turning:
+    ordinary = sorted(p.label for p in records.values() if p.label and not p.anonymous)
+    clearnet = sorted(n for n, g in registry.items() if not g.anonymising)
+    if ordinary or clearnet:
+        if ordinary:
+            print(f"    anonymous mode: projects that are not anonymous: {', '.join(ordinary)} "
+                  f"(delete them first)", file=sys.stderr)
+        if clearnet:
+            print(f"    anonymous mode: gateways that are not anonymising: {', '.join(clearnet)} "
+                  f"(qmcp gateway remove)", file=sys.stderr)
+        sys.exit(1)
+app = qubesadmin.app.QubesLocal()
+subjects = [p for p in sorted(records.values(), key=lambda p: p.slot)
+            if p.anonymous and p.slot != projects.HUB_SLOT]
+overlay, past = {}, []
+if mode_on or turn_on:
+    subjects.append(anon.HUB)
+if turning:
+    # qmcp-anon goes on these before the mode is written: judged as wearing it.
+    by_name, tags_by = anon._snapshot(app, strict=True)
+    for n in anon.hub_subjects(hub, records, registry, by_name, tags_by):
+        overlay[n] = tags_by[n] | {projects.ANON}
+    past = [n for n in overlay if n != hub]
+ticked = {n: gateways.Gateway(g.name, g.anonymising, g.label, g.upstream, True)
+          for n, g in registry.items()}
+failed = False
+for p in subjects:
+    v = anon.judge(app, p, records=records, overlay=overlay, registry=registry)
+    if v.status == anon.GREEN:
+        continue
+    why = "; ".join(d for _, d in v.problems)
+    if p is anon.HUB and turning:
+        print(f"    anonymous mode: the gate would stop the hub: {why}", file=sys.stderr)
+        failed = True
+    elif anon.judge(app, p, records=records, overlay=overlay, registry=ticked).status == anon.GREEN:
+        print(f"    {p.label} ({p.slot}) would be stopped by this release: {why}", file=sys.stderr)
+        failed = True
+    else:
+        print(f"    note: {p.label} ({p.slot}) is not sound already, whatever this release does: "
+              f"{why}")
+if failed:
+    print("    Tick a gateway whose upstream is the anonymiser itself (sys-whonix, a VPN qube) "
+          "with --updates-via GATEWAY, or fix what is named, then run this again.",
+          file=sys.stderr)
+    sys.exit(1)
+if turning:
+    print("    anonymous mode: every project will be anonymous, and the gate judges the hub "
+          "and the rest of AI space every 15 seconds.")
+    print("    qmcp cannot check whose account the hub's model uses, nor what the hub qube did "
+          "before now: use a hub qube and a model account that never ran on clearnet.")
+    for n in sorted(past):
+        print(f"    {n} is already in AI space and gets qmcp-anon: a qube has a past (what it "
+              f"holds and what it was used for come with it)")
+sys.exit(0)
+PYEOF
+[ "$MODE_STATUS" -eq 0 ] || die "the anonymity preflight refused (above); nothing was changed"
+
 say "preflight passed: qubes-mcp $VERSION, hub '$HUB', gate user '$GATE_USER'"
 if [ "$DRY_RUN" -eq 1 ]; then
     say "dry run: nothing was changed"
@@ -260,6 +382,18 @@ for f in /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.tim
     [ -f "$f" ] && cp -a "$f" "$BACKUP/"
 done
 say "backed up to $BACKUP (root-only)"
+
+# --- the gate's timer stops while this changes things; cleanup() starts it again
+if systemctl is-active --quiet qmcp-gate.timer 2>/dev/null; then
+    TIMER_STOPPED=1
+    systemctl stop qmcp-gate.timer
+    # A run already going finishes first (the unit stops one after 60 s).
+    for _ in $(seq 1 65); do
+        [ "$(systemctl is-active qmcp-gate.service 2>/dev/null)" = activating ] || break
+        sleep 1
+    done
+    say "stopped qmcp-gate.timer until the install is done"
+fi
 
 # --- v0.9.16 leftovers
 for unit in qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service; do
@@ -331,8 +465,15 @@ grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-gate.service" || die "the gate's unit 
 install -m 0644 "$SCRATCH/qmcp-gate.service" /etc/systemd/system/qmcp-gate.service
 install -m 0644 "$SRC/deploy/qmcp-gate.timer" /etc/systemd/system/qmcp-gate.timer
 systemctl daemon-reload
-systemctl enable --now qmcp-gate.timer >/dev/null
-say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
+systemctl enable qmcp-gate.timer >/dev/null
+TIMER_STOPPED=1
+say "the anonymity gate will run every 15 seconds as $GATE_USER (qmcp-gate.timer)"
+
+# --- the updates ticks, before the gate's timer runs the new code
+for g in $UPDATES_VIA; do
+    PYTHONPATH="$LIB" python3 -c 'import sys, qubesadmin.app; from qmcp import fleet; print(fleet.set_gateway(qubesadmin.app.QubesLocal(), sys.argv[1], updates=True))' "$g" \
+        || die "could not tick $g for updates; the new policy is NOT installed (nor, with --anonymous, the mode), but the gate's timer starts again on the new code and may stop a project, or in anonymous mode the hub, whose templates update through $g: run the install again at once"
+done
 
 # --- the policy, last: until it is in place no AI caller reaches the new code
 install -m 0644 -o root -g root "$RENDERED" "$POLICY_DST"
@@ -346,6 +487,52 @@ done
 [ "$(systemctl is-active qubes-qrexec-policy-daemon)" = "active" ] \
     || die "the qrexec policy daemon is not active after the restart; the policy IS installed"
 say "qrexec policy daemon restarted"
+
+# --- anonymous mode, last: qmcp-anon on the hub and the rest of AI space first, so
+# the gate never judges a qube of the mode without it
+stamp_mode() {   # qmcp-anon on the hub and on every qube under its check
+    PYTHONPATH="$LIB" QMCP_HUB="$HUB" python3 - <<'PYEOF'
+import os, sys
+import qubesadmin.app
+from qmcp import anon, core, gateways, projects
+hub = os.environ["QMCP_HUB"]
+app = qubesadmin.app.QubesLocal()
+records, registry = projects.load(), gateways.load()
+by_name, tags_by = anon._snapshot(app, strict=True)
+# The hub's subjects, and the anonymous projects' model qubes, which join them
+# when their project goes (its leads and members wear it already).
+models = sorted({p.model_qube for p in records.values() if p.anonymous and p.model_qube
+                 and p.model_qube in by_name})
+for name in anon.hub_subjects(hub, records, registry, by_name, tags_by) + models:
+    vm = app.domains[name]
+    if projects.ANON not in core.tags_of(vm):
+        vm.tags.add(projects.ANON)
+    if projects.ANON not in core.tags_of(vm):
+        sys.exit(f"    {name} does not read back wearing {projects.ANON}")
+    print(f"==> {name} wears {projects.ANON}")
+PYEOF
+}
+if [ "$ANONYMOUS" -eq 1 ] && [ ! -e "$ETC_QMCP/mode" ]; then
+    stamp_mode || die "could not put qmcp-anon on every qube of the mode; the mode is NOT on (the qubes named above wear it)"
+    printf 'anonymous\n' > "$ETC_QMCP/mode.new"
+    chmod 0644 "$ETC_QMCP/mode.new"
+    mv "$ETC_QMCP/mode.new" "$ETC_QMCP/mode"
+    # A qube the hub made between the first pass and the mode file was born
+    # without it (the services stamp only in the mode): a second pass, while
+    # the timer is still stopped.
+    stamp_mode > /dev/null || die "anonymous mode is on, but a qube made during the install could not be given qmcp-anon; run the install again"
+    say "anonymous mode is on ($ETC_QMCP/mode); no qmcp command turns it off, uninstall.sh --purge does"
+elif [ -e "$ETC_QMCP/mode" ]; then
+    say "kept $ETC_QMCP/mode ($(head -c 40 "$ETC_QMCP/mode" | tr '\n' ' '))"
+    # The mode's invariant, put back on an update: qmcp-anon on every qube under the hub's check.
+    stamp_mode > /dev/null || die "could not put qmcp-anon on every qube of the mode; run the install again"
+fi
+
+# --- the gate's timer, and one run now, so its heartbeat is this release's
+systemctl start qmcp-gate.timer
+systemctl start qmcp-gate.service || true
+TIMER_STOPPED=0
+say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 
 # ===================================================================== verify
 echo

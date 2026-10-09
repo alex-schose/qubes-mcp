@@ -659,7 +659,8 @@ class ProjectForm(Form, LeadFields, NetworkFields):
 
     LABEL_HINT = "1-8 lowercase letters or digits"
 
-    def __init__(self, parent, fleet_rows, gw_rows, hub, prefix="ai-", project_rows=()):
+    def __init__(self, parent, fleet_rows, gw_rows, hub, prefix="ai-", project_rows=(),
+                 mode="normal"):
         super().__init__(parent, "New project", "Create project",
                          "A project is a lead, the workers it creates, and optionally a dump "
                          "sink. The lead's own template is approved first when it is in AI space. "
@@ -674,7 +675,9 @@ class ProjectForm(Form, LeadFields, NetworkFields):
                          "templates the hub cannot change, and its lead is made fresh from a "
                          "template; the anonymity gate judges it from then on and stops it when "
                          "it is not sound. It is hidden from the hub unless you tick that the hub "
-                         "may see it; the note is yours, to tell it apart.")
+                         "may see it; the note is yours, to tell it apart."
+                         + (" In anonymous mode every project is anonymous." if mode == "anonymous"
+                            else ""))
         self.prefix = prefix
         self._projects = list(project_rows or ())
         self._typed_label = ""
@@ -698,6 +701,10 @@ class ProjectForm(Form, LeadFields, NetworkFields):
         self.row("Dump sink", self.dump)
         self.anonymous.connect("toggled", self._anonymous_changed)
         self._anonymous_changed()
+        if mode == "anonymous":
+            # Every project is anonymous: the tick is on, and stays on.
+            self.anonymous.set_active(True)
+            self.anonymous.set_sensitive(False)
         self.done_building()
 
     def _anonymous_changed(self, *_):
@@ -945,15 +952,18 @@ class MoveForm(Form):
     def __init__(self, parent, row, records):
         super().__init__(parent, f"Move {row.get('name')}", "Move",
                          "Its network does not change, so a project takes it only on one of "
-                         "its worker networks.")
+                         "its worker networks. A move into, out of or between anonymous "
+                         "projects needs the tick too, and the anonymity gate judges the project "
+                         "it goes into as the move would leave it: the command refuses a move "
+                         "the gate would stop.")
         self.row_data = row
         self.current = (row.get("slot") or "") or None
         self._records = records
         targets = [(t, esc(text)) for t, text in gm.move_targets(records)]
         self.target = self.combo("Into", targets)
-        self.confirm = _check(esc(f"yes, move it out of {self.current}: its content goes with it"))
+        self.confirm = _check(esc("yes, move it: what it holds goes with it"))
         self.confirm.connect("toggled", self.update)
-        self.row("Across slots", self.confirm)
+        self.row("Confirm", self.confirm)
         self.netinfo = _label(esc(""), wrap=True)
         _named(self.netinfo, esc("network fit"))
         self.row("Network", self.netinfo)
@@ -961,8 +971,11 @@ class MoveForm(Form):
 
     def network_fit(self, target) -> str:
         """What the command will judge, shown before OK: a project takes a qube
-        only on one of its worker networks. The command decides."""
+        only on one of its worker networks, or with none. The command decides."""
         net = self.row_data.get("netvm") or "none"
+        if net == "none":
+            return (f"{self.row_data.get('name')} has no network: any project takes it, and "
+                    f"p00 and no slot too.")
         rec = next((r for r in self._records.values() if r.get("label") == target), None)
         if rec is None:
             on = "'s network cannot be read" if net == gm.UNREADABLE else f" is on {net}"
@@ -986,11 +999,19 @@ class MoveForm(Form):
     def build(self):
         target = self.target.get_active_id()
         _set(self.netinfo, esc(self.network_fit(target)))
-        crossing = bool(self.current) and self._target_slot(target) not in (None, self.current)
-        self.confirm.set_sensitive(crossing)
-        if crossing and not self.confirm.get_active():
-            raise gm.FormError(f"tick the box: it leaves {self.current}")
-        return gm.move(self.row_data.get("name"), target, confirm=crossing)
+        slot = self._target_slot(target)
+        moving = target is not None and (self.current or None) != slot
+        warnings = gm.move_warnings(self._records, self.current, slot) if moving else []
+        # In red, in the form's own warning line: what the qube carries with it.
+        _set(self.warning, esc(("; ".join(warnings) + ".")[:1].upper()
+                               + ("; ".join(warnings) + ".")[1:] if warnings else ""))
+        crossing = bool(self.current) and slot not in (None, self.current)
+        needs = crossing or bool(warnings)
+        self.confirm.set_sensitive(needs)
+        if needs and not self.confirm.get_active():
+            raise gm.FormError("tick the box: it moves into or out of anonymous space"
+                               if warnings else f"tick the box: it leaves {self.current}")
+        return gm.move(self.row_data.get("name"), target, confirm=needs)
 
 
 class RevokeForm(Form):
@@ -1067,7 +1088,7 @@ class ProposalForm(Form):
 class EnrollForm(Form):
     """Enroll a qube that provides network as a gateway AI space may use."""
 
-    def __init__(self, parent, fleet_rows, gw_rows, hub):
+    def __init__(self, parent, fleet_rows, gw_rows, hub, mode="normal"):
         super().__init__(parent, "Enroll a gateway", "Enroll",
                          "AI space may use an enrolled gateway as a network: a project lists "
                          "it, a lead is born on it, the hub's creates use it. Enroll a plain "
@@ -1078,11 +1099,13 @@ class EnrollForm(Form):
                          "its template's), and that no template the hub manages builds it. "
                          "Marking it anonymising records the network it is on now as its "
                          "upstream: an anonymous project on it stays sound only while it stays "
-                         "there, and after moving it you mark it again. The qube itself does not "
-                         "change.")
+                         "there, and after moving it you mark it again. Tick its updates only "
+                         "when that upstream is the anonymiser itself (sys-whonix, a VPN qube), "
+                         "never sys-firewall: an anonymous project's templates may then send "
+                         "their updates there. The qube itself does not change.")
         self._rows = {r["name"]: r for r in fleet_rows
                       if isinstance(r, dict) and isinstance(r.get("name"), str)}
-        self._hub = hub
+        self._hub, self._mode = hub, mode
         self.qube = self.combo("Qube", [(n, esc(gm.enroll_text(self._rows[n], hub)))
                                         for n in gm.enroll_choices(fleet_rows, gw_rows, hub)],
                                preselect=False)
@@ -1092,6 +1115,10 @@ class EnrollForm(Form):
         self.row("Anonymising", self.anonymising)
         self.upstream = _label(esc(""), wrap=True)
         self.row("Its upstream", self.upstream)
+        self.updates = _check(esc("templates' updates may go to its upstream: that qube carries "
+                                  "them anonymously"))
+        self.updates.connect("toggled", self.update)
+        self.row("Updates", self.updates)
         self.label_entry = self.entry("Label", "optional, up to 40 characters, e.g. a jurisdiction")
         self.done_building()
 
@@ -1099,18 +1126,25 @@ class EnrollForm(Form):
         name = self.qube.get_active_id()
         row = self._rows.get(name) if name else None
         net = row.get("netvm") if row else None
+        anonymising = self.anonymising.get_active()
+        self.updates.set_sensitive(anonymising)
+        if not anonymising and self.updates.get_active():
+            self.updates.set_active(False)
         _set(self.upstream, esc("" if row is None else
                                 f"{name} is on {net or 'no network'} now"
                                 + ("; ticked, that is recorded as its upstream"
-                                   if self.anonymising.get_active() else "")))
+                                   if anonymising else "")))
         why = gm.enroll_refusal(row, self._hub) if name else None
         if why:
             raise gm.FormError(why)
-        if self.anonymising.get_active() and row is not None:
+        if not anonymising and self._mode != "normal":
+            raise gm.FormError(gm.mode_clearnet_refusal(self._mode))
+        if anonymising and row is not None:
             why = gm.anonymising_refusal(name, net)
             if why:
                 raise gm.FormError(why)
-        return gm.enroll_gateway(name, self.anonymising.get_active(), self.label_entry.get_text())
+        return gm.enroll_gateway(name, anonymising, self.label_entry.get_text(),
+                                 self.updates.get_active())
 
 
 class GatewayForm(Form):
@@ -1118,14 +1152,18 @@ class GatewayForm(Form):
     Marking it anonymising records the network it is on now; for one marked
     already, the tick records it again, after it was moved on purpose."""
 
-    def __init__(self, parent, row, fleet_rows=(), project_rows=()):
+    def __init__(self, parent, row, fleet_rows=(), project_rows=(), mode="normal"):
         super().__init__(parent, f"Change gateway {row.get('name')}", "Apply",
                          "Only what you change is sent. Marking it anonymising records the network "
                          "it is on now as its upstream: the anonymity gate stops every anonymous "
                          "project on it once it is anywhere else, so after moving it on purpose, "
-                         "mark it again. Taking the mark off one an anonymous project uses is "
-                         "refused. The qube itself does not change.")
+                         "mark it again. After a move the tick stays only if Updates stays "
+                         "ticked here: untick it unless the new upstream is the anonymiser "
+                         "itself. Taking the mark off one an anonymous project uses is "
+                         "refused, and so is taking the updates tick off where the gate would "
+                         "then stop a project. The qube itself does not change.")
         self.row_data = row
+        self._mode = mode
         self._fleet, self._projects = list(fleet_rows or ()), list(project_rows or ())
         self.anonymising = self.combo("Anonymising", [
             ("yes", esc("yes: it reaches the network anonymously (Tor)")), ("no", esc("no"))],
@@ -1136,6 +1174,12 @@ class GatewayForm(Form):
         self.remark.connect("toggled", self.update)
         self.row("Its upstream", self.remark)
         self.remark.set_sensitive(row.get("anonymising") is True)
+        self.updates = _check(esc(f"templates' updates may go to "
+                                  f"{row.get('recorded_upstream') or 'its recorded upstream'}: "
+                                  f"that qube carries them anonymously"))
+        self.updates.set_active(row.get("updates") is True)
+        self.updates.connect("toggled", self.update)
+        self.row("Updates", self.updates)
         self.label_entry = self.entry("Label", "up to 40 characters; empty: no label",
                                       row.get("label") or "")
         self.done_building()
@@ -1151,18 +1195,29 @@ class GatewayForm(Form):
             self.remark.set_active(False)
         mark = anonymising and (not was or self.remark.get_active())
         label = self.label_entry.get_text()
+        self.updates.set_sensitive(anonymising)
+        if not anonymising and self.updates.get_active():
+            self.updates.set_active(False)
+        ticked = self.updates.get_active()
         if mark:
             why = gm.anonymising_refusal(name, row.get("upstream"))
             if why:
                 raise gm.FormError(why)
         if was and not anonymising:
+            if self._mode != "normal":
+                raise gm.FormError(gm.mode_clearnet_refusal(self._mode))
             why = gm.unmark_refusal(name, self._projects, self._fleet)
             if why:
                 raise gm.FormError(why)
+        # Re-marking keeps the tick only on the same network: say it again.
+        moved = mark and was and row.get("upstream") != row.get("recorded_upstream")
+        updates = None if (ticked == (row.get("updates") is True) and not (moved and ticked)) \
+            else ticked
         # The field shows the label escaped: left as shown, it is unchanged.
         return gm.change_gateway(
             name, True if mark else (None if anonymising == was else anonymising),
-            None if label == gm.esc(row.get("label") or "") else label)
+            None if label == gm.esc(row.get("label") or "") else label,
+            None if not anonymising and not was else updates)
 
 
 class FirewallForm(Form):
@@ -1609,7 +1664,12 @@ class Window(Gtk.Window):
         self.settings_grid = Gtk.Grid(column_spacing=16, row_spacing=6)
         for side in ("start", "end", "top", "bottom"):
             getattr(self.settings_grid, f"set_margin_{side}")(12)
-        return _scrolled(self.settings_grid)
+        # No sideways scroll: a long value (the mode's) wraps at the window's
+        # width, where a reader sees all of it.
+        sw = _scrolled(self.settings_grid)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.settings_scroll = sw
+        return sw
 
     # ------------------------------------------------------------------ reads
     def refresh(self):
@@ -1760,7 +1820,9 @@ class Window(Gtk.Window):
         _clear(self.settings_grid)
         for i, (heading, text) in enumerate(gm.settings_rows(self.settings)):
             self.settings_grid.attach(_label(esc(heading)), 0, i, 1, 1)
-            self.settings_grid.attach(_label(text, selectable=True), 1, i, 1, 1)
+            value = _label(text, wrap=True, selectable=True)
+            value.set_hexpand(True)
+            self.settings_grid.attach(value, 1, i, 1, 1)
         n = len(gm.SETTINGS_FIELDS)
         self.settings_grid.attach(_label(esc(
             "Read-only here. The installer writes each file in /etc/qmcp only if it is absent "
@@ -1933,9 +1995,16 @@ class Window(Gtk.Window):
         while the gate has it stopped, and changes are on."""
         if not self.complete or self.busy:
             return set()
-        rec = self.records.get(self.gate_selected) if self.gate_selected else None
+        rec = self._gate_record(self.gate_selected)
         return {"gate_unblock"} if (isinstance(rec, dict) and rec.get("anonymous")
                                     and rec.get("blocked") is True) else set()
+
+    def _gate_record(self, slot):
+        """The record Unblock works on for a row of the Anonymity tab: the
+        project's, or for the hub's verdict (anonymous mode) p00's stand-in."""
+        if not slot:
+            return None
+        return gm.hub_record(gm.verdict_for(slot, self.gate_view())) or self.records.get(slot)
 
     def _on_audit_select(self, selection):
         model, it = selection.get_selected()
@@ -2099,7 +2168,8 @@ class Window(Gtk.Window):
         hub = self.settings.get("hub")
         prefix = self.settings.get("name_prefix") or "ai-"
         if ident == "new_project":
-            form = ProjectForm(self, self.fleet, self.gateways, hub, prefix, self.project_rows)
+            form = ProjectForm(self, self.fleet, self.gateways, hub, prefix, self.project_rows,
+                               self.settings.get("mode"))
             return self._open(form, "Create project", check=lambda: form.red_changed(self.fleet))
         if ident == "add_to_ai_space":
             sinks = [r.get("dump") for r in self.records.values() if r.get("dump")]
@@ -2194,7 +2264,7 @@ class Window(Gtk.Window):
         if ident == "gate_unblock":
             if ident not in self._gate_actions():
                 return None
-            rec = self.records.get(self.gate_selected)
+            rec = self._gate_record(self.gate_selected)
         else:
             if not self.complete or self.busy:
                 return None
@@ -2209,7 +2279,7 @@ class Window(Gtk.Window):
                                       gm.unblock_intro(rec), gm.unblock_project(rec.get("label")),
                                       refusal=gm.unblock_refusal(rec, verdict)), "Unblock project",
                           check=lambda: gm.unblock_refusal(
-                              self.records.get(slot, rec),
+                              rec if rec.get("hub") else self.records.get(slot, rec),
                               gm.verdict_for(slot, self.gate_view())))
 
     def registry(self, ident):
@@ -2219,11 +2289,12 @@ class Window(Gtk.Window):
             return None
         if ident == "enroll_gateway":
             return self._open(EnrollForm(self, self.fleet, self.gateways,
-                                         self.settings.get("hub")), "Enroll a gateway")
+                                         self.settings.get("hub"), self.settings.get("mode")),
+                              "Enroll a gateway")
         row = self.gateway_row()
         if ident == "change_gateway":
-            return self._open(GatewayForm(self, row, self.fleet, self.project_rows),
-                              "Change gateway")
+            return self._open(GatewayForm(self, row, self.fleet, self.project_rows,
+                                          self.settings.get("mode")), "Change gateway")
         # It removes authority, never a qube: no red line. The command refuses
         # a gateway still in use, and so does the form, from the row on show.
         return self._open(ConfirmForm(self, f"Remove gateway {row['name']}", "Remove",

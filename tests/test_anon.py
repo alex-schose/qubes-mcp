@@ -33,14 +33,18 @@ WHONIX_LINES = ("qubes.UpdatesProxy * @tag:whonix-updatevm @default allow target
                 "qubes.UpdatesProxy * @tag:whonix-updatevm @anyvm deny\n")
 
 
-def policy_view(app, updates_to="sys-whonix", extra=""):
+def policy_view(app, updates_to="sys-whonix", extra="", ours=False):
     """(policy, system information) as dom0's policy daemon would see them:
     upstream 4.3's files, and Global Config's update file sending every
-    TemplateVM's updates to `updates_to` (none: Qubes' default, sys-net)."""
+    TemplateVM's updates to `updates_to` (none: Qubes' default, sys-net);
+    with `ours`, our rulebook too, as installed."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="qmcp-anon-policy-"))
     try:
         shutil.copytree(UPSTREAM, tmp, dirs_exist_ok=True)
         (tmp / "README.md").unlink(missing_ok=True)
+        if ours:
+            shutil.copyfile(HERE.parent / "policy" / "30-mcp-control.policy",
+                            tmp / "30-mcp-control.policy")
         lines = WHONIX_LINES + extra
         if updates_to:
             lines += f"qubes.UpdatesProxy * @type:TemplateVM @default allow target={updates_to}\n"
@@ -62,8 +66,8 @@ def policy_view(app, updates_to="sys-whonix", extra=""):
 
 class AnonBase(PBase):
     """The project fleet, plus a Tor router behind `sys-whonix` and a VPN router
-    behind `sys-vpn`, both enrolled anonymising (their upstream recorded), and
-    dom0's updates going to `sys-whonix`."""
+    behind `sys-vpn`, both enrolled anonymising (their upstream recorded) and
+    ticked for updates, and dom0's updates going to `sys-whonix`."""
 
     def setUp(self):
         super().setUp()
@@ -77,8 +81,8 @@ class AnonBase(PBase):
              tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
         a.vm("ai-net-vpn", provides_network=True, netvm=vpn, power="Running",
              tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
-        fleet.enroll_gateway(a, "ai-net-tor", anonymising=True)
-        fleet.enroll_gateway(a, "ai-net-vpn", anonymising=True, label="vpn")
+        fleet.enroll_gateway(a, "ai-net-tor", anonymising=True, updates=True)
+        fleet.enroll_gateway(a, "ai-net-vpn", anonymising=True, label="vpn", updates=True)
         self.updates_to, self.extra = "sys-whonix", ""
         self.notices, self.timer = [], True
         for mod, attr, value in [
@@ -809,10 +813,10 @@ class Commands(AnonBase):
         fleet.edit_project(a, p.slot, networks=["ai-net-tor", "ai-net-vpn", "none"])
         with self.assertRaisesRegex(fleet.RoleError, "made fresh"):
             fleet.set_lead(a, p.slot, "promote", "ai-hubq")
-        with self.assertRaisesRegex(fleet.RoleError, "anonymous"):
-            fleet.move(a, "ai-hubq", p.slot)
-        with self.assertRaisesRegex(fleet.RoleError, "anonymous"):
-            fleet.move(a, f"ai-{p.label}-w2", "p00", confirm=True)
+        # A move into an anonymous project is no longer refused for being one
+        # (0.9.24), but still for a network the project does not list.
+        with self.assertRaisesRegex(fleet.RoleError, "not one of .* worker networks"):
+            fleet.move(a, "ai-hubq", p.slot, confirm=True)
         report = fleet.set_lead(a, p.slot, "template", "ai-tpl-g", lead_netvm="ai-net-vpn",
                                 keep_old=True, model="api.example.org:443")
         new = projects.find(self.records(), p.slot).lead

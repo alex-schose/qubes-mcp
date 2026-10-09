@@ -48,6 +48,10 @@ UNREADABLE = "<unreadable>"
 
 HUB_PATH = "/etc/qmcp/hub"
 RUN_DIR = "/run/qmcp"
+#: Anonymous mode: the one word `anonymous`, written by `install.sh --anonymous`
+#: and removed only by `uninstall.sh --purge`. Absent means normal mode.
+MODE_PATH = "/etc/qmcp/mode"
+ANONYMOUS = "anonymous"
 
 #: Requests larger than this are refused before they are parsed.
 MAX_REQUEST_BYTES = 64 * 1024
@@ -125,6 +129,33 @@ def read_hub(path: str | None = None) -> str | None:
     return word if valid_qube_name(word) else None
 
 
+class ModeUnreadable(Exception):
+    """`/etc/qmcp/mode` exists but cannot be read or does not say `anonymous`."""
+
+
+def anonymous_mode(path: str | None = None) -> bool:
+    """Whether this installation runs in anonymous mode: every project
+    anonymous, and the hub with its own qubes under the anonymity gate.
+
+    An absent file is normal mode, which is how an install starts. A file that
+    exists but cannot be read, or says anything but `anonymous`, raises
+    ModeUnreadable: each caller turns that into its restrictive answer (a
+    create or an enrollment refused, the gate blocking the hub without a
+    kill), never into normal mode.
+    """
+    try:
+        with open(MODE_PATH if path is None else path, encoding="utf-8") as fh:
+            word = fh.read(256).split("#", 1)[0].strip()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError):
+        raise ModeUnreadable(f"{MODE_PATH if path is None else path} cannot be read") from None
+    if word != ANONYMOUS:
+        raise ModeUnreadable(f"{MODE_PATH if path is None else path} does not hold the one "
+                             f"word '{ANONYMOUS}'")
+    return True
+
+
 class Principal:
     """Who is calling: the hub, or a lead with its project record."""
 
@@ -168,6 +199,15 @@ def principal(app, caller_name: str, hub: str | None = None) -> Principal:
     if hub is None:
         hub = read_hub()
     if hub is not None and caller_name == hub:
+        # The rulebook refuses a blocked hub every call (anonymous mode stops
+        # the hub); the services refuse it too, as they refuse a blocked lead.
+        try:
+            stopped = app.qubesd_call(caller_name, "admin.vm.tag.Get",
+                                      projects.BLOCKED).strip() != b"0"
+        except Exception:
+            stopped = True
+        if stopped:
+            raise Refusal(NOT_AUTHORIZED)
         return Principal(caller_name, "hub")
     try:
         records = projects.load()
@@ -524,8 +564,17 @@ def reference(app, name, what: str, who: Principal):
     """
     if not who.is_hub() and name not in who.project.templates:
         raise refuse(f"{what} is not on this project's approved list")
-    return _resolve(app, name, refuse(f"{what} must reference an ai-managed qube"),
-                    hub=who.is_hub())
+    vm = _resolve(app, name, refuse(f"{what} must reference an ai-managed qube"),
+                  hub=who.is_hub())
+    # A qube the anonymity gate stopped is nothing to build on: a create from
+    # it would make a fresh, unblocked child on the path the gate stopped.
+    try:
+        tags = tags_of(vm)
+    except Unreadable:
+        raise refuse(f"{what} must reference an ai-managed qube") from None
+    if tags & {projects.BLOCKED, projects.STOPPED}:
+        raise Refusal(BLOCKED_REFUSAL)
+    return vm
 
 
 # ------------------------------------------------------------------ the funnel

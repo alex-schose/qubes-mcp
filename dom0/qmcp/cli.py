@@ -127,6 +127,9 @@ def cmd_gateway(args) -> int:
                     "" if not r["anonymising"] else
                     f"recorded on {r['recorded_upstream']}" if r["recorded_upstream"]
                     else "no recorded network (mark it again)",
+                    "" if not r["anonymising"] else
+                    f"templates' updates may go to {r['recorded_upstream']}" if r["updates"]
+                    else "templates' updates do not count there",
                     "upstream ignores its firewall rules" if r["upstream_ignores_firewall"] is True
                     else "whether its upstream ignores its firewall rules cannot be read"
                     if r["upstream_ignores_firewall"] == fleet.UNREADABLE
@@ -141,10 +144,12 @@ def cmd_gateway(args) -> int:
         _need_root(what, "gateway")
         app = _app()
         if what == "enroll":
-            print(fleet.enroll_gateway(app, args.qube, args.anonymising, args.label or ""))
+            print(fleet.enroll_gateway(app, args.qube, args.anonymising, args.label or "",
+                                       args.updates))
         elif what == "set":
             anon = None if args.anonymising is None else args.anonymising == "yes"
-            print(fleet.set_gateway(app, args.qube, anon, args.label))
+            updates = None if args.updates is None else args.updates == "yes"
+            print(fleet.set_gateway(app, args.qube, anon, args.label, updates))
         else:
             print(fleet.remove_gateway(app, args.qube))
     except (fleet.RoleError, RuntimeError) as e:
@@ -233,7 +238,7 @@ def cmd_project(args) -> int:
             if source is None:
                 raise fleet.ProjectError("say where the lead comes from: --lead-template, "
                                          "--lead-clone or --lead-promote")
-            if args.name is None and not args.anonymous:
+            if args.name is None and not args.anonymous and not fleet.anonymous_mode():
                 raise fleet.ProjectError("give the project a LABEL (an anonymous project's is "
                                          "picked by dom0)")
             report = fleet.create_project(app, args.name, source, origin, args.template or (),
@@ -494,10 +499,16 @@ def build_parser() -> argparse.ArgumentParser:
     q = gsub.add_parser("enroll", help="let AI space use a gateway (root)")
     q.add_argument("qube")
     q.add_argument("--anonymising", action="store_true", help="it reaches the network anonymously (Tor)")
+    q.add_argument("--updates", action="store_true",
+                   help="with --anonymising: the qube above it carries templates' updates "
+                        "anonymously (sys-whonix, a VPN qube), so updates may go there")
     q.add_argument("--label", metavar="TEXT", help="a label, e.g. a jurisdiction (40 characters)")
-    q = gsub.add_parser("set", help="change an enrolled gateway's flag or label (root)")
+    q = gsub.add_parser("set", help="change an enrolled gateway's flag, label or updates tick "
+                                    "(root)")
     q.add_argument("qube")
     q.add_argument("--anonymising", choices=("yes", "no"))
+    q.add_argument("--updates", choices=("yes", "no"),
+                   help="whether templates' updates may go to the qube above it")
     q.add_argument("--label", metavar="TEXT")
     q = gsub.add_parser("remove", help="stop AI space using a gateway (root; refused while in use)")
     q.add_argument("qube")
@@ -509,7 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("name", help="label or slot")
     q = psub.add_parser("create", help="a new project (root)")
     q.add_argument("name", metavar="LABEL", nargs="?",
-                   help="1-8 lowercase letters or digits (none for --anonymous: dom0 picks one)")
+                   help="1-8 lowercase letters or digits (none for --anonymous, or in anonymous "
+                        "mode: dom0 picks one)")
     q.add_argument("--anonymous", action="store_true",
                    help="under the anonymity gate: anonymising networks, guarded templates, a "
                         "fresh lead; hidden from the hub unless --hub-sees")
@@ -561,15 +573,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("name", metavar="QUBE")
     q.add_argument("target", help="p00, a project's label or slot, or none")
     q.add_argument("--yes", action="store_true",
-                   help="confirm moving a qube out of one slot into another")
+                   help="confirm moving a qube out of one slot into another, or into or out of "
+                        "an anonymous project")
     q = psub.add_parser("unblock", help="clear the anonymity gate's stop once it finds the "
-                                        "project sound (root)")
-    q.add_argument("name", help="label or slot")
+                                        "project sound, or the hub's: p00 (root)")
+    q.add_argument("name", help="label or slot, or p00 for the hub and its qubes")
     q = psub.add_parser("delete", help="remove a project's lead and members, keep its sink "
                                          "(root; without --yes, the plan only)")
     q.add_argument("name", help="label or slot; a slot with no record finishes a delete")
     q.add_argument("--yes", action="store_true")
-    p = sub.add_parser("gate", help="judge the anonymous projects now, and stop one that is not")
+    p = sub.add_parser("gate", help="judge the anonymous projects (and the hub, in anonymous mode) "
+                                    "now, and stop what is not sound")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("proposal", help="the hub's proposals: what it asks you to do")
     psub = p.add_subparsers(dest="what", required=True)

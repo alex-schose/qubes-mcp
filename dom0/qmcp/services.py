@@ -143,10 +143,23 @@ def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False, source_
     return projects.member_badge(projects.HUB_SLOT) if new_klass == "AppVM" else None
 
 
+def _hub_mode() -> bool:
+    """Anonymous mode, for a hub's call; a mode file that cannot be read refuses."""
+    try:
+        return core.anonymous_mode()
+    except core.ModeUnreadable:
+        raise refuse("anonymous mode cannot be read") from None
+
+
 def _project_badges(who) -> set:
-    """What a lead's new qube wears besides its slot badge: its project's
-    anonymous badges. The hub's creates join no anonymous project."""
-    return set() if who.is_hub() else who.project.badges()
+    """What a new qube wears besides its slot badge: a lead's, its project's
+    anonymous badges; the hub's, `qmcp-anon` in anonymous mode (so the
+    rulebook's OpenURL and OpenInVM denies cover it, and a disposable template
+    passes it to its disposables) and nothing otherwise. Read before the
+    create, so a mode that cannot be read makes nothing."""
+    if who.is_hub():
+        return {projects.ANON} if _hub_mode() else set()
+    return who.project.badges()
 
 
 def _recheck(app, call, template=None, netvm=None) -> None:
@@ -160,6 +173,22 @@ def _recheck(app, call, template=None, netvm=None) -> None:
     call.principal = who
     if netvm is not None and not gateways.is_enrolled(netvm):
         raise refuse("netvm must be an enrolled gateway")
+    if netvm is not None and who.is_hub() and _hub_mode():
+        try:
+            g = gateways.load()[netvm]
+        except (gateways.GatewaysUnreadable, KeyError):
+            g = None
+        if g is None or not g.anonymising:
+            raise refuse("anonymous mode: netvm must be an anonymising gateway")
+        # Still on the network recorded for it: a router moved to clearnet is
+        # one the gate is about to stop; nothing new is born on it meanwhile.
+        router = core.lookup(app, netvm)
+        try:
+            now = None if router is None else core.netvm_of(router)
+        except core.Unreadable:
+            now = core.UNREADABLE
+        if g.upstream is None or now != g.upstream:
+            raise refuse("anonymous mode: netvm is not on the network recorded for it")
     if not who.is_hub():
         if template is not None and template not in who.project.templates:
             raise refuse("template is not on this project's approved list")
@@ -678,6 +707,7 @@ def svc_spawn(app, call, req):
     # carries (`anon-vm`) must reach the child, including one added while this
     # call waited, and a read that fails refuses here, before anything is made.
     tpl_tags = core.tags_of(tpl)
+    extra = _project_badges(who)
 
     create_klass = "AppVM" if klass == "DispVMTemplate" else klass
     try:
@@ -687,8 +717,7 @@ def svc_spawn(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
-                    _slot_badge(who, create_klass, klass == "DispVMTemplate"),
-                    _project_badges(who))
+                    _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
         if klass == "DispVMTemplate":
             step = "disposable template flag"
             vm.template_for_dispvms = True
@@ -741,6 +770,7 @@ def svc_clone(app, call, req):
     _check_budget(app, call, _estimate(budget.persistent_bytes, src))
 
     source_tags = core.tags_of(src)
+    extra = _project_badges(who)
     try:
         vm = app.clone_vm(src, name)
     except Exception as e:
@@ -748,8 +778,7 @@ def svc_clone(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
-                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags),
-                    _project_badges(who))
+                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags), extra)
         step = "network check"
         if core.is_gateway(vm):
             raise RuntimeError("the new qube provides network")
@@ -812,6 +841,7 @@ def svc_spawn_disposable(app, call, req):
     _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
 
     source_tags = core.tags_of(dvmt)
+    extra = _project_badges(who)
     try:
         disp = app.qubesd_call(dvmt.name, "admin.vm.CreateDisposable").decode(errors="replace").strip()
     except Exception as e:
@@ -828,7 +858,7 @@ def svc_spawn_disposable(app, call, req):
     step = "birth stamp"
     try:
         birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
-                    _slot_badge(who, "DispVM"), _project_badges(who))
+                    _slot_badge(who, "DispVM"), extra)
         step = "network check"
         if _prop_direct(app, disp, "provides_network")[1] == "True":
             raise RuntimeError("the new qube provides network")
@@ -997,6 +1027,10 @@ def svc_submit_proposal(app, call, req):
         proposal = proposals.normalise(req, birth.read_name_prefix())
     except proposals.Invalid as e:
         raise refuse(f"invalid proposal: {e}") from None
+    if proposal.get("type") == "project-create" and not proposal.get("anonymous") \
+            and _hub_mode():
+        raise refuse("invalid proposal: anonymous mode: every new project is anonymous "
+                     "(anonymous: true)")
     call.summary["subject"] = _clip(proposals.subject(proposal))
     try:
         pid, sha256, expires = proposals.submit(proposal, call.caller)

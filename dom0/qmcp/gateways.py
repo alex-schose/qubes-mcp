@@ -32,6 +32,15 @@ project records' newer keys are, so a registry written before 0.9.23 still
 reads; an anonymising entry without it carries no anonymous project until it
 is marked again.
 
+Whether that upstream carries updates anonymously is the operator's word too
+(`updates`, from 0.9.24): the qube above a plain router in front of
+`sys-whonix` or a VPN qube is the anonymiser itself, but the qube above a VPN
+qube enrolled with no router in front is `sys-firewall`, which dom0 cannot tell
+apart from the first case. So a template's updates count only when they go to
+the recorded upstream of an anonymising gateway the operator ticked. Absent
+means unticked, so an entry written before 0.9.24 counts for no template's
+updates until it is ticked.
+
 The file is root-owned, written by `qmcp gateway` under the project records'
 lock, by atomic rename; the services only read it. A file that exists but
 cannot be read or validated means that no gateway is enrolled, so every create
@@ -64,18 +73,22 @@ class GatewaysUnreadable(Exception):
 
 
 class Gateway:
-    __slots__ = ("name", "anonymising", "label", "upstream")
+    __slots__ = ("name", "anonymising", "label", "upstream", "updates")
 
     def __init__(self, name: str, anonymising: bool = False, label: str = "",
-                 upstream: str | None = None) -> None:
+                 upstream: str | None = None, updates: bool = False) -> None:
         self.name, self.anonymising, self.label = name, anonymising, label
         #: The network an anonymising gateway sat on when the operator marked it.
         self.upstream = upstream if anonymising else None
+        #: The operator's word that templates' updates may go to that network.
+        self.updates = bool(updates) and self.upstream is not None
 
     def to_json(self) -> dict:
         out = {"anonymising": self.anonymising, "label": self.label}
         if self.upstream is not None:
             out["upstream"] = self.upstream
+        if self.updates:
+            out["updates"] = True
         return out
 
     def __repr__(self):
@@ -108,15 +121,19 @@ def parse(text: str) -> dict:
         if not valid_name(name):
             raise GatewaysUnreadable("a gateway's name is not a qube name")
         if not isinstance(entry, dict) or not {"anonymising", "label"} <= set(entry) \
-                <= {"anonymising", "label", "upstream"}:
+                <= {"anonymising", "label", "upstream", "updates"}:
             raise GatewaysUnreadable(f"{name}: keys must be 'anonymising' and 'label', and "
-                                     f"optionally 'upstream'")
+                                     f"optionally 'upstream' and 'updates'")
         if not isinstance(entry["anonymising"], bool) or label_refusal(entry["label"]):
             raise GatewaysUnreadable(f"{name}: bad anonymising flag or label")
         upstream = entry.get("upstream")
         if upstream is not None and not (entry["anonymising"] and valid_name(upstream)):
             raise GatewaysUnreadable(f"{name}: upstream is a qube name, on an anonymising gateway")
-        out[name] = Gateway(name, entry["anonymising"], entry["label"], upstream)
+        updates = entry.get("updates", False)
+        if updates is not False and not (updates is True and upstream is not None):
+            raise GatewaysUnreadable(f"{name}: updates is true, on an anonymising gateway with a "
+                                     f"recorded upstream")
+        out[name] = Gateway(name, entry["anonymising"], entry["label"], upstream, updates)
     return out
 
 

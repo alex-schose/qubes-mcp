@@ -302,6 +302,13 @@ class Services(PBase):
         # stored, and the host is never consulted, so the reply says nothing
         # about names outside AI space.
         class NoHost:
+            # One read only: whether the caller, the hub, is stopped by the
+            # anonymity gate. Nothing about any name in the proposal.
+            def qubesd_call(self, dest, method, arg=None, *rest):
+                if (dest, method, arg) != (HUB, "admin.vm.tag.Get", "qmcp-blocked"):
+                    raise AssertionError(f"a submit looked at the host: {dest} {method} {arg}")
+                return b"0"
+
             def __getattr__(self, name):
                 raise AssertionError(f"a submit looked at the host: {name}")
         for i, tpl in enumerate(("debian-13", "no-such-template")):

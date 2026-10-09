@@ -42,13 +42,19 @@
 
 # A0. Anonymous projects. A qube the anonymity gate stopped wears qmcp-blocked:
 # nothing reaches it, by any service, so qrexec can never wake it; the operator
-# may still start it from dom0, which no rule here governs. Every qube of a
-# hidden anonymous project wears qmcp-hubblind, and the hub reaches none of
-# them, by any service. These sit above every allow in this file.
+# may still start it from dom0, which no rule here governs. One the operator
+# started reaches nothing either, by any service, dom0's included (@anyvm does
+# not match @adminvm): in anonymous mode that covers the hub, whose own lines
+# below would otherwise let it act. Every qube of a hidden anonymous project
+# wears qmcp-hubblind, and the hub reaches none of them, by any service. These
+# sit above every allow in this file.
 *                          *  @anyvm           @tag:qmcp-blocked        deny
+*                          *  @tag:qmcp-blocked  @adminvm               deny
+*                          *  @tag:qmcp-blocked  @anyvm                 deny
 *                          *  mcp-control      @tag:qmcp-hubblind       deny
 # An anonymous project's qubes open nothing in another qube, not even through a
 # dialog: a URL or a file opened in a clearnet qube leaves outside its router.
+# In anonymous mode the hub and every qube it creates wear qmcp-anon too.
 qubes.OpenURL              *  @tag:qmcp-anon   @anyvm                   deny
 qubes.OpenInVM             *  @tag:qmcp-anon   @anyvm                   deny
 

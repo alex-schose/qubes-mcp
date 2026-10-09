@@ -138,6 +138,10 @@ FLEET["lead-p03-model-p01"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p03", "qmcp
 FLEET["w-p01-blocked"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-anon", "qmcp-blocked"])
 FLEET["lead-p06-blocked"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p06", "qmcp-anon",
                                        "qmcp-blocked"])
+FLEET["w-p06-a"] = _dom(tags=[AI, "qmcp-proj-p06", "qmcp-anon"])
+FLEET["model-p06"] = _dom(tags=[AI, "qmcp-guarded", "qmcp-model-p06"])
+# A member the operator started by hand after the gate stopped its project.
+FLEET["w-p06-blocked"] = _dom(tags=[AI, "qmcp-proj-p06", "qmcp-anon", "qmcp-blocked"])
 FLEET["w-p05-hidden"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubblind"])
 FLEET["lead-p07-hidden"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p07", "qmcp-anon",
                                       "qmcp-hubblind"])
@@ -304,8 +308,18 @@ def _cases() -> list[Case]:
         "deny", "deny")
     add("hub exec into a stopped lead", "qmcp.RunInAIManaged", HUB, "lead-p06-blocked",
         "deny", "deny")
-    add("a stopped lead reaches dom0 (the services refuse it)", "qmcp.ListAIManagedQubes",
-        "lead-p06-blocked", "dom0", "allow", "allow")
+    # A stopped qube the operator started by hand reaches nothing: not dom0, not
+    # its own members, not its model qube, not a peer in its slot.
+    add("a stopped lead reaches no dom0 service", "qmcp.ListAIManagedQubes",
+        "lead-p06-blocked", "dom0", "deny", "deny")
+    add("a stopped lead runs nothing in its member", "qmcp.RunInAIManaged",
+        "lead-p06-blocked", "w-p06-a", "deny", "deny")
+    add("a stopped lead reaches no model qube", "qubes.ConnectTCP+11434", "lead-p06-blocked",
+        "model-p06", "deny", "deny")
+    add("a stopped member copies nothing into its slot", "qubes.Filecopy", "w-p06-blocked",
+        "w-p06-a", "deny", "deny")
+    add("a stopped member gets no clock through @default", "qubes.GetDate", "w-p06-blocked",
+        "@default", "deny", "deny")
     for svc in ("qubes.Filecopy", "qubes.OpenInVM", "qubes.OpenURL", "qubes.ClipboardPaste"):
         add("hub dialog into a hidden qube", svc, HUB, "w-p05-hidden", "deny", "deny")
         add("hub dialog into a hidden sink", svc, HUB, "sink-p07-hidden", "deny", "deny")
@@ -554,8 +568,10 @@ class PolicyShape(unittest.TestCase):
                     | {f"@tag:qmcp-proj-{s}" for s in SLOTS})
 
     def test_sources_are_ours(self):
-        # `@tag:qmcp-anon` only denies (A0): the next test holds every allow to a principal.
-        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump", "@tag:qmcp-anon"} \
+        # `@tag:qmcp-anon` and `@tag:qmcp-blocked` only deny (A0): the next test
+        # holds every allow to a principal.
+        allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump", "@tag:qmcp-anon",
+                   "@tag:qmcp-blocked"} \
             | self.SLOT_SOURCES
         bad = [(n, l) for n, l in self.lines if l.split()[2] not in allowed]
         self.assertEqual(bad, [])
