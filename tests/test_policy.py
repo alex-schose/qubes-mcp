@@ -146,6 +146,19 @@ FLEET["w-p05-hidden"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubbl
 FLEET["lead-p07-hidden"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p07", "qmcp-anon",
                                       "qmcp-hubblind"])
 FLEET["sink-p07-hidden"] = _dom(tags=["ai-dump", "qmcp-dump-p07", "qmcp-hubblind"])
+# M5's open windows: a guarded qube the operator opened, with and without the
+# firewall half, and a model qube in one (the common case). A badge on a qube
+# `qmcp open` refuses is not a legitimate state and is not modelled as one: the
+# expiry pass strips it and `qmcp check` fails on it. The two below exist only
+# to prove A0 still outranks A6b.
+FLEET["ai-tpl-open"] = _dom("TemplateVM", tags=[AI, G, "qmcp-open"])
+FLEET["ai-tpl-open-fw"] = _dom("TemplateVM", tags=[AI, G, "qmcp-open", "qmcp-open-fw"])
+FLEET["model-p04-open"] = _dom(tags=[AI, G, "qmcp-model-p04", "qmcp-open"])
+FLEET["w-p01-blocked-open"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-anon", "qmcp-blocked",
+                                         "qmcp-open", "qmcp-open-fw"])
+FLEET["w-p05-hidden-open"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubblind",
+                                        "qmcp-open", "qmcp-open-fw"])
+
 SYSINFO = {"domains": FLEET}
 
 
@@ -248,6 +261,41 @@ def _cases() -> list[Case]:
         add("ai exec guarded", "qmcp.RunInAIManaged", "ai-work", tgt, "deny", "deny")
         add("ai open-in guarded", "qubes.OpenInVM", "ai-work", tgt, "deny", "deny")
         add("ai open-url guarded", "qubes.OpenURL", "ai-work", tgt, "deny", "deny")
+    # --- M5: the operator's open window (A6b). The hub runs commands and copies
+    # a file in by dialog; the firewall writes need the second badge; nothing
+    # else in the window changes, and no other source gains anything.
+    for tgt in ("ai-tpl-open", "model-p04-open"):
+        add("hub exec open", "qmcp.RunInAIManaged", HUB, tgt, "allow user=root",
+            "allow user=root")
+        add("hub filecopy open", "qubes.Filecopy", HUB, tgt, "ask", "ask")
+        add("hub fw-set open, no firewall half", "admin.vm.firewall.Set", HUB, tgt, "deny", "deny")
+        add("hub fw-reload open, no firewall half", "admin.vm.firewall.Reload", HUB, tgt,
+            "deny", "deny")
+        add("hub fw-get open", "admin.vm.firewall.Get", HUB, tgt, "allow target=@adminvm",
+            "allow target=@adminvm")
+        add("hub copy-out open", "qmcp.CopyToAIManaged", HUB, tgt, "deny", "deny")
+        add("ai exec open", "qmcp.RunInAIManaged", "ai-work", tgt, "deny", "deny")
+        add("ai filecopy open", "qubes.Filecopy", "ai-work", tgt, "deny", "deny")
+        add("lead exec open", "qmcp.RunInAIManaged", "lead-p01", tgt, "deny", "deny")
+        add("lead filecopy open", "qubes.Filecopy", "lead-p01", tgt, "deny", "deny")
+        add("sink into open", "qubes.Filecopy", "sink-p01", tgt, "deny", "deny")
+    add("hub exec open+fw", "qmcp.RunInAIManaged", HUB, "ai-tpl-open-fw", "allow user=root",
+        "allow user=root")
+    add("hub fw-set open+fw", "admin.vm.firewall.Set", HUB, "ai-tpl-open-fw",
+        "allow target=@adminvm", "allow target=@adminvm")
+    add("hub fw-reload open+fw", "admin.vm.firewall.Reload", HUB, "ai-tpl-open-fw",
+        "allow target=@adminvm", "allow target=@adminvm")
+    # A0 outranks the window: a qube the gate stopped and a hidden one stay
+    # unreachable however they are badged.
+    for svc in ("qmcp.RunInAIManaged", "qubes.Filecopy", "admin.vm.firewall.Set"):
+        add("hub into blocked+open", svc, HUB, "w-p01-blocked-open", "deny", "deny")
+        add("hub into hubblind+open", svc, HUB, "w-p05-hidden-open", "deny", "deny")
+    # The four Filecopy request shapes this project requires of any Filecopy
+    # change: a named in-scope qube, a named out-of-scope one, a made-up name
+    # and @default. The last two must not be distinguishable from each other.
+    add("hub filecopy named out of scope", "qubes.Filecopy", HUB, "ai-tpl-g", "deny", "deny")
+    add("hub filecopy made-up name", "qubes.Filecopy", HUB, "no-such-qube", "ask", "ask")
+    add("hub filecopy @default", "qubes.Filecopy", HUB, "@default", "ask", "ask")
     # --- a lead's firewall is the operator's: the hub reads it and never writes it
     for tgt in ("lead-p01", "lead-p15"):
         add("hub fw-set lead", "admin.vm.firewall.Set", HUB, tgt, "deny", "deny")

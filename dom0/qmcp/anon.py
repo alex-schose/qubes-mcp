@@ -636,6 +636,14 @@ def notify(text: str) -> bool:
     return proposals.notify_text(text)
 
 
+def gate_lock(path: str | None = None, wait: float | None = None):
+    """The gate's lock, for a command outside this module that changes qubes
+    (`qmcp open`, `qmcp seal`): one run at a time, so a window never races the
+    pass that expires one. `with gate_lock() as got:` is False when another
+    run held it past its wait."""
+    return _GateLock(path, wait)
+
+
 class _GateLock:
     """One run at a time. False from __enter__ when another run holds it past
     `wait` seconds."""

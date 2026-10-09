@@ -52,6 +52,16 @@
 #   /etc/qmcp/{hub,pool-cap,private-cap,birth-egress}   only when absent
 #   /etc/qmcp/projects.json          the project records, empty, only when absent;
 #                                    `qmcp project` writes it (as root)
+#   /etc/systemd/system/qmcp-seal.service   the boot seal: it takes the open
+#                                    badges off every guarded qube before any user session
+#                                    exists, because a tag survives a reboot and the window
+#                                    records under /run do not. Enabled, and run once here
+#                                    so an install never leaves a window open
+#   /etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf   a drop-in on Qubes' own
+#                                    per-qube autostart unit, ordering it after the seal, so
+#                                    an autostart qube cannot start ahead of it. The one file
+#                                    qmcp installs that belongs to a Qubes unit; it changes
+#                                    that unit's ordering and nothing else
 #   /etc/systemd/system/qmcp-gate.{service,timer}   the anonymity gate every 15 s, as the
 #                                    dom0 user the services run as (never root: it notifies
 #                                    the operator's desktop), enabled and started. The timer
@@ -468,6 +478,19 @@ systemctl daemon-reload
 systemctl enable qmcp-gate.timer >/dev/null
 TIMER_STOPPED=1
 say "the anonymity gate will run every 15 seconds as $GATE_USER (qmcp-gate.timer)"
+
+# --- the boot seal, and one run now: an install never leaves a window open.
+# It runs BEFORE the new policy goes in, so a window that was open under the
+# old code is closed before the lines that would honour it exist.
+install -d -m 0755 /etc/systemd/system/qubes-vm@.service.d
+install -m 0644 "$SRC/deploy/qmcp-seal.service" /etc/systemd/system/qmcp-seal.service
+install -m 0644 "$SRC/deploy/qubes-vm-qmcp-seal.conf" \
+    /etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf
+systemctl daemon-reload
+systemctl enable qmcp-seal.service >/dev/null
+SEAL_OUT="$(PYTHONPATH="$LIB" python3 -c 'import sys; from qmcp import cli; sys.exit(cli.main(["seal", "--all"]))' 2>&1)"     || die "an open window could not be sealed ($SEAL_OUT); the new policy is NOT installed: run qmcp seal --all by hand, then install again"
+[ -n "$SEAL_OUT" ] && say "sealed what was open: $SEAL_OUT"
+say "every boot seals the open guarded qubes before any user session (qmcp-seal.service)"
 
 # --- the updates ticks, before the gate's timer runs the new code
 for g in $UPDATES_VIA; do

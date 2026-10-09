@@ -51,7 +51,7 @@ from __future__ import annotations
 import json
 import shlex
 
-from qmcp import anon, birth, firewall, fleet, gateways, projects, proposals
+from qmcp import anon, birth, core, firewall, fleet, gateways, projects, proposals
 
 QMCP = "/usr/local/bin/qmcp"
 SUDO = ("/usr/bin/sudo", "-n")
@@ -441,6 +441,20 @@ def role(action, qube, keep_running=False) -> list:
     return argv
 
 
+def open_qube(qube, duration, firewall=False) -> list:
+    """Open a guarded qube to the hub for a bounded time. `duration` is what
+    the operator typed: the command parses it, so the form never has a second
+    opinion about what "2h" means."""
+    argv = write_cmd("open", _qube(qube, "the qube"), "--for", str(duration or "").strip())
+    if firewall:
+        argv.append("--firewall")
+    return argv
+
+
+def seal_qube(qube) -> list:
+    return write_cmd("seal", _qube(qube, "the qube"))
+
+
 def audit_rotate() -> list:
     return write_cmd("audit", "rotate")
 
@@ -553,7 +567,8 @@ def reject_proposal(pid) -> list:
 
 #: Every builder the window calls. The parity test calls each one.
 BUILDERS = (create_project, edit_project, remove_lead, change_lead, add_dump, move,
-            delete_plan, delete_project, role, audit_rotate, show_proposal, accept_proposal,
+            delete_plan, delete_project, role, open_qube, seal_qube,
+            audit_rotate, show_proposal, accept_proposal,
             reject_proposal, enroll_gateway, change_gateway, remove_gateway,
             show_lead_firewall, set_lead_model, set_lead_model_qube, set_lead_rules,
             accept_lead_rules, unblock_project)
@@ -565,6 +580,10 @@ CLI_ONLY = {
     ("migrate",): "a one-time step from v0.9.16, run before the first install of this release",
     ("audit", "--path"): "reads a log other than the live one, such as a rotated file; "
                          "the window shows the live log",
+    ("seal", "--all"): "the boot seal: qmcp-seal.service runs it before any user session exists, "
+                       "so there is no window open for the operator to close by hand",
+    ("seal", "--expired"): "the expiry pass: the gate's timer runs it every 15 seconds, and the "
+                           "window closes a single qube's window with Seal",
 }
 #: Commands the window shows without running them, and where.
 SHOWN_BY = {
@@ -578,7 +597,8 @@ SHOWN_BY = {
 #: Every field of a `list` row, as the details pane names it.
 QUBE_FIELDS = (
     ("name", "Name"), ("state", "State"), ("klass", "Class"), ("template", "Template"),
-    ("netvm", "Network"), ("power", "Power"), ("slot", "Slot badges"), ("lead", "Lead badge"),
+    ("netvm", "Network"), ("power", "Power"), ("open", "Open window"),
+    ("slot", "Slot badges"), ("lead", "Lead badge"),
     ("model", "Model qube of"), ("owner", "Created by"), ("gateway", "Provides network"),
     ("dvmt", "Disposable template"), ("badges", "Badges"),
 )
@@ -651,6 +671,11 @@ def field_text(key, value) -> Shown:
                                         f"blocks the hub"))
     if key == "blocked":
         return esc(BLOCKED_TEXT.get(value, value))
+    if key == "open":
+        # The command answers in seconds, which is the one form that cannot be
+        # read two ways; a person reads a duration. Drawn on the box before
+        # this was wired: the pane showed "899".
+        return esc(window_left({"open": value}))
     return esc(value)
 
 
@@ -744,6 +769,32 @@ def light(doc) -> str:
     return result if result in ("GREEN", "FAILED", "INCOMPLETE") else "UNKNOWN"
 
 
+def light_text(doc) -> str:
+    """What the light says. An open window is the one thing a GREEN check
+    carries that the operator must see without opening the Check tab: it is
+    their own deliberate exception, it clears itself, and while it lasts the
+    hub is inside a qube that normally refuses it. Drawn on the dev box, a
+    plain GREEN said nothing about it, though the window's own text promised
+    the light would."""
+    result = light(doc)
+    note = open_window_note(doc)
+    return f"qmcp check: {result}" + (f" — {note}" if note else "")
+
+
+#: What the light adds while a window is open. A fixed phrase, not the check
+#: item's own words: a light is a status and not a sentence, and the Check tab
+#: and the details pane are where the qube and its time are named.
+OPEN_NOTE = "a guarded qube is open"
+
+
+def open_window_note(doc) -> str:
+    """OPEN_NOTE while the open-windows item is the warning it is, else ""."""
+    for row in (doc or {}).get("findings") or ():
+        if row.get("check") == "open windows" and row.get("status") == "warn":
+            return OPEN_NOTE
+    return ""
+
+
 # ======================================================================= the tree
 
 #: The tree's columns: (row field, heading).
@@ -797,7 +848,10 @@ def badges(row) -> dict:
             "member": {s for k, s in parts if k == "proj"},
             "lead": {s for k, s in parts if k == "lead"},
             "dump": {s for k, s in parts if k == "dump"},
-            "model": {s for k, s in parts if k == "model"}}
+            "model": {s for k, s in parts if k == "model"},
+            # The open window's badges, which the rulebook routes on exactly
+            # as it does on the slot badges above.
+            "open": tags & {core.OPEN, core.OPEN_FW}}
 
 
 #: Why a qube is under Needs attention: (the Role column, the details pane).
@@ -1233,6 +1287,16 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
             out.add("move")
         if state == "guarded" and role != "gateway":
             out.add("manage")
+        # The window is the bounded alternative to Manage, on a guarded qube
+        # the command will take: never a gateway, never one the gate stopped
+        # or a hidden project's (`attention` and `state is None` returned
+        # above cover the rest). Seal shows whenever a badge is on, including
+        # on a qube Open refuses, which is how the operator takes one off by
+        # hand without waiting for the pass.
+        if state == "guarded" and role != "gateway" and not open_window_of(node.data):
+            out.add("open")
+        if open_window_of(node.data) is not None:
+            out.add("seal")
         # A model qube is managed only for its maintenance window, which Guard closes.
         if state == "managed" and (role in ("hub's qube, no slot", "template", "disposable template")
                                    or role.startswith("model qube")):
@@ -1240,6 +1304,52 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         if not role.startswith("lead"):
             out.add("revoke")
     return out
+
+
+def open_window_of(row) -> str | None:
+    """What a row's badges say about its window: None when it is not open,
+    else a short phrase for a button's reach and a form's text. Read from the
+    badges, which is what the rulebook routes on, never from the `open` field,
+    which is the record's view and may be UNREADABLE."""
+    worn = set(badges(row or {}).get("open") or ())
+    if not worn:
+        return None
+    return "open, firewall rules too" if core.OPEN_FW in worn else "open"
+
+
+def window_left(row) -> str:
+    """The `open` field as the details pane shows it (`field_text`)."""
+    left = (row or {}).get("open")
+    if left is None:
+        return "sealed"
+    if left == UNREADABLE:
+        return f"{UNREADABLE} (a badge is on and its record will not read; qmcp check fails)"
+    if left <= 0:
+        return "ran out; the next pass of the gate's timer seals it"
+    return f"{left // 60} min left" if left >= 60 else f"{left} s left"
+
+
+def open_intro(row) -> str:
+    """What opening a guarded qube does, for the form that asks."""
+    name = (row or {}).get("name")
+    return (f"{name} is guarded, so the rulebook refuses the hub every service into it. A window "
+            f"lets the hub run commands in it as root, and copy a file in, which Qubes asks you "
+            f"to confirm one file at a time. With the firewall box ticked it may also write the "
+            f"qube's firewall rules; it can never change which network the qube is on, which "
+            f"stays yours. The window ends by itself, and at every boot, and Seal ends it at "
+            f"once. qmcp check shows amber while it is open.")
+
+
+def seal_intro(row) -> str:
+    """What sealing does, for the form that asks. The kill is the part worth
+    saying plainly: it is why a window is closed deliberately and not left to
+    run out while something is mid-install."""
+    name = (row or {}).get("name")
+    return (f"{name} goes back to sealed at once: the badges come off, and if it is running it is "
+            f"KILLED, so nothing the hub started in it runs on. A package manager stopped "
+            f"part-way may leave the qube needing repair. Its files stay: what the hub wrote "
+            f"to disk is still there, and whatever is set to start from there runs at its next "
+            f"start.")
 
 
 def role_intro(action, row) -> str:
@@ -1354,6 +1464,8 @@ PROPOSAL_OPTIONS = (
     ("add_networks", "Worker networks to add"), ("remove_networks", "Worker networks to remove"),
     ("default_network", "New default worker network"),
     ("rules", "Lead firewall rules"),
+    ("qube", "Guarded qube to open"), ("for", "The window lasts"),
+    ("firewall", "Also lets the hub write that qube's firewall rules"),
 )
 #: An edit's project record now and after accepting, a line per part.
 EDIT_FIELDS = (("templates", "Templates, now -> after"),

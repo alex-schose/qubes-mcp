@@ -48,7 +48,8 @@ from test_projects import LEAD, ProjectBase  # noqa: E402
 
 DAY = 24 * 3600
 #: The installed paths, read before any test points the modules at a temp dir.
-REAL = {"store": proposals.PROPOSALS_DIR, "lock": proposals.LOCK_PATH, "log": audit.LOG_PATH}
+REAL = {"store": proposals.PROPOSALS_DIR, "lock": proposals.LOCK_PATH, "log": audit.LOG_PATH,
+        "windows": fleet.WINDOW_DIR}
 
 
 def create(**over):
@@ -109,6 +110,7 @@ class Shape(unittest.TestCase):
                              {"model", "add_old_network"}),
             "project-firewall": ({"project"}, {"model", "rules"}),
             "project-delete": ({"project"}, set()),
+            "qube-open": ({"qube", "for", "firewall"}, set()),
         }
         samples = [
             create(), create(lead={"from": "promote", "qube": "ai-work2"}, lead_netvm="none",
@@ -130,6 +132,9 @@ class Shape(unittest.TestCase):
             {"type": "project-firewall", "title": "t", "project": "osint", "model": "h.example:8443"},
             {"type": "project-firewall", "title": "t", "project": "osint",
              "rules": ["action=accept proto=tcp dsthost=h.example dstports=443", "action=drop"]},
+            {"type": "qube-open", "title": "t", "qube": "ai-tpl-g", "for": "2h"},
+            {"type": "qube-open", "title": "t", "qube": "ai-tpl-g", "for": "45s",
+             "firewall": True},
         ]
         self.assertEqual({s["type"] for s in samples}, set(proposals.TYPES))
         for req in samples:
@@ -1183,8 +1188,132 @@ class Install(PBase):
                     ("f", REAL["lock"], "0660", "root", "qubes"),
                     ("z", REAL["lock"], "0660", "root", "qubes"),
                     ("f", REAL["log"], "0660", "root", "qubes"),
-                    ("z", REAL["log"], "0660", "root", "qubes")]:
+                    ("z", REAL["log"], "0660", "root", "qubes"),
+                    # The open-window records: root writes one, and the expiry
+                    # pass, which runs as the services' user, unlinks it.
+                    ("d", REAL["windows"], "2770", "root", "qubes")]:
             self.assertIn(row, rows, row)
+
+    def test_the_timer_runs_the_expiry_pass(self):
+        """A window that "ends by itself" needs something to end it. The pass
+        exists in the library and in the command; it closes a window only
+        because the gate's unit runs it, and nothing else in the suite would
+        notice if that line went away — it was missing from the first build of
+        this release, and three documents already said the timer ran it."""
+        unit = (HERE.parent / "deploy" / "qmcp-gate.service").read_text()
+        execs = [l.split("=", 1)[1].strip() for l in unit.splitlines()
+                 if l.startswith("ExecStart=")]
+        self.assertEqual(execs, ["/usr/local/bin/qmcp seal --expired",
+                                 "/usr/local/bin/qmcp gate"])
+        # The pass returns 3 when it could not judge a window, so the unit must
+        # count 3 a success or the gate behind it would not run.
+        success = next(l.split("=", 1)[1].split() for l in unit.splitlines()
+                       if l.startswith("SuccessExitStatus="))
+        self.assertIn("3", success)
+        # And the timer must start that unit.
+        timer = (HERE.parent / "deploy" / "qmcp-gate.timer").read_text()
+        self.assertIn("OnUnitActiveSec=", timer)
+
+    def test_the_deploy_units_are_installed_and_uninstalled(self):
+        """A unit list kept by hand beside its files drifts, and the drift has
+        no symptom: the uninstaller's clean-state check enumerates UNITS, so a
+        unit missing from it is left enabled and reported clean."""
+        deploy = HERE.parent / "deploy"
+        install = (deploy / "install.sh").read_text()
+        uninstall = (deploy / "uninstall.sh").read_text()
+        units = sorted(f.name for f in deploy.iterdir()
+                       if f.suffix in (".service", ".timer"))
+        self.assertIn("qmcp-seal.service", units)           # not a vacuous pass
+        # Anchored at the line start: 'UNITS="' also matches LEGACY_UNITS=".
+        listed = set(uninstall.split('\nUNITS="', 1)[1].split('"', 1)[0].split())
+        paths = uninstall.split("OTHER_PATHS=", 1)[1].split('"', 2)[1]
+        for unit in units:
+            self.assertIn(unit, install, f"install.sh does not install {unit}")
+            self.assertIn(unit, listed, f"uninstall.sh's UNITS does not name {unit}")
+            self.assertIn(f"/etc/systemd/system/{unit}", paths, unit)
+        # The drop-in on Qubes' own autostart unit: installed, and removed by
+        # name, never by removing a directory that is not ours.
+        drop = "/etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf"
+        self.assertIn("qubes-vm-qmcp-seal.conf", install)
+        self.assertIn(drop, paths)
+        self.assertNotIn("rm -rf /etc/systemd/system/qubes-vm@.service.d", uninstall)
+
+
+class OpenProposal(PBase):
+    """The hub may ask for a window on a guarded qube; only the operator opens
+    one. The hub cannot write the badges — the rulebook refuses it every
+    dom0 service its own lines do not name — so the proposal is the whole of
+    its reach here."""
+
+    TPL = "ai-tpl-g"
+
+    def ask(self, **over):
+        req = {"type": "qube-open", "title": "install curl in the reference template",
+               "qube": self.TPL, "for": "2h"}
+        req.update(over)
+        return self.submit(req)
+
+    def tags(self, name=None):
+        return self.app.domains[name or self.TPL].tags.raw()
+
+    def test_a_window_always_needs_the_second_tick(self):
+        self.assertTrue(self.ask()["ok"])
+        doc = proposals.show(self.app, 1)
+        self.assertIsNotNone(doc["tick"])
+        reasons = " ".join(doc["second_tick"])
+        self.assertIn("OPENS the guarded qube", reasons)
+        self.assertIn("2h", reasons)
+        self.assertIn("kills the qube", reasons)
+        self.assertEqual(doc["command"], f"qmcp open {self.TPL} --for 2h")
+        # One click is not enough. A refusal before the command runs leaves the
+        # proposal pending and changes nothing, so nothing is opened by trying.
+        with self.assertRaises(proposals.Refused) as cm:
+            self.accept(1)
+        self.assertIn("needs the second tick", str(cm.exception))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertEqual(proposals.show(self.app, 1)["state"], "pending")
+
+    def test_accepting_opens_the_window_and_the_firewall_half_is_named(self):
+        self.assertTrue(self.ask(firewall=True)["ok"])
+        doc = proposals.show(self.app, 1)
+        self.assertIn("firewall rules", " ".join(doc["second_tick"]))
+        self.assertEqual(doc["command"], f"qmcp open {self.TPL} --for 2h --firewall")
+        ok, report = self.accept(1, yes=True)
+        self.assertTrue(ok, report)
+        self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN, core.OPEN_FW})
+        self.assertTrue(fleet.read_window(self.TPL)["firewall"])
+        self.assertEqual(proposals.show(self.app, 1)["state"], "accepted")
+
+    def test_the_command_refuses_at_accept_what_submit_never_looked_up(self):
+        # Submit checks the shape and looks no name up, so it is no oracle; the
+        # command's own refusals decide, on the fleet as it is at accept.
+        self.assertTrue(self.ask(qube="ai-net-router")["ok"])       # a gateway
+        ok, report = self.accept(1, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("provides network", " ".join(report))
+        self.assertEqual(proposals.show(self.app, 1)["state"], "failed")
+        self.assertNotIn(core.OPEN, self.tags("ai-net-router"))
+
+    def test_a_duration_the_command_would_refuse_is_refused_at_submit(self):
+        for bad in ("2d", "25h", "0s", "", "1.5h", "-1h"):
+            reply = self.ask(**{"for": bad})
+            self.assertFalse(reply["ok"], bad)
+        self.assertEqual(len(list(self.store().glob("*.json"))), 0)
+
+    def test_only_the_hub_may_ask(self):
+        reply = self.ask()
+        self.assertTrue(reply["ok"])
+        self.assertFalse(self.submit({"type": "qube-open", "title": "t", "qube": self.TPL,
+                                      "for": "1h"}, caller="ai-work")["ok"])
+
+    def test_the_stored_proposal_holds_the_hubs_own_words(self):
+        self.assertTrue(self.ask(**{"for": "120m"})["ok"])
+        doc = proposals.show(self.app, 1)
+        self.assertEqual(doc["proposal"]["for"], "120m")
+        self.assertEqual(doc["command"], f"qmcp open {self.TPL} --for 120m")
+        ok, report = self.accept(1, yes=True)
+        self.assertTrue(ok, report)
+        self.assertGreater(fleet.window_left(self.TPL), 7100)
 
 
 if __name__ == "__main__":

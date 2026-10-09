@@ -1253,6 +1253,43 @@ def _qubes_propose_project_delete(args: dict) -> dict:
     return _submit("project-delete", args)
 
 
+@_register("qubes_propose_open", _proposal_doc("""
+    Propose opening a guarded qube to this hub for a bounded time.
+
+    A guarded qube is a reference: it is listed and can be spawned from, and
+    every attempt to run a command in it, copy a file into it or change its
+    firewall is refused. A window lifts that for one qube, for as long as the
+    operator accepts, and nothing else: while it is open this hub may run
+    commands in the qube as root, and copy a file in, which the operator
+    confirms one file at a time. It can never change which network the qube
+    is on.
+
+    Use it to get software into a guarded template, or to maintain a model
+    qube. Say in the title what the qube is for and what will be done in it:
+    this always needs the operator's second tick, and those words are what
+    they read.
+
+    - qube: the guarded qube to open.
+    - for: how long, as 90s, 30m or 2h. At most 24h, and there is no
+      indefinite form.
+    - firewall: also let this hub write that qube's firewall rules while the
+      window is open. Leave it out unless the work needs it.
+
+    The window ends by itself, at the next boot of the machine, and whenever
+    the operator closes it, which kills the qube if it is running. Nothing
+    tells this hub when it ended: a call that worked before and is refused
+    now means it is closed.
+    """), {
+        "title": _TITLE,
+        "qube": _prop("string", "The guarded qube to open."),
+        "for": _prop("string", "How long: 90s, 30m, 2h. At most 24h."),
+        "firewall": _prop("boolean", "Also let the hub write that qube's firewall rules while "
+                                     "it is open. Leave it out otherwise."),
+    }, required=("title", "qube", "for"))
+def _qubes_propose_open(args: dict) -> dict:
+    return _submit("qube-open", args)
+
+
 @_register("qubes_proposals", """
     List the hub's proposals and what became of them, or show one in full.
 

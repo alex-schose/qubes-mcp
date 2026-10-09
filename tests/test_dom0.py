@@ -54,6 +54,7 @@ class Base(unittest.TestCase):
             (proposals, "PROPOSALS_DIR", self.tmp / "proposals"),
             (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
             (proposals, "BUS_DIR", self.tmp / "no-session"),
+            (fleet, "WINDOW_DIR", self.tmp / "run" / "open"),
             (anon, "LOCK_PATH", self.tmp / "run" / "gate.lock"),
             (anon, "HEARTBEAT_PATH", self.tmp / "run" / "gate.last"),
             # The files the fixtures make are this user's group, as tmpfiles makes
@@ -64,7 +65,8 @@ class Base(unittest.TestCase):
             setattr(mod, attr, value if isinstance(value, float) else str(value))
         self.addCleanup(self._restore)
         (self.tmp / "run" / "calls").mkdir(parents=True)
-        for d in ("run", "run/calls"):              # as tmpfiles makes them, whatever the umask
+        (self.tmp / "run" / "open").mkdir()
+        for d in ("run", "run/calls", "run/open"):  # as tmpfiles makes them, whatever the umask
             os.chmod(self.tmp / d, 0o2770)
         (self.tmp / "proposals").mkdir(mode=0o2770)
         os.chmod(self.tmp / "proposals", 0o2770)
@@ -1053,6 +1055,258 @@ class PolicyFacts(Base):
     def test_a_malformed_policy_file_still_fails(self):
         f = self._check_with("20-operator.policy", "qubes.OpenURL * @anyvm\n")
         self.assertEqual(f["policy parses"].status, "fail")
+
+
+class Windows(Base):
+    """The operator's open window on a guarded qube.
+
+    The badge is the whole gate — A6b routes on it, and the services it opens
+    run inside the target qube or are qubesd's own — so these tests are about
+    two things: that a badge is never on when it should not be, and that
+    whatever takes it off is an ACTION and not a report.
+    """
+
+    TPL = "ai-tpl-g"            # a guarded template: the window's own use case
+
+    def findings(self):
+        return {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                system_info={"domains": {}})}
+
+    def tags(self, name=None):
+        return self.app.domains[name or self.TPL].tags.raw()
+
+    def test_open_gives_both_halves_only_when_asked(self):
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN})
+        rec = fleet.read_window(self.TPL)
+        self.assertFalse(rec["firewall"])
+        self.assertGreater(fleet.window_left(self.TPL), 3500)
+        # Re-opening with --firewall adds the second badge; without it, it goes.
+        fleet.open_window(self.app, self.TPL, 600, firewall=True)
+        self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN, core.OPEN_FW})
+        self.assertTrue(fleet.read_window(self.TPL)["firewall"])
+        fleet.open_window(self.app, self.TPL, 600)
+        self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN})
+
+    def test_open_refuses_every_qube_243_names(self):
+        a = self.app
+        for name, word in (("ai-net-router", "provides network"),    # a gateway, by its property
+                           ("ai-work", "managed already"),           # no window needed
+                           ("personal", "not in AI space"),
+                           ("mcp-control", "the hub"),
+                           ("ai-sink", "drop box")):
+            with self.assertRaises(fleet.RoleError) as cm:
+                fleet.open_window(a, name, 60)
+            self.assertIn(word, str(cm.exception))
+        for badge in (projects.BLOCKED, projects.HUBBLIND):
+            a.domains[self.TPL].tags.add(badge)
+            with self.assertRaises(fleet.RoleError) as cm:
+                fleet.open_window(a, self.TPL, 60)
+            self.assertIn(badge, str(cm.exception))
+            a.domains[self.TPL].tags.discard(badge)
+        a.domains[self.TPL].tags.add("qmcp-proj-p01")
+        with self.assertRaises(fleet.RoleError):
+            fleet.open_window(a, self.TPL, 60)
+        # Refused means nothing was written: no badge, and no record either.
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        with self.assertRaises(fleet.WindowUnreadable):
+            fleet.read_window(self.TPL)
+
+    def test_the_duration_is_bounded_and_has_no_indefinite_form(self):
+        self.assertEqual([fleet.duration_seconds(x) for x in ("90s", "30m", "2h", "45")],
+                         [90, 1800, 7200, 45])
+        for junk in ("", "2 h", "1.5h", "-5", "2d", "h", None, 3600):
+            with self.assertRaises(fleet.RoleError):
+                fleet.duration_seconds(junk)
+        for bad in (0, -1, fleet.WINDOW_MAX_S + 1, True, 1.5):
+            with self.assertRaises(fleet.RoleError):
+                fleet.open_window(self.app, self.TPL, bad)
+        fleet.open_window(self.app, self.TPL, fleet.WINDOW_MAX_S)       # the cap itself is fine
+
+    def test_a_failed_badge_write_leaves_neither_badge_nor_record(self):
+        self.app.fail.add(f"tag.add:{core.OPEN}")
+        with self.assertRaises(fleet.RoleError):
+            fleet.open_window(self.app, self.TPL, 600, firewall=True)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        with self.assertRaises(fleet.WindowUnreadable):
+            fleet.read_window(self.TPL)
+
+    def test_a_badge_that_landed_before_the_failure_still_comes_off(self):
+        # qubesd sets the tag and then fails: the rollback must not believe
+        # the exception meant nothing was written.
+        self.app.fail.add(f"tag.add.landed:{core.OPEN}")
+        with self.assertRaises(fleet.RoleError):
+            fleet.open_window(self.app, self.TPL, 600)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+
+    def test_the_record_rejects_a_bool_and_anything_malformed(self):
+        fleet.open_window(self.app, self.TPL, 600)
+        path = pathlib.Path(fleet.WINDOW_DIR) / self.TPL
+        for bad in ('{"opened": 1, "expires": true, "firewall": false}',
+                    '{"opened": 1, "expires": 99, "firewall": "yes"}',
+                    '{"expires": 99, "firewall": false}', "[]", "not json", ""):
+            path.write_text(bad)
+            with self.assertRaises(fleet.WindowUnreadable):
+                fleet.read_window(self.TPL)
+
+    def test_seal_takes_both_badges_off_and_kills_what_runs(self):
+        self.app.domains[self.TPL].__dict__["_power"] = "Running"
+        fleet.open_window(self.app, self.TPL, 600, firewall=True)
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("killed", msg)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Halted")
+        self.assertFalse((pathlib.Path(fleet.WINDOW_DIR) / self.TPL).exists())
+        # Twice is safe, and says so rather than killing a qube that is not open.
+        self.app.domains[self.TPL].__dict__["_power"] = "Running"
+        self.assertIn("not open", fleet.seal(self.app, self.TPL))
+        self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Running")
+
+    def test_the_pass_seals_every_window_that_cannot_be_trusted(self):
+        a, path = self.app, pathlib.Path(fleet.WINDOW_DIR)
+        fleet.open_window(a, self.TPL, 600)
+        (path / self.TPL).write_text('{"opened": 1, "expires": 2, "firewall": false}')
+        self.assertTrue(fleet.expire_windows(a))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        # A badge with no record at all: the state every boot would leave.
+        fleet.open_window(a, self.TPL, 600)
+        (path / self.TPL).unlink()
+        self.assertTrue(fleet.expire_windows(a))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        # A record that does not parse.
+        fleet.open_window(a, self.TPL, 600)
+        (path / self.TPL).write_text("{")
+        self.assertTrue(fleet.expire_windows(a))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        # A healthy window is left alone.
+        fleet.open_window(a, self.TPL, 600)
+        self.assertEqual(fleet.expire_windows(a), [])
+        self.assertIn(core.OPEN, self.tags())
+
+    def test_the_pass_strips_a_badge_the_rulebook_could_not_refuse(self):
+        # A gateway is guarded by its provides_network property, and no tag
+        # carries that, so A6b would be live for one wearing the badge. The
+        # command refuses to put it there; this takes it off if it arrives.
+        a = self.app
+        # A HEALTHY, unexpired record, so the only thing that can seal this is
+        # the refusal itself. Without it the qube is sealed for having no
+        # record at all and the test passes whatever `_open_refusal` says — a
+        # mutation run caught exactly that.
+        fleet.write_window("ai-net-router", 600, False)
+        a.domains["ai-net-router"].tags.add(core.OPEN)
+        self.assertGreater(fleet.window_left("ai-net-router"), 500)
+        lines = fleet.expire_windows(a)
+        self.assertTrue(any("ai-net-router" in l and "provides network" in l for l in lines),
+                        lines)
+        self.assertNotIn(core.OPEN, a.domains["ai-net-router"].tags.raw())
+
+    def test_the_boot_seal_takes_a_healthy_window_too(self):
+        fleet.open_window(self.app, self.TPL, fleet.WINDOW_MAX_S, firewall=True)
+        lines = fleet.expire_windows(self.app, every=True)
+        self.assertTrue(any("never survives a reboot" in l for l in lines), lines)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+
+    def test_a_qube_whose_tags_will_not_read_is_reported_never_skipped(self):
+        self.app.fail_reads("tag.List", "fail")
+        lines = fleet.expire_windows(self.app)
+        self.assertTrue(any("could not be judged" in l for l in lines), lines)
+
+    def test_check_warns_while_a_window_is_open_and_fails_when_it_is_not_sound(self):
+        self.assertEqual(self.findings()["open windows"].status, "pass")
+        fleet.open_window(self.app, self.TPL, 600)
+        self.assertEqual(self.findings()["open windows"].status, "warn")
+        (pathlib.Path(fleet.WINDOW_DIR) / self.TPL).unlink()
+        f = self.findings()["open windows"]
+        self.assertEqual(f.status, "fail")
+        self.assertIn("no window record", f.detail)
+        fleet.write_window(self.TPL, -1, False)
+        self.assertEqual(self.findings()["open windows"].status, "fail")
+
+    def test_check_fails_on_the_firewall_half_alone(self):
+        self.app.domains[self.TPL].tags.add(core.OPEN_FW)
+        f = self.findings()["open windows"]
+        self.assertEqual(f.status, "fail")
+        self.assertIn("without", f.detail)
+
+    def test_an_open_badge_comes_off_before_the_umbrella(self):
+        # A6b does not ask for the umbrella, so a failure between the two must
+        # never leave a window open on a qube that has left AI space.
+        order = sorted([core.UMBRELLA, core.OPEN, core.OPEN_FW, "qmcp-lead-p01", "other"],
+                       key=fleet._removal_order)
+        self.assertLess(order.index(core.OPEN), order.index(core.UMBRELLA))
+        self.assertLess(order.index(core.OPEN_FW), order.index(core.UMBRELLA))
+        self.assertLess(order.index(core.OPEN), order.index(core.OPEN_FW))
+        self.assertEqual(order[-1], "other")
+
+    def test_the_badges_are_controlled_and_unreadable_to_a_principal(self):
+        from qmcp import scope
+        for badge in (core.OPEN, core.OPEN_FW):
+            self.assertTrue(birth.controlled(badge))        # stripped on every create path
+            self.assertNotIn(badge, scope.TAG_VOCABULARY)   # no principal reads it
+
+    def test_open_refuses_when_the_record_directory_is_missing(self):
+        shutil.rmtree(fleet.WINDOW_DIR)
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.open_window(self.app, self.TPL, 600)
+        self.assertIn("missing", str(cm.exception))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+
+    def test_a_quiet_sweep_leaves_no_audit_line_and_a_real_one_leaves_one(self):
+        """The gate's timer runs a sweep every 15 seconds. On the dev box every
+        one of them wrote an operator audit line, which is 5,760 a day: it
+        buries what the operator did and rotates the log for nothing. A sweep
+        is recorded by what it sealed, not by having run."""
+        from qmcp import cli
+        for argv in (["seal", "--expired"], ["seal", "--all"]):
+            self.assertIsNone(cli.operator_line(cli.build_parser().parse_args(argv)), argv)
+        named = cli.operator_line(cli.build_parser().parse_args(["seal", self.TPL]))
+        self.assertEqual(named, ("qmcp seal", {"qube": self.TPL}))
+        before = len(self.audit_lines())
+        self.assertEqual(fleet.expire_windows(self.app), [])        # nothing to do
+        self.assertEqual(len(self.audit_lines()), before)
+        fleet.open_window(self.app, self.TPL, 600)
+        (pathlib.Path(fleet.WINDOW_DIR) / self.TPL).unlink()        # a badge with no record
+        self.assertTrue(fleet.expire_windows(self.app))
+        lines = self.audit_lines()
+        self.assertEqual(len(lines), before + 1)
+        self.assertEqual(lines[-1]["caller"], "operator")
+        self.assertEqual(lines[-1]["service"], "qmcp seal")
+        self.assertEqual(lines[-1]["args"]["qube"], self.TPL)
+        self.assertIn("no window record", lines[-1]["args"]["swept"])
+
+    def test_a_window_widens_no_dom0_wrapper(self):
+        """The window is four lines of the rulebook and nothing else. Every
+        dom0 service still refuses an open qube, because `core.operand` was
+        never taught the badge: that is what makes "it can never change which
+        network the qube is on" true, and it is asserted here rather than left
+        to the fact that nobody wrote the code."""
+        self.assertEqual(core.tags_of(self.app.domains[self.TPL]) & {core.OPEN}, set())
+        fleet.open_window(self.app, self.TPL, 600, firewall=True)
+        self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN, core.OPEN_FW})
+        for service, req in (
+                ("qmcp.SetPropertyAIManaged",
+                 {"name": self.TPL, "property": "netvm", "value": "ai-net-router"}),
+                ("qmcp.SetFeatureAIManaged", {"name": self.TPL, "feature": "x", "value": "1"}),
+                ("qmcp.LifecycleAIManaged", {"name": self.TPL, "action": "start"}),
+                ("qmcp.CloneAIManagedQube", {"source": self.TPL, "name": "ai-hub-x1"}),
+                ("qmcp.SpawnDisposableAIManaged", {"name": "ai-hub-x2", "dvmt": self.TPL})):
+            reply = self.call(service, req)
+            self.assertFalse(reply.get("ok"), (service, reply))
+        # The refused write did not land: the qube's network is what it was.
+        self.assertIsNone(self.app.domains[self.TPL].netvm)
+        # A spawn FROM it answers exactly as it does for a managed template,
+        # so the window changed nothing there either. (This base configures no
+        # birth egress, so both refuse for that reason; the point is that the
+        # two answers are the same.)
+        guarded = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x3", "template": self.TPL})
+        managed = self.call("qmcp.SpawnAIManagedQube",
+                            {"name": "ai-hub-x4", "template": "ai-debian-13"})
+        self.assertEqual(guarded, managed)
+
+    def test_revoke_takes_an_open_badge_off_too(self):
+        fleet.open_window(self.app, self.TPL, 600, firewall=True)
+        fleet.revoke(self.app, self.TPL)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW, core.UMBRELLA, core.GUARDED})
 
 
 if __name__ == "__main__":

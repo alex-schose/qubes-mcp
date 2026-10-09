@@ -105,6 +105,48 @@ def cmd_role(args) -> int:
     return 0
 
 
+def cmd_window(args) -> int:
+    """`qmcp open` and `qmcp seal`, both under the gate's lock, so a window
+    never races the pass that expires one. `--expired` is the pass itself,
+    which the gate's timer runs, and `--all` the boot seal: both report what
+    they did and exit 3 when something could not be judged, never 1, so the
+    unit's other command still runs."""
+    if args.cmd == "seal" and not args.all and not args.expired and args.qube is None:
+        raise SystemExit("qmcp seal: name a qube, or --all, or --expired")
+    if args.cmd == "seal" and args.qube is not None and (args.all or args.expired):
+        raise SystemExit("qmcp seal: a qube, or --all, or --expired, not both")
+    try:
+        if args.cmd == "open":
+            seconds = fleet.duration_seconds(args.duration)
+    except fleet.RoleError as e:
+        print(f"qmcp open: {e}", file=sys.stderr)
+        return 1
+    try:
+        with anon.gate_lock() as got:
+            if not got:
+                print(f"qmcp {args.cmd}: another run held the gate past its wait; nothing was "
+                      f"changed", file=sys.stderr)
+                return 3
+            if args.cmd == "open":
+                print(fleet.open_window(_app(), args.qube, seconds, firewall=args.firewall))
+                return 0
+            if args.qube is not None:
+                print(fleet.seal(_app(), args.qube))
+                return 0
+            lines = fleet.expire_windows(_app(), every=args.all)
+    except fleet.RoleError as e:
+        print(f"qmcp {args.cmd}: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"qmcp {args.cmd}: {type(e).__name__}", file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line)
+    # "NOT sealed" and "could not be judged" are the two a window may be left
+    # open by; `qmcp check` fails on the badge either way.
+    return 3 if any("NOT sealed" in l or "could not be judged" in l for l in lines) else 0
+
+
 def _need_root(what: str, command: str = "project") -> None:
     if os.geteuid() != 0:
         raise SystemExit(f"qmcp {command} {what}: run as root (sudo qmcp {command} {what} ...); "
@@ -492,6 +534,23 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("qube")
         if name == "revoke":
             p.add_argument("--no-shutdown", action="store_true")
+    p = sub.add_parser("open", help="open a guarded qube to the hub for a bounded time; the "
+                                    "timer, qmcp seal and every boot close it")
+    p.add_argument("qube")
+    p.add_argument("--for", dest="duration", required=True, metavar="DURATION",
+                   help="how long the window lasts: 90s, 30m, 2h; at most 24h, and there is no "
+                        "indefinite open (qmcp manage leaves the guarded state altogether)")
+    p.add_argument("--firewall", action="store_true",
+                   help="also let the hub write this qube's firewall rules while it is open")
+    p = sub.add_parser("seal", help="close a guarded qube's window now, and kill what the hub "
+                                    "left running in it")
+    p.add_argument("qube", nargs="?")
+    p.add_argument("--all", action="store_true",
+                   help="every open qube, whatever its record says (qmcp-seal.service runs this "
+                        "at every boot)")
+    p.add_argument("--expired", action="store_true",
+                   help="only the windows that ran out, that have no readable record, or that "
+                        "sit on a qube qmcp open refuses (the gate's timer runs this)")
     p = sub.add_parser("gateway", help="the networks AI space may use")
     gsub = p.add_subparsers(dest="what", required=True)
     q = gsub.add_parser("list", help="every enrolled gateway, and whether it is still usable")
@@ -633,6 +692,19 @@ def operator_line(args):
         if c == "revoke":
             summary["no_shutdown"] = bool(args.no_shutdown)
         return f"qmcp {c}", summary
+    if c == "open":
+        return "qmcp open", {"qube": str(args.qube)[:128], "for": str(args.duration)[:32],
+                             "firewall": bool(args.firewall)}
+    if c == "seal":
+        if args.qube is None:
+            # A sweep: the gate's timer runs one every 15 seconds and the boot
+            # unit one at every boot, and almost all of them find nothing. A
+            # line per run would be 5,760 a day, which buries what the
+            # operator actually did and rotates the log for no reason.
+            # `expire_windows` writes one line per qube it really seals, so a
+            # quiet run leaves nothing and a real one is recorded in full.
+            return None
+        return "qmcp seal", {"qube": str(args.qube)[:128]}
     if c == "gateway":
         if args.what == "list":
             return None
@@ -704,6 +776,7 @@ def main(argv=None) -> int:
         return 0
     handler = {"check": cmd_check, "list": cmd_list, "settings": cmd_settings,
                "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
+               "open": cmd_window, "seal": cmd_window,
                "gateway": cmd_gateway, "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
                "audit": cmd_audit, "gate": cmd_gate}[args.cmd]
     line = operator_line(args)

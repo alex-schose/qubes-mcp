@@ -13,8 +13,11 @@ project records, or take their lock, which needs root.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
+import time
 
 from qmcp import anon, audit, birth, budget, core, firewall, gateways, projects, proposals
 
@@ -146,6 +149,15 @@ PRECEDENCE_CLAIMS = (
     ("qmcp exec from AI space", "qmcp.RunInAIManaged", "ai", "peer"),
     ("a copy into a guarded qube", "qubes.Filecopy", "ai", "guarded"),
     ("hub exec into a guarded qube", "qmcp.RunInAIManaged", "hub", "guarded"),
+    ("the hub's firewall write into a guarded qube", "admin.vm.firewall.Set", "hub", "guarded"),
+    ("hub exec into an open qube", "qmcp.RunInAIManaged", "hub", "open"),
+    ("the hub's copy into an open qube", "qubes.Filecopy", "hub", "open"),
+    ("the hub's firewall write into an open qube without the firewall half",
+     "admin.vm.firewall.Set", "hub", "open"),
+    ("the hub's firewall write into an open qube with it", "admin.vm.firewall.Set",
+     "hub", "openfw"),
+    ("a lead's exec into an open qube", "qmcp.RunInAIManaged", "lead", "open"),
+    ("AI space reaching an open qube", "qubes.Filecopy", "ai", "open"),
     ("the hub writing a lead's firewall", "admin.vm.firewall.Set", "hub", "lead"),
     ("the Admin API to dom0 from the hub", "admin.vm.List", "hub", "dom0"),
     ("hub exec outside AI space", "qmcp.RunInAIManaged", "hub", "outside"),
@@ -170,7 +182,8 @@ _PROBES = {"ai": "qmcp-probe-ai", "peer": "qmcp-probe-peer",
            "lead": "qmcp-probe-lead", "member": "qmcp-probe-member",
            "other": "qmcp-probe-other", "sink": "qmcp-probe-sink",
            "model": "qmcp-probe-model", "blocked": "qmcp-probe-blocked",
-           "hidden": "qmcp-probe-hidden", "anon": "qmcp-probe-anon"}
+           "hidden": "qmcp-probe-hidden", "anon": "qmcp-probe-anon",
+           "open": "qmcp-probe-open", "openfw": "qmcp-probe-openfw"}
 #: Synthetic project p01 (lead, member, sink, model qube) and a member of p02.
 _PROBE_TAGS = {
     "ai": [core.UMBRELLA], "peer": [core.UMBRELLA], "guarded": [core.UMBRELLA, core.GUARDED],
@@ -180,6 +193,8 @@ _PROBE_TAGS = {
     "other": [core.UMBRELLA, projects.member_badge("p02")],
     "sink": [projects.DROP_BOX, projects.dump_badge("p01")],
     "model": [core.UMBRELLA, core.GUARDED, projects.model_badge("p01")],
+    "open": [core.UMBRELLA, core.GUARDED, core.OPEN],
+    "openfw": [core.UMBRELLA, core.GUARDED, core.OPEN, core.OPEN_FW],
     "blocked": [core.UMBRELLA, projects.member_badge("p01"), projects.ANON, projects.BLOCKED],
     "hidden": [core.UMBRELLA, projects.member_badge("p03"), projects.ANON, projects.HUBBLIND],
     "anon": [core.UMBRELLA, projects.member_badge("p04"), projects.ANON],
@@ -209,7 +224,8 @@ def precedence(policy, system_info, hub: str) -> list:
     ai_sources = sorted({n for n, d in domains.items()
                          if not n.startswith("uuid:") and core.UMBRELLA in d.get("tags", [])
                          and n not in (_PROBES["peer"], _PROBES["guarded"], _PROBES["model"],
-                                       _PROBES["blocked"], _PROBES["hidden"], _PROBES["anon"])})
+                                       _PROBES["blocked"], _PROBES["hidden"], _PROBES["anon"],
+                                       _PROBES["open"], _PROBES["openfw"])})
     problems = []
     for label, service, role, target in PRECEDENCE_CLAIMS:
         service, _, argument = service.partition("+")
@@ -370,6 +386,51 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
                f"AI qubes on a network that is not enrolled: {', '.join(sorted(loose))} (enroll "
                f"it with qmcp gateway enroll NAME, or clear the qube's network)",
                "every AI qube's network (gateways aside) is an enrolled gateway, or none")
+
+    # 3c. open windows. The badge is the whole gate — the services it
+    # opens run inside the target qube, or are qubesd's own, so no dom0 code
+    # sees those calls and none can read an expiry — and the record in /run is
+    # what says when the window ends. So a badge without a readable, unexpired
+    # record is a window nothing will close on time, and a badge on a qube
+    # `qmcp open` refuses (a gateway above all, which the rulebook cannot tell
+    # from any other guarded qube) is a window that should never have opened.
+    # The expiry pass takes both off within the timer's interval; this fails
+    # while they are on. A healthy window is a warning, not a failure: it is
+    # the operator's own deliberate exception and it clears itself, and a red
+    # light that is red on purpose stops being read.
+    open_bad, open_unread, open_now = [], [], []
+    for vm in vms:
+        tags, name = T(vm), vm.name
+        if not tags & {core.OPEN, core.OPEN_FW}:
+            continue
+        if core.OPEN_FW in tags and core.OPEN not in tags:
+            open_bad.append(f"{name} wears {core.OPEN_FW} without {core.OPEN}: its firewall "
+                            f"writes are open on their own")
+        try:
+            why = _open_refusal(vm, name, tags)
+        except RoleError as e:
+            open_unread.append(f"whether {name} may be open ({e})")
+            continue
+        if why:
+            open_bad.append(f"{name} wears an open badge and {why[why.find(' ') + 1:]}")
+            continue
+        try:
+            left = window_left(name)
+        except WindowUnreadable as e:
+            open_bad.append(str(e))
+            continue
+        if left <= 0:
+            open_bad.append(f"{name}'s window ran out {-left}s ago and its badge is still on")
+            continue
+        open_now.append(f"{name} ({left // 60} min left"
+                        + (", firewall too" if core.OPEN_FW in tags else "") + ")")
+    if open_bad or open_unread:
+        judged("open windows", open_bad, open_unread, "; ".join(open_bad), "")
+    elif open_now:
+        add("warn", "open windows", f"open to the hub: {', '.join(sorted(open_now))}; "
+                                    f"qmcp seal closes one at once")
+    else:
+        add("pass", "open windows", "no guarded qube is open")
 
     # 4. the airlock: a drop box is never in AI space
     hybrids = sorted(vm.name for vm in vms if {"ai-dump", core.UMBRELLA} <= T(vm))
@@ -1036,7 +1097,15 @@ def _gateway_refusal(by_name: dict, name: str, hub) -> str | None:
         return "no such qube"
     if not core.is_gateway(vm):
         return "does not provide network"
-    if name == (core.read_hub() if hub is None else hub):
+    # A hub file that cannot be read means it is not known whether this qube is
+    # the hub, which must refuse rather than enroll it: `read_hub` answers None
+    # both for a file that is absent and for one it could not read, and `name
+    # == None` is false for every qube. The model-qube refusal beside this one
+    # has always read it this way; this one did not until 0.9.25.
+    hub = core.read_hub() if hub is None else hub
+    if hub is None:
+        return f"{core.HUB_PATH} cannot be read, so it is not known whether it is the hub"
+    if name == hub:
         return "is the hub"
     try:
         tags = _tags(vm)
@@ -1905,6 +1974,290 @@ def revoke(app, name, shutdown: bool = True) -> str:
     return msg
 
 
+#: M5's open windows. `qmcp open` writes the record and THEN the badges; the
+#: expiry pass, `qmcp seal` and the boot unit take the badges off. The record
+#: lives in /run, so a boot leaves every badge without one — which is why
+#: `qmcp-seal.service` strips the badges at boot, before any user session
+#: exists, instead of trusting the record it would not find.
+#: Declared root:qubes 2770 in tmpfiles: root writes the records and the
+#: expiry pass, which runs as the services' user, unlinks them.
+WINDOW_DIR = "/run/qmcp/open"
+#: The longest window the command writes. There is no indefinite open:
+#: that is `qmcp manage`, which leaves the guarded state altogether.
+WINDOW_MAX_S = 24 * 60 * 60
+
+
+class WindowUnreadable(Exception):
+    """A window's record is absent, malformed or unreadable.
+
+    This is a GATE, not instrumentation, so it fails toward LESS authority and
+    sealing is an ACTION: the expiry pass takes the badges off, and `qmcp
+    check` fails while they are on. It must never degrade into "no expiry
+    could be read, so leave the window open" — the direction the best-effort
+    helpers elsewhere in this tree fail in.
+    """
+
+
+#: `--for`: whole seconds, or one unit of s, m or h. No fractions, so no
+#: rounding to argue about, and `bool` cannot sneak in as an `int`.
+_DURATION = re.compile(r"^([0-9]{1,7})([smh]?)$")
+
+
+def duration_seconds(text) -> int:
+    """`"90s"`, `"30m"`, `"2h"` or bare digits as seconds. Raises `RoleError`
+    on anything else, including an empty string and a float."""
+    m = _DURATION.match(text.strip()) if isinstance(text, str) else None
+    if m is None:
+        raise RoleError("--for wants a whole number of seconds, or one with s, m or h, "
+                        "e.g. 90s, 30m, 2h")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def _window_path(name: str, dir_: str | None = None) -> str:
+    if not core.valid_qube_name(name):
+        raise WindowUnreadable("that is no qube name")
+    return os.path.join(WINDOW_DIR if dir_ is None else dir_, name)
+
+
+def read_window(name: str, dir_: str | None = None) -> dict:
+    """`{"opened": int, "expires": int, "firewall": bool}`, or raise.
+
+    A record that does not parse, or whose fields are the wrong shape, is
+    unreadable rather than read as any expiry. `expires` must be an `int` and
+    not a `bool`, which is an `int` in Python and would otherwise pass as an
+    epoch of 0 or 1.
+    """
+    path = _window_path(name, dir_)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.loads(fh.read(4096))
+    except FileNotFoundError:
+        raise WindowUnreadable(f"'{name}' wears an open badge and has no window record") from None
+    except (OSError, ValueError) as e:
+        raise WindowUnreadable(f"'{name}''s window record cannot be read "
+                               f"({type(e).__name__})") from None
+    ok = (isinstance(rec, dict)
+          and isinstance(rec.get("expires"), int) and not isinstance(rec.get("expires"), bool)
+          and isinstance(rec.get("opened"), int) and not isinstance(rec.get("opened"), bool)
+          and isinstance(rec.get("firewall"), bool))
+    if not ok:
+        raise WindowUnreadable(f"'{name}''s window record is malformed")
+    return rec
+
+
+def window_left(name: str, dir_: str | None = None, now: float | None = None) -> int:
+    """Whole seconds left, zero or less when the window has run out."""
+    return read_window(name, dir_)["expires"] - int(time.time() if now is None else now)
+
+
+def write_window(name: str, seconds: int, firewall: bool, dir_: str | None = None) -> dict:
+    """Write the record, before any badge is written. A failure between the two
+    leaves a record and no badge, which opens nothing."""
+    path = _window_path(name, dir_)
+    now = int(time.time())
+    rec = {"opened": now, "expires": now + seconds, "firewall": bool(firewall)}
+    old = os.umask(0o007)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
+    finally:
+        os.umask(old)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    return rec
+
+
+def clear_window(name: str, dir_: str | None = None) -> None:
+    """Delete the record. One that is already gone is success."""
+    try:
+        os.unlink(_window_path(name, dir_))
+    except FileNotFoundError:
+        pass
+
+
+def _open_refusal(vm, name, tags) -> str | None:
+    """Why this qube is never opened, or None. Read before any write."""
+    if core.UMBRELLA not in tags:
+        return f"'{name}' is not in AI space, so nothing reaches it to be opened"
+    if _is_gateway(vm):
+        return (f"'{name}' provides network: a gateway carries AI space's egress rules and the "
+                f"hub never operates one, window or none")
+    if core.GUARDED not in tags:
+        return f"'{name}' is managed already; the hub operates it without a window"
+    for badge, why in ((projects.BLOCKED, "the anonymity gate stopped it"),
+                       (projects.HUBBLIND, "it belongs to a hidden anonymous project")):
+        if badge in tags:
+            return (f"'{name}' wears {badge}: {why}, and the rulebook refuses the hub every "
+                    f"service into it above the window's own lines")
+    return None
+
+
+def open_window(app, name, seconds: int, firewall: bool = False, dir_: str | None = None) -> str:
+    """Open a guarded qube to the hub for a bounded time.
+
+    Everything is checked before anything is written, and the record before
+    the badges. An `open` on a qube that is open already replaces its window,
+    and drops the firewall half when this call did not ask for it.
+    """
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds <= 0:
+        raise RoleError("--for wants a duration above zero, e.g. 2h")
+    if seconds > WINDOW_MAX_S:
+        raise RoleError(f"--for is at most {WINDOW_MAX_S // 3600}h, and there is no indefinite "
+                        f"open: qmcp manage {name} leaves the guarded state altogether")
+    vm = _target(app, name)
+    tags = _not_in_a_slot(vm, name, "open")
+    why = _open_refusal(vm, name, tags)
+    if why:
+        raise RoleError(why)
+    if not os.path.isdir(WINDOW_DIR if dir_ is None else dir_):
+        raise RoleError(f"{WINDOW_DIR if dir_ is None else dir_} is missing, so no window can be "
+                        f"recorded and none is opened; the installer declares it in tmpfiles")
+    try:
+        rec = write_window(name, seconds, firewall, dir_)
+    except OSError as e:
+        raise RoleError(f"'{name}''s window record could not be written ({type(e).__name__}), so "
+                        f"no badge was given and nothing is open") from None
+    add = [core.OPEN] + ([core.OPEN_FW] if firewall else [])
+    remove = [] if firewall else [core.OPEN_FW]
+    try:
+        _set_tags(vm, add=add, remove=remove)
+    except Exception as e:
+        # The badge is the whole gate, so a half-written pair must not be left
+        # on: take both off, then the record. Badges first — a record with no
+        # badge opens nothing, while a badge with no record is exactly what
+        # `qmcp check` fails on.
+        failed = type(e).__name__
+        try:
+            _set_tags(vm, remove=(core.OPEN, core.OPEN_FW))
+        except Exception:
+            raise RoleError(f"'{name}' could not be opened ({failed}) and may still wear an open "
+                            f"badge: run qmcp seal {name}") from None
+        clear_window(name, dir_)
+        raise RoleError(f"'{name}' was not opened ({failed}); nothing is left on it") from None
+    ends = time.strftime("%H:%M:%S", time.localtime(rec["expires"]))
+    return (f"{name}: open until {ends} ({seconds // 60} min)"
+            + (", firewall rules too" if firewall else "")
+            + f"; qmcp seal {name} closes it at once")
+
+
+def open_window_report(app, name, seconds: int, firewall: bool = False) -> "Report":
+    """`open_window` as a Report, for an accepted proposal: the accept
+    path wants a report, while `qmcp open` wants a line.
+
+    It takes the gate's lock, which `qmcp open` takes at the command layer, so
+    an accept never races the pass that expires a window. The lock cannot
+    nest: nothing that already holds it calls this.
+    """
+    report = Report()
+    with anon.gate_lock() as got:
+        if not got:
+            raise RoleError("another run held the gate past its wait; the window was not opened, "
+                            "and the proposal may be submitted again")
+        report.append(open_window(app, name, seconds, firewall=firewall))
+    return report
+
+
+def seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
+    """Close a window at once: the badges off, then the record, then the
+    work the hub left running in the qube.
+
+    A qube that was not open is left alone and said so, so this is safe to
+    run twice. `kill` is false only where a caller has decided the cost of a
+    kill is not worth paying; the operator's own `qmcp seal` always pays it.
+    """
+    vm = _target(app, name)
+    tags = _read_tags(vm)
+    worn = sorted(tags & {core.OPEN, core.OPEN_FW}, key=_removal_order)
+    if not worn:
+        clear_window(name, dir_)        # a record without a badge opens nothing
+        return f"{name}: not open"
+    try:
+        _set_tags(vm, remove=worn)
+    except Exception as e:
+        raise RoleError(f"'{name}' may still wear {', '.join(worn)} ({type(e).__name__}); run "
+                        f"qmcp seal {name} again") from None
+    clear_window(name, dir_)
+    if not kill:
+        return f"{name}: sealed"
+    done = _kill_if_running(vm)
+    if done == "killed":
+        return (f"{name}: sealed and killed, so nothing the hub started in it runs on; what it "
+                f"wrote to disk stays")
+    if done == "halted":
+        return f"{name}: sealed"
+    return (f"{name}: sealed, but it could NOT be killed ({done}): a process the hub started in "
+            f"it may still run; kill it by hand (qvm-kill {name})")
+
+
+def expire_windows(app, dir_: str | None = None, now: float | None = None,
+                   every: bool = False) -> list:
+    """The pass the gate's timer runs: seal every window that has run
+    out, that has no readable record, or that is on a qube `qmcp open` would
+    refuse. With `every`, seal them all whatever their record says, which is
+    what the boot unit does: a window never survives a reboot, and at
+    boot the records are gone with /run anyway. Returns one line per qube it
+    acted on or could not read.
+
+    The last case is why this exists as well as the command's own refusals:
+    the rulebook cannot tell a gateway from any other guarded qube — a gateway
+    is one by its `provides_network` property, and no tag carries that — so a
+    badge that reached one would make A6b live for it. Here it comes off.
+    """
+    out = []
+    for vm in app.domains:
+        try:
+            tags = _tags(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable as e:
+            # Never silently: a qube whose tags will not read may be open.
+            out.append(f"{vm.name}: {e}; its window could not be judged")
+            continue
+        if not tags & {core.OPEN, core.OPEN_FW}:
+            continue
+        name = vm.name
+        try:
+            why = _open_refusal(vm, name, tags)
+        except RoleError as e:
+            out.append(f"{name}: {e}; its window could not be judged")
+            continue
+        reason = why
+        if reason is None and every:
+            reason = "the boot seal: a window never survives a reboot"
+        if reason is None:
+            try:
+                left = window_left(name, dir_, now)
+            except WindowUnreadable as e:
+                reason = str(e)
+            else:
+                if left > 0:
+                    continue
+                reason = f"'{name}''s window ran out"
+        try:
+            line = seal(app, name, dir_)
+        except RoleError as e:
+            out.append(f"{name}: NOT sealed: {e}")
+            _swept(name, reason, False, str(e))
+            continue
+        out.append(f"{line}: {reason}")
+        _swept(name, reason, True)
+    return out
+
+
+def _swept(name: str, reason: str, ok: bool, error: str | None = None) -> None:
+    """One audit line per window this sweep really closed, as the operator.
+
+    The sweep itself leaves no line (`cli.operator_line`): the gate's timer
+    runs one every 15 seconds and finds nothing almost every time, and a line
+    per run would bury what the operator did. Best-effort, like every other
+    audit write: a logging failure never changes what was sealed.
+    """
+    try:
+        audit.audit("qmcp seal", "operator",
+                    {"qube": name[:128], "swept": reason[:128]}, ok, error)
+    except Exception:
+        pass
+
+
 def listing(app, everything: bool = False) -> list:
     """One row per qube in AI space. `everything` adds every other qube but
     dom0, with state None: the operator's window offers them when a qube joins
@@ -1937,6 +2290,7 @@ def listing(app, everything: bool = False) -> list:
             # The slots whose lead reaches it as their model qube.
             "model": UNREADABLE if tags is None else
             ",".join(sorted(projects.model_slots(tags))) or None,
+            "open": _window_field(vm.name, tags),
             "owner": UNREADABLE if tags is None else _owner(tags),
             "gateway": _shown(lambda: core.is_gateway(vm)),
             "dvmt": _shown(lambda: core.is_dvmt(vm)),
@@ -1944,6 +2298,20 @@ def listing(app, everything: bool = False) -> list:
             sorted(t for t in tags if birth.controlled(t) or t == projects.DROP_BOX),
         })
     return rows
+
+
+def _window_field(name: str, tags):
+    """Seconds left on this qube's window for a listing row: None when it is
+    not open, UNREADABLE when it wears a badge whose record will not read, and
+    a number that may be zero or less when the window has run out and the
+    expiry pass has not come round yet. The listing is a read and never acts
+    on what it finds; `qmcp seal --expired` is what acts."""
+    if tags is None or not tags & {core.OPEN, core.OPEN_FW}:
+        return None
+    try:
+        return window_left(name)
+    except WindowUnreadable:
+        return UNREADABLE
 
 
 def settings(app) -> dict:
@@ -2371,11 +2739,19 @@ def _badges_of_slot(app, slot: str) -> tuple:
 
 def _removal_order(tag: str) -> tuple:
     """Badges come off in this order, and go on in the reverse: first the
-    slot badges the rulebook routes on (`qmcp-lead-pNN` alone gives root exec
+    badges the rulebook routes on (`qmcp-lead-pNN` alone gives root exec
     into a slot's members, `qmcp-proj-pNN` makes a qube reachable from its
-    lead), then the umbrella, then the rest. A failure part-way then leaves a
-    qube with less authority than the command meant, never more."""
-    if projects.slot_badge_parts(tag) is not None:
+    lead, and either open badge opens a guarded qube to the hub), then the
+    umbrella, then the rest. A failure part-way then leaves a qube with less
+    authority than the command meant, never more.
+
+    The open badges are named here rather than left to fall in with "the
+    rest", and the test suite pins it: A6b does not ask for the umbrella, so
+    taking the umbrella off first would leave a window open on a qube that is
+    no longer in AI space. Within the routed group the sort puts `qmcp-open`
+    (exec) before `qmcp-open-fw` (the firewall writes), which is the order
+    authority runs in."""
+    if projects.slot_badge_parts(tag) is not None or tag in (core.OPEN, core.OPEN_FW):
         return (0, tag)
     return (1, tag) if tag == core.UMBRELLA else (2, tag)
 

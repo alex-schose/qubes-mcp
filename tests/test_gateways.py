@@ -19,7 +19,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import firewall, fleet, gateways, projects, proposals, scope  # noqa: E402
+from qmcp import core, firewall, fleet, gateways, projects, proposals, scope  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, ProjectBase  # noqa: E402
 
@@ -201,6 +201,38 @@ class Enroll(ProjectBase):
             with self.assertRaises(fleet.RoleError, msg=name) as cm:
                 fleet.enroll_gateway(self.app, name)
             self.assertIn(why, str(cm.exception), name)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_an_unreadable_hub_file_refuses_a_gateway_rather_than_enrolling_it(self):
+        """`read_hub` answers None both for a file that is absent and for one it
+        could not read, and `name == None` is false for every qube — so until
+        0.9.25 a hub qube that provides network could be enrolled while the hub
+        file was unreadable. The model-qube refusal beside it always refused.
+
+        The teeth: the subject here IS the hub qube, with network, so the only
+        thing that can refuse it is the hub read. Remove that check and this
+        passes.
+        """
+        a = self.app
+        a.domains[HUB]._props["provides_network"] = True
+        a.domains[HUB].features["qubes-firewall"] = "1"
+        hub_file = pathlib.Path(core.HUB_PATH)
+        self.assertEqual(core.read_hub(), HUB)              # readable: refused as the hub
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.enroll_gateway(a, HUB)
+        self.assertIn("is the hub", str(cm.exception))
+        os.chmod(hub_file, 0o000)
+        try:
+            self.assertIsNone(core.read_hub())              # the fail-closed read
+            with self.assertRaises(fleet.RoleError) as cm:
+                fleet.enroll_gateway(a, HUB)
+            self.assertIn("cannot be read", str(cm.exception))
+            self.assertNotIn(HUB, gateways.load())
+            # The same answer the model-qube refusal gives, so the two agree.
+            self.assertIn("cannot be read",
+                          fleet.model_qube_refusal({v.name: v for v in a.domains}, HUB) or "")
+        finally:
+            os.chmod(hub_file, 0o644)
 
     def test_enroll_set_remove(self):
         self.assertIn("enrolled", fleet.enroll_gateway(self.app, "sys-ai-tor", True, "Tor, CH"))

@@ -48,7 +48,7 @@ EXPECTED_TOOLS = [
     "qubes_run_disposable", "qubes_feature_set", "qubes_events", "qubes_get_pool_stats",
     "qubes_propose_project", "qubes_propose_project_edit", "qubes_propose_dump",
     "qubes_propose_lead", "qubes_propose_lead_firewall", "qubes_propose_project_delete",
-    "qubes_proposals",
+    "qubes_propose_open", "qubes_proposals",
 ]
 # Each proposal tool and the dom0 proposal type it submits.
 PROPOSAL_TYPES = {
@@ -58,6 +58,7 @@ PROPOSAL_TYPES = {
     "qubes_propose_lead": "project-lead",
     "qubes_propose_lead_firewall": "project-firewall",
     "qubes_propose_project_delete": "project-delete",
+    "qubes_propose_open": "qube-open",
 }
 SUBMIT = "qmcp.SubmitProposal"
 STATUS = "qmcp.ProposalStatus"
@@ -72,6 +73,8 @@ MINIMAL_PROPOSALS = {
     "qubes_propose_lead_firewall": {"title": "New model", "project": "osint",
                                     "model": "api.anthropic.com:443"},
     "qubes_propose_project_delete": {"title": "Done", "project": "osint"},
+    "qubes_propose_open": {"title": "Install curl in the reference template",
+                           "qube": "ai-tpl-g", "for": "2h"},
 }
 REMOVED_TOOLS = ["qubes_device_list", "qubes_device_attach", "qubes_device_detach",
                  "qubes_install_pkg"]
@@ -318,8 +321,48 @@ _FORBIDDEN = re.compile(
     r"|spend_gate|GATED_TIMEOUT|ai-net-router", re.IGNORECASE)
 
 
+class VersionTests(unittest.TestCase):
+    """Every documented install runs the server from a checkout or the release
+    tarball and installs no package, so the metadata read always failed and the
+    server told the client 0.0.0+unknown. It falls back to the pyproject.toml
+    of the tree it was imported from."""
+
+    def pyproject_version(self) -> str:
+        import pathlib, re
+        text = (pathlib.Path(qubes_mcp.__file__).resolve().parent.parent
+                / "pyproject.toml").read_text(encoding="utf-8")
+        return re.search(r'(?m)^version\s*=\s*"([^"]+)"', text).group(1)
+
+    def test_the_version_is_the_trees_own_and_never_unknown(self):
+        want = self.pyproject_version()
+        self.assertRegex(want, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(qubes_mcp.__version__, want)
+        self.assertNotEqual(qubes_mcp.__version__, "0.0.0+unknown")
+
+    def test_a_tree_without_a_pyproject_still_imports(self):
+        # The fallback reads a file, so it must answer when the file is gone
+        # rather than raising inside an import.
+        import importlib, pathlib, shutil, sys, tempfile
+        src = pathlib.Path(qubes_mcp.__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(src, pathlib.Path(tmp) / "qubes_mcp")
+            sys.path.insert(0, tmp)
+            saved = {k: v for k, v in sys.modules.items() if k.startswith("qubes_mcp")}
+            try:
+                for k in list(saved):
+                    del sys.modules[k]
+                mod = importlib.import_module("qubes_mcp")
+                self.assertEqual(mod.__version__, "0.0.0+unknown")
+            finally:
+                for k in list(sys.modules):
+                    if k.startswith("qubes_mcp"):
+                        del sys.modules[k]
+                sys.modules.update(saved)
+                sys.path.remove(tmp)
+
+
 class RegistryTests(unittest.TestCase):
-    def test_exactly_the_24_tools(self):
+    def test_exactly_the_25_tools(self):
         self.assertEqual(list(tools.TOOLS), EXPECTED_TOOLS)
         for name in REMOVED_TOOLS:
             self.assertNotIn(name, tools.TOOLS)
@@ -1319,6 +1362,10 @@ PAYLOAD_CASES = [
             "title": "No model qube", "project": "osint", "model_qube": "none"}),
         ("qubes_propose_project_delete", "project-delete",
          MINIMAL_PROPOSALS["qubes_propose_project_delete"]),
+        ("qubes_propose_open", "qube-open", MINIMAL_PROPOSALS["qubes_propose_open"]),
+        ("qubes_propose_open", "qube-open", {
+            "title": "Update the model qube", "qube": "ai-hub-model", "for": "30m",
+            "firewall": True}),
      )
 ] + [
     ("qubes_proposals", {}, [(A, STATUS, {})]),

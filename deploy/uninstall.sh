@@ -41,9 +41,11 @@ qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
 qmcp.AIManagedEvents qmcp.GetPoolStats qmcp.SubmitProposal qmcp.ProposalStatus"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
-UNITS="qmcp-gate.timer qmcp-gate.service"
+UNITS="qmcp-gate.timer qmcp-gate.service qmcp-seal.service"
 OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
 /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer
+/etc/systemd/system/qmcp-seal.service
+/etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf
 /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
 /etc/systemd/system/qmcp-consent.service /etc/systemd/system/qmcp-tombstone-reaper.service
 /etc/systemd/system/qmcp-tombstone-reaper.timer
@@ -88,6 +90,13 @@ if [ "$MODE" != check ]; then
     for path in $OTHER_PATHS; do
         if [ -e "$path" ] || [ -L "$path" ]; then rm -rf "$path"; say "removed $path"; fi
     done
+    # The drop-in directory is Qubes' unit's, not ours: take it away only if
+    # removing our file left it empty, and never recursively.
+    if [ -d /etc/systemd/system/qubes-vm@.service.d ]; then
+        rmdir /etc/systemd/system/qubes-vm@.service.d 2>/dev/null \
+            && say "removed the empty /etc/systemd/system/qubes-vm@.service.d" \
+            || say "left /etc/systemd/system/qubes-vm@.service.d: it holds another drop-in"
+    fi
     if [ -d "$LIB" ]; then rm -rf "$LIB"; say "removed $LIB"; fi
     systemctl daemon-reload
     if [ "$MODE" = purge ]; then

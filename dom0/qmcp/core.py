@@ -41,6 +41,19 @@ from qmcp import projects
 
 UMBRELLA = "ai-managed"
 GUARDED = "qmcp-guarded"
+#: The operator's open window on a guarded qube. The rulebook's A6b
+#: routes on these two badges and on nothing else, because no dom0 code sees
+#: the calls they open: the exec service runs INSIDE the target qube, the copy
+#: is Qubes' own, and the firewall methods are qubesd's. So a badge is the
+#: whole gate, dom0 takes it off when the window ends and at every boot, and
+#: nothing here can consult an expiry at call time.
+#: `OPEN` opens the hub's exec and its copy-in dialog, `OPEN_FW` the two
+#: firewall writes; each works alone, and exec is the greater authority, so
+#: `OPEN` comes off first and goes on last (`fleet._removal_order`).
+#: Deliberately outside `scope.TAG_VOCABULARY`: a principal reads neither,
+#: as it reads no other badge that carries authority.
+OPEN = "qmcp-open"
+OPEN_FW = "qmcp-open-fw"
 
 #: A value that could not be read, where one is shown: never a qube name or a
 #: state, so nothing that reads it can take it for none.

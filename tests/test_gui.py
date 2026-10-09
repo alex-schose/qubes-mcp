@@ -112,6 +112,12 @@ PROPOSALS = {
             "model_qube": MODEL},
     "qnone": {"type": "project-firewall", "title": "no model qube for other", "project": "other",
               "model_qube": "none"},
+    # A window on a guarded qube: it always needs the second tick, so the
+    # window's red text is read from one of these in the tests below.
+    "open": {"type": "qube-open", "title": "install curl in the reference template",
+             "qube": "ai-tpl-g", "for": "2h"},
+    "openfw": {"type": "qube-open", "title": "the model qube needs its rules",
+               "qube": MODEL, "for": "30m", "firewall": True},
 }
 HOSTILE = "ai-x\u202egnp.exe\nFAKE ok:true <b>bold</b> &amp; \x00\x7f\u200b\x1b[31m"
 
@@ -280,18 +286,31 @@ class GuiBase(ProjectBase):
     def show(self, pid):
         return gm.parse_proposal(self.runner.execute(gm.show_proposal(pid)), pid)
 
+    #: The fixtures `submit_every_proposal` decides as it goes: `dump` is
+    #: accepted, the rest rejected, so a decision with a report is read as well
+    #: and the pending ones stay under `proposals.MAX_PENDING`.
+    DECIDED = ("dump", "lead", "anon", "qfw", "qnone", "openfw")
+
     def submit_every_proposal(self):
         """One proposal of every shape in PROPOSALS, through the real service:
-        `dump` accepted and `lead` and `anon` rejected as soon as each is in, so
-        a decision with a report is read as well, and the pending ones stay
-        within the cap (`proposals.MAX_PENDING`)."""
+        `dump` accepted and five rejected as soon as each is in, so a decision
+        with a report is read as well and the pending ones stay within the cap
+        (`proposals.MAX_PENDING`). The cap is checked at submit, and PROPOSALS
+        is half again as long as the cap, so the rejections are what keeps room
+        for the next shape added here. `open` stays PENDING: only a pending
+        proposal shows its second-tick reasons, which is what the tests below
+        read."""
         ids = {}
         for name in PROPOSALS:
             ids[name] = self.submit_proposal(name)["id"]
             if name == "dump":
+                assert name in self.DECIDED
                 self.runner.execute(gm.accept_proposal(ids[name], self.show(ids[name])["sha256"]))
-            elif name in ("lead", "anon"):
+            elif name in self.DECIDED:
                 self.runner.execute(gm.reject_proposal(ids[name]))
+        self.assertLessEqual(
+            sum(1 for r in self.read_json("proposal", "list", "--json") if r["state"] == "pending"),
+            proposals.MAX_PENDING)
         return ids
 
     def routers(self):
@@ -465,6 +484,9 @@ SAMPLES = {
     gm.delete_project: [dict(key="osint")],
     gm.role: [dict(action="manage", qube="x1"), dict(action="guard", qube="x1"),
               dict(action="revoke", qube="x1", keep_running=True)],
+    gm.open_qube: [dict(qube="x1", duration="2h"),
+                   dict(qube="x1", duration="30m", firewall=True)],
+    gm.seal_qube: [dict(qube="x1")],
     gm.audit_rotate: [dict()],
     gm.show_proposal: [dict(pid=1)],
     gm.accept_proposal: [dict(pid=1, sha256="0" * 64), dict(pid=2, sha256="ab" * 32, tick="cd" * 32)],
@@ -597,7 +619,11 @@ class Parity(GuiBase):
             self.assertEqual(set(doc["before"]) | set(doc["after"]), {k for k, _ in table},
                              doc["type"])
         decisions = [doc["decision"] for doc in docs if doc["decision"] is not None]
-        self.assertEqual(len(decisions), 3)             # dump accepted, lead and anon rejected
+        # Whatever submit_every_proposal decides, so adding a shape there does
+        # not need a number changed here; one accept and the rest rejections.
+        self.assertEqual(len(decisions), len(self.DECIDED))
+        self.assertEqual(sorted(d["state"] for d in decisions),
+                         sorted(["accepted"] + ["rejected"] * (len(self.DECIDED) - 1)))
         fields = set().union(*(d.keys() for d in decisions))
         self.assertEqual(fields - {k for k, _ in gm.DECISION_FIELDS}, set(gm.DECISION_NOT_SHOWN))
         self.assertLessEqual({k for k, _ in gm.DECISION_FIELDS}, fields)
@@ -2029,7 +2055,7 @@ class ModelQubes(GuiBase):
         self.assertNotIn("Shared", shown)
         # Guarded: Manage opens its maintenance window; it moves into no slot.
         self.assertEqual(gm.actions(node, self.records()) - {"new_project", "add_to_ai_space"},
-                         {"manage", "revoke"})
+                         {"manage", "open", "revoke"})
         project = dict(gm.details(osint, None, self.rows()))
         self.assertEqual((project["Lead's model qube"], project["Lead's model endpoint"]),
                          (MODEL, "-"))
@@ -3230,6 +3256,8 @@ class Widgets(GuiBase):
                 "qube": "row_data", "target": "target", "confirm": "confirm"}),
             gm.role: (self.gui.RevokeForm(self.win, "ai-work2"), {
                 "action": "build", "qube": "qube_name", "keep_running": "keep"}),
+            gm.open_qube: (self.gui.OpenForm(self.win, {"name": "ai-tpl-g"}), {
+                "qube": "qube_name", "duration": "duration", "firewall": "firewall"}),
         }
         for builder, (form, fields) in forms.items():
             params = set(inspect.signature(builder).parameters)
@@ -3238,7 +3266,7 @@ class Widgets(GuiBase):
                 self.assertTrue(hasattr(form, attr), (builder.__name__, attr))
             form.destroy()
         for ident in ("remove_lead", "delete_project", "add_to_ai_space", "manage", "guard",
-                      "set_model", "set_rules", "accept_rules", "set_model_qube"):
+                      "open", "seal", "set_model", "set_rules", "accept_rules", "set_model_qube"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
         self.assertEqual(set(self.win.gateway_buttons),
                          {"enroll_gateway", "change_gateway", "remove_gateway"})
@@ -3252,7 +3280,8 @@ class Widgets(GuiBase):
             # runs before the delete form. The others are confirmations.
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
                                              "audit_rotate", "show_proposal", "remove_gateway",
-                                             "show_lead_firewall", "unblock_project"},
+                                             "show_lead_firewall", "unblock_project",
+                                             "seal_qube"},
                           "a builder without a form")
 
     def test_refresh_fills_every_page_from_the_command(self):
@@ -3617,12 +3646,23 @@ class Widgets(GuiBase):
             f.qube.set_active_id("personal")
             getattr(f, kind).set_active(True)
             forms.append(f)
+        # The window on a guarded qube: the firewall half is the one option a
+        # form has to be able to make, since the command keys its own policy
+        # lines on the second badge.
+        f = self.gui.OpenForm(self.win, self.node("qube:ai-tpl-g").data)
+        f.firewall.set_active(True)
+        forms.append(f)
         for argv in forms:
             self.one_line(argv)
             argvs.append(argv.argv())
             argv.destroy()
-        for ident in ("manage", "guard", "remove_lead", "rotate"):
+        # Seal shows only while a badge is on, so put one on and refresh: the
+        # buttons come from the badges the rulebook routes on, as the tree does.
+        self.app.domains["ai-dvm-g"].tags.add("qmcp-open")
+        self.win.refresh()
+        for ident in ("manage", "guard", "open", "seal", "remove_lead", "rotate"):
             self.select({"manage": "qube:ai-tpl-g", "guard": "qube:ai-work2",
+                         "open": "qube:ai-tpl-g", "seal": "qube:ai-dvm-g",
                          "remove_lead": "project:p01", "rotate": "project:p01"}[ident])
             form = self.win.act(ident)
             self.one_line(form)
@@ -3676,6 +3716,40 @@ class Widgets(GuiBase):
         exempt = set(gm.CLI_ONLY) | set(gm.SHOWN_BY)
         missing = {k for k in cli_keys(parser) - covered if not any(k[:len(e)] == e for e in exempt)}
         self.assertEqual(missing, set(), "a form cannot make these")
+
+    def test_the_light_says_a_window_is_open(self):
+        """Drawn on the dev box, the light read a plain GREEN while a guarded
+        qube was open, though the Open form's own text promised it would show
+        amber. A warning the operator must act on within hours is not one to
+        leave behind a tab."""
+        green = {"result": "GREEN", "findings": [
+            {"status": "pass", "check": "open windows", "detail": "no guarded qube is open"}]}
+        self.assertEqual(gm.light_text(green), "qmcp check: GREEN")
+        self.assertEqual(gm.open_window_note(green), "")
+        opened = {"result": "GREEN", "findings": [
+            {"status": "warn", "check": "open windows",
+             "detail": "open to the hub: ai-tpl-g (14 min left)"}]}
+        self.assertEqual(gm.light_text(opened), f"qmcp check: GREEN — {gm.OPEN_NOTE}")
+        self.assertTrue(gm.open_window_note(opened))
+        # A failure is still a failure, and says so first.
+        bad = {"result": "FAILED", "findings": opened["findings"]}
+        self.assertTrue(gm.light_text(bad).startswith("qmcp check: FAILED"))
+        self.assertEqual(gm.light_text(None), "qmcp check: UNKNOWN")
+
+    def test_the_details_pane_reads_a_window_as_a_person_does(self):
+        """Drawn on the dev box before this was wired, the pane showed the
+        command's own answer — "899" — where a person reads a duration, and
+        "-" for a sealed qube. A helper that formats it is no use until the
+        pane calls it."""
+        for value, want in ((899, "14 min left"), (30, "30 s left"), (None, "sealed")):
+            self.assertEqual(str(gm.field_text("open", value)), want)
+        self.assertIn("ran out", str(gm.field_text("open", -5)))
+        self.assertIn("qmcp check fails", str(gm.field_text("open", gm.UNREADABLE)))
+        # And through the pane itself, on a row as `qmcp list --json` gives it.
+        node = self.node("qube:ai-tpl-g")
+        node.data["open"] = 899
+        rows = dict(gm.details(node, {}))
+        self.assertEqual(str(rows.get("Open window")), "14 min left")
 
     def test_keeping_the_old_lead_asks_for_a_new_name_first(self):
         # Checklist step 9, 2026-10-02: the form ran, and the command refused the
@@ -5021,7 +5095,10 @@ class Widgets(GuiBase):
         details = self.grid(self.win.details)
         self.assertEqual(details["Role"], "model qube of p01")
         self.assertTrue(details["Maintenance"].startswith("guarded: the hub cannot operate it"))
-        self.assertEqual(self.sensitive() - {"new_project", "add_to_ai_space"}, {"manage", "revoke"})
+        # Open is the bounded form of this qube's maintenance window:
+        # Manage opens one that lasts until the operator remembers to Guard.
+        self.assertEqual(self.sensitive() - {"new_project", "add_to_ai_space"},
+                         {"manage", "open", "revoke"})
         form = self.win.act("manage")
         intro = form.intro.get_text()
         self.assertIn("this opens its maintenance window", intro)

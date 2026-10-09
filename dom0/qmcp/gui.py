@@ -1033,6 +1033,30 @@ class RevokeForm(Form):
         return gm.role("revoke", self.qube_name, keep_running=self.keep.get_active())
 
 
+class OpenForm(Form):
+    """Open a guarded qube to the hub for a bounded time. The duration is a
+    list, not a typed field: every value here is one the command accepts, so
+    the form cannot build a command the command then refuses, and `--for`'s
+    own parser stays the only reader of what a duration means."""
+
+    CHOICES = (("15m", "15 minutes"), ("30m", "30 minutes"), ("1h", "1 hour"),
+               ("2h", "2 hours"), ("4h", "4 hours"), ("8h", "8 hours"),
+               ("24h", "24 hours (the longest)"))
+
+    def __init__(self, parent, row):
+        super().__init__(parent, f"Open {row.get('name')}", "Open", gm.open_intro(row))
+        self.qube_name = row.get("name")
+        self.duration = self.combo("For", [(v, esc(t)) for v, t in self.CHOICES], active="1h")
+        self.firewall = _check(esc("also let the hub write this qube's firewall rules"))
+        self.firewall.connect("toggled", self.update)
+        self.row("Firewall", self.firewall)
+        self.done_building()
+
+    def build(self):
+        return gm.open_qube(self.qube_name, self.duration.get_active_id(),
+                            firewall=self.firewall.get_active())
+
+
 class AddForm(Form):
     def __init__(self, parent, fleet_rows, hub, sinks):
         super().__init__(parent, "Add a qube to AI space", "Add",
@@ -1365,7 +1389,8 @@ class Window(Gtk.Window):
         ("change_lead", "Change lead..."), ("remove_lead", "Remove lead..."),
         ("add_dump", "Dump sink..."), ("delete_project", "Delete project..."),
         ("finish_delete", "Finish delete..."), ("move", "Move..."), ("manage", "Manage..."),
-        ("guard", "Guard..."), ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
+        ("guard", "Guard..."), ("open", "Open..."), ("seal", "Seal..."),
+        ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
         ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
         ("unblock", "Unblock..."),
@@ -1805,8 +1830,11 @@ class Window(Gtk.Window):
         ctx = self.light.get_style_context()
         for name in LIGHTS:
             ctx.remove_class(f"qmcp-{name}")
-        ctx.add_class(f"qmcp-{result}")
-        _set(self.light, esc(f"qmcp check: {result}"))
+        # A GREEN check with a guarded qube open is amber, not green: the
+        # colour INCOMPLETE already uses, which is this window's amber.
+        open_now = result == "GREEN" and bool(gm.open_window_note(self.check_doc))
+        ctx.add_class("qmcp-INCOMPLETE" if open_now else f"qmcp-{result}")
+        _set(self.light, esc(gm.light_text(self.check_doc)))
         if self.check_doc is not None:
             _set(self.checked, esc("checked " + time.strftime("%H:%M:%S")))
         else:
@@ -2222,6 +2250,16 @@ class Window(Gtk.Window):
             return self._open(ConfirmForm(self, f"{ident.capitalize()} {name}", ident.capitalize(),
                                           gm.role_intro(ident, node.data),
                                           gm.role(ident, name)), ident.capitalize())
+        if ident == "open":
+            return self._open(OpenForm(self, node.data), "Open")
+        if ident == "seal":
+            # The kill is destructive and is said in red, as every other
+            # destructive action is, rather than only in the intro.
+            return self._open(ConfirmForm(self, f"Seal {name}", "Seal", gm.seal_intro(node.data),
+                                          gm.seal_qube(name),
+                                          warning="If the qube is running it is killed. Work it "
+                                                  "has part-finished, a package install above "
+                                                  "all, is interrupted."), "Seal")
         return None
 
     def delete(self, key):

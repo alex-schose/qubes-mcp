@@ -103,7 +103,7 @@ REPORT_WIDTH = 300
 NOTIFY_TIMEOUT_S = 5.0
 
 TYPES = ("project-create", "project-edit", "project-dump", "project-lead", "project-firewall",
-         "project-delete")
+         "project-delete", "qube-open")
 #: The states the hub may learn.
 STATES = ("pending", "accepted", "rejected", "expired", "failed")
 DECIDED = ("accepted", "rejected", "failed")
@@ -418,6 +418,34 @@ def _dump(req: dict, prefix) -> dict:
     return {"project": key, "name": name}
 
 
+def _open_window(req: dict, prefix) -> dict:
+    """A window on a guarded qube. The shape only: submit looks no name
+    up, so this is no oracle over a qube the hub cannot see, and it says
+    nothing about whether the qube may be opened — `qmcp open`'s own refusals
+    decide that at accept, on the fleet as it is then.
+
+    `for` is parsed here, so a duration the command would refuse is refused at
+    submit rather than at accept, and is STORED AS SENT: every field the hub
+    sends is stored verbatim, so the operator reads the hub's own words and
+    the command is built from them. The accept parses it again, with the same
+    parser.
+    """
+    from qmcp import fleet
+    _fields(req, {"qube", "for"}, {"firewall"})
+    name = _qube(req["qube"], "qube")
+    if not isinstance(req["for"], str):
+        raise Invalid("for: a duration as text, e.g. 90s, 30m, 2h")
+    try:
+        seconds = fleet.duration_seconds(req["for"])
+    except fleet.RoleError as e:
+        raise Invalid(f"for: {e}") from None
+    if seconds <= 0 or seconds > fleet.WINDOW_MAX_S:
+        raise Invalid(f"for: above zero and at most {fleet.WINDOW_MAX_S // 3600}h")
+    firewall = req.get("firewall")
+    return {"qube": name, "for": req["for"],
+            "firewall": False if firewall is None else _bool(firewall, "firewall")}
+
+
 def _lead_change(req: dict, prefix) -> dict:
     _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old", "model",
                                "add_old_network", "model_qube"})
@@ -480,7 +508,7 @@ def _delete(req: dict, prefix) -> dict:
 
 _NORMALISE = {"project-create": _create, "project-edit": _edit, "project-dump": _dump,
               "project-lead": _lead_change, "project-firewall": _lead_firewall,
-              "project-delete": _delete}
+              "project-delete": _delete, "qube-open": _open_window}
 
 
 def normalise(req, prefix: str | None = None) -> dict:
@@ -500,8 +528,9 @@ def normalise(req, prefix: str | None = None) -> dict:
 
 
 def subject(p: dict) -> str | None:
-    """What a proposal is about: the new project's label, or the project it names."""
-    return p.get("label") or p.get("project")
+    """What a proposal is about: the new project's label, the project it names,
+    or the qube a window would open."""
+    return p.get("label") or p.get("project") or p.get("qube")
 
 
 # ======================================================================= the store
@@ -880,6 +909,10 @@ def command(p: dict) -> str | None:
             argv += ["--name", p["name"]]
     elif t == "project-delete":
         argv = ["qmcp", "project", "delete", p["project"], "--yes"]
+    elif t == "qube-open":
+        argv = ["qmcp", "open", p["qube"], "--for", p["for"]]
+        if p["firewall"]:
+            argv.append("--firewall")
     return None if argv is None else shlex.join(argv)
 
 
@@ -991,6 +1024,19 @@ def second_tick(app, p: dict, records: dict) -> list:
                        "the network, not from the hub or its model provider")
         if not p.get("hub_sees"):
             reasons.append(f"WARNING: {fleet.HIDDEN_WARNING}")
+    if t == "qube-open":
+        # Always: 2.9 needs the second tick for anything touching a guarded or
+        # sealed qube, and this is the only proposal that opens one. The
+        # window shows these words in red, which is 242's disclaimer.
+        reasons.append(f"OPENS the guarded qube {p['qube']} to the hub for "
+                       f"{p['for']}: while it is open the hub may run "
+                       f"commands in it as root and copy files in, which is what guarded "
+                       f"normally refuses")
+        if p["firewall"]:
+            reasons.append(f"and lets the hub write {p['qube']}'s firewall rules, which are "
+                           f"otherwise yours alone")
+        reasons.append("the window closes by itself, at every boot, and on Seal, which kills "
+                       "the qube if it is running")
     if t == "project-delete":
         reasons.append(f"deletes the project {p['project']}: its lead and every worker are removed "
                        f"with everything in them; its dump sink is kept")
@@ -1087,6 +1133,11 @@ def _execute(app, p: dict) -> list:
                                        model_qube=p.get("model_qube"))
     if t == "project-delete":
         return fleet.delete_project(app, p["project"])
+    if t == "qube-open":
+        # Parsed again here, by the same parser that refused a bad duration at
+        # submit: the stored proposal holds the hub's own words.
+        return fleet.open_window_report(app, p["qube"], fleet.duration_seconds(p["for"]),
+                                        firewall=p["firewall"])
     raise Refused(f"unknown type {t}")
 
 

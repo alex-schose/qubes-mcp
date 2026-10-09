@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.24 — anonymous mode.** Besides the hub, up to 15
+**Status: 0.9.25 — sealed qubes.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -36,13 +36,22 @@ the hub (the default) is out of the hub's reach, its names are random, and the
 hub's services answer about them as about names that do not exist.
 An installation can be in **anonymous mode**: every project is anonymous, and
 the gate judges the hub too, with its own qubes and the templates it made.
+A **guarded** qube — a template kept as a clean root, a model qube, any
+reference — is sealed: the rulebook refuses the hub every way into it. The
+operator can open one for a bounded time with `qmcp open QUBE --for 2h`, to
+install software in it or maintain it; the hub may then run commands in it and
+copy a file in behind your dialog, and with `--firewall` write its firewall
+rules, never its network. The window ends by itself, at every boot, and on
+`qmcp seal`, which kills the qube so nothing the hub started in it runs on.
 The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
 command with forms: every change it makes is a command it shows first. The hub
-may ask for a project, a change to one, a new lead, a lead's new firewall or a
-deletion; nothing happens until the operator accepts it in dom0, in that
-window or with `qmcp proposal accept`. Next: other distributions (M4), sealed
-qubes (M5) and the complete GUI (1.0.0). 0.9.17 replaced the tier model of
-0.9.0–0.9.16; see `CHANGELOG.md`.
+may ask for a project, a change to one, a new lead, a lead's new firewall, a
+deletion or a window on a guarded qube; nothing happens until the operator
+accepts it in dom0, in that window or with `qmcp proposal accept`. The two
+in-qube services need python3 and `qvm-copy-to-vm` and nothing else; measured
+on Qubes 4.3.1, a lead and its workers run on Debian 13, Fedora 43 and Arch
+templates alike. Next: the complete GUI (1.0.0). 0.9.17 replaced the tier
+model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -180,13 +189,19 @@ git clone https://github.com/alex-schose/qubes-mcp.git ~/qubes-mcp
 Nothing to install: the server uses only the standard library and talks to dom0
 through `qrexec-client-vm`, which every qube has.
 
+`git` is not in every template, and the hub's template is whatever
+`qubes-prefs default_template` names — measured on Qubes 4.3.1: the Debian 13
+xfce template ships git, the Fedora 43 xfce and Arch templates do not. Install
+git in the hub's template, or skip the clone and copy the release in from dom0
+the way step 4 does for a lead.
+
 **2. dom0.** The installer runs as root, so fetch it somewhere AI cannot
 write: a fresh disposable, not the hub. Any disposable template with curl and
 network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.24.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.25.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -196,7 +211,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 40 checked claims. It installs the anonymity gate's timer as
+overrides its 47 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user

@@ -26,6 +26,64 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.25] — 2026-10-09
+
+**Sealed qubes (M5): the operator's open window.** A guarded qube is a
+refusal, not a state the hub can change, and until now the only way to let the
+hub into one was `qmcp manage`, which lasts until the operator remembers to
+guard it again. A window is the bounded form: one qube, one stretch of time,
+and nothing wider than the work needs.
+
+### Added
+
+- `qmcp open QUBE --for DURATION [--firewall]`. The hub may then run commands
+  in that guarded qube as root and copy a file in, which Qubes asks the
+  operator to confirm one file at a time; with `--firewall`, write that qube's
+  firewall rules as well, under a second badge. It can never change which
+  network the qube is on. `DURATION` is `90s`, `30m` or `2h`, at most 24h.
+  There is no indefinite window: that is `qmcp manage`.
+- `qmcp seal QUBE` closes a window at once and kills the qube if it runs, so
+  nothing the hub started in it runs on. A package manager stopped part-way
+  may leave the qube needing repair; its files stay.
+- `qmcp-seal.service` seals every open qube at boot, ordered after qubesd and
+  before any user session, with a drop-in on Qubes' own `qubes-vm@.service` so
+  no autostart qube starts before it. A tag survives a reboot and the window
+  records under `/run/qmcp/open/` do not, so nothing is left trusting a record
+  that is gone.
+- `qmcp seal --expired`, which the anonymity gate's timer runs every 15
+  seconds: it seals a window that has run out, one whose record does not read,
+  and one on a qube `qmcp open` refuses.
+- An "open windows" item in `qmcp check`: amber while a window is healthy, red
+  for a badge with no record, an expired one, the firewall half on its own, or
+  either badge on a qube that may not be opened.
+- The window and Seal in the operator's window, with what is left of a window
+  in the details pane, and the check light amber and saying so while any
+  guarded qube is open.
+- A `qube-open` proposal, so the hub can ask for a window. It always needs the
+  operator's second tick, and the reasons name the qube, how long, the
+  firewall half when it is asked for, and that sealing kills the qube. The hub
+  can never open a window itself: the rulebook refuses it every dom0 service
+  its own lines do not name, `admin.vm.tag.Set` included.
+- Seven more claims in the policy's precedence check (47), covering the
+  window's own lines and the firewall write into a guarded qube.
+
+### Fixed
+
+- `qmcp gateway enroll` took a hub file it could not read as "there is no hub",
+  so a hub qube that provides network could be enrolled as a gateway while
+  `/etc/qmcp/hub` was unreadable. It now refuses until that file reads, as the
+  model-qube check beside it always did.
+- The server reported its version as `0.0.0+unknown` on every documented
+  install, since none of them installs the package: it now falls back to the
+  `pyproject.toml` of the tree it was imported from.
+
+### Changed
+
+- The README's step 1 says that `git` is not in every template — measured on
+  Qubes 4.3.1, the Debian 13 xfce template ships it, the Fedora 43 xfce and
+  Arch templates do not — and what to do instead. The in-qube services were
+  measured on all three: a lead and its workers run on each.
+
 ## [0.9.24] — 2026-10-09
 
 **Networks, part four (M3d): anonymous mode.** `install.sh --anonymous` makes

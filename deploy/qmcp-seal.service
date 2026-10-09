@@ -1,0 +1,46 @@
+# /etc/systemd/system/qmcp-seal.service -- qubes-mcp
+#
+# Seal every open guarded qube at boot. `qmcp open` gives a guarded qube a
+# badge the rulebook routes on, and a record under /run that says when the
+# window ends. A tag survives a reboot and /run does not, so after a boot
+# every badge would be left with no record and nothing to close it: this unit
+# takes them off, once, before anything can use one.
+#
+# The ordering is the whole point, and it was measured on Qubes 4.3.1
+# (qubes-core-dom0 4.3.51, systemd 256):
+#   * After=qubesd.service      -- a tag comes off through the Admin API, so
+#                                  there is no earlier moment this can run.
+#   * Before=systemd-user-sessions.service
+#                               -- qubesd itself is ordered before user
+#                                  sessions, so this runs before any session
+#                                  exists and the operator cannot start the
+#                                  hub ahead of it.
+#   * qubes-vm@.service, the unit that starts an autostart qube, is
+#     After=qubesd.service and WantedBy=multi-user.target, so it could
+#     otherwise run beside this one. deploy/qubes-vm-qmcp-seal.conf is
+#     installed as a drop-in on that unit to hold the autostart qubes behind
+#     this one.
+# Ordering only, never Requires: a seal that fails must not stop the fleet
+# booting. `qmcp check` fails on a badge left on, which is the signal.
+#
+# Runs as root: it needs the Admin API and no desktop notification, unlike
+# qmcp-gate.service, which runs as the services' user so its notification can
+# reach the operator's session bus.
+
+[Unit]
+Description=qubes-mcp: seal every open guarded qube at boot
+After=qubesd.service systemd-tmpfiles-setup.service
+Wants=qubesd.service
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/qmcp seal --all
+# 3 is "something could not be judged": the run happened and `qmcp check`
+# reports what is left. 1 is never returned by --all.
+SuccessExitStatus=3
+TimeoutStartSec=120
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

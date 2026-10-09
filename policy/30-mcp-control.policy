@@ -116,6 +116,33 @@ qubes.ConnectTCP           +11434  @tag:qmcp-lead-p13  @tag:qmcp-model-p13  allo
 qubes.ConnectTCP           +11434  @tag:qmcp-lead-p14  @tag:qmcp-model-p14  allow
 qubes.ConnectTCP           +11434  @tag:qmcp-lead-p15  @tag:qmcp-model-p15  allow
 
+# A6b. The operator's open window (M5). A guarded qube is sealed, and A7 just
+# below refuses everything into it. `qmcp open QUBE --for D` adds qmcp-open,
+# and these lines ARE the window: the hub runs commands in the qube, copies a
+# file in through Qubes' own copy with the operator's dialog, and, only when
+# the operator passed --firewall, writes its firewall rules under the second
+# badge. Reading the rules is not here, because A7 never denied it.
+# Only dom0 writes either badge: section H refuses the hub every dom0 service
+# its own lines do not name, admin.vm.tag.Set included, so the hub can propose
+# a window and never open one.
+# The badge is the ONLY gate the exec line has: that service runs inside the
+# target qube, and the firewall methods are qubesd's own, so no dom0 code sees
+# these calls and none can read an expiry. dom0 strips the badges when the
+# window ends and at every boot, before any user session exists. The copy is
+# the one surface with a second gate, the dialog, which names the file and the
+# destination.
+# qmcp.CopyToAIManaged is deliberately absent: it runs INSIDE the qube it names
+# and copies OUT of it, which exec already allows, so it would add a path and
+# no capability.
+# The source is the hub alone, so nothing here widens what a LEAD reaches; A7's
+# last line still refuses every AI-space source into a guarded qube. They sit
+# below A0, so a stopped qube and a hub-blind one still outrank an open window,
+# and above A7, which they exist to except.
+qmcp.RunInAIManaged        *  mcp-control      @tag:qmcp-open           allow  user=root
+qubes.Filecopy             *  mcp-control      @tag:qmcp-open           ask
+admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-open-fw        allow  target=@adminvm
+admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-open-fw        allow  target=@adminvm
+
 # A7. Guarded qubes are read and spawned from, never written. The hub cannot
 # run, copy or change firewall rules in one (it may still read its firewall),
 # and nothing from AI space reaches one at all, but a lead its model qube (A6).
