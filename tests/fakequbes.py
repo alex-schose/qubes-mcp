@@ -15,6 +15,12 @@ self-escalation bug green through a whole stage. So:
 - removing a running qube fails, as qubesd refuses it;
 - features answer `check_with_template` through the template chain, as
   qubesadmin does (a template's `qubes-firewall` reaches the qubes built on it);
+  a feature read (`features[key]`, `.get`, `in`) is `admin.vm.feature.Get` and
+  can fail (`feature.get`, or `feature.get:<qube>`), as in qubesadmin, where only
+  a missing feature is a KeyError;
+- every qube has a `uuid`, read like any property, which qubesd never lets a
+  client set; a clone gets a NEW one and keeps the source's features, as a
+  `qvm-clone` and a backup restore do (measured 2026-10-10 on Qubes 4.3.1);
 - a qube's firewall is a list of rule lines behind `admin.vm.firewall.Get` and
   `Set`; a new qube's is `action=accept`, and qubesd's own spelling is modelled
   where qmcp reads it back (`dstports=443` reads back as `dstports=443-443`);
@@ -43,6 +49,7 @@ from __future__ import annotations
 
 import collections
 import re
+import uuid as _uuid
 
 GiB = 1024 ** 3
 SECRET = "SECRET-qubes_dom0/vm-pool-private-lvm"
@@ -152,9 +159,32 @@ class FakeFeatures(dict):
         super().__init__(items or {})
         self._vm = vm
 
+    def _read(self):
+        app = self._vm.app
+        app._maybe_fail("feature.get")
+        app._maybe_fail(f"feature.get:{self._vm.__dict__['name']}")
+
+    def __getitem__(self, key):
+        self._read()
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        self._read()
+        return dict.__contains__(self, key)
+
     def __setitem__(self, key, value):
         self._vm.app._maybe_fail("feature.set")
         super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._vm.app._maybe_fail("feature.remove")
+        super().__delitem__(key)
 
     def check_with_template(self, key, default=None):
         self._vm.app._maybe_fail("feature.check")
@@ -217,7 +247,8 @@ class FakeVM:
                  "autostart": False, "template_for_dispvms": template_for_dispvms,
                  "virt_mode": "pvh", "management_dispvm": None,
                  "guivm": None, "audiovm": None,
-                 "visible_gateway": "10.137.0.5", "dns": "10.139.1.1"}
+                 "visible_gateway": "10.137.0.5", "dns": "10.139.1.1",
+                 "uuid": str(_uuid.uuid4())}
         if klass in ("AppVM", "DispVM"):
             props["template"] = template
         for p in _CLASS_LACKS.get(klass, ()):
@@ -249,7 +280,7 @@ class FakeVM:
         raise AttributeError(item)
 
     def __setattr__(self, key, value):
-        if key not in self._props:
+        if key not in self._props or key == "uuid":
             raise AttributeError(f"no such property {key}")
         self.app._maybe_fail(f"set.{key}")
         if key == "label":
@@ -273,9 +304,28 @@ class FakeVM:
         self.app._maybe_fail("start")
         self.__dict__["_power"] = "Running"
 
-    def shutdown(self):
+    def shutdown(self, force=False, wait=False):
         self.app._maybe_fail("shutdown")
         self.__dict__["_power"] = "Halted"
+
+    def run_service(self, service, user=None, autostart=True, **kw):
+        """qubesadmin's run_service, for `qubes.VMShell` as root: the process it
+        returns runs the script it is given, which may write files under
+        /etc/qubes-rpc (read back with `rpc_files`). `app.vmshell[name]` makes
+        one hang ("timeout") or fail ("exit1"). Without autostart a halted qube
+        refuses, as qubesadmin's QubesVMNotRunningError does."""
+        name = self.__dict__["name"]
+        self.app._maybe_fail("run_service")
+        self.app._maybe_fail(f"run_service:{name}")
+        if not self.is_running():
+            if not autostart:
+                raise Injected("QubesVMNotRunningError")
+            self.__dict__["_power"] = "Running"
+        self.app.calls.append((name, "run_service", service, user))
+        return FakeProc(self, self.app.vmshell.get(name, "ok"))
+
+    def rpc_files(self) -> dict:
+        return dict(self.__dict__.setdefault("_rpc", {}))
 
     def kill(self):
         self.app._maybe_fail("kill")
@@ -290,6 +340,40 @@ class FakeVM:
 
     def unpause(self):
         self.__dict__["_power"] = "Running"
+
+
+class FakeProc:
+    """The process `run_service` returns. It reads the qmcp prepare script's
+    `# qmcp file NAME` blocks and writes each file into the qube."""
+
+    def __init__(self, vm, mode):
+        self.vm, self.mode, self.returncode, self.killed = vm, mode, None, False
+
+    def communicate(self, input=None, timeout=None):
+        import base64
+        import subprocess
+        if self.mode == "timeout" and not self.killed:
+            raise subprocess.TimeoutExpired("qrexec-client", timeout)
+        if self.mode == "timeout":
+            self.returncode = -9
+            return None, None
+        if input and self.mode == "ok":
+            lines = input.decode("ascii").split("\n")
+            files = self.vm.__dict__.setdefault("_rpc", {})
+            i = 0
+            while i < len(lines):
+                if lines[i].startswith("# qmcp file "):
+                    name = lines[i][len("# qmcp file "):]
+                    start = next(j for j in range(i, len(lines)) if lines[j].endswith("<<'QMCP_B64_END'"))
+                    end = lines.index("QMCP_B64_END", start + 1)
+                    files[name] = base64.b64decode("".join(lines[start + 1:end]))
+                    i = end
+                i += 1
+        self.returncode = 0 if self.mode == "ok" else 1
+        return None, None
+
+    def kill(self):
+        self.killed = True
 
 
 class FakeDomains:
@@ -354,6 +438,8 @@ class FakeApp:
         self.default_template = None
         self._disp_counter = 1000
         self.calls: list = []
+        #: `run_service` per qube: "ok" (the default), "timeout" or "exit1".
+        self.vmshell: dict = {}
 
     def fail_reads(self, key, pattern: str):
         """Fail some of the reads under `key`, in order: "ok fail" lets the
@@ -370,8 +456,16 @@ class FakeApp:
                 raise InjectedPropertyAccess(f"{key} failed: {SECRET}")
             raise Injected(f"{key} failed: {SECRET}")
 
-    def vm(self, name, **kw):
-        return self.domains._add(FakeVM(self, name, **kw))
+    def vm(self, name, labelled=True, **kw):
+        """A qube as a test fleet has it. `labelled` (the default) gives it the
+        `qmcp-id` label dom0 writes on every qube it brings into AI space or
+        badges, set to its own UUID, unless `features` already names one: a
+        fixture stands for a fleet qmcp built. A test of the restore check
+        passes `labelled=False`, or a label naming another UUID."""
+        vm = self.domains._add(FakeVM(self, name, **kw))
+        if labelled and "qmcp-id" not in dict.keys(vm.features):
+            dict.__setitem__(vm.features, "qmcp-id", vm._props["uuid"])
+        return vm
 
     # -- creates
     def add_new_vm(self, klass, name, label, template=None):
@@ -451,6 +545,14 @@ class FakeApp:
             text = (payload or b"").decode()
             vm._props[arg] = None if text == "" else self.domains._any(text)
             vm.__dict__["_defaults"].discard(arg)
+            return b""
+        if method == "admin.vm.feature.Get":
+            vm.features._read()
+            if not dict.__contains__(vm.features, arg):
+                raise Injected("QubesFeatureNotFoundError")
+            return str(dict.__getitem__(vm.features, arg)).encode()
+        if method == "admin.vm.feature.Set":
+            vm.features[arg] = (payload or b"").decode()
             return b""
         if method == "admin.vm.firewall.Get":
             return "".join(f"{r}\n" for r in vm.__dict__["_firewall"]).encode()

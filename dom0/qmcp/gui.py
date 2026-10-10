@@ -13,7 +13,11 @@ before OK, and so does one that shares a model qube between projects. An
 anonymous project is judged by the anonymity gate on every refresh (`qmcp
 gate --json`); the Anonymity tab lists its verdicts, the tree marks every
 qube by its anonymity badges, and the forms that make or change a hidden
-project say in red what its safety rests on.
+project say in red what its safety rests on. A qube back from a backup or a
+copy is under Needs attention, held, with its row of `qmcp restored list`,
+until it is accepted or rejected (one at a time from its row, or all of them
+from the Check tab, which also prepares any template); the Settings tab
+changes the caps and birth egress, and exports and imports the operator files.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()`,
@@ -411,14 +415,16 @@ class Form(Gtk.Dialog):
 
 class ConfirmForm(Form):
     """No fields: the command and what it does, to read before OK. `refusal`:
-    why the command would refuse it, as the window can see, so OK stays off."""
+    why the command would refuse it, as the window can see, so OK stays off.
+    The intro and the red `warning` are plain text, or text of several lines
+    escaped already (`esc_lines`)."""
 
     def __init__(self, parent, title, ok_label, intro, argv, warning=None, refusal=None):
         super().__init__(parent, title, ok_label, intro)
         self._argv = argv
         self._refusal = refusal
         if warning:
-            _set(self.warning, esc(warning))
+            _set(self.warning, warning if isinstance(warning, gm.Shown) else esc(warning))
         self.done_building()
 
     def build(self):
@@ -1079,6 +1085,96 @@ class AddForm(Form):
         return gm.role("manage" if self.managed.get_active() else "guard", name)
 
 
+class PrepareForm(Form):
+    """Write the in-qube services into any TemplateVM or StandaloneVM, in AI
+    space or not, chosen from a list: the templates a lead is best made from
+    are outside AI space, where the tree has no row to start from. Each is
+    marked with why the command refuses it, where its row shows why."""
+
+    def __init__(self, parent, fleet_rows, chosen=None):
+        super().__init__(parent, "Prepare a template", "Prepare", gm.PREPARE_INTRO)
+        self._rows = {r["name"]: r for r in fleet_rows or ()
+                      if isinstance(r, dict) and isinstance(r.get("name"), str)}
+        names = gm.prepare_choices(fleet_rows)
+        self.qube = self.combo("Qube", [(n, esc(gm.prepare_text(self._rows[n]))) for n in names],
+                               active=chosen if chosen in names else None, preselect=False)
+        self.power = _label(esc(""), wrap=True)
+        self.row("Power", self.power)
+        self.done_building()
+
+    def build(self):
+        name = self.qube.get_active_id()
+        row = self._rows.get(name) if name else None
+        _set(self.power, esc(gm.prepare_power(row)))
+        why = gm.prepare_refusal(row)
+        if why:
+            raise gm.FormError(why)
+        return gm.prepare_template(name)
+
+
+class SettingsForm(Form):
+    """The pool cap, the private-volume cap and birth egress: only what
+    changed is sent. A field left as it was read is unchanged, and birth
+    egress starts on `unchanged`."""
+
+    def __init__(self, parent, settings, gw_rows):
+        super().__init__(parent, "Edit settings", "Apply", gm.SETTINGS_INTRO)
+        self.values = dict(settings or {})
+        v = self.values
+        self.pool_cap = self.entry("Pool cap (all of AI space)", "e.g. 200G",
+                                   gm.quota_text(v.get("pool_cap")))
+        self.used = _label(esc(gm.in_use_text(v.get("ai_space_bytes"))), wrap=True)
+        self.row("In use", self.used)
+        self.private_cap = self.entry("Private-volume cap (one qube)", "e.g. 20G",
+                                      gm.quota_text(v.get("private_cap")))
+        self.birth_egress = self.combo(
+            "Birth egress", [(i, esc(t)) for i, t in gm.egress_choices(v.get("birth_egress"),
+                                                                       gw_rows)],
+            active="unchanged")
+        self.done_building()
+
+    def build(self):
+        v = self.values
+        pool = self.pool_cap.get_text().strip()
+        private = self.private_cap.get_text().strip()
+        pool = None if pool == gm.quota_text(v.get("pool_cap")) else pool
+        private = None if private == gm.quota_text(v.get("private_cap")) else private
+        egress = self.birth_egress.get_active_id()
+        if pool is not None:
+            why = gm.pool_cap_refusal(pool, v.get("ai_space_bytes"))
+            if why:
+                raise gm.FormError(why)
+        return gm.settings_set(pool, private, None if egress in (None, "unchanged") else egress)
+
+
+class ExportForm(Form):
+    def __init__(self, parent):
+        super().__init__(parent, "Export the operator files", "Export", gm.EXPORT_INTRO)
+        self.file = self.entry("File", "empty: qmcp-export-<UTC time>.json in your dom0 home")
+        self.done_building()
+
+    def build(self):
+        return gm.export_config(self.file.get_text().strip() or None)
+
+
+class ImportForm(Form):
+    """An export's operator files, onto a fresh install. What it is for and
+    what comes after it are in red before OK; a project or a gateway on show
+    turns OK off, as the command refuses then."""
+
+    def __init__(self, parent, records, gw_rows):
+        super().__init__(parent, "Import the operator files", "Import", gm.IMPORT_INTRO)
+        _set(self.warning, esc(gm.IMPORT_RED))
+        self._refusal = gm.import_refusal(records, gw_rows)
+        self.file = self.entry("Export file", "the full path of the file Export wrote")
+        self.done_building()
+
+    def build(self):
+        if self._refusal:
+            raise gm.FormError(self._refusal)
+        return gm.import_config(self.file.get_text())
+
+
 class ProposalForm(Form):
     """Accept, reject or close one proposal. Accept's command carries the
     fingerprint of the `show` on display, and, when the second tick was given
@@ -1382,7 +1478,9 @@ class Window(Gtk.Window):
     """The tree of AI space and projects with each lead's firewall, the hub's
     proposals, the gateway registry, the anonymity gate's verdicts, the check
     light, the audit log and the settings; every command that changes
-    something, but `migrate`, is a button and a form."""
+    something, but `migrate`, `restored accept --all` (Accept all names the
+    qubes it shows) and what the timers and the boot unit run, is a button and
+    a form."""
 
     ACTIONS = (
         ("new_project", "New project..."), ("edit_project", "Edit project..."),
@@ -1393,8 +1491,16 @@ class Window(Gtk.Window):
         ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
         ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
-        ("unblock", "Unblock..."),
+        ("unblock", "Unblock..."), ("prepare", "Prepare..."),
+        ("accept_restored", "Accept restored..."), ("reject_restored", "Reject restored..."),
     )
+    #: The Check tab's: write the in-qube services into any template, and
+    #: accept every qube held for review (the step after an import).
+    CHECK_ACTIONS = (("prepare_template", "Prepare a template..."),
+                     ("accept_all_restored", "Accept all held..."))
+    #: The Settings tab's.
+    SETTINGS_ACTIONS = (("edit_settings", "Edit settings..."), ("export", "Export..."),
+                        ("import", "Import..."))
     #: The forms that change a lead's firewall or model: action -> (form, title).
     FIREWALL_FORMS = {"set_model": (ModelForm, "Set lead model"),
                       "set_rules": (RulesForm, "Set lead rules"),
@@ -1438,6 +1544,10 @@ class Window(Gtk.Window):
         self.gate_read = False
         self.gate_selected = None
         self._gate_filling = False
+        #: The rows of `restored list --json`, as the last complete refresh
+        #: read them: what came back from a backup or a copy, held or not yet.
+        self.restored_rows: list = []
+        self.restored_read = False
         #: The selected proposal, as its last `show` read it.
         self.pane = gm.ProposalPane()
         #: The selected project's lead firewall, as its last read gave it.
@@ -1646,13 +1756,28 @@ class Window(Gtk.Window):
         return paned
 
     def _check_page(self):
+        """The check's findings, failures first, and two changes they ask for:
+        writing the in-qube services into a template (the "in-qube services"
+        item names them, and those outside AI space have no row in the tree),
+        and accepting every qube held for review ("restored qubes")."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{side}")(6)
+        bar = Gtk.Box(spacing=8)
+        self.check_buttons = {}
+        for ident, text in self.CHECK_ACTIONS:
+            button = _button(esc(text), lambda _b, ident=ident: self.act(ident))
+            self.check_buttons[ident] = button
+            bar.pack_start(button, False, False, 0)
+        box.pack_start(bar, False, False, 0)
         self.check_store = Gtk.ListStore(*([str] * 4))
         view = Gtk.TreeView(model=self.check_store)
         for i, (_, heading) in enumerate(gm.CHECK_FIELDS):
             _column(view, esc(heading), i + 1, expand=(i == 2), wrap=(700 if i == 2 else 0))
         _named(view, esc("check findings"))
         self.check_view = view
-        return _scrolled(view)
+        box.pack_start(_scrolled(view), True, True, 0)
+        return box
 
     def _audit_page(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1686,6 +1811,16 @@ class Window(Gtk.Window):
         return box
 
     def _settings_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        bar = Gtk.Box(spacing=8)
+        for side in ("start", "end", "top"):
+            getattr(bar, f"set_margin_{side}")(12)
+        self.settings_buttons = {}
+        for ident, text in self.SETTINGS_ACTIONS:
+            button = _button(esc(text), lambda _b, ident=ident: self.act(ident))
+            self.settings_buttons[ident] = button
+            bar.pack_start(button, False, False, 0)
+        box.pack_start(bar, False, False, 0)
         self.settings_grid = Gtk.Grid(column_spacing=16, row_spacing=6)
         for side in ("start", "end", "top", "bottom"):
             getattr(self.settings_grid, f"set_margin_{side}")(12)
@@ -1694,7 +1829,8 @@ class Window(Gtk.Window):
         sw = _scrolled(self.settings_grid)
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.settings_scroll = sw
-        return sw
+        box.pack_start(sw, True, True, 0)
+        return box
 
     # ------------------------------------------------------------------ reads
     def refresh(self):
@@ -1772,6 +1908,7 @@ class Window(Gtk.Window):
         proposal_rows = parsed("proposals", gm.parse_json, list)
         gateways = parsed("gateways", gm.parse_json, list)
         gate = parsed("gate", gm.parse_gate, list)
+        restored = parsed("restored", gm.parse_restored, list)
         self.check_doc = check            # a light from a failed read would be a guess
         self.complete = not self.errors
         if self.view_time is not None and not self.complete:
@@ -1796,6 +1933,9 @@ class Window(Gtk.Window):
         if gate is not None:
             self.gate_verdicts = gate
             self.gate_read = True
+        if restored is not None:
+            self.restored_rows = restored
+            self.restored_read = True
         if self.complete:
             self.view_time = time.strftime("%H:%M:%S")
 
@@ -1808,7 +1948,7 @@ class Window(Gtk.Window):
             self.store.clear()
             self.nodes = {}
             tree = gm.build_tree(self.fleet, self.project_rows if self.records_read else None,
-                                 self.settings, self.gate_view())
+                                 self.settings, self.gate_view(), self.restored_view())
 
             def add(parent, nodes):
                 for node in nodes:
@@ -1852,12 +1992,7 @@ class Window(Gtk.Window):
             value.set_hexpand(True)
             self.settings_grid.attach(value, 1, i, 1, 1)
         n = len(gm.SETTINGS_FIELDS)
-        self.settings_grid.attach(_label(esc(
-            "Read-only here. The installer writes each file in /etc/qmcp only if it is absent "
-            "(deploy/install.sh --pool-cap, --private-cap, --birth-egress); to change one, edit "
-            "it as root. The name prefix is /etc/qmcp/name-prefix. The hub is fixed at install. "
-            "The gateway registry, /etc/qmcp/gateways.json, changes on the Gateways tab."),
-            wrap=True), 0, n, 2, 1)
+        self.settings_grid.attach(_label(esc(gm.SETTINGS_NOTE), wrap=True), 0, n, 2, 1)
         self.settings_grid.show_all()
         self._render_proposals()
         self._render_gateways()
@@ -1902,7 +2037,7 @@ class Window(Gtk.Window):
         if node is None:
             return
         rows = gm.details(node, self.project_rows, self.fleet, self.gate_view(),
-                          self.settings.get("hub"))
+                          self.settings.get("hub"), self.restored_view())
         rows += gm.firewall_section(self.fw_pane, gm.firewall_key(node, self.records), self.fleet)
         for i, (heading, text) in enumerate(rows):
             self.details.attach(_label(esc(heading)), 0, i, 1, 1)
@@ -1971,6 +2106,15 @@ class Window(Gtk.Window):
     def gate_view(self):
         """The anonymity gate's verdicts on show; None when it was never read."""
         return self.gate_verdicts if self.gate_read else None
+
+    def restored_view(self):
+        """The rows of `restored list` on show; None when it was never read."""
+        return self.restored_rows if self.restored_read else None
+
+    def fleet_row(self, name):
+        """The `list` row of `name` on show, or None."""
+        return next((r for r in self.fleet if isinstance(r, dict) and r.get("name") == name),
+                    None) if name else None
 
     def gate_rows(self) -> list:
         return gm.gate_rows(self.gate_view(), self.project_rows if self.records_read else None)
@@ -2118,6 +2262,19 @@ class Window(Gtk.Window):
         gate = self._gate_actions()
         for ident, button in self.gate_buttons.items():
             button.set_sensitive(ident in gate)
+        check = self._check_actions()
+        for ident, button in self.check_buttons.items():
+            button.set_sensitive(ident in check)
+        for button in self.settings_buttons.values():
+            button.set_sensitive(writable)
+
+    def _check_actions(self) -> set:
+        """What the Check tab allows now, while changes are on: Prepare a
+        template, and Accept all held while any qube is held, as last read."""
+        if not self.complete or self.busy:
+            return set()
+        return {"prepare_template"} | (
+            {"accept_all_restored"} if gm.held_rows(self.restored_view()) else set())
 
     def _registry_actions(self) -> set:
         """What the Gateways tab allows now: Enroll, and Change and Remove for
@@ -2215,6 +2372,17 @@ class Window(Gtk.Window):
             return self.lead_firewall(ident)
         if ident in ("unblock", "gate_unblock"):
             return self.unblock(ident)
+        if ident in dict(self.CHECK_ACTIONS):
+            return self.check_action(ident)
+        if ident == "edit_settings":
+            return self._open(SettingsForm(self, self.settings, self.gateways), "Edit settings")
+        if ident == "export":
+            return self._open(ExportForm(self), "Export")
+        if ident == "import":
+            # Asked again at OK, against the records and the registry as the
+            # latest refresh read them.
+            return self._open(ImportForm(self, self.records, self.gateways), "Import",
+                              check=lambda: gm.import_refusal(self.records, self.gateways))
         if node is None:
             return None
         if ident == "edit_project":
@@ -2252,6 +2420,16 @@ class Window(Gtk.Window):
                                           gm.role(ident, name)), ident.capitalize())
         if ident == "open":
             return self._open(OpenForm(self, node.data), "Open")
+        if ident == "prepare":
+            # Asked again at OK, against the qube's row as the latest refresh read it.
+            return self._open(ConfirmForm(
+                self, f"Prepare {name}", "Prepare",
+                " ".join(filter(None, (gm.PREPARE_INTRO, gm.prepare_power(node.data)))),
+                gm.prepare_template(name),
+                refusal=gm.prepare_refusal(node.data)), "Prepare",
+                check=lambda: self._prepare_now(name))
+        if ident in ("accept_restored", "reject_restored"):
+            return self.review(ident, name)
         if ident == "seal":
             # The kill is destructive and is said in red, as every other
             # destructive action is, rather than only in the intro.
@@ -2261,6 +2439,55 @@ class Window(Gtk.Window):
                                                   "has part-finished, a package install above "
                                                   "all, is interrupted."), "Seal")
         return None
+
+    def review(self, ident, name):
+        """Accept or reject a qube that came back from a backup or a copy,
+        through a form that shows the command, its row of `restored list`, and
+        in red what accepting keeps or rejecting takes. At OK it runs only if
+        the qube's hold and row read as when the form opened."""
+        rows = self.restored_view()
+        rec = gm.restored_row(rows, name)
+        opened = gm.review_state(name, self.fleet, rows)
+        if ident == "accept_restored":
+            title = f"Accept {name}"
+            form = ConfirmForm(self, title, "Accept", gm.accept_restored_intro(name, rec),
+                               gm.restored_accept(name), warning=gm.accept_restored_red(rec))
+        else:
+            title = f"Reject {name}"
+            form = ConfirmForm(self, title, "Reject", gm.reject_restored_intro(name),
+                               gm.restored_reject(name), warning=gm.reject_restored_red(name, rec))
+        return self._open(form, title, check=lambda: gm.review_changed(
+            opened, gm.review_state(name, self.fleet, self.restored_view())))
+
+    def _prepare_now(self, name):
+        """Why the command refuses to prepare `name`, as the latest refresh
+        read its row, or None: asked at OK."""
+        if name is not None and self.fleet_row(name) is None:
+            return f"'{name}' is not in the fleet as last read: refresh"
+        return gm.prepare_refusal(self.fleet_row(name))
+
+    def check_action(self, ident):
+        """The Check tab's: prepare any template, from a list preselected with
+        the qube selected in the tree when it is one; or accept every held
+        qube, through a form that lists them as last read and runs only while
+        the same ones are held."""
+        if ident not in self._check_actions():
+            return None
+        if ident == "prepare_template":
+            node = self.node()
+            chosen = node.data.get("name") if node is not None and node.kind == "qube" else None
+            form = PrepareForm(self, self.fleet, chosen)
+            return self._open(form, "Prepare a template",
+                              check=lambda: self._prepare_now(form.qube.get_active_id()))
+        rows = self.restored_view()
+        opened = gm.held_names(rows)
+        red = gm.accept_all_red(rows)
+        form = ConfirmForm(self, "Accept every held qube", "Accept all",
+                           esc_lines(gm.accept_all_intro(rows)), gm.restored_accept(opened),
+                           warning=esc_lines(red) if red else None,
+                           refusal=gm.accept_all_refusal(rows))
+        return self._open(form, "Accept every held qube",
+                          check=lambda: gm.held_changed(opened, self.restored_view()))
 
     def delete(self, key):
         """Ask the command for its plan first (no --yes changes nothing), then

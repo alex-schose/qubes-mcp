@@ -158,6 +158,11 @@ FLEET["w-p01-blocked-open"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-anon", "qmcp
                                          "qmcp-open", "qmcp-open-fw"])
 FLEET["w-p05-hidden-open"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubblind",
                                         "qmcp-open", "qmcp-open-fw"])
+# 0.9.26's restore check: a member and a lead that came back from a backup with
+# their badges, held for the operator's review. Nothing reaches them and they
+# reach nothing, whatever their badges route.
+FLEET["w-p01-held"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-quarantine"])
+FLEET["lead-p08-held"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p08", "qmcp-quarantine"])
 
 SYSINFO = {"domains": FLEET}
 
@@ -367,6 +372,26 @@ def _cases() -> list[Case]:
     add("a stopped member copies nothing into its slot", "qubes.Filecopy", "w-p06-blocked",
         "w-p06-a", "deny", "deny")
     add("a stopped member gets no clock through @default", "qubes.GetDate", "w-p06-blocked",
+        "@default", "deny", "deny")
+    # --- the restore check: a held qube is refused both ways, by any service
+    for svc, lead_out in (("qmcp.RunInAIManaged", "allow user=root"),
+                          ("qmcp.CopyToAIManaged", "allow user=root"),
+                          ("admin.vm.firewall.Set", "allow target=@adminvm"),
+                          ("qubes.Filecopy", "allow")):
+        add("lead into its held member", svc, "lead-p01", "w-p01-held", "deny", "deny")
+        add("hub into a held member", svc, HUB, "w-p01-held", "deny", "deny")
+        add("a held lead into its member", svc, "lead-p08-held", "w-p08-a", "deny", "deny")
+    add("member copy into a held member", "qubes.Filecopy", "w-p01-a", "w-p01-held",
+        "deny", "deny")
+    add("a held lead reaches no dom0 service", "qmcp.ListAIManagedQubes", "lead-p08-held",
+        "dom0", "deny", "deny")
+    add("a held lead submits nothing", "qmcp.SpawnAIManagedQube", "lead-p08-held", "dom0",
+        "deny", "deny")
+    add("a held member copies nothing into its slot", "qubes.Filecopy", "w-p01-held",
+        "w-p01-a", "deny", "deny")
+    add("a held member copies nothing into its sink", "qubes.Filecopy", "w-p01-held",
+        "sink-p01", "deny", "deny")
+    add("a held member gets no clock through @default", "qubes.GetDate", "w-p01-held",
         "@default", "deny", "deny")
     for svc in ("qubes.Filecopy", "qubes.OpenInVM", "qubes.OpenURL", "qubes.ClipboardPaste"):
         add("hub dialog into a hidden qube", svc, HUB, "w-p05-hidden", "deny", "deny")
@@ -616,10 +641,10 @@ class PolicyShape(unittest.TestCase):
                     | {f"@tag:qmcp-proj-{s}" for s in SLOTS})
 
     def test_sources_are_ours(self):
-        # `@tag:qmcp-anon` and `@tag:qmcp-blocked` only deny (A0): the next test
-        # holds every allow to a principal.
+        # `@tag:qmcp-anon`, `@tag:qmcp-blocked` and `@tag:qmcp-quarantine` only
+        # deny (A0): the next test holds every allow to a principal.
         allowed = {HUB, "@tag:ai-managed", "@anyvm", "@tag:ai-dump", "@tag:qmcp-anon",
-                   "@tag:qmcp-blocked"} \
+                   "@tag:qmcp-blocked", "@tag:qmcp-quarantine"} \
             | self.SLOT_SOURCES
         bad = [(n, l) for n, l in self.lines if l.split()[2] not in allowed]
         self.assertEqual(bad, [])

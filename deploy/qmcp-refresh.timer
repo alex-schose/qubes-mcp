@@ -1,0 +1,15 @@
+# /etc/systemd/system/qmcp-refresh.timer -- qubes-mcp
+#
+# Runs qmcp-refresh.service every minute, and a minute after boot.
+
+[Unit]
+Description=qubes-mcp: in-qube services up to date, every minute
+
+[Timer]
+OnBootSec=60s
+OnActiveSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

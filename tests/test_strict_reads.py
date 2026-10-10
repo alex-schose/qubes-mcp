@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import shutil
 import sys
 import time
 import unittest
@@ -610,6 +611,8 @@ class Check(StrictBase):
         from qmcp.services import SERVICES
         for s in SERVICES:
             (rpc / s).write_text("")
+        # dom0's copy of the in-qube services, as install.sh keeps it.
+        shutil.copytree(HERE.parent / "template-rpc", self.tmp / "lib" / "template-rpc")
         self.env = dict(policy_dir=str(pol), lib_dir=str(self.tmp / "lib"), rpc_dir=str(rpc),
                         legacy_paths=(), system_info={"domains": {}})
         self.app.domains["ai-gw-unbadged"].tags.add("qmcp-guarded")
@@ -770,6 +773,12 @@ QUBE_PROPERTIES = frozenset({
 #: (module, function) whose `try` reads a qube property and does not re-raise,
 #: with the reason its answer on failure is the restrictive one, or is reported.
 ALLOWED_TRY = {
+    ("restored.py", "reject"): "only a label already absent (KeyError) is passed over; any other "
+                               "failure raises and the reject reports it, with the badges off",
+    ("restored.py", "hold"): "a hold that fails is reported in the pass's result and on the audit "
+                             "chain, and tried again next run; the qube is never taken as reviewed",
+    ("inqube.py", "refresh"): "a qube whose label cannot be read is reported as not judged and "
+                              "not written into; a failed write leaves its label as it was",
     ("anon.py", "_tag"): "a badge write; its failure is returned and goes in the gate's report",
     ("anon.py", "block"): "autostart off is a write; its failure goes in the gate's report",
     ("birth.py", "resolve_egress"): "a failed read answers 'unresolved', which refuses the create",

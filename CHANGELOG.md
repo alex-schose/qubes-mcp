@@ -26,6 +26,128 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.26] — 2026-10-10
+
+**The operator's tools, first of 1.0's releases.** qmcp's in-qube services are
+kept in dom0 so a template can be prepared at any time; a qube that comes back
+from a backup, or is copied by hand, waits for the operator's review instead of
+rejoining whatever project holds its slot now; the operator files can be
+exported into a file a Qubes backup carries, and imported onto a fresh install;
+and the caps and birth egress can be changed with a command.
+
+### Added
+
+- `qmcp template prepare QUBE` writes the two in-qube services into a
+  TemplateVM or a StandaloneVM as root, starting it if it is halted and shutting
+  it down again afterwards, and labels it with their version (the feature
+  `qmcp-services`). The installer keeps the services in
+  `/usr/local/lib/qmcp/template-rpc/`, so this works after a dom0 reboot, when
+  the release unpacked under `/tmp` is gone.
+- `qmcp-refresh.timer`: every minute, as the gate's dom0 user, `qmcp template
+  refresh` writes the installed services into every RUNNING prepared template
+  or standalone that carries an older version, with one audit line (caller
+  `refresh`) per qube it wrote into. It never starts a qube: a halted one is
+  brought up to date the next time it runs, and the qubes built on a template
+  get the new services once it has shut down and they restart. It skips a qube
+  the anonymity gate stopped or the restore check holds. A unit of its own, so
+  a qube that stalls the write cannot delay the gate.
+- An "in-qube services" item in `qmcp check`: amber for a template a project
+  approves, a managed qube's template or a managed standalone whose label is
+  missing or not the installed version. It reads dom0's record, not the qube's
+  disk.
+- **The restore check.** dom0 labels every qube it brings into AI space, and
+  every qube before a project command badges it, with the feature `qmcp-id`, set
+  to the qube's own UUID. A Qubes restore and `qvm-clone` give a qube a new UUID
+  and keep its tags and its features (measured on Qubes 4.3.1, for `qvm-clone`,
+  a restore beside the original and a restore with the original gone), so a
+  restored or
+  hand-copied qube's label no longer matches; one with no label at all counts
+  the same. The gate's next pass, normally within about 15 seconds, puts
+  `qmcp-quarantine` on it: three lines in the rulebook's first section refuse
+  every qrexec call into it and out of it; the services refuse to operate it,
+  create from it or take it as a principal. Until it is reviewed the
+  operator's commands refuse to manage, guard, revoke, open, move or prepare
+  it, to take it as a template (a cloned or promoted lead's included), a
+  lead's source, a model qube, a project's or lead's network or birth egress,
+  to change, remove or set the firewall or model of a held lead, and to
+  migrate it. Every operator command that gives a badge refuses a qube that
+  wears one with no label or another's, held yet or not, but `migrate` on a
+  fleet where no qube in scope carries a label yet (v0.9.16's). These still
+  act on it: `seal`, `gateway remove`, taking a model qube away, `project
+  unblock` (the hold stays), `import`, which brings back records that may name
+  it, `project delete`, which removes a held lead or member and strips the
+  slot's badges from every qube that wears them, and dom0's own passes, which
+  may still put a badge that only restricts on it (the anonymity gate's stop,
+  the installer's `qmcp-anon`). A disposable that
+  Qubes makes itself and cleans up, from a labelled disposable template,
+  carries the template's label and is not held. It keeps the
+  badges it came back with.
+- `qmcp restored list [--json]`: each such qube, what its badges make it, and
+  whether that agrees with the project records now (`null` when the records do
+  not read). `qmcp restored accept QUBE...` labels the qubes named and lifts
+  their hold; `--all` takes every qube held when it runs. The window's Accept
+  all, on the Check tab, names the qubes it showed. `qmcp restored reject QUBE`
+  takes every qmcp badge off it, the routed ones first and the hold last, then
+  its label. `qmcp manage` and `guard` label a qube with no qmcp badge afresh,
+  and refuse a badged one whose label is missing or another qube's; `revoke`
+  refuses a held qube, which is rejected instead.
+- A "restored qubes" item in `qmcp check`: amber for each qube held for
+  review, red for a badged qube whose label is missing or not its own and that
+  is not yet held.
+- `qmcp export [FILE]` writes the operator files (`/etc/qmcp`) into one file,
+  by default `qmcp-export-<time>.json` in your dom0 home, mode 0600, never over
+  an existing file. A Qubes backup takes dom0 in as its user's home and nothing
+  else (measured), so a backup with dom0 ticked now carries them. Not in it: the
+  proposals and the audit chain.
+- `qmcp import FILE` puts an export back onto a fresh install: refused while any
+  project, gateway or p00 sink is recorded, or for an export of another hub, or
+  for an ordinary export onto an install in anonymous mode. An export of an
+  install in anonymous mode goes onto a normal install, and `install.sh
+  --anonymous` turns the mode on once the qubes are restored and accepted. A
+  backup does not carry dom0's update routing: with anonymous projects, send
+  templates' updates through the anonymiser again before the import.
+- `qmcp settings set [--pool-cap SIZE] [--private-cap SIZE] [--birth-egress
+  QUBE|none]`. A pool cap below what AI space already holds is refused; birth
+  egress must be an enrolled gateway that is not held. It cannot change the
+  hub, the mode or the name prefix.
+- The window: Prepare on a template or standalone row and on the Check tab,
+  Edit settings, Export and Import on the Settings tab, held qubes under Needs
+  attention with Accept and Reject, and Accept all on the Check tab.
+- A README section on updating, and one on backing up and restoring.
+- Four more claims in the policy's precedence check (51), for the quarantine
+  lines.
+
+### Changed
+
+- **Upgrading from any release before 0.9.26, or reinstalling over the operator
+  files a plain `uninstall.sh` of one kept when no qube carries a label or a
+  hold yet,
+  labels AI space once.** v0.9.16 wrote no version file; the installer knows it
+  by the files it installed. `qmcp migrate` writes no label; it refuses a qube
+  held for review and, once any qube in scope carries a label, one in scope
+  whose label is missing or another's. The installer
+  labels every qube already wearing `ai-managed`, `ai-dump` or a `qmcp-` badge
+  that has no label and is not held, while the gate's timer is stopped. A
+  fresh install seeds
+  none (with `--anonymous` it labels the hub as it gets `qmcp-anon`): a badged
+  qube with no label of its own there came back from a backup or a copy, or was
+  badged by a release before 0.9.26 and kept through `uninstall.sh --purge`, and
+  the gate holds it. After upgrading, prepare once each template `qmcp check`
+  names under "in-qube services": dom0 keeps no record of what an earlier copy
+  loop wrote into it. Rolling back to 0.9.25 needs every held qube accepted or
+  rejected first, then this release's `uninstall.sh` before 0.9.25's
+  installer.
+- `qmcp gate` holds restored qubes before it judges the anonymous projects; it
+  prints what it held on standard error, so `qmcp gate --json` is unchanged.
+  It also exits 3 when that pass could not run, or a hold or a read failed.
+- The services' check of the hub reads its tags once, for both
+  `qmcp-blocked` and `qmcp-quarantine`.
+
+### Fixed
+
+- The public design document said 40 policy claims in two places; 0.9.25
+  checked 47.
+
 ## [0.9.25] — 2026-10-09
 
 **Sealed qubes (M5): the operator's open window.** A guarded qube is a

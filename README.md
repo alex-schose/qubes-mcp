@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.25 — sealed qubes.** Besides the hub, up to 15
+**Status: 0.9.26 — the operator's tools.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -50,8 +50,13 @@ deletion or a window on a guarded qube; nothing happens until the operator
 accepts it in dom0, in that window or with `qmcp proposal accept`. The two
 in-qube services need python3 and `qvm-copy-to-vm` and nothing else; measured
 on Qubes 4.3.1, a lead and its workers run on Debian 13, Fedora 43 and Arch
-templates alike. Next: the complete GUI (1.0.0). 0.9.17 replaced the tier
-model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+templates alike, and dom0 keeps its own copy of them, so
+`qmcp template prepare` writes them into a template or a standalone at any
+time. A qube that comes back from a backup, or is copied by hand, is held for
+your review rather than rejoining a project that may have changed, and
+`qmcp export` puts qmcp's settings where a Qubes backup carries them. Next:
+standalone workers and leads, the last proposal types, an audit round, then
+1.0.0. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -201,7 +206,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.25.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.26.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -211,7 +216,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 47 checked claims. It installs the anonymity gate's timer as
+overrides its 51 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user
@@ -225,11 +230,22 @@ user. It shows AI
 space and the projects as a tree, the gateways AI space may use, each lead's
 model endpoint and firewall, the `qmcp check` light, the audit log and the
 settings, each anonymous project with what the anonymity gate found, and
-offers every command that changes something, but `migrate`, as a form. Each form shows the command it will run (`sudo -n qmcp ...`); the
+offers every command that changes something as a form, but `migrate`,
+`restored accept --all` (its Accept all names the qubes it shows) and what
+the timers and the boot unit run. Each form shows the command it will run (`sudo -n qmcp ...`); the
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
+Coming from any release before 0.9.26? Besides that release's own note below,
+the installer labels every qube that wears a qmcp badge and has no label, for
+the restore check (see
+"Backing up and restoring"). Then prepare,
+once, each template `qmcp check` names under "in-qube services"
+(`sudo qmcp template prepare QUBE`): dom0 keeps no record of what an earlier
+copy loop wrote into it. Rolling back to 0.9.25 needs every held qube accepted
+or rejected first (`qmcp restored list`), then this release's `uninstall.sh`
+before 0.9.25's installer.
 Coming from 0.9.23? Install over it. If you have anonymous projects, the
 installer first checks them against this release's rule for template updates
 (step 7): a template's updates count only through a gateway you ticked. It
@@ -277,10 +293,7 @@ goes in front of it, and a limit for all your Tor AI belongs inside that router.
 ```sh
 # in dom0
 qvm-clone <a Debian template> ai-debian-13    # a template for AI qubes, if you have none
-for s in qmcp.RunInAIManaged qmcp.CopyToAIManaged; do
-  qvm-run --pass-io -u root ai-debian-13 \
-    "cat > /etc/qubes-rpc/$s && chmod 0755 /etc/qubes-rpc/$s" < /tmp/qubes-mcp/template-rpc/$s
-done
+sudo qmcp template prepare ai-debian-13       # writes the in-qube services in, from dom0's copy
 sudo qmcp manage ai-debian-13       # the hub may build on it; `guard` keeps it a reference only
 qvm-create --class AppVM --template "$(qubes-prefs default_template)" --label red sys-ai-net
 qvm-prefs sys-ai-net provides_network True
@@ -288,6 +301,16 @@ qvm-prefs sys-ai-net netvm sys-firewall
 sudo qmcp gateway enroll sys-ai-net --label clearnet   # AI qubes may sit on it
 echo sys-ai-net | sudo tee /etc/qmcp/birth-egress      # where the hub's template-based qubes go online
 ```
+
+`qmcp template prepare` takes a TemplateVM or a StandaloneVM: it starts a
+halted one, writes the two services in as root, labels it with their version,
+and shuts it down again. dom0 keeps its own copy of the services, so this works
+at any time, not only while a fetched release is unpacked; `qmcp check` warns
+on a template it runs commands in that was never prepared, or carries an older
+version. After an update, a running prepared qube's own disk is brought up to
+date within a minute, and a halted one's the next time it runs (none is started
+for it); the qubes built on a template get the new services once it has shut
+down and they restart.
 
 `qmcp gateway list` shows what is enrolled and whether each is still usable,
 and marks a router whose upstream is a Whonix gateway. The birth-egress file is
@@ -436,11 +459,7 @@ qvm-prefs sys-ai-tor provides_network True
 qvm-prefs sys-ai-tor netvm sys-whonix
 sudo qmcp gateway enroll sys-ai-tor --anonymising --updates --label tor
 qvm-clone <a Debian template of yours> anon-debian-13   # one the hub never touched
-for s in qmcp.RunInAIManaged qmcp.CopyToAIManaged; do
-  qvm-run --pass-io -u root anon-debian-13 \
-    "cat > /etc/qubes-rpc/$s && chmod 0755 /etc/qubes-rpc/$s" < /tmp/qubes-mcp/template-rpc/$s
-done
-qvm-shutdown --wait anon-debian-13
+sudo qmcp template prepare anon-debian-13
 sudo qmcp guard anon-debian-13
 sudo qmcp project create --anonymous --lead-template anon-debian-13 --lead-netvm sys-ai-tor \
   --model api.anthropic.com:443 --network sys-ai-tor --quota 20G --note "what it is for"
@@ -482,6 +501,73 @@ and a stopped hub is cleared with `sudo qmcp project unblock p00`. No qmcp
 command turns the mode off; `uninstall.sh --purge` does. Then remove `qmcp-anon` from the
 hub (`qvm-tags mcp-control del qmcp-anon`), or `qmcp check` fails on it.
 
+### Updating
+
+Fetch the new release exactly as in step 2, into a fresh
+`/tmp/qubes-mcp`, and run the installer again: it is idempotent, backs up what
+it replaces and ends with `qmcp check`. Then:
+
+- **Prepare what the check names.** A release that changes the in-qube services
+  marks every prepared template and standalone as behind. A running one's own
+  disk is brought up to date within a minute, a halted one's the next time it
+  runs, and the qubes built on a template get it once it has shut down and they
+  restart. To do one now, `sudo qmcp template prepare QUBE`, which starts it if
+  it is halted.
+- **Restart the window** if it is open: one opened before the install runs the
+  old code.
+- **Update the hub's copy** of `qubes_mcp/` (step 1) and each lead's.
+
+The CHANGELOG's entry for each version says what else an update from the one
+before it needs.
+
+### Backing up and restoring
+
+A Qubes backup takes dom0 in as your home directory and nothing else, so it
+never holds qmcp's own settings. Export them into your home first, then back up
+with dom0 ticked:
+
+```sh
+# in dom0
+sudo qmcp export                  # writes ~/qmcp-export-<time>.json, mode 0600
+```
+
+To restore onto a reinstalled Qubes:
+
+```sh
+# in dom0
+qvm-backup-restore --skip-conflicting ...   # everything, dom0 ticked; nothing operates the AI qubes yet
+# fetch and unpack the release into /tmp/qubes-mcp as in step 2, then:
+sudo bash /tmp/qubes-mcp/deploy/install.sh --hub mcp-control   # the same hub
+sudo qmcp import ~/home-restore-<time>/dom0-home/<you>/qmcp-export-<time>.json
+sudo qmcp restored accept --all   # the restored AI qubes, back into their projects
+```
+
+The installer's closing check is FAILED until the import and the accept: no
+gateway is enrolled yet, and the restored AI qubes are held. That is expected
+here; for an export of an install in anonymous mode, until the mode is on
+again (step 8).
+
+A restore gives every qube a new identity and keeps its tags, so the installed
+qubes-mcp holds each restored AI qube for your review: no call from another
+qube reaches it, and it reaches nothing, until you accept it (its network is
+unchanged). `qmcp restored
+list` shows what each came back as and whether that agrees with the projects.
+With anonymous projects, send your templates' updates through the anonymiser
+again (step 7) before the import: a Qubes backup does not carry dom0's update
+routing, and the gate, which runs right after the import, would stop each
+anonymous project (clear one with `sudo qmcp project unblock NAME` once it is
+sound). An export of an install in anonymous mode is imported onto a normal
+install the same way; once the qubes are accepted, turn the mode on (step 8),
+and start neither the hub nor any AI qube, nor mark one to start at boot,
+before then.
+
+**Do not restore AI qubes into a running install whose projects have changed.**
+Until the gate's next pass holds it, normally within about 15 seconds, a worker
+restored months later is routed by its old badges into whatever project holds
+its slot now. If you must, shut the hub and the leads down first, then review
+each one (`qmcp restored accept QUBE` or `reject QUBE`). The same hold catches
+an AI qube you copy by hand with `qvm-clone`.
+
 ## Tests
 
 ```sh
@@ -510,6 +596,9 @@ twice, unblock, and what the hub can no longer see. `tests/test_mode.py` covers
 anonymous mode: the hub's check and what each violation stops, the updates
 tick, creates and proposals in the mode, and moves into and out of anonymous
 projects.
+`tests/test_operator_tools.py` covers 0.9.26's tools: preparing templates and
+standalones and keeping them up to date, the restore check that holds a qube
+back from a backup or a copy, the settings, and export and import.
 `tests/test_gui.py` drives the window's forms through the real `qmcp` command
 and fails if the command has a command, option or field the window neither
 offers nor exempts; `tests/GUI-CHECKLIST.md` is the click-through for a

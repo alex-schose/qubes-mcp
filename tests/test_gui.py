@@ -272,7 +272,37 @@ class GuiBase(ProjectBase):
     def tree(self):
         return gm.build_tree(self.read_json("list", "--all", "--json"),
                              self.read_json("project", "list", "--json"),
-                             self.read_json("settings", "--json"))
+                             self.read_json("settings", "--json"),
+                             restored=self.restored())
+
+    def services(self):
+        """dom0's copy of the in-qube services, as the installer keeps it, so
+        `template prepare` has something to write."""
+        import shutil
+        from qmcp import inqube
+        copy = self.tmp / "lib" / "template-rpc"
+        shutil.copytree(HERE.parent / "template-rpc", copy)
+        self._saved.append((inqube, "SERVICES_DIR", inqube.SERVICES_DIR))
+        inqube.SERVICES_DIR = str(copy)
+
+    def restored(self):
+        """`restored list --json`, as the window reads it."""
+        return gm.parse_restored(self.runner.execute(gm.READS["restored"]))
+
+    def came_back(self, name="ai-back", tags=("ai-managed", "qmcp-proj-p01"), hold=True,
+                  **kw):
+        """A qube as a backup restore or a hand copy leaves it: badged, with no
+        qmcp-id label of its own (`labelled=False`, or `features` naming
+        another UUID); then, with `hold`, the gate's pass holds it, as every
+        refresh's first read runs it."""
+        kw.setdefault("template", self.app.domains["ai-debian-13"])
+        if "features" not in kw:
+            kw["labelled"] = False
+        vm = self.app.vm(name, tags=set(tags), **kw)
+        if hold:
+            self.gate()
+            self.assertIn(core.QUARANTINE, vm.tags)
+        return vm
 
     def node(self, key):
         return next(n for n in gm.walk(self.tree()) if n.key == key)
@@ -399,13 +429,18 @@ def _options(sp, skip=None) -> set:
 
 
 def _leaves(parser):
-    """(command path, option-key prefix, subparser, the choices positional)."""
+    """(command path, option-key prefix, subparser, the choices positional).
+    A command whose subcommands are optional (`settings`, and `settings set`)
+    is a leaf of its own as well, with its own options; its chooser is then
+    the subcommands' action."""
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     for cmd, sp in sub.choices.items():
         nested = [a for a in sp._actions if isinstance(a, argparse._SubParsersAction)]
         if nested:
             for what, leaf in nested[0].choices.items():
                 yield (cmd, what), (cmd, what), leaf, None
+            if not nested[0].required:
+                yield (cmd,), (cmd,), sp, nested[0]
             continue
         chooser = next((a for a in sp._actions if a.choices and not a.option_strings), None)
         if chooser is not None:
@@ -431,6 +466,10 @@ def covered_by(parser, argv) -> set:
         if path[0] != ns.cmd:
             continue
         if len(path) == 2 and getattr(ns, "what", None) != path[1]:
+            continue
+        # The bare command (`settings --json`) only when no subcommand was given.
+        if (isinstance(chooser, argparse._SubParsersAction)
+                and getattr(ns, chooser.dest) is not None):
             continue
         keys = {path}
         for a in sp._actions:
@@ -502,6 +541,13 @@ SAMPLES = {
     gm.set_lead_rules: [dict(key="osint", rules=RULES)],
     gm.accept_lead_rules: [dict(key="osint")],
     gm.unblock_project: [dict(key="osint")],
+    gm.settings_set: [dict(pool_cap="2000G", private_cap="30G", birth_egress="ai-net-router"),
+                      dict(birth_egress="none")],
+    gm.prepare_template: [dict(qube="debian-13")],
+    gm.restored_accept: [dict(qubes="ai-back"), dict(qubes=["ai-back", "ai-back2"])],
+    gm.restored_reject: [dict(qube="ai-back")],
+    gm.export_config: [dict(), dict(file="/tmp/qmcp-export.json")],
+    gm.import_config: [dict(file="/tmp/qmcp-export.json")],
 }
 
 
@@ -582,6 +628,31 @@ class Parity(GuiBase):
                     self.assertIn(heading, shown, key)
             self.assertEqual(shown["Lead firewall of"], f"osint (p01), lead {LEAD}")
             self.assertEqual(failing, view["read_error"] is not None)
+        # What came back from a backup or a copy: one held, one the pass has not
+        # held yet, and one whose label cannot be read. Every field, on screen.
+        self.came_back("ai-back")
+        self.came_back("ai-copy", tags=("ai-managed", "qmcp-guarded"), hold=False,
+                       features={core.ID_FEATURE: "another-qubes-uuid"})
+        self.came_back("ai-blind", hold=False)
+        self.app.fail.add("feature.get:ai-blind")
+        try:
+            rows = self.restored()
+        finally:
+            self.app.fail.discard("feature.get:ai-blind")
+        self.assertEqual({r["name"]: (r.get("held"), "unreadable" in r) for r in rows},
+                         {"ai-back": (True, False), "ai-copy": (False, False),
+                          "ai-blind": (None, True)})
+        judged = [r for r in rows if "unreadable" not in r]
+        self.assertEqual(set().union(*(r.keys() for r in judged)),
+                         {k for k, _ in gm.RESTORED_FIELDS} | set(gm.RESTORED_NOT_SHOWN))
+        self.assertEqual(set().union(*(r.keys() for r in rows if "unreadable" in r)),
+                         {gm.RESTORED_UNREAD[0]} | set(gm.RESTORED_NOT_SHOWN))
+        for row in judged:
+            self.assertEqual([h for h, _ in gm.restored_details(row)],
+                             [h for _, h in gm.RESTORED_FIELDS])
+        unread = next(r for r in rows if "unreadable" in r)
+        self.assertEqual([h for h, _ in gm.restored_details(unread)], [gm.RESTORED_UNREAD[1]])
+        self.assertIn(unread["unreadable"], gm.restored_details(unread)[0][1])
 
     def test_every_field_of_an_audit_line_is_shown_or_left_to_verify(self):
         self.app.fail.add("start")
@@ -2811,6 +2882,323 @@ class AnonModel(GuiBase):
 
 # ======================================================================= the command's new reads
 
+# ======================================================================= restored qubes, templates, settings
+
+#: What every selection offers, whatever it is.
+ALWAYS = {"new_project", "add_to_ai_space"}
+
+
+class RestoredModel(GuiBase):
+    """A qube back from a backup or a copy, the in-qube services and the
+    operator files: the window's builders and judgements, against the real
+    command."""
+
+    def failing(self, status="fail"):
+        doc = self.read_json("check", "--json")
+        return {(f["check"], f["detail"]) for f in doc["findings"] if f["status"] == status}
+
+    def placed(self, name, tree=None):
+        return [n for n in gm.walk(tree or self.tree())
+                if n.kind == "qube" and n.data.get("name") == name]
+
+    def test_accept_alls_text_says_what_its_command_does(self):
+        # On the dev box (2026-10-10) the form said "every qube held when it
+        # runs ... accepted too" over a command that names the qubes: prose and
+        # command disagreed, and every scripted check passed. Tie them.
+        self.came_back("ai-back")
+        rows = self.restored()
+        argv = gm.restored_accept(gm.held_names(rows))
+        intro = gm.accept_all_intro(rows)
+        self.assertNotIn("--all", argv)
+        self.assertNotIn("--all", intro)
+        self.assertNotIn("accepted too", intro)
+        self.assertIn("exactly the qubes below, by name", intro)
+        self.assertIn("ai-back", argv)
+
+    def test_the_builders_make_exactly_the_typed_command(self):
+        w = ["/usr/bin/sudo", "-n", gm.QMCP]
+        self.assertEqual(gm.settings_set("2000G", "30G", "ai-net-router"),
+                         w + ["settings", "set", "--pool-cap", "2000G", "--private-cap", "30G",
+                              "--birth-egress", "ai-net-router"])
+        self.assertEqual(gm.settings_set(private_cap=" 512M "),
+                         w + ["settings", "set", "--private-cap", "512M"])
+        self.assertEqual(gm.settings_set(birth_egress="none"),
+                         w + ["settings", "set", "--birth-egress", "none"])
+        self.assertEqual(gm.prepare_template("debian-13"), w + ["template", "prepare", "debian-13"])
+        self.assertEqual(gm.restored_accept("ai-back"), w + ["restored", "accept", "ai-back"])
+        self.assertEqual(gm.restored_accept(["ai-a", "ai-b"]),
+                         w + ["restored", "accept", "ai-a", "ai-b"])
+        self.assertEqual(gm.restored_reject("ai-back"), w + ["restored", "reject", "ai-back"])
+        self.assertEqual(gm.export_config(), w + ["export"])
+        self.assertEqual(gm.export_config(" /srv/e.json "), w + ["export", "/srv/e.json"])
+        self.assertEqual(gm.import_config("/srv/e.json"), w + ["import", "/srv/e.json"])
+        self.assertEqual(gm.READS["restored"], [gm.QMCP, "restored", "list", "--json"])
+        # Each parses with the real parser, as the command it names.
+        parser = cli.build_parser()
+        ns = parser.parse_args(gm.settings_set("1T", None, "none")[3:])
+        self.assertEqual((ns.cmd, ns.what, ns.pool_cap, ns.private_cap, ns.birth_egress),
+                         ("settings", "set", "1T", None, "none"))
+        ns = parser.parse_args(gm.restored_accept(["ai-a", "ai-b"])[3:])
+        self.assertEqual((ns.cmd, ns.what, ns.qube, ns.all),
+                         ("restored", "accept", ["ai-a", "ai-b"], False))
+        ns = parser.parse_args(gm.export_config()[3:])
+        self.assertEqual((ns.cmd, ns.file), ("export", None))
+
+    def test_the_builders_refuse_what_the_command_would(self):
+        cases = [
+            (gm.settings_set, dict()),                              # nothing changed
+            (gm.settings_set, dict(pool_cap="")),
+            (gm.settings_set, dict(pool_cap="lots")),
+            (gm.settings_set, dict(private_cap="0")),
+            (gm.settings_set, dict(private_cap="-5G")),
+            (gm.settings_set, dict(birth_egress="--evil")),
+            (gm.prepare_template, dict(qube="-x")),
+            (gm.prepare_template, dict(qube=None)),
+            (gm.restored_accept, dict(qubes=[])),                   # nothing to accept
+            (gm.restored_accept, dict(qubes=["ai-back", "--all"])),  # an option, not a name
+            (gm.restored_reject, dict(qube="--all")),
+            (gm.export_config, dict(file="relative.json")),         # where the window runs
+            (gm.export_config, dict(file="")),
+            (gm.import_config, dict(file="relative.json")),
+            (gm.import_config, dict(file=None)),
+        ]
+        for builder, kw in cases:
+            with self.assertRaises(gm.FormError, msg=(builder.__name__, kw)):
+                builder(**kw)
+        # The command's own reader of a size: what it takes, the form takes.
+        for text in ("200G", "512M", "1T", "1073741824", "20GiB"):
+            self.assertGreater(fleet.parse_size(text), 0)
+            self.assertEqual(gm.settings_set(pool_cap=text)[-1], text)
+
+    def test_a_held_qube_is_under_needs_attention_and_the_check_warns(self):
+        before = self.failing("warn")
+        self.came_back("ai-back")
+        new = " ".join(d for c, d in self.failing("warn") - before if c == "restored qubes")
+        self.assertIn("ai-back", new, "check must warn on it first")
+        tree = self.tree()
+        [node] = self.placed("ai-back", tree)
+        self.assertEqual((node.data["attention"], node.data["role"]),
+                         ("held", "needs attention: held for review"))
+        attention = next(n for n in tree if n.key == "group:attention")
+        self.assertIn("qube:ai-back", {c.key for c in attention.children})
+        # Never shown as the worker of p01 its badge names: the rulebook acts on it nowhere.
+        osint = next(n for n in gm.walk(tree) if n.key == "project:p01")
+        self.assertNotIn("qube:ai-back", {c.key for c in osint.children})
+        self.assertEqual(gm.actions(node, {}) - ALWAYS, {"accept_restored", "reject_restored"})
+        shown = dict(gm.details(node, restored=self.restored()))
+        self.assertTrue(shown["Why"].startswith("held for your review"))
+        self.assertTrue(shown["Held for review"].startswith("yes: the rulebook refuses"))
+        self.assertTrue(shown["Its qmcp-id label"].startswith("none: no label from dom0"))
+        self.assertEqual(shown["Badges it came back with"], '["ai-managed", "qmcp-proj-p01"]')
+        self.assertEqual(shown["Its badges make it"], "member of p01")
+        self.assertEqual(shown["Agrees with the records"], "yes, as the records are now")
+        # The pane names its rows before they are read, and never says "none came back".
+        self.assertEqual(dict(gm.details(node))["Restore review"],
+                         "its row of qmcp restored list has not been read; refresh")
+        # A qube that is neither held nor on the list says nothing of a review.
+        for restored in (None, self.restored()):
+            for key in ("qube:ai-work", "qube:ai-osint-w1", f"qube:{LEAD}"):
+                shown = {h for h, _ in gm.details(self.node(key), restored=restored)}
+                self.assertFalse(shown & ({"Restore review", gm.RESTORED_UNREAD[1]}
+                                          | {h for _, h in gm.RESTORED_FIELDS}), key)
+
+    def test_a_qube_not_held_yet_is_under_needs_attention_as_the_check_fails(self):
+        before = self.failing()
+        self.came_back("ai-copy", tags=("ai-managed", "qmcp-guarded"), hold=False,
+                       features={core.ID_FEATURE: "another-qubes-uuid"})
+        new = " ".join(d for c, d in self.failing() - before if c == "restored qubes")
+        self.assertIn("ai-copy", new, "check must fail on it first")
+        [node] = self.placed("ai-copy")
+        self.assertEqual(node.data["attention"], "unheld")
+        self.assertEqual(gm.actions(node, {}) - ALWAYS, {"accept_restored", "reject_restored"})
+        shown = dict(gm.details(node, restored=self.restored()))
+        self.assertTrue(shown["Held for review"].startswith("NOT YET"))
+        self.assertTrue(shown["Its qmcp-id label"].startswith("another qube's UUID"))
+        # Without the restore list, nothing says it is restored: it stays where
+        # its badges put it, as the rulebook still routes them.
+        rows = self.read_json("list", "--all", "--json")
+        plain = gm.build_tree(rows, self.read_json("project", "list", "--json"),
+                              self.read_json("settings", "--json"))
+        self.assertEqual([n.data["attention"] for n in self.placed("ai-copy", plain)], [None])
+        # The gate's pass holds it, and it is held from then on.
+        self.gate()
+        self.assertEqual([n.data["attention"] for n in self.placed("ai-copy")], ["held"])
+
+    def test_a_held_sink_outside_ai_space_is_shown(self):
+        # A sink is outside AI space and has no row in the tree; held, it does.
+        self.assertEqual(self.placed("osint-dump")[0].data["role"], "dump sink")
+        vm = self.app.domains["osint-dump"]
+        dict.__setitem__(vm.features, core.ID_FEATURE, "another-qubes-uuid")
+        self.gate()
+        [node] = self.placed("osint-dump")
+        self.assertEqual(node.data["attention"], "held")
+        ref = next(n for n in gm.walk(self.tree()) if n.key == "ref:p01:dump")
+        self.assertEqual(ref.data["role"], "dump sink (see Needs attention)")
+
+    def test_a_held_qube_whose_label_is_its_own_offers_accept(self):
+        # The hold stayed on after an accept, or was put on by hand: no row,
+        # and the command still takes the accept.
+        self.app.domains["ai-work2"].tags.add(core.QUARANTINE)
+        [node] = self.placed("ai-work2")
+        self.assertEqual(node.data["attention"], "held")
+        # Listed for review, its label its own: an accept stopped part-way.
+        row = gm.restored_row(self.restored(), "ai-work2")
+        self.assertEqual((row["held"], row["label"]), (True, "its own"))
+        self.assertEqual(dict(gm.details(node, restored=self.restored()))['Its qmcp-id label'],
+                         gm.esc(gm.LABEL_TEXT["its own"]))
+        self.assertIn("accept_restored", gm.actions(node, {}))
+        self.assertIn("though its qmcp-id label is its own",
+                      gm.accept_restored_intro("ai-work2", None))
+        result = self.runner.execute(gm.restored_accept("ai-work2"))
+        self.assertEqual(result.rc, 0, result.err)
+        self.assertNotIn(core.QUARANTINE, self.tags("ai-work2"))
+
+    def test_a_list_that_could_not_judge_the_records_says_not_known(self):
+        self.came_back("ai-back")
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        result = self.runner.execute(gm.READS["restored"])
+        self.assertEqual(result.rc, 0)
+        self.assertTrue(result.err.strip())                     # the command says so on stderr only
+        raw = json.loads(result.out)
+        # The command itself says not known, never "disagrees".
+        self.assertEqual((raw[0]["agrees"], raw[0]["why"]), (None, None))
+        [row] = gm.parse_restored(result)
+        self.assertEqual((row["agrees"], row["why"], row["held"]), (None, None, True))
+        shown = dict(gm.restored_details(row))
+        self.assertEqual(shown["Agrees with the records"], gm.RECORDS_UNREAD)
+        self.assertEqual(shown["Where they disagree"], gm.RECORDS_UNREAD)
+        self.assertIn("not known", gm.accept_restored_red(row))
+        self.assertIn("not known", gm.accept_all_red([row]))
+
+    def test_a_failed_restore_list_is_never_nothing_came_back(self):
+        argv = gm.READS["restored"]
+        for result in (gm.Result(argv, 1, "", "QubesDaemonCommunicationError"),
+                       gm.Result(argv, 0, "", ""),
+                       gm.Result(argv, 0, '{"name": "x"}', ""),
+                       gm.Result(argv, 0, '[{"name": "x", "held": "yes"}]', ""),
+                       gm.Result(argv, 0, '[{"held": true}]', "")):
+            with self.assertRaises(gm.ReadError, msg=result.out):
+                gm.parse_restored(result)
+        self.assertEqual(gm.parse_restored(gm.Result(argv, 0, "[]", "")), [])
+
+    def test_accepting_and_rejecting_say_what_they_keep_and_take(self):
+        self.came_back("ai-back")
+        self.came_back("ai-rogue", tags=("ai-managed", "qmcp-lead", "qmcp-lead-p05"))
+        rows = self.restored()
+        back, rogue = gm.restored_row(rows, "ai-back"), gm.restored_row(rows, "ai-rogue")
+        self.assertIn("(ai-managed, qmcp-proj-p01), which make it member of p01",
+                      gm.accept_restored_intro("ai-back", back))
+        self.assertEqual(gm.accept_restored_red(back), "")
+        self.assertFalse(rogue["agrees"])
+        red = gm.accept_restored_red(rogue)
+        self.assertIn("disagree with the project records", red)
+        self.assertIn("p05's record names no such project as lead", red)
+        self.assertEqual(gm.reject_restored_red("ai-rogue", rogue),
+                         "Every qmcp badge comes off ai-rogue: ai-managed, qmcp-lead, "
+                         "qmcp-lead-p05. It is out of AI space and every project afterwards.")
+        intro = gm.accept_all_intro(rows)
+        self.assertIn("- ai-back: member of p01 (ai-managed, qmcp-proj-p01)", intro)
+        self.assertIn("- ai-rogue: lead of p05", intro)
+        red = gm.accept_all_red(rows)
+        self.assertIn("ai-rogue: p05's record names no such project as lead", red)
+        self.assertNotIn("ai-back", red)
+        self.assertEqual(gm.held_names(rows), ["ai-back", "ai-rogue"])
+        self.assertIsNone(gm.held_changed(["ai-back", "ai-rogue"], rows))
+        self.assertIn("changed since this form opened", gm.held_changed(["ai-back"], rows))
+        self.assertEqual(gm.held_changed([], []), "nothing is held")
+        self.assertEqual(gm.accept_all_refusal([]), "nothing is held")
+        opened = gm.review_state("ai-back", self.read_json("list", "--all", "--json"), rows)
+        self.assertEqual(opened[0], True)
+        self.assertIsNone(gm.review_changed(opened, opened))
+        self.assertTrue(gm.review_changed(opened, (False, None)))
+
+    def test_prepare_is_offered_on_a_template_or_standalone_the_command_takes(self):
+        self.services()
+        a = self.app
+        a.vm("ai-stand", klass="StandaloneVM", tags={"ai-managed"})
+        a.vm("ai-tpl-stopped", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded",
+                                                         projects.STOPPED})
+        a.vm("ai-tpl-paused", klass="TemplateVM", tags={"ai-managed"}, power="Paused")
+        self.came_back("ai-tpl-back", tags=("ai-managed", "qmcp-guarded"), klass="TemplateVM",
+                       template=None)
+        offers = {name: "prepare" in gm.actions(self.node(f"qube:{name}"), {})
+                  for name in ("ai-debian-13", "ai-tpl-g", "ai-stand", "ai-tpl-paused",
+                               "ai-work", "ai-dvm", "ai-tpl-stopped", "ai-tpl-back")}
+        self.assertEqual(offers, {"ai-debian-13": True, "ai-tpl-g": True, "ai-stand": True,
+                                  "ai-tpl-paused": True, "ai-work": False, "ai-dvm": False,
+                                  "ai-tpl-stopped": False, "ai-tpl-back": False})
+        rows = {r["name"]: r for r in self.read_json("list", "--all", "--json")}
+        # The list has every one, outside AI space too, where the tree has none.
+        self.assertEqual(gm.prepare_choices(rows.values()),
+                         ["ai-debian-13", "ai-stand", "ai-tpl-back", "ai-tpl-g", "ai-tpl-paused",
+                          "ai-tpl-stopped", "debian-13"])
+        self.assertEqual(self.placed("debian-13"), [])
+        self.assertIsNone(gm.prepare_refusal(rows["debian-13"]))
+        self.assertEqual(gm.prepare_text(rows["debian-13"]),
+                         f"debian-13 (TemplateVM, outside AI space, {rows['debian-13']['power']})")
+        # Refused in the command's words (`inqube.prepare`), which the form shows.
+        words = {name: gm.prepare_refusal(rows[name]) for name in
+                 ("ai-work", "ai-tpl-stopped", "ai-tpl-back", "ai-tpl-paused")}
+        self.assertEqual(words["ai-work"], "'ai-work' is a AppVM, which takes its root from its "
+                                           "template: prepare the template instead")
+        self.assertTrue(words["ai-tpl-stopped"].startswith(
+            "'ai-tpl-stopped' was stopped by the anonymity gate, and preparing it would start it"))
+        self.assertEqual(words["ai-tpl-back"], "'ai-tpl-back' is held for your review: accept or "
+                                               "reject it first (qmcp restored)")
+        self.assertEqual(words["ai-tpl-paused"], "'ai-tpl-paused' is Paused: prepare it while it "
+                                                 "runs or is halted")
+        for name, why in words.items():
+            if name == "ai-work":
+                continue
+            result = self.runner.execute(gm.prepare_template(name))
+            self.assertEqual(result.rc, 1, name)
+            self.assertIn(why, result.err, name)
+        self.assertIn("cannot be prepared: is held for your review",
+                      gm.prepare_text(rows["ai-tpl-back"]))
+        self.assertEqual(gm.prepare_refusal(None), "choose a TemplateVM or a StandaloneVM")
+        self.assertIn("starts it for this and shuts it down again after",
+                      gm.prepare_power(dict(rows["debian-13"], power="Halted")))
+        self.assertIn("keeps running", gm.prepare_power(dict(rows["debian-13"], power="Running")))
+        self.assertIsNone(gm.prepare_refusal(dict(rows["debian-13"], power="unknown")))
+
+    def test_the_settings_and_import_forms_judge_what_they_can_see(self):
+        gws = self.gateways()
+        choices = gm.egress_choices(None, gws)
+        self.assertEqual([i for i, _ in choices], ["unchanged", "none", "ai-net-router"])
+        self.assertEqual(choices[0][1], "unchanged: not set")
+        self.assertIn("is not enrolled, so the services do not use it",
+                      gm.egress_choices("sys-firewall", gws)[0][1])
+        self.assertEqual(gm.pool_cap_refusal("1G", 2 * GiB),
+                         f"a pool cap of {GiB} bytes is below the {2 * GiB} AI space already uses")
+        self.assertIsNone(gm.pool_cap_refusal("3G", 2 * GiB))
+        self.assertIsNone(gm.pool_cap_refusal("1G", None))         # not read: the command reads it
+        self.assertIsNone(gm.pool_cap_refusal("lots", 2 * GiB))    # the builder refuses that one
+        self.assertEqual(gm.in_use_text(2 * GiB), "AI space uses 2.0 GiB, as last read")
+        self.assertIn("could not be read", gm.in_use_text(None))  # never "uses -"
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        refused = ("this install already has projects or gateways: an import is for a fresh "
+                   "install, and changes nothing here")
+        self.assertEqual(gm.import_refusal(records, []), refused)
+        self.assertEqual(gm.import_refusal({}, gws), refused)
+        self.assertEqual(gm.import_refusal({"p00": {"slot": "p00", "dump": "hub-dump"}}, []),
+                         refused)
+        self.assertIsNone(gm.import_refusal({"p00": {"slot": "p00", "dump": None}}, []))
+        # The command refuses this install in the same words.
+        export = self.tmp / "e.json"
+        self.assertEqual(self.runner.execute(gm.export_config(str(export))).rc, 0)
+        result = self.runner.execute(gm.import_config(str(export)))
+        self.assertEqual(result.rc, 1)
+        self.assertIn(refused, result.err)
+
+    def test_every_new_string_is_escaped(self):
+        self.came_back("ai-back")
+        rows = self.restored()
+        hostile = dict(rows[0], role=HOSTILE, why=[HOSTILE], badges=[HOSTILE])
+        for _, text in gm.restored_details(hostile):
+            self.assertIsInstance(text, gm.Shown)
+            self.assertTrue(text.isascii() and "\n" not in text, text)
+
+
 class CliReads(GuiBase):
     def test_check_json_keeps_the_exit_status(self):
         result = self.read("check", "--json")
@@ -3258,6 +3646,16 @@ class Widgets(GuiBase):
                 "action": "build", "qube": "qube_name", "keep_running": "keep"}),
             gm.open_qube: (self.gui.OpenForm(self.win, {"name": "ai-tpl-g"}), {
                 "qube": "qube_name", "duration": "duration", "firewall": "firewall"}),
+            # The Settings tab's: what was read, and the gateways it may name.
+            gm.settings_set: (self.gui.SettingsForm(self.win, self.win.settings,
+                                                    self.win.gateways), {
+                "pool_cap": "pool_cap", "private_cap": "private_cap",
+                "birth_egress": "birth_egress"}),
+            gm.export_config: (self.gui.ExportForm(self.win), {"file": "file"}),
+            gm.import_config: (self.gui.ImportForm(self.win, {}, []), {"file": "file"}),
+            # The Check tab's list of every template; a template's row has a
+            # confirmation for itself (test_prepare_from_a_row_or_the_list).
+            gm.prepare_template: (self.gui.PrepareForm(self.win, self.win.fleet), {"qube": "qube"}),
         }
         for builder, (form, fields) in forms.items():
             params = set(inspect.signature(builder).parameters)
@@ -3281,8 +3679,12 @@ class Widgets(GuiBase):
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
                                              "audit_rotate", "show_proposal", "remove_gateway",
                                              "show_lead_firewall", "unblock_project",
-                                             "seal_qube"},
+                                             "seal_qube", "restored_accept", "restored_reject"},
                           "a builder without a form")
+        for ident in ("prepare", "accept_restored", "reject_restored"):
+            self.assertIn(ident, dict(self.gui.Window.ACTIONS))
+        self.assertEqual(set(self.win.check_buttons), {"prepare_template", "accept_all_restored"})
+        self.assertEqual(set(self.win.settings_buttons), {"edit_settings", "export", "import"})
 
     def test_refresh_fills_every_page_from_the_command(self):
         keys = [r[0] for r in self.rows(self.win.store)]
@@ -3652,6 +4054,24 @@ class Widgets(GuiBase):
         f = self.gui.OpenForm(self.win, self.node("qube:ai-tpl-g").data)
         f.firewall.set_active(True)
         forms.append(f)
+        # The Settings tab's: every part changed, an export to a named file and
+        # one to the command's default, and an import as a fresh install has it.
+        f = self.gui.SettingsForm(self.win, self.win.settings, gws)
+        f.pool_cap.set_text("2000G")
+        f.private_cap.set_text("30G")
+        f.birth_egress.set_active_id("ai-net-router")
+        forms.append(f)
+        f = self.gui.ExportForm(self.win)
+        f.file.set_text(str(self.tmp / "qmcp-export.json"))
+        forms.append(f)
+        forms.append(self.gui.ExportForm(self.win))
+        f = self.gui.ImportForm(self.win, {}, [])
+        f.file.set_text(str(self.tmp / "qmcp-export.json"))
+        forms.append(f)
+        # Any template, from the Check tab's list: here one outside AI space.
+        f = self.gui.PrepareForm(self.win, rows)
+        f.qube.set_active_id("debian-13")
+        forms.append(f)
         for argv in forms:
             self.one_line(argv)
             argvs.append(argv.argv())
@@ -3710,6 +4130,23 @@ class Widgets(GuiBase):
         self.one_line(form)
         argvs.append(form.argv())
         form.destroy()
+        # A qube back from a backup, accepted or rejected from its row and with
+        # every other held one from the Check tab; a template prepared from its row.
+        self.came_back("ai-back")
+        self.win.refresh()
+        for ident in ("accept_restored", "reject_restored"):
+            self.select("qube:ai-back")
+            form = self.win.act(ident)
+            self.one_line(form)
+            argvs.append(form.argv())
+            form.destroy()
+        for ident, key in (("accept_all_restored", None), ("prepare", "qube:ai-debian-13")):
+            if key:
+                self.select(key)
+            form = self.win.act(ident)
+            self.one_line(form)
+            argvs.append(form.argv())
+            form.destroy()
         covered = set()
         for argv in argvs:
             covered |= covered_by(parser, argv)
@@ -5595,6 +6032,273 @@ class Widgets(GuiBase):
         self.assertIn(fleet.MOVE_PAST_WARNING, result.err)
         self.assertEqual(self.runner.execute(gm.move(worker, "none", confirm=True)).rc, 0)
         self.assertNotIn(projects.ANON, self.tags(worker))
+
+    # ------------------------------------------------------------------ restored qubes, settings
+
+    def checks_on(self):
+        """The Check tab's buttons that are on."""
+        return {k for k, b in self.win.check_buttons.items() if b.get_sensitive()}
+
+    def settings_on(self):
+        """The Settings tab's buttons that are on."""
+        return {k for k, b in self.win.settings_buttons.items() if b.get_sensitive()}
+
+    def test_a_held_qube_from_its_row_back_into_its_project(self):
+        self.came_back("ai-back")
+        self.win.refresh()
+        self.assertIn("qube:ai-back", {c.key for c in self.win.nodes["group:attention"].children})
+        self.assertNotIn("qube:ai-back", {c.key for c in self.win.nodes["project:p01"].children})
+        self.select("qube:ai-back")
+        self.assertEqual(self.sensitive() - ALWAYS, {"accept_restored", "reject_restored"})
+        details = self.grid(self.win.details)
+        self.assertEqual(details["Role"], "needs attention: held for review")
+        self.assertEqual(details["Its badges make it"], "member of p01")
+        self.assertTrue(details["Held for review"].startswith("yes: the rulebook refuses"))
+        self.assertIn(("WARN", "restored qubes"),
+                      {(r[1], r[2]) for r in self.rows(self.win.check_store)})
+        self.assertEqual(self.checks_on(), {"prepare_template", "accept_all_restored"})
+        form = self.win.act("accept_restored")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.restored_accept("ai-back"))
+        self.assertIn("(ai-managed, qmcp-proj-p01), which make it member of p01",
+                      form.intro.get_text())
+        self.assertEqual(form.warning.get_text(), "")
+        result = self.submit(form)
+        self.assertIn("ai-back: accepted", result.out)
+        self.assertNotIn(core.QUARANTINE, self.tags("ai-back"))
+        # Where its badges put it, a worker of p01; nothing is held now.
+        self.assertIn("qube:ai-back", {c.key for c in self.win.nodes["project:p01"].children})
+        self.assertEqual(self.checks_on(), {"prepare_template"})
+
+    def test_accepting_badges_the_records_do_not_back_is_red_first(self):
+        self.came_back("ai-rogue", tags=("ai-managed", "qmcp-lead", "qmcp-lead-p05"))
+        self.win.refresh()
+        self.select("qube:ai-rogue")
+        form = self.win.act("accept_restored")
+        self.one_line(form)
+        self.assertIn("p05's record names no such project as lead", form.warning.get_text())
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        form.destroy()
+        form = self.win.act("reject_restored")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.restored_reject("ai-rogue"))
+        self.assertEqual(form.warning.get_text(),
+                         "Every qmcp badge comes off ai-rogue: ai-managed, qmcp-lead, "
+                         "qmcp-lead-p05. It is out of AI space and every project afterwards.")
+        self.submit(form)
+        self.assertEqual({t for t in self.tags("ai-rogue")
+                          if t.startswith("qmcp-") or t in ("ai-managed", "ai-dump")}, set())
+        self.assertNotIn("qube:ai-rogue", self.win.nodes)       # out of AI space
+
+    def test_a_review_that_changed_after_its_form_opened_runs_nothing(self):
+        self.came_back("ai-back")
+        self.win.refresh()
+        self.select("qube:ai-back")
+        form = self.win.act("reject_restored")
+        self.runner.execute(gm.restored_accept("ai-back"))      # accepted meanwhile, by hand
+        self.win.refresh()
+        before = len(self.reports)
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(len(self.reports), before)
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("review changed since this form opened", form.error.get_text())
+        self.assertIn("ai-managed", self.tags("ai-back"))       # not rejected
+        form.destroy()
+
+    def test_a_prepare_whose_qube_changed_after_its_form_opened_runs_nothing(self):
+        self.services()
+        self.select("qube:ai-tpl-g")
+        form = self.win.act("prepare")
+        self.one_line(form)
+        self.app.domains["ai-tpl-g"].tags.add(projects.STOPPED)     # the gate stopped it meanwhile
+        self.win.refresh()
+        before = len(self.reports)
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(len(self.reports), before)
+        self.assertIn("was stopped by the anonymity gate", form.error.get_text())
+        self.assertNotIn("qmcp-services", dict(self.app.domains["ai-tpl-g"].features))
+        form.destroy()
+
+    def test_accept_every_held_qube_from_the_check_tab(self):
+        self.assertNotIn("accept_all_restored", self.checks_on())
+        self.assertIsNone(self.win.act("accept_all_restored"))
+        self.came_back("ai-back")
+        self.came_back("ai-rogue", tags=("ai-managed", "qmcp-lead", "qmcp-lead-p05"))
+        self.win.refresh()
+        form = self.win.act("accept_all_restored")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.restored_accept(gm.held_names(self.restored())))
+        intro = form.intro.get_text()
+        self.assertIn("\n- ai-back: member of p01 (ai-managed, qmcp-proj-p01)", intro)
+        self.assertIn("\n- ai-rogue: lead of p05", intro)
+        self.assertIn("ai-rogue: p05's record names no such project as lead",
+                      form.warning.get_text())
+        # One held after the form opened: OK refuses until it is opened again.
+        self.came_back("ai-third")
+        self.win.refresh()
+        form.response(Gtk.ResponseType.OK)
+        self.assertIn("the qubes held changed since this form opened", form.error.get_text())
+        self.assertIn(core.QUARANTINE, self.tags("ai-back"))
+        form.destroy()
+        result = self.submit(self.win.act("accept_all_restored"))
+        for name in ("ai-back", "ai-rogue", "ai-third"):
+            self.assertIn(f"{name}: accepted", result.out)
+            self.assertNotIn(core.QUARANTINE, self.tags(name))
+        # Accepted, the rogue's lead badges are what qmcp check fails on.
+        self.assertEqual(self.win.nodes["qube:ai-rogue"].data["attention"], "lead")
+        self.assertNotIn("accept_all_restored", self.checks_on())
+
+    def test_prepare_from_a_row_or_the_list(self):
+        from qmcp import inqube
+        self.services()
+        # The check's item for them is on the Check tab, beside Prepare a template.
+        self.assertIn("in-qube services", {r[2] for r in self.rows(self.win.check_store)})
+        self.select("qube:ai-debian-13")
+        self.assertIn("prepare", self.sensitive())
+        form = self.win.act("prepare")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.prepare_template("ai-debian-13"))
+        intro = form.intro.get_text()
+        self.assertIn("A halted qube is started for this and shut down again after", intro)
+        self.assertTrue(intro.endswith("ai-debian-13 is halted: the command starts it for this "
+                                       "and shuts it down again after."))
+        result = self.submit(form)
+        self.assertIn("ai-debian-13: prepared", result.out)
+        version = inqube.installed_version()
+        self.assertEqual(dict.get(self.app.domains["ai-debian-13"].features, inqube.LABEL),
+                         version)
+        # The Check tab's list: the selection preselected, any template on it,
+        # one outside AI space too, which has no row in the tree.
+        self.select("qube:ai-tpl-g")
+        form = self.win.act("prepare_template")
+        self.assertEqual(form.qube.get_active_id(), "ai-tpl-g")
+        form.qube.set_active_id("debian-13")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.prepare_template("debian-13"))
+        self.assertIn("debian-13 is halted", form.power.get_text())
+        self.submit(form)
+        self.assertEqual(dict.get(self.app.domains["debian-13"].features, inqube.LABEL), version)
+        # Nothing chosen, nothing runs; a held one is listed, and refused in the
+        # command's words, and its row offers no Prepare.
+        self.came_back("ai-tpl-back", tags=("ai-managed", "qmcp-guarded"), klass="TemplateVM")
+        self.win.refresh()
+        self.select("project:p01")
+        form = self.win.act("prepare_template")
+        self.assertIsNone(form.qube.get_active_id())
+        self.one_line(form, ok=False)
+        form.destroy()
+        self.select("qube:ai-tpl-back")
+        self.assertNotIn("prepare", self.sensitive())
+        form = self.win.act("prepare_template")
+        self.assertEqual(form.qube.get_active_id(), "ai-tpl-back")
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), "'ai-tpl-back' is held for your review: accept "
+                                                "or reject it first (qmcp restored)")
+        form.destroy()
+
+    def test_settings_from_the_form_to_the_files(self):
+        self.assertEqual(self.settings_on(), {"edit_settings", "export", "import"})
+        form = self.win.act("edit_settings")
+        self.assertEqual((form.pool_cap.get_text(), form.private_cap.get_text(),
+                          form.birth_egress.get_active_text()),
+                         ("1000G", "20G", "unchanged: not set"))
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), "nothing changed")
+        self.assertEqual(form.used.get_text(),
+                         gm.in_use_text(self.read_json("settings", "--json")["ai_space_bytes"]))
+        form.pool_cap.set_text("1G")                            # below what AI space uses
+        self.one_line(form, ok=False)
+        self.assertIn("bytes is below the", form.error.get_text())
+        form.pool_cap.set_text("lots")
+        self.assertIn("'lots' is not a size", form.error.get_text())
+        form.pool_cap.set_text("1000G")                         # as read: not sent
+        form.private_cap.set_text("30G")
+        form.birth_egress.set_active_id("ai-net-router")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.settings_set(None, "30G", "ai-net-router"))
+        self.submit(form)
+        s = self.read_json("settings", "--json")
+        self.assertEqual((s["private_cap"], s["birth_egress"], s["pool_cap"]),
+                         (30 * GiB, "ai-net-router", 1000 * GiB))
+        texts = [c.get_text() for c in self.win.settings_grid.get_children()]
+        self.assertIn("ai-net-router", texts)
+        self.assertIn(gm.SETTINGS_NOTE, texts)
+        form = self.win.act("edit_settings")
+        self.assertEqual(form.birth_egress.get_active_text(), "unchanged: ai-net-router")
+        form.birth_egress.set_active_id("none")
+        self.assertEqual(form.argv(), gm.settings_set(birth_egress="none"))
+        self.submit(form)
+        self.assertIsNone(self.read_json("settings", "--json")["birth_egress"])
+
+    def test_export_and_import_from_the_settings_tab(self):
+        form = self.win.act("export")
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.export_config())        # the command's own default
+        form.file.set_text("export.json")
+        self.one_line(form, ok=False)
+        self.assertIn("give the full path", form.error.get_text())
+        path = self.tmp / "e.json"
+        form.file.set_text(str(path))
+        self.assertIn(f"wrote {path}", self.submit(form).out)
+        self.assertEqual(json.loads(path.read_text())["files"]["hub"], HUB + "\n")
+        form = self.win.act("export")
+        form.file.set_text(str(path))
+        self.assertIn("exists", self.submit(form, ok=False).err)  # never over a file
+        # Import: for a fresh install, which this is not; in red before OK.
+        form = self.win.act("import")
+        self.assertEqual(form.warning.get_text(), gm.IMPORT_RED)
+        self.assertTrue(form.warning.get_style_context().has_class("qmcp-FAILED"))
+        form.file.set_text(str(path))
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), gm.import_refusal(self.win.records,
+                                                                  self.win.gateways))
+        form.destroy()
+        form = self.gui.ImportForm(self.win, {}, [])            # as a fresh install shows it
+        form.file.set_text(str(path))
+        self.one_line(form)
+        self.assertEqual(form.argv(), gm.import_config(str(path)))
+        form.destroy()
+
+    def test_a_failed_restore_list_keeps_the_last_view_and_turns_changes_off(self):
+        self.came_back("ai-back")
+        self.win.refresh()
+        self.runner.fail.add(tuple(gm.READS["restored"]))
+        self.win.refresh()
+        self.assertIn("restored", self.win.errors)
+        self.select("qube:ai-back")
+        self.assertEqual(self.sensitive(), set())
+        self.assertEqual(self.grid(self.win.details)["Its badges make it"], "member of p01")
+        self.assertEqual((self.checks_on(), self.settings_on()), (set(), set()))
+        self.assertIsNone(self.win.act("accept_all_restored"))
+        self.runner.fail.clear()
+        self.win.refresh()
+        self.select("qube:ai-back")
+        self.assertIn("accept_restored", self.sensitive())
+        self.assertEqual(self.settings_on(), {"edit_settings", "export", "import"})
+
+    def test_the_new_forms_open_tall_enough_for_what_they_say(self):
+        # The same bound as every other form's (test_a_form_opens_tall_enough...):
+        # these carry long intros, and Accept all a line per held qube.
+        for i in range(6):
+            self.came_back(f"ai-back{i}")
+        self.win.refresh()
+        self.select("qube:ai-debian-13")
+        for ident in ("edit_settings", "export", "import", "prepare_template", "prepare",
+                      "accept_all_restored"):
+            form = self.win.act(ident)
+            self.assertIsNotNone(form, ident)
+            ok, why = self.shown_whole(form)
+            self.assertTrue(ok, why)
+            form.destroy()
+
+    def test_the_tabs_buttons_wait_for_a_change_to_finish(self):
+        self.runner.hold = True
+        self.assertTrue(self.win.write("t", gm.audit_rotate()))
+        self.assertEqual((self.checks_on(), self.settings_on()), (set(), set()))
+        self.runner.hold = False
+        self.runner.release()
+        self.assertEqual(self.checks_on(), {"prepare_template"})
+        self.assertEqual(self.settings_on(), {"edit_settings", "export", "import"})
 
     def test_it_never_runs_as_root(self):
         # If the refusal ever goes, main() must fail here, fast and invisibly,

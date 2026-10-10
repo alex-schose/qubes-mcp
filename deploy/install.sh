@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.24.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.26.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -69,6 +69,25 @@
 #                                    already going has finished, and started again at the end,
 #                                    also when it fails part-way, so the anonymous projects stay
 #                                    judged; a qmcp command run meanwhile still runs the gate
+#   /usr/local/lib/qmcp/template-rpc/   dom0's copy of the two in-qube services, from which
+#                                    `qmcp template prepare` writes them into a template or a
+#                                    standalone at any time
+#   /etc/systemd/system/qmcp-refresh.{service,timer}   every minute, as the gate's user, the
+#                                    in-qube services brought up to date in every RUNNING
+#                                    prepared template or standalone; it never starts one
+#   the qmcp-id label                on an upgrade from before 0.9.26 (v0.9.16, which wrote no
+#                                    version file, known by the files it installed), or a
+#                                    reinstall over the operator files a plain uninstall of
+#                                    one kept when no qube carries a label or a hold yet,
+#                                    once: every qube already wearing ai-managed, ai-dump or
+#                                    a qmcp- badge with no label and no hold is labelled with its own UUID, the label the restore check
+#                                    reads; a seed that stopped part-way runs again on the
+#                                    next install (after an uninstall in between, the gate
+#                                    holds what it missed). A fresh install seeds none: a badged
+#                                    qube with no label of its own there came back from a backup
+#                                    or a copy, or was badged before 0.9.26 and kept through a
+#                                    purge, and the gate holds it for review. (With --anonymous
+#                                    it labels the hub as it gets qmcp-anon.)
 #   /etc/qmcp/mode                   with --anonymous: the word anonymous, written after the
 #                                    policy, once qmcp-anon is on the hub and on every qube
 #                                    under the hub's check; then they are stamped once more
@@ -144,15 +163,53 @@ for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/pr
          dom0/qmcp/proposals.py dom0/qmcp/gateways.py dom0/qmcp/firewall.py dom0/rpc/qmcp-service \
          dom0/bin/qmcp policy/30-mcp-control.policy deploy/qmcp-tmpfiles.conf pyproject.toml \
          dom0/qmcp/gui.py dom0/qmcp/guimodel.py dom0/bin/qmcp-gui deploy/qubes-mcp.desktop \
-         dom0/qmcp/anon.py deploy/qmcp-gate.service deploy/qmcp-gate.timer; do
+         dom0/qmcp/anon.py deploy/qmcp-gate.service deploy/qmcp-gate.timer \
+         dom0/qmcp/restored.py dom0/qmcp/inqube.py dom0/qmcp/opfiles.py \
+         template-rpc/qmcp.RunInAIManaged template-rpc/qmcp.CopyToAIManaged \
+         deploy/qmcp-refresh.service deploy/qmcp-refresh.timer; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
 done
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/pyproject.toml")"
 [ -n "$VERSION" ] || die "no version in $SRC/pyproject.toml"
+# The version installed now, read before anything changes. The qmcp-id labels
+# are seeded once, on an upgrade from a release before 0.9.26, or a reinstall
+# over an earlier install's kept operator files (see the header). v0.9.16 wrote
+# no version file and no /etc/qmcp/hub; the files it installed tell it apart
+# from a fresh box.
+PREV_VERSION="$(head -c 32 /usr/local/lib/qmcp/VERSION 2>/dev/null | tr -d '[:space:]' || true)"
+LEGACY_LEFT="$(PYTHONPATH="$SRC/dom0" python3 -c 'import os
+from qmcp import fleet
+print(sum(os.path.lexists(p) for p in fleet.LEGACY_PATHS))')" || die "the v0.9.16 file list could not be read"
+SEED_LABELS=0 SEED_WHY=""
+if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != unknown ] \
+        && [ "$(printf '%s\n%s\n' "$PREV_VERSION" 0.9.26 | sort -V | head -n1)" != 0.9.26 ]; then
+    SEED_LABELS=1 SEED_WHY="upgrade from $PREV_VERSION"
+elif [ -z "$PREV_VERSION" ] && [ -e "$ETC_QMCP/hub" ]; then
+    # Every uninstall removes the version file, and only --purge removes
+    # /etc/qmcp: an earlier install's operator files with no version file are a
+    # reinstall over a plain uninstall. The seed then runs only if no qube on
+    # the box carries a label or a hold yet: then no 0.9.26 or later labelled or
+    # held a qube here.
+    SEED_LABELS=2 SEED_WHY="reinstall over the operator files an uninstall kept"
+elif [ -z "$PREV_VERSION" ] && [ "$LEGACY_LEFT" -gt 0 ]; then
+    SEED_LABELS=1 SEED_WHY="upgrade from v0.9.16"
+fi
+# An install that seeds leaves this marker until its version file is written:
+# the first path from before its first change (the v0.9.16 files it keys on
+# are removed below), the second once its guard has passed. The next run with
+# no version file then seeds again, whatever it finds: the labels a seed did
+# write would otherwise read as a box that ran 0.9.26. Every uninstall removes
+# it with the rest of the library.
+SEED_PENDING=0
+[ -e "$LIB/SEED-PENDING" ] && SEED_PENDING=1
+if [ "$SEED_PENDING" -eq 1 ] && [ -z "$PREV_VERSION" ] && [ "$SEED_LABELS" -ne 1 ]; then
+    SEED_LABELS=2 SEED_WHY="the seed an earlier install did not finish"
+fi
+# (end of the seed decision)
 # An empty or truncated pull passes "parses clean", so check for a known rule.
 grep -qE '^\*[[:space:]]+\*[[:space:]]+mcp-control[[:space:]]+@anyvm[[:space:]]+deny' \
     "$SRC/policy/30-mcp-control.policy" || die "the staged policy is not the qubes-mcp rulebook"
-PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel, qmcp.proposals, qmcp.anon' \
+PYTHONPATH="$SRC/dom0" python3 -c 'import qmcp.services, qmcp.fleet, qmcp.cli, qmcp.guimodel, qmcp.proposals, qmcp.anon, qmcp.restored, qmcp.inqube, qmcp.opfiles' \
     || die "the staged library does not import"
 
 # The hub: fixed at the first install. Read with the same function the services
@@ -218,7 +275,8 @@ from qmcp import core, fleet
 import qubesadmin.app
 core.read_hub = lambda path=None: os.environ["QMCP_HUB"]
 app = qubesadmin.app.QubesLocal()
-steps, problems = fleet.plan_migration(app, {})
+# The shape only: a restored or held qube is the restore check's, not the migration's.
+steps, problems = fleet.plan_migration(app, {}, review=False)
 blocking = [s for s in steps if s.add or s.remove]
 for p in problems:
     print(f"    BLOCKED {p}")
@@ -313,6 +371,21 @@ for name in os.environ["QMCP_UPDATES_VIA"].split():
         print(f"    --updates-via {name}: not an enrolled anonymising gateway with a recorded "
               f"network", file=sys.stderr)
         sys.exit(1)
+    # Ticking it later goes through `qmcp gateway set`, which refuses a held one.
+    domains = qubesadmin.app.QubesLocal().domains
+    if name not in domains:
+        print(f"    --updates-via {name}: no such qube", file=sys.stderr)
+        sys.exit(1)
+    try:
+        held = core.QUARANTINE in core.tags_of(domains[name])
+    except Exception as e:
+        print(f"    --updates-via {name}: its tags cannot be read ({type(e).__name__})",
+              file=sys.stderr)
+        sys.exit(1)
+    if held:
+        print(f"    --updates-via {name}: held for your review (qmcp restored list); accept "
+              f"or reject it first", file=sys.stderr)
+        sys.exit(1)
     g.updates = True
 turning = turn_on and not mode_on
 if turning:
@@ -373,9 +446,20 @@ PYEOF
 [ "$MODE_STATUS" -eq 0 ] || die "the anonymity preflight refused (above); nothing was changed"
 
 say "preflight passed: qubes-mcp $VERSION, hub '$HUB', gate user '$GATE_USER'"
+if [ "$SEED_LABELS" -eq 1 ] || { [ "$SEED_PENDING" -eq 1 ] && [ "$SEED_LABELS" -eq 2 ]; }; then
+    say "it will label AI space for the restore check: $SEED_WHY"
+elif [ "$SEED_LABELS" -eq 2 ]; then
+    say "it will label AI space for the restore check if no qube carries a label or a hold yet: $SEED_WHY"
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
     say "dry run: nothing was changed"
     exit 0
+fi
+# The first path's marker goes on before the first change (the v0.9.16 files
+# it keys on are removed below); the second path's once its guard has passed.
+if [ "$SEED_LABELS" -eq 1 ]; then
+    install -d -m 0755 "$LIB"
+    : > "$LIB/SEED-PENDING"
 fi
 
 # ===================================================================== install
@@ -388,7 +472,8 @@ for f in "$RPC"/qmcp.* "$RPC"/qmcp_*.py; do [ -e "$f" ] && cp -a "$f" "$BACKUP/"
 [ -d "$ETC_QMCP" ] && cp -a "$ETC_QMCP" "$BACKUP/etc-qmcp"
 [ -d "$LIB" ] && cp -a "$LIB" "$BACKUP/usr-local-lib-qmcp"
 [ -f /etc/tmpfiles.d/qmcp.conf ] && cp -a /etc/tmpfiles.d/qmcp.conf "$BACKUP/"
-for f in /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer; do
+for f in /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer \
+         /etc/systemd/system/qmcp-refresh.service /etc/systemd/system/qmcp-refresh.timer; do
     [ -f "$f" ] && cp -a "$f" "$BACKUP/"
 done
 say "backed up to $BACKUP (root-only)"
@@ -430,10 +515,70 @@ install -m 0644 "$SRC"/dom0/qmcp/*.py "$LIB/qmcp/"
 # cannot write here, and would otherwise recompile the library on every call.
 PYTHONDONTWRITEBYTECODE= python3 -m compileall -q "$LIB/qmcp"
 install -m 0644 "$RENDERED" "$LIB/share/30-mcp-control.policy"
-printf '%s\n' "$VERSION" > "$LIB/VERSION"
-chmod 0644 "$LIB/VERSION"
 install -m 0755 "$SRC/dom0/bin/qmcp" /usr/local/bin/qmcp
 say "installed the library to $LIB and the command to /usr/local/bin/qmcp"
+rm -rf "$LIB/template-rpc"
+install -d -m 0755 "$LIB/template-rpc"
+install -m 0644 "$SRC/template-rpc/qmcp.RunInAIManaged" "$SRC/template-rpc/qmcp.CopyToAIManaged" \
+    "$LIB/template-rpc/"
+say "kept the in-qube services in $LIB/template-rpc (qmcp template prepare QUBE writes them in)"
+
+# --- the qmcp-id labels: once, on an upgrade or a reinstall (above), while the
+# gate's timer is stopped, so no pass can hold a qube before it is labelled
+if [ "$SEED_LABELS" -ne 0 ]; then
+    SEEDED="$(PYTHONPATH="$LIB" QMCP_SEED="$SEED_LABELS" QMCP_SEED_PENDING="$SEED_PENDING" \
+              QMCP_SEED_MARKER="$LIB/SEED-PENDING" python3 - <<'PYEOF'
+import os
+import sys
+import qubesadmin.app
+from qmcp import core, restored
+app = qubesadmin.app.QubesLocal()
+if os.environ.get("QMCP_SEED") == "2" and os.environ.get("QMCP_SEED_PENDING") != "1":
+    for vm in app.domains:
+        try:
+            if core.klass_of(vm) != "AdminVM" and (restored.label_of(vm) is not None
+                                                   or core.QUARANTINE in core.tags_of(vm)):
+                print("no seed: a qube already carries a label or a hold, so this box ran "
+                      "0.9.26 or later")
+                sys.exit(0)
+        except core.Gone:
+            continue
+open(os.environ["QMCP_SEED_MARKER"], "w").close()
+done, left, held, failed, unread = 0, [], [], [], []
+for vm in app.domains:
+    try:
+        tags = core.tags_of(vm)
+        if core.klass_of(vm) == "AdminVM" or not restored.in_scope(tags):
+            continue
+        if core.QUARANTINE in tags:
+            held.append(vm.name)
+            continue
+        if restored.label_of(vm) is None:
+            try:
+                restored.label(vm)
+                done += 1
+            except Exception as e:
+                failed.append(f"{vm.name} ({type(e).__name__})")
+        elif not restored.known(vm):
+            left.append(vm.name)
+    except core.Gone:
+        continue
+    except Exception as e:
+        unread.append(f"{vm.name} ({type(e).__name__})")
+print(f"labelled {done} qube(s)" + (f"; {', '.join(left)} carry another qube's label and will be held for review" if left else "")
+      + (f"; {', '.join(held)} held for review, left as they are" if held else "")
+      + (f"; NOT labelled: {', '.join(failed)}" if failed else "")
+      + (f"; could not be read: {', '.join(unread)}" if unread else ""))
+sys.exit(1 if failed or unread else 0)
+PYEOF
+)" || die "the qmcp-id labels could not all be read or written (${SEEDED:-the seed stopped before it reported}). The gate's timer may hold those qubes for review meanwhile. Run the install again (it seeds again until it finishes), then accept any qube it held: qmcp restored list"
+    say "$SEED_WHY: $SEEDED"
+fi
+# The version last, then the marker: a seed that did not finish is tried again
+# by the next run, on either path.
+printf '%s\n' "$VERSION" > "$LIB/VERSION"
+chmod 0644 "$LIB/VERSION"
+rm -f "$LIB/SEED-PENDING"
 install -m 0755 "$SRC/dom0/bin/qmcp-gui" /usr/local/bin/qmcp-gui
 install -m 0644 "$SRC/deploy/qubes-mcp.desktop" /usr/share/applications/qubes-mcp.desktop
 say "installed the window, /usr/local/bin/qmcp-gui, and its menu entry"
@@ -474,8 +619,13 @@ sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-gate.service" > "$SCRATCH/qmcp
 grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-gate.service" || die "the gate's unit did not render"
 install -m 0644 "$SCRATCH/qmcp-gate.service" /etc/systemd/system/qmcp-gate.service
 install -m 0644 "$SRC/deploy/qmcp-gate.timer" /etc/systemd/system/qmcp-gate.timer
+sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-refresh.service" > "$SCRATCH/qmcp-refresh.service"
+grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-refresh.service" || die "the refresh unit did not render"
+install -m 0644 "$SCRATCH/qmcp-refresh.service" /etc/systemd/system/qmcp-refresh.service
+install -m 0644 "$SRC/deploy/qmcp-refresh.timer" /etc/systemd/system/qmcp-refresh.timer
 systemctl daemon-reload
 systemctl enable qmcp-gate.timer >/dev/null
+systemctl enable qmcp-refresh.timer >/dev/null
 TIMER_STOPPED=1
 say "the anonymity gate will run every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 
@@ -526,9 +676,18 @@ by_name, tags_by = anon._snapshot(app, strict=True)
 # when their project goes (its leads and members wear it already).
 models = sorted({p.model_qube for p in records.values() if p.anonymous and p.model_qube
                  and p.model_qube in by_name})
+from qmcp import restored
 for name in anon.hub_subjects(hub, records, registry, by_name, tags_by) + models:
     vm = app.domains[name]
-    if projects.ANON not in core.tags_of(vm):
+    tags = core.tags_of(vm)
+    if projects.ANON not in tags:
+        # A qube outside the restore check's scope (no ai-managed, ai-dump or
+        # qmcp badge) and with no label yet (the hub) is labelled before it gets
+        # this one; one carrying another qube's label keeps it. One already badged
+        # is never labelled here: if it has no label of its own it came back from
+        # a backup, and the gate holds it.
+        if not restored.in_scope(tags):
+            restored.label_if_missing(vm)
         vm.tags.add(projects.ANON)
     if projects.ANON not in core.tags_of(vm):
         sys.exit(f"    {name} does not read back wearing {projects.ANON}")
@@ -555,6 +714,7 @@ fi
 systemctl start qmcp-gate.timer
 systemctl start qmcp-gate.service || true
 TIMER_STOPPED=0
+systemctl start qmcp-refresh.timer
 say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 
 # ===================================================================== verify

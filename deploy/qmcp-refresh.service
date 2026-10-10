@@ -1,0 +1,31 @@
+# /etc/systemd/system/qmcp-refresh.service -- qubes-mcp
+#
+# Brings qmcp's two in-qube services up to the installed version in every
+# RUNNING template and standalone that was prepared before
+# (`qmcp template prepare`) and carries an older version. It never starts a
+# qube: a halted one is brought up to date the next time it runs. It skips a
+# qube the anonymity gate stopped and one held for the operator's review, and
+# one never prepared. One audit line per qube it wrote into, as caller
+# "refresh"; a qube it could not write into goes to this unit's journal only.
+#
+# A unit of its own, not a third command in qmcp-gate.service: a timer does
+# not start a unit that is still running, so a hostile qube that stalled a
+# write would delay the anonymity gate's next run. Each write has a timeout.
+#
+# deploy/install.sh renders the gate's dom0 user into User=, as for the gate:
+# a member of `qubes`, never root.
+
+[Unit]
+Description=qubes-mcp: bring the in-qube services up to date in running prepared qubes
+After=qubesd.service
+Wants=qubesd.service
+
+[Service]
+Type=oneshot
+User=@GATE_USER@
+ExecStart=/usr/local/bin/qmcp template refresh
+# 3: a qube could not be judged or written into; the next run tries again,
+# and `qmcp check` names such a qube when qmcp runs commands in it.
+SuccessExitStatus=3
+TimeoutStartSec=300
+NoNewPrivileges=yes

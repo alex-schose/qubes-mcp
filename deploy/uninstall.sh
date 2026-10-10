@@ -41,9 +41,10 @@ qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
 qmcp.AIManagedEvents qmcp.GetPoolStats qmcp.SubmitProposal qmcp.ProposalStatus"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
-UNITS="qmcp-gate.timer qmcp-gate.service qmcp-seal.service"
+UNITS="qmcp-gate.timer qmcp-gate.service qmcp-refresh.timer qmcp-refresh.service qmcp-seal.service"
 OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
 /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer
+/etc/systemd/system/qmcp-refresh.service /etc/systemd/system/qmcp-refresh.timer
 /etc/systemd/system/qmcp-seal.service
 /etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf
 /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent

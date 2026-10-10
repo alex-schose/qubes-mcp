@@ -134,6 +134,11 @@ def owner_tag(principal: str) -> str:
     return f"{OWNER_PREFIX}{safe or 'unknown'}"
 
 
+#: The restore check's hold (`core.QUARANTINE`), named here because birth
+#: cannot import core.
+HELD = "qmcp-quarantine"
+
+
 def controlled(tag: str) -> bool:
     return tag in LEGACY_TIER_TAGS or tag.startswith(NAMESPACE) or tag in (UMBRELLA, GUARDED)
 
@@ -172,6 +177,11 @@ def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None,
     """
     want = expected_tags(source_tags, principal, slot_badge, extra)
     have = set(io.read())
+    # A child already held for the operator's review (a disposable the gate
+    # held before it was claimed) is never released by a create: only the
+    # operator lifts a hold. Refused, so the caller rolls the child back.
+    if HELD in have:
+        raise RuntimeError("the new qube is held for the operator's review")
     for tag in sorted(want - have, key=_add_order):
         io.add(tag)
     for tag in sorted(t for t in have - want if controlled(t) and not is_restriction(t)):

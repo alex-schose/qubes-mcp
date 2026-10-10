@@ -55,6 +55,16 @@ GUARDED = "qmcp-guarded"
 OPEN = "qmcp-open"
 OPEN_FW = "qmcp-open-fw"
 
+#: A qube that came back from a backup or was copied by hand, held for the
+#: operator's review (`qmcp.restored`). dom0 labels every qube it brings into AI
+#: space or badges with the feature `ID_FEATURE` set to the qube's own UUID; a
+#: restore and a `qvm-clone` keep the feature and give the qube a new UUID, so
+#: the label stops matching. The gate's pass then puts `QUARANTINE` on it, and
+#: the rulebook's A0 refuses every call into it and out of it. Like the open
+#: badges it is outside `scope.TAG_VOCABULARY`.
+QUARANTINE = "qmcp-quarantine"
+ID_FEATURE = "qmcp-id"
+
 #: A value that could not be read, where one is shown: never a qube name or a
 #: state, so nothing that reads it can take it for none.
 UNREADABLE = "<unreadable>"
@@ -85,6 +95,7 @@ _QUBE_NAME_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
 NOT_FOUND = {"ok": False, "error": "not found"}
 GUARDED_REFUSAL = {"ok": False, "error": "guarded: reference only"}
 BLOCKED_REFUSAL = {"ok": False, "error": "stopped by the anonymity gate"}
+QUARANTINE_REFUSAL = {"ok": False, "error": "held for the operator's review"}
 NOT_AUTHORIZED = {"ok": False, "error": "caller is not a qmcp principal"}
 
 
@@ -192,10 +203,12 @@ def lead_badges_agree(tags, slot: str) -> bool:
     """A lead wears the umbrella, `qmcp-lead` and exactly its own slot's lead
     badge, no member badge and no model badge, and is not guarded. A lead the
     anonymity gate stopped (`qmcp-blocked`) is no principal: the operator may
-    start it by hand to look at it, and it acts on nothing."""
+    start it by hand to look at it, and it acts on nothing. Nor is one held for
+    the operator's review (`qmcp-quarantine`): a lead restored from a backup is
+    a lead again only once the operator accepts it."""
     tags = set(tags)
     return (UMBRELLA in tags and projects.LEAD in tags and GUARDED not in tags
-            and projects.BLOCKED not in tags
+            and projects.BLOCKED not in tags and QUARANTINE not in tags
             and projects.lead_slots(tags) == {slot} and not projects.member_slots(tags)
             and not projects.model_slots(tags))
 
@@ -213,10 +226,13 @@ def principal(app, caller_name: str, hub: str | None = None) -> Principal:
         hub = read_hub()
     if hub is not None and caller_name == hub:
         # The rulebook refuses a blocked hub every call (anonymous mode stops
-        # the hub); the services refuse it too, as they refuse a blocked lead.
+        # the hub), and a held one (a hub in anonymous mode wears qmcp-anon, so
+        # a hub restored from a backup is held for review); the services refuse
+        # both too, as they refuse a blocked or held lead. One read of its tags.
         try:
-            stopped = app.qubesd_call(caller_name, "admin.vm.tag.Get",
-                                      projects.BLOCKED).strip() != b"0"
+            raw = app.qubesd_call(caller_name, "admin.vm.tag.List")
+            stopped = bool({projects.BLOCKED, QUARANTINE}
+                           & set(raw.decode(errors="replace").split()))
         except Exception:
             stopped = True
         if stopped:
@@ -550,6 +566,8 @@ def operand(app, name, who: Principal):
         raise Refusal(GUARDED_REFUSAL) from None
     if projects.BLOCKED in tags:
         raise Refusal(BLOCKED_REFUSAL)
+    if QUARANTINE in tags:
+        raise Refusal(QUARANTINE_REFUSAL)
     if is_guarded(vm, tags):
         raise Refusal(GUARDED_REFUSAL)
     return vm
@@ -587,6 +605,8 @@ def reference(app, name, what: str, who: Principal):
         raise refuse(f"{what} must reference an ai-managed qube") from None
     if tags & {projects.BLOCKED, projects.STOPPED}:
         raise Refusal(BLOCKED_REFUSAL)
+    if QUARANTINE in tags:
+        raise Refusal(QUARANTINE_REFUSAL)
     return vm
 
 

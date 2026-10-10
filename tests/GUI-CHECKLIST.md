@@ -105,7 +105,10 @@ what runs. While OK is off, that line says why instead, in orange, under
     is kept.
 16. **Settings.** The Settings tab shows the hub, the name prefix, the caps,
     the disk AI space uses, the birth egress, the number of gateways enrolled,
-    and the version, with no way to edit them.
+    the mode and the version, and above them *Edit settings...*, *Export...*
+    and *Import...* (steps 60 to 62 use them). The note under the values says
+    the hub is fixed at install, and the mode is turned on only by install.sh
+    and off only by uninstall.sh --purge.
 17. **Busy.** Start any change, and while it runs, try another button.
     Expect: every action button is greyed out until the first one reports.
 18. **A proposal arrives.** In the hub, propose a project as an agent would,
@@ -670,3 +673,137 @@ and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
     enroll your routers again (`sys-ai-tor` with `--anonymising --updates`):
     until they are, a qube in AI space on one of them fails the check too.
     Expect `qmcp check` GREEN.
+
+### Restored qubes, templates and the operator files (0.9.26)
+
+Steps 53 to 63 cover the restore check, the in-qube services and the operator
+files. Run them in normal mode, with `qmcp check` GREEN: an *in-qube services*
+WARN is fine, since a template is named there until it is prepared. Besides
+`<template>` and `<gateway>` as above, they need `<outside-template>`, a
+TemplateVM outside AI space that a qube in AI space is built on, such as the
+one `qvm-prefs <some managed AppVM> template` prints (step 59 writes the two
+services into it; they do nothing unless qmcp's rulebook routes a call to
+them). The names `ai-t10`, `ai-t10c`, `ai-t10r`, `ai-t10a`, `ai-t10b` and
+`ai-t10x` must not exist yet, and slot `p15` must hold no project: the Qubes
+tab lists the projects with their slots.
+
+A qube is held for review when it carries qmcp badges and its `qmcp-id`
+feature is not its own UUID. `qvm-clone` copies both the badges and the
+feature to a new UUID, as a backup restore does, so a clone stands in for a
+qube back from a backup. Each Refresh runs the gate's pass, which holds such a
+qube, first; its timer does the same every 15 seconds.
+
+53. **A copy made by hand is held.** Make a qube to copy:
+    `qvm-create --class AppVM --template <template> --label gray ai-t10`, then
+    `qvm-prefs ai-t10 netvm ''`. Press Refresh, *Add a qube to AI space...*,
+    choose `ai-t10`, tick *managed*, OK. Then in dom0
+    `qvm-clone ai-t10 ai-t10c`, and press Refresh. Expect a desktop
+    notification `qubes-mcp is holding ai-t10c for your review: it came back
+    from a backup, or was copied by hand. Open the qubes-mcp window.` (from
+    this refresh or from the timer, whichever held it first). On the Qubes
+    tab, `ai-t10c` under *Needs attention*, *Role* `needs attention: held for
+    review`; `ai-t10` stays under the hub's "no slot". Select `ai-t10c`: *Why*
+    starts `held for your review: it came back from a backup or was copied by
+    hand`, *Held for review* `yes: the rulebook refuses every call into it and
+    out of it until you accept or reject it`, *Its qmcp-id label* starts
+    `another qube's UUID`, *Badges it came back with* `["ai-managed"]`, *Its
+    badges make it* `managed`, *Agrees with the records* `yes, as the records
+    are now`. Of the qube buttons only *Accept restored...* and *Reject
+    restored...* are on (with *New project...* and *Add a qube to AI
+    space...*). The Check tab lists `WARN` `restored qubes` `held for your
+    review: ai-t10c (...)`, the light stays `GREEN`, and *Accept all held...*
+    above the list is on. In dom0, `qvm-tags ai-t10c` lists `qmcp-quarantine`.
+54. **Accept it.** Select `ai-t10c`, *Accept restored...*. Expect the form to
+    say it keeps the badges it came back with `(ai-managed), which make it
+    managed`, no red line, and the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp restored accept ai-t10c`. OK. Expect
+    a report `ai-t10c: accepted; its badges stay as they came back`;
+    `ai-t10c` under the hub's "no slot"; the Check tab's *restored qubes*
+    `PASS`, and *Accept all held...* greyed out. In dom0,
+    `qvm-features ai-t10c qmcp-id` prints what `qvm-prefs ai-t10c uuid` does.
+55. **Reject a copy, in red first.** `qvm-clone ai-t10 ai-t10r`, Refresh.
+    Select `ai-t10r`, *Reject restored...*. Expect the red line `Every qmcp
+    badge comes off ai-t10r: ai-managed. It is out of AI space and every
+    project afterwards.` and the command `.../qmcp restored reject ai-t10r`.
+    OK. Expect a report starting `ai-t10r: taken out of AI space`, `ai-t10r`
+    gone from the tree, and `qvm-ls ai-t10r` still listing it.
+56. **Accept every held qube.** `qvm-clone ai-t10 ai-t10a`, then
+    `qvm-clone ai-t10 ai-t10b`, Refresh. On the Check tab, *Accept all
+    held...*. Expect the form to say it accepts exactly the qubes listed, by
+    name, that it is the last step after a reinstall, and that a qube held
+    after the window last read is not in the list and stays held; then, under
+    `Held now, as this window last read it:`, the lines
+    `- ai-t10a: managed (ai-managed)` and `- ai-t10b: managed (ai-managed)`;
+    no red line; and the command `.../qmcp restored accept ai-t10a ai-t10b`
+    (never `--all`). OK. Expect
+    a report with an `accepted` line for each, and *Needs attention* without
+    them.
+57. **Badges the records do not back, in red.** `qvm-clone ai-t10 ai-t10x`,
+    then `qvm-tags ai-t10x add qmcp-lead` and `qvm-tags ai-t10x add
+    qmcp-lead-p15`, and Refresh. Select
+    `ai-t10x` (under *Needs attention*, held): *Its badges make it* `lead of
+    p15`, *Agrees with the records* starts `NO`, *Where they disagree*
+    `p15's record names no such project as lead`. *Accept restored...*:
+    expect the red paragraph `Its badges disagree with the project records as
+    they are now: p15's record names no such project as lead. Accepted, it
+    acts on them, and qmcp check fails until the badges or the records
+    change.` Cancel. On the Check tab, *Accept all held...*: expect the same
+    reason in red, after `Accepted, these keep badges the project records do
+    not back, and qmcp check fails on them:`. Cancel. Select `ai-t10x`,
+    *Reject restored...*, OK: expect `qvm-tags ai-t10x` to list neither
+    `qmcp-lead` nor `qmcp-quarantine`.
+58. **Prepare a template from its row.** Select `<template>` under
+    *Templates*, *Prepare...*. Expect the form to say it writes
+    `qmcp.RunInAIManaged` and `qmcp.CopyToAIManaged` into a TemplateVM or a
+    StandaloneVM as root and labels it `qmcp-services`, and to end with
+    `<template> is halted: the command starts it for this and shuts it down
+    again after.` (or `is running: it keeps running.`); the command
+    `.../qmcp template prepare <template>`. OK. Expect, once it has started and
+    stopped it, a report `<template>: prepared (sha256:...)`, followed by
+    `; it was started for this and shut down again` when it was halted.
+    `qvm-features <template> qmcp-services` prints that `sha256:` value, and
+    the Check tab's *in-qube services* no longer names `<template>`. Select
+    `ai-t10` (an AppVM): *Prepare...* is greyed out.
+59. **Prepare one outside AI space, from the Check tab.** Select a project on
+    the Qubes tab, then on the Check tab *Prepare a template...*. Expect a
+    list of every TemplateVM and StandaloneVM, `<outside-template>` among
+    them as `<outside-template> (TemplateVM, outside AI space, Halted)`,
+    nothing chosen, and OK greyed out. Choose `<outside-template>`: *Power*
+    reads `<outside-template> is halted: the command starts it for this and
+    shuts it down again after.`, and the command
+    `.../qmcp template prepare <outside-template>`. OK. Expect `prepared`,
+    as in step 58.
+60. **Edit the settings.** On the Settings tab, *Edit settings...*. Expect
+    *Pool cap* and *Private-volume cap* filled with the values the tab shows
+    (as `1000G`, say), *In use* the disk AI space uses, *Birth egress*
+    `unchanged: ` and what the tab shows (`not set` when it is empty), and OK
+    greyed out with `nothing changed`. Type `1G` as the pool cap: OK greyed
+    out, `a pool cap of 1073741824 bytes is below the N AI space already
+    uses`. Put the pool cap back as it was. Raise *Private-volume cap* by one
+    (`21G` for `20G`): the command `.../qmcp settings set --private-cap 21G`,
+    and nothing else. OK. Expect a report `private-cap: 22548578304` and the
+    tab's *Private-volume cap (one qube)* `21.0 GiB`. Open the form again,
+    choose `<gateway>` under *Birth egress*, OK: the tab's *Birth egress*
+    `<gateway>`. Put both back: the private cap as it was, and *Birth
+    egress* as it was (`none: not set` when it read `-`).
+61. **Export.** *Export...*. Expect the form to say what the file holds and
+    that a backup with dom0 ticked carries it; with *File* empty, the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp export`. Type `export.json`: OK
+    greyed out, `the file to write: give the full path, starting with /`.
+    Empty the field, OK. Expect a report `wrote` and a path under your dom0
+    home, `qmcp-export-<time>.json`, then what to do with it after a
+    reinstall. In dom0, `ls -l` on that file shows it yours, `-rw-------`.
+    *Export...* again with that path typed in full, OK: the report FAILED,
+    `... exists; nothing was written`.
+62. **Import refuses on this install.** *Import...*. Expect the red paragraph
+    starting `For a fresh install only: the command refuses if this install
+    has a project, a sink for p00 or an enrolled gateway.` and saying to
+    restore the qubes, then *Accept all held...*. Type the path from step 61:
+    OK greyed out, `this install already has projects or gateways: an import
+    is for a fresh install, and changes nothing here`. Cancel. The import
+    itself is drilled on a reinstalled box: install, *Import...*, restore the
+    qubes with `qvm-backup-restore`, then *Accept all held...*.
+63. **Clean up.** In dom0, `qvm-remove -f ai-t10 ai-t10c ai-t10r ai-t10a
+    ai-t10b ai-t10x` (`qvm-shutdown --wait` first for any that runs), and
+    remove the export file from step 61 unless you keep it. Refresh. Expect
+    none of them in the tree, and `qmcp check` GREEN.

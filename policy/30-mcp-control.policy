@@ -51,6 +51,14 @@
 *                          *  @anyvm           @tag:qmcp-blocked        deny
 *                          *  @tag:qmcp-blocked  @adminvm               deny
 *                          *  @tag:qmcp-blocked  @anyvm                 deny
+# A qube that came back from a backup, or was copied by hand, wears
+# qmcp-quarantine until the operator reviews it: dom0's label on it no longer
+# matches its UUID. Whatever badges it came back with, nothing reaches it and it
+# reaches nothing, dom0's services included, as for a stopped qube. Only dom0
+# writes this badge, and only the operator takes it off.
+*                          *  @anyvm           @tag:qmcp-quarantine     deny
+*                          *  @tag:qmcp-quarantine  @adminvm            deny
+*                          *  @tag:qmcp-quarantine  @anyvm              deny
 *                          *  mcp-control      @tag:qmcp-hubblind       deny
 # An anonymous project's qubes open nothing in another qube, not even through a
 # dialog: a URL or a file opened in a clearnet qube leaves outside its router.

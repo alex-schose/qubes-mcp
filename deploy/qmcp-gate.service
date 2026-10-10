@@ -6,8 +6,11 @@
 #      out, one whose record under /run does not read, and one on a qube
 #      `qmcp open` refuses. It goes first because it only ever takes authority
 #      away, and because the gate below may stop qubes and take longer.
-#   2. `qmcp gate` judges every anonymous project, and the hub in anonymous
-#      mode, and stops one that is not sound.
+#   2. `qmcp gate` first holds for the operator's review every qube wearing
+#      ai-managed, ai-dump or a qmcp- badge whose qmcp-id label is missing or
+#      not its own UUID (it came back from a backup or a copy), then judges
+#      every anonymous project, and the hub in anonymous mode, and stops one
+#      that is not sound.
 #
 # qmcp-gate.timer starts this every 15 seconds, and once soon after boot. Each
 # command takes the gate's lock in turn and releases it, so they never hold it

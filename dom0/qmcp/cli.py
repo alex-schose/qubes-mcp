@@ -3,6 +3,10 @@
     qmcp check [--json]            is the fleet sound? (exit 0 GREEN, 1 FAILED, 3 INCOMPLETE)
     qmcp list [--all] [--json]     AI space: state, class, template, network, slot, owner
     qmcp settings [--json]         the operator files and the disk AI space uses
+    qmcp settings set ...          change the pool cap, the private cap or birth egress
+    qmcp template prepare|refresh  write qmcp's in-qube services into a template or standalone
+    qmcp restored list|accept|reject   qubes back from a backup or a copy, held for review
+    qmcp export [FILE] / import FILE   the operator files, as one file a backup carries
     qmcp manage|guard|revoke QUBE  role actions
     qmcp gateway ...               the networks AI space may use: list, enroll, set, remove
     qmcp project ...               projects: list, show, create, edit, lead, firewall, dump,
@@ -34,7 +38,7 @@ import json
 import os
 import sys
 
-from qmcp import anon, audit, fleet, projects, proposals
+from qmcp import anon, audit, core, fleet, inqube, opfiles, projects, proposals, restored
 
 EXIT = {"GREEN": 0, "FAILED": 1, "INCOMPLETE": 3}
 
@@ -80,6 +84,21 @@ def cmd_list(args) -> int:
 
 
 def cmd_settings(args) -> int:
+    if getattr(args, "what", None) == "set":
+        _need_root("set", "settings")
+        try:
+            lines = opfiles.settings_set(_app(), pool_cap=args.pool_cap,
+                                         private_cap=args.private_cap,
+                                         birth_egress=args.birth_egress)
+        except opfiles.OpFilesError as e:
+            print(f"qmcp settings set: {e}; nothing was changed", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"qmcp settings set: {type(e).__name__}", file=sys.stderr)
+            return 1
+        for line in lines:
+            print(line)
+        return 0
     values = dict(fleet.settings(_app()), version=_version())
     if args.json:
         print(json.dumps(values, indent=2))
@@ -149,7 +168,8 @@ def cmd_window(args) -> int:
 
 def _need_root(what: str, command: str = "project") -> None:
     if os.geteuid() != 0:
-        raise SystemExit(f"qmcp {command} {what}: run as root (sudo qmcp {command} {what} ...); "
+        cmd = " ".join(w for w in (command, what) if w)
+        raise SystemExit(f"qmcp {cmd}: run as root (sudo qmcp {cmd} ...); "
                          f"it writes /etc/qmcp or takes the records' lock")
 
 
@@ -332,11 +352,148 @@ def cmd_project(args) -> int:
     return 1 if getattr(report, "failed", None) else 0
 
 
+def cmd_template(args) -> int:
+    """`prepare`: the operator writes the in-qube services into one qube.
+    `refresh`: the timer brings every running prepared qube up to date, and
+    leaves one audit line per qube it wrote into, as caller "refresh". A qube
+    it could not judge or write into is printed (the unit's journal) and makes
+    the run exit 3, with no line: the chain records changes, and a qube that
+    keeps failing would otherwise add one every minute."""
+    if args.what == "prepare":
+        _need_root("prepare", "template")
+        try:
+            r = inqube.prepare(_app(), args.qube)
+        except (inqube.InQubeError, core.Unreadable) as e:
+            print(f"qmcp template prepare: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"qmcp template prepare: {type(e).__name__}", file=sys.stderr)
+            return 1
+        print(f"{r['qube']}: prepared ({r['version']})"
+              + ("; it was started for this and shut down again" if r["started"] else ""))
+        return 0
+    try:
+        done = inqube.refresh(_app())
+    except inqube.InQubeError as e:
+        print(f"qmcp template refresh: {e}", file=sys.stderr)
+        return 3
+    rc = 0
+    for name, outcome in done:
+        print(f"{name}: {outcome}")
+        if outcome != "updated":
+            rc = 3
+            continue
+        try:
+            audit.audit("qmcp template refresh", "refresh", {"qube": str(name)[:128]}, True)
+        except Exception:
+            pass
+    return rc
+
+
+def cmd_restored(args) -> int:
+    if args.what == "list":
+        try:
+            records = projects.load()
+        except projects.ProjectsUnreadable:
+            records = None
+            print("qmcp restored: the project records cannot be read, so no row says whether "
+                  "it agrees with them", file=sys.stderr)
+        rows = restored.review(_app(), records)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("none waiting for review")
+        for r in rows:
+            if "unreadable" in r:
+                print(f"{r['name']}: {r['unreadable']}")
+                continue
+            print(f"{r['name']}: {'held' if r['held'] else 'NOT YET HELD'}; came back as "
+                  f"{r['role']}; label {r['label']}; "
+                  + ("agreement with the records not known" if r["agrees"] is None else
+                     "agrees with the records" if r["agrees"] else "; ".join(r["why"])))
+        return 0
+    _need_root(args.what, "restored")
+    app = _app()
+    if args.what == "accept" and args.all:
+        if args.qube:
+            raise SystemExit("qmcp restored accept: name the qubes, or give --all, not both")
+        names = [r["name"] for r in restored.review(app, None) if r.get("held")]
+        if not names:
+            print("nothing is held")
+            return 0
+    elif not args.qube:
+        raise SystemExit(f"qmcp restored {args.what}: name a qube"
+                         + (", or give --all" if args.what == "accept" else ""))
+    else:
+        # accept takes the names the operator saw (the window passes the ones it showed)
+        names = list(args.qube) if isinstance(args.qube, list) else [args.qube]
+    rc = 0
+    for name in names:
+        try:
+            print((restored.accept if args.what == "accept" else restored.reject)(app, name))
+        except restored.ReviewError as e:
+            print(f"qmcp restored {args.what}: {e}", file=sys.stderr)
+            rc = 1
+        except Exception as e:
+            print(f"qmcp restored {args.what}: {name}: {type(e).__name__}; see qmcp "
+                  f"restored list",
+                  file=sys.stderr)
+            rc = 1
+    return rc
+
+
+def cmd_export(args) -> int:
+    _need_root("", "export")
+    try:
+        path = opfiles.export(_version(), args.file, os.environ.get("SUDO_USER"))
+    except opfiles.OpFilesError as e:
+        print(f"qmcp export: {e}", file=sys.stderr)
+        return 1
+    print(f"wrote {path}: back it up with dom0 ticked. On a reinstalled Qubes: restore "
+          f"everything, install qubes-mcp with the same --hub, sudo qmcp import FILE (it comes "
+          f"back under ~/home-restore-<time>/dom0-home/), then sudo qmcp restored accept --all")
+    return 0
+
+
+def cmd_import(args) -> int:
+    _need_root("", "import")
+    try:
+        lines = opfiles.import_(args.file)
+    except opfiles.OpFilesError as e:
+        print(f"qmcp import: {e}; nothing was changed", file=sys.stderr)
+        return 1
+    except fleet.ProjectError as e:
+        print(f"qmcp import: {e}; nothing was changed", file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line)
+    print("next: accept the restored AI qubes, which the gate holds until you do: sudo qmcp "
+          "restored accept --all (qmcp restored list shows each first)")
+    return 0
+
+
 def cmd_gate(args) -> int:
     """Judge every anonymous project now, and stop one that is not (the timer
     runs this). Prints only what is not sound, or what it did, unless --json.
     Exit 0 all sound, 1 one is not, 3 one could not be judged, or another run
     held the gate so nothing was."""
+    held = None
+    try:
+        held = restored.hold(_app())
+        restored.notify(held)
+    except Exception as e:
+        print(f"qmcp gate: the restore check could not run ({type(e).__name__})", file=sys.stderr)
+    if held is not None:
+        # On stderr: `--json` is the gate's verdicts alone, which the window reads.
+        for name in held.held:
+            print(f"{name}: held for review (it came back from a backup or a copy)",
+                  file=sys.stderr)
+        for name, err in held.failed:
+            print(f"{name}: NOT held ({err}); tried again next run", file=sys.stderr)
+        if not held.judged:
+            print("qmcp gate: a create held the lock, so no restored qube was looked for; the "
+                  "next run looks", file=sys.stderr)
     try:
         verdicts = anon.run(_app(), beat=os.environ.get(anon.HEARTBEAT_ENV) == "1")
     except projects.ProjectsUnreadable as e:
@@ -363,7 +520,8 @@ def cmd_gate(args) -> int:
                 print(f"  {line}")
     if any(v.status == anon.RED for v in verdicts):
         return 1
-    return 3 if any(v.status == anon.UNREADABLE for v in verdicts) else 0
+    unjudged = held is None or not held.judged or bool(held.failed or held.unread)
+    return 3 if unjudged or any(v.status == anon.UNREADABLE for v in verdicts) else 0
 
 
 def _gate_after(args) -> None:
@@ -526,6 +684,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="also every qube outside AI space but dom0")
     p = sub.add_parser("settings", help="the operator files and the disk AI space uses")
     p.add_argument("--json", action="store_true")
+    ssub = p.add_subparsers(dest="what")
+    q = ssub.add_parser("set", help="change the pool cap, the private-volume cap or birth "
+                                    "egress (root)")
+    q.add_argument("--pool-cap", metavar="SIZE", help="the disk all of AI space may hold, e.g. 200G")
+    q.add_argument("--private-cap", metavar="SIZE", help="the largest private volume one qube "
+                                                         "may ask for, e.g. 20G")
+    q.add_argument("--birth-egress", metavar="QUBE|none",
+                   help="where the hub's template-based qubes go online (an enrolled gateway)")
+    p = sub.add_parser("template", help="qmcp's in-qube services in a template or standalone")
+    tsub = p.add_subparsers(dest="what", required=True)
+    q = tsub.add_parser("prepare", help="write them into a TemplateVM or StandaloneVM, starting "
+                                        "it if halted (root)")
+    q.add_argument("qube")
+    tsub.add_parser("refresh", help="bring every RUNNING prepared qube up to the installed "
+                                    "services; never starts one (its timer runs this)")
+    p = sub.add_parser("restored", help="qubes back from a backup or a copy, held for review")
+    rsub = p.add_subparsers(dest="what", required=True)
+    q = rsub.add_parser("list", help="every badged qube whose label is not its own, and every "
+                                     "held one, with what it came back as")
+    q.add_argument("--json", action="store_true")
+    q = rsub.add_parser("accept", help="label each and lift the hold; its badges stay (root)")
+    q.add_argument("qube", nargs="*", help="the qubes you reviewed")
+    q.add_argument("--all", action="store_true",
+                   help="every qube held when it runs (after qmcp import)")
+    q = rsub.add_parser("reject", help="take every qmcp badge off; the qube stays (root)")
+    q.add_argument("qube")
+    p = sub.add_parser("export", help="the operator files, as one file in your dom0 home (root)")
+    p.add_argument("file", nargs="?", help="where to write it (default: your home)")
+    p = sub.add_parser("import", help="an export's operator files, onto a fresh install (root)")
+    p.add_argument("file")
     for name, text in (("manage", "make a qube managed (the hub may operate it)"),
                        ("guard", "make a qube guarded (reference only); a model qube that was "
                                  "managed is killed if it runs (never a gateway or a template)"),
@@ -687,6 +875,28 @@ def operator_line(args):
     and reject write their own line, with the proposal's fingerprint; a
     rotation writes the first line of the new log itself."""
     c = args.cmd
+    if c == "settings":
+        if getattr(args, "what", None) != "set":
+            return None
+        return "qmcp settings set", {"pool_cap": None if args.pool_cap is None else "set",
+                                     "private_cap": None if args.private_cap is None else "set",
+                                     "birth_egress": None if args.birth_egress is None
+                                     else str(args.birth_egress)[:128]}
+    if c == "template":
+        # The refresh is the timer's: it writes one line per qube it changed.
+        return None if args.what == "refresh" else ("qmcp template prepare",
+                                                    {"qube": str(args.qube)[:128]})
+    if c == "restored":
+        if args.what == "list":
+            return None
+        qubes = args.qube if isinstance(args.qube, list) else ([] if args.qube is None
+                                                               else [args.qube])
+        return f"qmcp restored {args.what}", {"qubes": _names(qubes),
+                                              "all": bool(getattr(args, "all", False))}
+    if c == "export":
+        return "qmcp export", {"file": None if args.file is None else str(args.file)[:128]}
+    if c == "import":
+        return "qmcp import", {"file": str(args.file)[:128]}
     if c in ("manage", "guard", "revoke"):
         summary = {"qube": str(args.qube)[:128]}
         if c == "revoke":
@@ -778,7 +988,8 @@ def main(argv=None) -> int:
                "manage": cmd_role, "guard": cmd_role, "revoke": cmd_role,
                "open": cmd_window, "seal": cmd_window,
                "gateway": cmd_gateway, "project": cmd_project, "proposal": cmd_proposal, "migrate": cmd_migrate,
-               "audit": cmd_audit, "gate": cmd_gate}[args.cmd]
+               "audit": cmd_audit, "gate": cmd_gate, "template": cmd_template,
+               "restored": cmd_restored, "export": cmd_export, "import": cmd_import}[args.cmd]
     line = operator_line(args)
     if line is None:
         rc = handler(args)

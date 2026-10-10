@@ -19,7 +19,7 @@ import re
 import stat
 import time
 
-from qmcp import anon, audit, birth, budget, core, firewall, gateways, projects, proposals
+from qmcp import anon, audit, birth, budget, core, firewall, gateways, inqube, projects, proposals, restored
 
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_NAME = "30-mcp-control.policy"
@@ -131,6 +131,10 @@ PRECEDENCE_CLAIMS = (
     ("the hub's exec into a stopped qube", "qmcp.RunInAIManaged", "hub", "blocked"),
     ("a stopped qube calling a qmcp service", "qmcp.ListAIManagedQubes", "blocked", "dom0"),
     ("a stopped qube reaching another qube", "qubes.Filecopy", "blocked", "member"),
+    ("the hub's exec into a qube held for review", "qmcp.RunInAIManaged", "hub", "heldm"),
+    ("a lead's exec into its member held for review", "qmcp.RunInAIManaged", "lead", "heldm"),
+    ("a lead held for review calling a qmcp service", "qmcp.ListAIManagedQubes", "heldl", "dom0"),
+    ("a lead held for review reaching its members", "qmcp.RunInAIManaged", "heldl", "member"),
     ("the hub reaching a hidden anonymous project", "qmcp.RunInAIManaged", "hub", "hidden"),
     ("the hub's copy into a hidden anonymous project", "qubes.Filecopy", "hub", "hidden"),
     ("an anonymous qube opening a URL elsewhere", "qubes.OpenURL", "anon", "outside"),
@@ -183,7 +187,8 @@ _PROBES = {"ai": "qmcp-probe-ai", "peer": "qmcp-probe-peer",
            "other": "qmcp-probe-other", "sink": "qmcp-probe-sink",
            "model": "qmcp-probe-model", "blocked": "qmcp-probe-blocked",
            "hidden": "qmcp-probe-hidden", "anon": "qmcp-probe-anon",
-           "open": "qmcp-probe-open", "openfw": "qmcp-probe-openfw"}
+           "open": "qmcp-probe-open", "openfw": "qmcp-probe-openfw",
+           "heldm": "qmcp-probe-heldm", "heldl": "qmcp-probe-heldl"}
 #: Synthetic project p01 (lead, member, sink, model qube) and a member of p02.
 _PROBE_TAGS = {
     "ai": [core.UMBRELLA], "peer": [core.UMBRELLA], "guarded": [core.UMBRELLA, core.GUARDED],
@@ -198,6 +203,10 @@ _PROBE_TAGS = {
     "blocked": [core.UMBRELLA, projects.member_badge("p01"), projects.ANON, projects.BLOCKED],
     "hidden": [core.UMBRELLA, projects.member_badge("p03"), projects.ANON, projects.HUBBLIND],
     "anon": [core.UMBRELLA, projects.member_badge("p04"), projects.ANON],
+    # Restored with their badges, so the lines that would route them are live:
+    # only A0's quarantine lines stand between them and their slot.
+    "heldm": [core.UMBRELLA, projects.member_badge("p01"), core.QUARANTINE],
+    "heldl": [core.UMBRELLA, projects.LEAD, projects.lead_badge("p01"), core.QUARANTINE],
 }
 
 
@@ -317,7 +326,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     else:
         # In anonymous mode the hub wears `qmcp-anon`, and the gate may stop
         # it; a mode that cannot be read fails its own item below.
-        mode_badges = {projects.ANON, projects.BLOCKED, projects.STOPPED} \
+        mode_badges = {projects.ANON, projects.BLOCKED, projects.STOPPED, core.QUARANTINE} \
             if anon.mode_state()[0] is not False else set()
         bad = {t for t in tags_by[hub] if birth.controlled(t)} - mode_badges
         if bad:
@@ -451,6 +460,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
                    and any(t == core.GUARDED or t.startswith(birth.NAMESPACE)
                            for t in T(vm) if not t.startswith(TOMBSTONE_PREFIX)
                            and not projects.is_slot_tag(t) and t != projects.HUBBLIND
+                           and t != core.QUARANTINE
                            and not (vm.name == hub and t in hub_badges)))
     add("warn" if stray else "pass", "stray badges",
         f"qmcp badges outside AI space: {', '.join(stray)}" if stray else "none")
@@ -653,6 +663,9 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     add("fail" if left else "pass", "v0.9.16 leftovers",
         f"still present: {', '.join(left)}" if left else "none")
 
+    # 14b. qubes back from a backup or a copy, held for the operator's review
+    restored.findings(app, add)
+
     # 15. projects: the records, and the badges the rulebook routes on
     try:
         records = projects.load()
@@ -668,6 +681,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub))
     out.extend(lead_firewall_findings(app, by_name, records))
     out.extend(anonymity_findings(app, vms, records, tags_by, registry, hub))
+    inqube.findings(vms, records, tags_by, add, os.path.join(lib_dir, "template-rpc"))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
     if cap is not None and quotas > cap:
@@ -1114,6 +1128,8 @@ def _gateway_refusal(by_name: dict, name: str, hub) -> str | None:
     if projects.DROP_BOX in tags or projects.LEAD in tags or projects.member_slots(tags) \
             or projects.lead_slots(tags):
         return "is a drop box, a lead or a project's member"
+    if _held(tags):
+        return HELD_WHY
     if core.in_scope(vm) and core.GUARDED not in tags:
         return f"is in AI space without {core.GUARDED} (qmcp guard {name})"
     if gateways.WHONIX_GATEWAY_TAG in tags:
@@ -1296,6 +1312,9 @@ def set_gateway(app, name: str, anonymising=None, label=None, updates=None) -> s
         g = registry.get(name)
         if g is None:
             raise RoleError(f"'{name}' is not enrolled")
+        vm = _vm(app, name)
+        if vm is not None and _held(_tags(vm)):
+            raise RoleError(f"'{name}' {HELD_WHY}")
         before = gateways.Gateway(g.name, g.anonymising, g.label, g.upstream, g.updates)
         if anonymising is True:
             upstream = _recorded_upstream(app, name)
@@ -1428,6 +1447,8 @@ def _model_qube_refusal(by_name: dict, name: str, hub) -> str | None:
         return "no such qube"
     if projects.DROP_BOX in tags or _dump_slots(tags):
         return "is a drop box"
+    if _held(tags):
+        return HELD_WHY
     if core.UMBRELLA not in tags:
         return f"is outside AI space: guard it first (qmcp guard {name})"
     if projects.LEAD in tags or projects.lead_slots(tags):
@@ -1568,8 +1589,13 @@ def read_guarded_list(path: str | None = None):
 
 
 def plan_migration(app, choices: dict, exec_default: str | None = None,
-                   compat_default: str | None = None, tier_default: str | None = "unset"):
-    """(steps, problems). Nothing is changed.
+                   compat_default: str | None = None, tier_default: str | None = "unset",
+                   review: bool = True):
+    """(steps, problems). Nothing is changed. With `review` (the migration
+    itself), a qube held for review is refused, and so, once any qube in scope
+    carries a label, is one whose label is missing or another's. The
+    installer's preflight asks only whether the fleet is in the two-state
+    shape (`review=False`): a restored qube is the restore check's to hold.
 
     Mapping: `ai-full` -> managed; `ai-exec`/`ai-net` -> the
     operator's choice per qube; gateways -> guarded whatever they carried; a
@@ -1602,10 +1628,34 @@ def plan_migration(app, choices: dict, exec_default: str | None = None,
         problems.append(f"{GUARDED_LIST_PATH} exists but cannot be read; it may name qubes "
                         f"v0.9.16 always refused. Fix or remove it first")
         listed = set()
+    # The restore check's labels. A migration never writes one: on a fleet
+    # where no qube in scope carries a label yet (v0.9.16, which the installer
+    # seeds), there is nothing to review. Once one does, a qube in scope that is
+    # not known came back from a backup or a copy and waits for review, held
+    # yet or not, and the migration refuses it.
+    labels, unknown = {}, set()
+    for vm in app.domains:
+        if not review or vm.name not in tags_by or not restored.in_scope(tags_by[vm.name]):
+            continue
+        try:
+            labels[vm.name] = restored.label_of(vm)
+            if not restored.known(vm):
+                unknown.add(vm.name)
+        except core.Unreadable as e:
+            problems.append(f"{vm.name}: {e}; run the plan again")
+    labels_exist = any(v is not None for v in labels.values())
     for vm in app.domains:
         if vm.name not in tags_by:
             continue
         tags = tags_by[vm.name]
+        if review and _held(tags):
+            problems.append(f"{vm.name} {HELD_WHY}: accept or reject it first")
+            continue
+        if review and labels_exist and vm.name in unknown:
+            problems.append(f"{vm.name} wears qmcp badges but its qmcp-id label is missing or "
+                            f"another qube's: it came back from a backup or a copy and waits for "
+                            f"review (qmcp restored list): accept or reject it first")
+            continue
         tiers = tags & LEGACY_TIER_TAGS
         if vm.name == hub and (core.UMBRELLA in tags or tiers):
             problems.append(f"{vm.name}: the hub must not be in AI space; "
@@ -1709,6 +1759,32 @@ def _read_tags(vm) -> set:
         raise RoleError(f"{e}; try again") from None
 
 
+def _refuse_held(vm, name) -> None:
+    if _held(_read_tags(vm)):
+        raise RoleError(f"'{name}' {HELD_WHY}")
+
+
+def _label(vm, name) -> None:
+    """Label a qube before `manage` or `guard` adds a badge (`qmcp.restored`).
+    A qube with no qmcp badge is the operator's to bring in, whatever label an
+    earlier life left on it, so it is labelled afresh. One that wears a badge and
+    carries another qube's label came back from a backup or a copy, and waits
+    for review: refused, so a command can never stand in for an accept."""
+    try:
+        if restored.labelled(vm):
+            return
+        if restored.in_scope(_read_tags(vm)):
+            raise RoleError(f"'{name}' wears qmcp badges but its qmcp-id label is missing or "
+                            f"another qube's: it came back from a backup or a copy, or was "
+                            f"badged outside qmcp, and waits for review (qmcp restored list)")
+        restored.label(vm)
+    except RoleError:
+        raise
+    except Exception as e:
+        raise RoleError(f"'{name}' could not be labelled ({type(e).__name__}), so nothing was "
+                        f"changed") from None
+
+
 def _target(app, name):
     if not core.valid_qube_name(name) or name not in app.domains:
         raise RoleError(f"no qube named '{name}'")
@@ -1778,9 +1854,11 @@ def _mode_badge(vm, name) -> None:
 
 def manage(app, name) -> str:
     vm = _target(app, name)
+    _refuse_held(vm, name)
     if _is_gateway(vm):
         raise RoleError(f"'{name}' provides network; gateways are always guarded (qmcp guard)")
     _network_enrolled(vm, name)
+    _label(vm, name)
     _mode_badge(vm, name)
     pinned = _pin_dispvm(vm, name)          # before it joins AI space
     try:
@@ -1818,9 +1896,11 @@ def _not_in_a_slot(vm, name, action: str) -> set:
 
 def guard(app, name) -> str:
     vm = _target(app, name)
+    _refuse_held(vm, name)
     before = _not_in_a_slot(vm, name, "guard")
     _network_enrolled(vm, name)
     mode = anonymous_mode()                 # read before anything is written
+    _label(vm, name)
     serves = sorted(projects.model_slots(before))
     # A model qube's maintenance window closes (managed to guarded): nothing
     # the hub started in it while it was managed runs on. It is killed right
@@ -1946,6 +2026,9 @@ def revoke(app, name, shutdown: bool = True) -> str:
     """Strip every AI-space badge, pin default_dispvm, and shut the qube down
     Restrictions such as an egress lock go too: revoke is yours."""
     vm = _target(app, name)
+    if _held(_read_tags(vm)):
+        raise RoleError(f"'{name}' is held for your review: reject it instead (qmcp restored "
+                        f"reject {name}), which also removes its label")
     _not_in_a_slot(vm, name, "revoke")
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
@@ -2083,6 +2166,8 @@ def _open_refusal(vm, name, tags) -> str | None:
                 f"hub never operates one, window or none")
     if core.GUARDED not in tags:
         return f"'{name}' is managed already; the hub operates it without a window"
+    if _held(tags):
+        return f"'{name}' {HELD_WHY}"
     for badge, why in ((projects.BLOCKED, "the anonymity gate stopped it"),
                        (projects.HUBBLIND, "it belongs to a hidden anonymous project")):
         if badge in tags:
@@ -2498,6 +2583,8 @@ def _check_templates(app, names) -> list:
         vm = _vm(app, name)
         if vm is None or not core.in_scope(vm) or not core.is_template(vm):
             raise ProjectError(f"'{name}' is not a template or disposable template in AI space")
+        if _held(_read_tags(vm)):
+            raise ProjectError(f"'{name}' {HELD_WHY}")
         if name not in out:
             out.append(name)
     if not out:
@@ -2701,6 +2788,8 @@ def _hubs_own_appvm(app, name, what: str):
         raise ProjectError(f"{what} must be an AppVM, not a template or gateway")
     if core.GUARDED in tags or projects.DROP_BOX in tags:
         raise ProjectError(f"'{name}' is guarded or a drop box")
+    if _held(tags):
+        raise ProjectError(f"'{name}' {HELD_WHY}")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' already leads a project")
     if projects.model_slots(tags):
@@ -2717,6 +2806,8 @@ def _lead_template(app, name):
     vm = _vm(app, name)
     if vm is None or core.klass_of(vm) != "TemplateVM":
         raise ProjectError(f"'{name}' is not a TemplateVM")
+    if _held(_read_tags(vm)):
+        raise ProjectError(f"'{name}' {HELD_WHY}")
     return vm
 
 
@@ -2756,9 +2847,20 @@ def _removal_order(tag: str) -> tuple:
     return (1, tag) if tag == core.UMBRELLA else (2, tag)
 
 
+HELD_WHY = "is held for your review: it came back from a backup or was copied by hand (qmcp restored)"
+
+
+def _held(tags) -> bool:
+    return core.QUARANTINE in tags
+
+
 def _set_tags(vm, add=(), remove=()):
     """Remove, then add, each in authority order (see `_removal_order`),
-    then read back exactly."""
+    then read back exactly. Before any badge goes on, a qube with no `qmcp-id`
+    label gets one (`qmcp.restored`); one whose label names another qube's UUID
+    is refused, since it came back from a backup or a copy and waits for review."""
+    if add:
+        restored.require_label(vm)
     for t in sorted(remove, key=_removal_order):
         vm.tags.discard(t)
     for t in sorted(add, key=_removal_order, reverse=True):
@@ -2814,6 +2916,10 @@ def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
         _lead_template(app, origin)
     elif source in ("clone", "promote"):
         _hubs_own_appvm(app, origin, "the lead")
+        # Its template joins the approved list, which never takes a held one.
+        tpl = _template_name(_vm(app, origin))
+        if tpl and (vm := _vm(app, tpl)) is not None and _held(_read_tags(vm)):
+            raise ProjectError(f"the template of {origin}, '{tpl}', {HELD_WHY}")
     else:
         raise ProjectError(f"unknown lead source '{source}'")
     _lead_rules(app, source, origin, lead_netvm, model)
@@ -2892,6 +2998,8 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
         vm = app.clone_vm(_hubs_own_appvm(app, origin, "a lead's clone source"), name)
     stored = None
     try:
+        # A clone carries its source's label: its own goes on first.
+        restored.label(vm)
         birth.stamp(birth.TagIO.for_vm(vm), _tags(vm), "dom0", None, badges)
         # `qmcp-lead` before the rules (see promote above), the slot's badge last.
         _set_tags(vm, add={projects.LEAD})
@@ -2942,6 +3050,14 @@ def _undo_lead(app, lead: str, fresh: bool, slot: str, before=frozenset(),
             except Exception as e:
                 return f"{lead}: network {type(e).__name__}"
     return ""
+
+
+def _refuse_held_lead(app, p) -> None:
+    """A lead change or removal refuses, before it changes anything, while the
+    recorded lead is held for review: accepting or rejecting it comes first."""
+    vm = _vm(app, p.lead) if p.lead else None
+    if vm is not None and _held(_tags(vm)):
+        raise ProjectError(f"the lead {p.lead} {HELD_WHY}: accept or reject it first")
 
 
 def _recorded_lead(app, p):
@@ -3154,6 +3270,7 @@ def _make_sink(app, slot: str, name: str, hidden: bool = False):
         raise ProjectError("Qubes has no default template for the dump sink")
     vm = app.add_new_vm("AppVM", name, SINK_LABEL, template=tpl)
     try:
+        restored.label(vm)
         if hidden:
             _set_tags(vm, add={projects.HUBBLIND})
         _set_tags(vm, add={projects.DROP_BOX, projects.dump_badge(slot)})
@@ -3180,6 +3297,7 @@ def _remove_lead(report, app, key):
     p = _project(records, key)
     if p.lead is None:
         raise ProjectError(f"project '{p.label}' has no lead")
+    _refuse_held_lead(app, p)
     ours = _demote_lead(app, p, report, removing=True)
     # The accepted rules were the removed lead's; the model stays for the next one.
     old, p.lead, p.lead_firewall = p.lead, None, None
@@ -3214,6 +3332,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
     prefix = birth.read_name_prefix()
     records = _load_records()
     p = _project(records, key)
+    _refuse_held_lead(app, p)
     lead_netvm = _model_qube_lead_netvm(model, model_qube, lead_netvm)
     if p.anonymous:
         if lead_name is not None:
@@ -3461,6 +3580,9 @@ def _set_lead_firewall(report, app, key, model, rules, accept_current, model_qub
                            "(repeatable) or --accept-current")
     records = _load_records()
     p = _project(records, key)
+    if model_qube != "none":
+        # Taking a model qube away only takes authority, and leaves the lead alone.
+        _refuse_held_lead(app, p)
     if model_qube is not None:
         _set_model_qube(report, app, records, p, None if model_qube == "none" else model_qube)
         return
@@ -3728,6 +3850,8 @@ def _move(report, app, name, target, confirm):
     if tags & {projects.BLOCKED, projects.STOPPED}:
         raise ProjectError(f"'{name}' was stopped by the anonymity gate; clear it first (qmcp "
                            f"project unblock)")
+    if _held(tags):
+        raise ProjectError(f"'{name}' {HELD_WHY}")
     if target == "none":
         slot, p = None, None
     elif target == projects.HUB_SLOT:

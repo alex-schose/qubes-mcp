@@ -819,9 +819,10 @@ class AuditFindings(Base):
             hidden = self.trace(svc, make("ai-hid-w1"))
             self.assertEqual(missing, outside, svc)
             self.assertEqual(missing, hidden, svc)
-            # The first read is the caller's own: the services refuse a hub the
-            # anonymity gate stopped. It is the same for every name.
-            self.assertEqual(missing[1], ["admin.vm.tag.Get", "admin.vm.tag.List"], svc)
+            # The first read is the caller's own tags: the services refuse a hub
+            # the anonymity gate stopped or the restore check holds. It is the
+            # same for every name.
+            self.assertEqual(missing[1], ["admin.vm.tag.List", "admin.vm.tag.List"], svc)
             self.assertEqual(missing[2], 0, svc)
 
     def test_explicit_netvm_is_checked_by_name(self):

@@ -29,7 +29,7 @@ import re
 import sys
 import time
 
-from qmcp import birth, budget, core, gateways, projects, proposals, scope
+from qmcp import birth, budget, core, gateways, projects, proposals, restored, scope
 from qmcp.core import refuse
 
 LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"})
@@ -714,8 +714,10 @@ def svc_spawn(app, call, req):
         vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
         raise _create_failed(app, call, name, "create", e)
-    step = "birth stamp"
+    step = "label"
     try:
+        restored.label(vm)
+        step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
                     _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
         if klass == "DispVMTemplate":
@@ -775,8 +777,12 @@ def svc_clone(app, call, req):
         vm = app.clone_vm(src, name)
     except Exception as e:
         raise _create_failed(app, call, name, "clone", e)
-    step = "birth stamp"
+    # A clone carries its source's label (features are copied): it is
+    # labelled with its own UUID before anything else, inside the create lock.
+    step = "label"
     try:
+        restored.label(vm)
+        step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
                     _slot_badge(who, core.klass_of(src), src_is_template, source_tags), extra)
         step = "network check"
@@ -855,8 +861,10 @@ def svc_spawn_disposable(app, call, req):
     # preloaded disposable arrives already running on its template's network,
     # which is the network it must have; it is left following that default,
     # since a disposable lives only until it halts.
-    step = "birth stamp"
+    step = "label"
     try:
+        restored.label_direct(app, disp)
+        step = "birth stamp"
         birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
                     _slot_badge(who, "DispVM"), extra)
         step = "network check"
