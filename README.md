@@ -18,10 +18,12 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.26 — the operator's tools.** Besides the hub, up to 15
+**Status: 0.9.27 — Linux standalones.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
+A worker or a lead may be a **standalone**: its own copy of a template's
+root, so the tools installed in it stay across restarts.
 Every network an AI qube is given is a gateway the operator enrolled, and a
 lead's firewall, which dom0 writes to allow its model endpoint (and DNS for a
 host name), nothing else, is the operator's. A lead can instead use a
@@ -55,8 +57,7 @@ templates alike, and dom0 keeps its own copy of them, so
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
 `qmcp export` puts qmcp's settings where a Qubes backup carries them. Next:
-standalone workers and leads, the last proposal types, an audit round, then
-1.0.0. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+the last proposal types, an audit round, then 1.0.0. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -159,7 +160,7 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | Tool | |
 |---|---|
 | `qubes_list`, `qubes_state`, `qubes_props_get` | what is in scope, and its properties |
-| `qubes_spawn`, `qubes_clone`, `qubes_remove` | create (AppVM, disposable template, named disposable) and remove |
+| `qubes_spawn`, `qubes_clone`, `qubes_remove` | create (AppVM, standalone, disposable template, named disposable) and remove |
 | `qubes_start`, `qubes_shutdown` | lifecycle |
 | `qubes_props_set`, `qubes_feature_set` | label/memory/maxmem/vcpus, netvm only to none; features on an allowlist |
 | `qubes_run`, `qubes_copy` | run a command as root in a managed qube; copy a file out of one (operator dialog) |
@@ -206,7 +207,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.26.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.27.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -237,6 +238,16 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
+Coming from 0.9.26? Install over it. Clones, the hub's and a lead's, change:
+a clone lands where its source is, so the hub's clone of a project's member
+joins that project (named inside its names, counted against its quota, on its
+worker networks) and its clone of an AppVM in no slot joins none (0.9.26 put
+it in p00); a clone, a lead cloned from one of the hub's qubes included, no
+longer copies its source's device assignments, menu entries or a disposable
+template's `preload-dispvm-max`; and a clone is refused when its template is
+stopped by the gate, waits for review, or, for a lead, is off its approved
+list. Every create also refuses to copy or build on a qube in AI space whose
+`qmcp-id` label is not its own. The CHANGELOG's 0.9.27 entry has the whole list.
 Coming from any release before 0.9.26? Besides that release's own note below,
 the installer labels every qube that wears a qmcp badge and has no label, for
 the restore check (see
@@ -275,7 +286,8 @@ lead's current firewall, or give it a model (`sudo qmcp project firewall NAME
 --accept-current` or `--model HOST:PORT`); `--accept-current` takes only rules
 in qmcp's format (no comment or expire, at most 32), so a lead with others
 needs `--model` or `--rule`. `qmcp check` warns until you do. The hub's spawns
-and clones must be named `ai-hub-…`.
+and clones must be named `ai-hub-…` (from 0.9.27, a clone of a project's member
+is named inside that project's names instead).
 Coming from 0.9.16?
 Run the staged migration first; see "Install, migrate, uninstall" in
 [CLAUDE.md](CLAUDE.md).
@@ -346,7 +358,28 @@ changes it); the qubes it creates will be named `ai-osint-*` (Qubes names
 disposables), built from the approved templates (the lead's own when it is in AI space, plus
 any `--template`), on the listed networks, inside the quota. `--lead-clone
 QUBE` copies one of the hub's own qubes that you prepared as an agent instead,
-and `--lead-promote QUBE` makes one of the hub's qubes the lead in place.
+and `--lead-promote QUBE` makes one of the hub's qubes the lead in place;
+either may be a standalone, and the lead keeps its class.
+`--lead-template T --lead-class standalone` makes the lead a standalone: its
+own copy of T's root, so an agent you install in it stays after a restart, and
+so does anything a compromised agent leaves there. A lead may spawn standalone
+workers from its approved templates too (`qubes_spawn` with `klass`
+`StandaloneVM`). A standalone's root counts at the template root's full size,
+often 20 GiB, against the pool cap and, for a worker, the project's quota: a
+40 GiB quota holds one standalone and a few AppVMs. Sizes count as
+provisioned, not as used, so what AI space keeps (private volumes, and the
+roots of templates and standalones) cannot outgrow the cap through its own
+creates even on a thin pool; volatile volumes and an AppVM's changes to its
+template's root are not counted, and a lead you make with `qmcp project` is not
+checked against the cap. A Linux standalone you built yourself joins a project
+once it is in AI space: `sudo qmcp manage QUBE`, `sudo qmcp template prepare
+QUBE` (so the lead can run commands in it), then `sudo qmcp project move QUBE
+LABEL`. Moving it in is your approval of what it runs, as approving a template
+is. Build it from a template outside AI space: `qvm-create --standalone -t T`
+copies T's tags and features, so a copy of a template in AI space comes up
+wearing `ai-managed` and another qube's label, and the restore check holds it
+as a hand copy (`sudo qmcp restored reject QUBE` takes it out again). Windows
+qubes are not supported.
 The lead's firewall lets it reach its model endpoint and DNS (for a host
 name) only, so it cannot fetch software, `git clone` included: its agent and qubes-mcp come from
 outside. Prepare both in one of the hub's qubes and make the lead with

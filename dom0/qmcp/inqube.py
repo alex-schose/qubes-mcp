@@ -18,6 +18,17 @@ a fetched release is still unpacked.
   never starts a qube, and it skips one never prepared (no label) and one the
   gate stopped or the restore check holds.
 - `label_state(vm)` answers what `qmcp check` reports.
+- `after_copy(vm, source, halted_before)`, on every qube made by copying a root (a
+  clone of a template or a standalone, and a standalone made from a template).
+  A copy gets its source's root as it was when the source last stopped
+  (measured 2026-10-10 on Qubes 4.3.1), and its source's label as it is when
+  the features are copied. Unless the source read as halted, with that same
+  label, just before and just after the copy, the refresh may have written
+  newer services into it and labelled it
+  since it started, so the copy's label could claim services its disk lacks: it
+  gets `UNKNOWN` instead, which reads as behind, and the refresh writes into it
+  the next time it runs. A source never prepared gives a copy with no label,
+  which the check reports and the refresh skips.
 
 The label records what dom0 wrote, never what the qube's disk holds now: a
 check that read the disk would have to start the qube. Neither the hub nor a
@@ -45,6 +56,9 @@ TIMEOUT_S = 30
 #: A qube in any of these is not written into by the refresh. The gate stopped
 #: one, and the restore check holds one for the operator's review.
 SKIP_BADGES = frozenset({projects.BLOCKED, projects.STOPPED, core.QUARANTINE})
+#: The label of a copy made while its source ran: never a version, so the check
+#: reads it as behind and the refresh brings the copy up to date when it runs.
+UNKNOWN = "unknown: copied from a running qube"
 
 
 class InQubeError(Exception):
@@ -140,6 +154,32 @@ def label_state(vm, current: str) -> str:
     if label is None:
         return "missing"
     return "current" if label == current else "behind"
+
+
+def halted(vm) -> bool:
+    """True only when the qube reads as halted: a state that cannot be read
+    is not halted, which keeps a copy's label from claiming too much."""
+    try:
+        return vm.get_power_state() == "Halted"
+    except Exception:
+        return False
+
+
+def after_copy(vm, source, halted_before: bool) -> None:
+    """Keep a copy's label only when its source read as halted before the copy
+    (`halted_before`) and after it, with the same label. That leaves one narrow
+    case, a start, a refresh and a stop all between the two reads with the
+    root copied while it ran; it does not catch every interleaving. Otherwise
+    write `UNKNOWN`. A copy with no label keeps none. Raises when a label
+    cannot be read or written, so the caller rolls the copy back."""
+    label = label_of(vm)
+    if label is None:
+        return
+    if halted_before and halted(source) and label_of(source) == label:
+        return
+    vm.features[LABEL] = UNKNOWN
+    if label_of(vm) != UNKNOWN:
+        raise RuntimeError(f"the {LABEL} label did not read back")
 
 
 def prepare(app, name: str, timeout: float = TIMEOUT_S) -> dict:

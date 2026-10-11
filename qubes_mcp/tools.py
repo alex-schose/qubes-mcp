@@ -362,9 +362,14 @@ def _qubes_list(args: dict) -> dict:
       operator's reserved prefix followed by "hub-" (by default "ai-hub-",
       e.g. "ai-hub-browser"); for a lead, its project's (e.g. "ai-osint-").
       qubes_get_pool_stats reports the prefix. Any other name is refused.
-    - klass: "AppVM" (the default) or "DispVMTemplate", both built on a
-      TemplateVM; or "DispVM", built on a disposable template (a qube with
-      template_for_dispvms=True). A lead cannot create a DispVMTemplate.
+    - klass: "AppVM" (the default), "StandaloneVM" or "DispVMTemplate", all
+      built on a TemplateVM; or "DispVM", built on a disposable template (a
+      qube with template_for_dispvms=True). A lead cannot create a
+      DispVMTemplate. A StandaloneVM gets its own copy of the template's root,
+      as the template was when it last shut down: what is installed in it
+      stays after a restart, and nothing reaches it from the template later.
+      Its root counts against the disk budget at the template root's full
+      size (often 20 GiB), on top of its private volume.
     - template: the qube to build on, managed or guarded. A lead may use only
       its project's approved templates. One that is out of scope or does not
       exist is refused with "template must reference an ai-managed qube",
@@ -372,8 +377,8 @@ def _qubes_list(args: dict) -> dict:
     - netvm: omit it and the network is inherited. Every network must be a
       gateway the operator enrolled (qubes_get_pool_stats lists them for the
       hub). For the hub: a DispVM takes its disposable template's network,
-      which must be enrolled (or none), else the create is refused; an AppVM
-      or a disposable template takes the hub's own network if it is enrolled,
+      which must be enrolled (or none), else the create is refused; an AppVM,
+      a StandaloneVM or a disposable template takes the hub's own network if it is enrolled,
       else the operator's configured default if that is enrolled, else the
       create is refused. A name must equal the inherited value. For a lead: its project's default worker network, or another one
       on the project's list; a DispVM keeps its disposable template's, which
@@ -397,7 +402,8 @@ def _qubes_list(args: dict) -> dict:
         "template": _prop("string", "Template (or, for a DispVM, disposable template) "
                                     "to build on; managed or guarded."),
         "klass": _prop("string", "Kind of qube to create.",
-                       enum=["AppVM", "DispVMTemplate", "DispVM"], default="AppVM"),
+                       enum=["AppVM", "StandaloneVM", "DispVMTemplate", "DispVM"],
+                       default="AppVM"),
         "label": _prop("string", "Qubes label colour: red, orange, yellow, green, gray, "
                                  "blue, purple or black.", default="gray"),
         # No default on purpose: an omitted netvm (inherit) and an explicit
@@ -662,11 +668,20 @@ def _qubes_firewall_set(args: dict) -> dict:
     The source must be managed: for the hub, anything it operates, including
     the TemplateVMs it manages; for a lead, one of its project's workers. A
     guarded source is refused, and one that is out of scope or does not exist
-    is reported as "not found". The new name must start with the caller's
-    prefix, as for qubes_spawn. The clone copies the source's settings and
-    keeps the source's network, "none" included; a source whose network is not
-    an enrolled gateway (for a lead, one of its project's networks) is refused. A
-    cloned template stays off the network.
+    is reported as "not found". The clone copies the source's settings, files
+    and class (a StandaloneVM's clone is one too) and keeps the source's
+    network, "none" included; a source whose network is not an enrolled
+    gateway (for a lead, or for the hub's clone of a project's member, one of
+    that project's worker networks) is refused. So is a source built on a
+    template the anonymity gate stopped, one held for the operator's review,
+    and for a lead one off its project's approved list. A cloned template
+    stays off the network.
+
+    A clone lands where its source is: a clone of one of p00's qubes joins p00,
+    and a clone of a project's member joins that project, counts against its
+    quota and is named inside its names (for the hub too, e.g.
+    "ai-osint-..." for a member of osint). A clone of a lead, of a template or
+    of a qube in no slot joins no slot, and is named as for qubes_spawn.
 
     dom0 runs one create at a time, so this call may wait for others to finish.
 
@@ -864,8 +879,9 @@ def _qubes_events(args: dict) -> dict:
 
     Returns {"ok": true, "ai_managed_bytes_used": <int>,
     "ai_managed_bytes_cap": <int>, "ai_managed_bytes_headroom": <int>,
-    "name_prefix": "<prefix new names must carry>"}. For the hub the figures
-    are all of AI space against the operator's pool cap, and the reply adds
+    "name_prefix": "<prefix your spawns carry; a clone's: see qubes_clone>"}.
+    For the hub the figures are all of AI space against the operator's pool
+    cap, and the reply adds
     "reserved_prefix", the prefix reserved for the names AI creates, which
     a project's names build on (<reserved_prefix><label>-...), and
     "projects": one entry per slot in use, {slot, label, lead, templates,
@@ -953,12 +969,19 @@ _LEAD = _prop("object", 'Where the lead comes from: {"from": "template", "clone"
               properties={
                   "from": _prop("string", "template: a fresh lead built on the TemplateVM "
                                           "`qube`. clone: a copy of `qube`, one of the hub's "
-                                          "own managed AppVMs. promote: `qube` itself, one of "
-                                          "the hub's own AppVMs, becomes the lead.",
+                                          "own managed AppVMs or StandaloneVMs. promote: "
+                                          "`qube` itself, one of the hub's own AppVMs or "
+                                          "StandaloneVMs, becomes the lead.",
                                 enum=["template", "clone", "promote"]),
-                  "qube": _prop("string", "The TemplateVM, or the hub's own AppVM, the lead "
-                                          "comes from."),
+                  "qube": _prop("string", "The TemplateVM, or the hub's own AppVM or "
+                                          "StandaloneVM, the lead comes from."),
               }, required=["from", "qube"], additionalProperties=False)
+_LEAD_CLASS = _prop(["string", "null"], 'With "from": "template", "standalone" makes the lead '
+                                        "a StandaloneVM: its own copy of the template's root, "
+                                        "so its tools stay after a restart (and so does anything "
+                                        'left in it). Omit for an AppVM. A cloned or promoted '
+                                        "lead keeps its source's class.",
+                   enum=["appvm", "standalone", None])
 _LEAD_NAME = _prop(["string", "null"], "A fresh lead's name, inside the project's names; "
                                        "omit it for <reserved_prefix><label>-lead.")
 _LEAD_NETVM = _prop(["string", "null"], "The lead's own network: an enrolled gateway "
@@ -1007,8 +1030,11 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
       operate: hidden from the network, not from you.
     - lead: {"from": ..., "qube": NAME}. "template": a fresh lead built on the
       TemplateVM NAME. "clone": a copy of NAME, one of the hub's own managed
-      AppVMs (in p00 or in no slot). "promote": NAME itself, one of the hub's
-      own AppVMs, becomes the lead, keeping its files, template and network.
+      AppVMs or StandaloneVMs (in p00 or in no slot). "promote": NAME itself,
+      one of the hub's own AppVMs or StandaloneVMs, becomes the lead, keeping
+      its files, its template if it has one, and its network.
+    - lead_class: with "from": "template", "standalone" for a StandaloneVM
+      lead, whose tools stay installed across restarts. Omit it for an AppVM.
     - lead_name: a fresh lead's name, inside <reserved_prefix><label>-; omit
       it for <reserved_prefix><label>-lead. A promoted lead keeps its own name.
     - lead_netvm: the lead's own network, an enrolled gateway, or "none".
@@ -1051,6 +1077,7 @@ _TEMPLATES_TEXT = "Templates or disposable templates in AI space the lead may sp
         "hub_sees": _prop("boolean", "With anonymous: a project you may see and operate; "
                                      "omit for false (hidden from you)."),
         "lead": _LEAD,
+        "lead_class": _LEAD_CLASS,
         "lead_name": _LEAD_NAME,
         "lead_netvm": _LEAD_NETVM,
         "model": _MODEL,
@@ -1148,8 +1175,9 @@ def _qubes_propose_dump(args: dict) -> dict:
     - To remove the lead: remove=true and no other lead field. The lead's qube
       is removed with everything in it; the project keeps its workers, which
       only the hub reaches until the project has a lead again.
-    - To give the project a new lead: lead, and optionally lead_name,
-      lead_netvm and model or model_qube, as for qubes_propose_project
+    - To give the project a new lead: lead, and optionally lead_class,
+      lead_name, lead_netvm and model or model_qube, as for
+      qubes_propose_project
       (without model, a new lead with a network takes the project's
       endpoint, and is refused when the project's model is a qube; a new
       lead with no network keeps the project's model qube; model_qube
@@ -1176,6 +1204,7 @@ def _qubes_propose_dump(args: dict) -> dict:
         "remove": _prop(["boolean", "null"], "true to remove the lead; then give no other "
                                              "lead field."),
         "lead": dict(_LEAD, type=["object", "null"]),
+        "lead_class": _LEAD_CLASS,
         "lead_name": _LEAD_NAME,
         "lead_netvm": _LEAD_NETVM,
         "keep_old": _prop(["boolean", "null"], "Required with a new lead, no default: true keeps "

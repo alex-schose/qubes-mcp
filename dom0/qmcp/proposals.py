@@ -236,6 +236,22 @@ def _lead(value) -> dict:
     return {"from": value["from"], "qube": _qube(value["qube"], "lead.qube")}
 
 
+def _lead_class(out: dict, req: dict, lead: dict) -> dict:
+    """A fresh lead made from a template may be a StandaloneVM. Joins the
+    normal form only as "standalone" (0.9.27), so a proposal stored before
+    reads back as itself; "appvm" is the default and is left out."""
+    value = req.get("lead_class")
+    if value is None or value == "appvm":
+        return out
+    if value != "standalone":
+        raise Invalid('lead_class: "appvm" or "standalone"')
+    if lead["from"] != "template":
+        raise Invalid('lead_class: a cloned or promoted lead keeps its own class; '
+                      '"standalone" goes with "from": "template"')
+    out["lead_class"] = "standalone"
+    return out
+
+
 def _lead_netvm(value, lead: dict | None = None):
     """A lead's network. A promoted lead keeps its own, since no network moves:
     for one, only none (disconnect it) or nothing is taken."""
@@ -277,8 +293,9 @@ def _model_qube(value, allow_none: bool) -> str:
 
 
 #: Per type, the fields that join the normal form only when given (see below).
-OPTIONAL = {"project-create": frozenset({"model", "model_qube", "anonymous", "hub_sees"}),
-            "project-lead": frozenset({"model", "add_old_network", "model_qube"}),
+OPTIONAL = {"project-create": frozenset({"model", "model_qube", "anonymous", "hub_sees",
+                                         "lead_class"}),
+            "project-lead": frozenset({"model", "add_old_network", "model_qube", "lead_class"}),
             "project-firewall": frozenset({"model", "rules", "model_qube"})}
 
 
@@ -323,7 +340,7 @@ def _sink_refusal(key: str, prefix) -> str | None:
 def _create(req: dict, prefix) -> dict:
     _fields(req, {"lead", "networks", "quota"},
             {"label", "lead_netvm", "lead_name", "templates", "dump", "model", "model_qube",
-             "anonymous", "hub_sees"})
+             "anonymous", "hub_sees", "lead_class"})
     anonymous = _bool(req.get("anonymous", False), "anonymous")
     hub_sees = _bool(req.get("hub_sees", False), "hub_sees")
     lead = _lead(req["lead"])
@@ -363,7 +380,7 @@ def _create(req: dict, prefix) -> dict:
             "networks": _list(req["networks"], "networks", 1, projects.MAX_NETWORKS,
                               _list_network),
             "quota": _quota(req["quota"]),
-            "dump": dump} | _optional({}, req)
+            "dump": dump} | _optional({}, req) | _lead_class({}, req, lead)
 
 
 def _hidden(records: dict, key) -> bool:
@@ -448,12 +465,13 @@ def _open_window(req: dict, prefix) -> dict:
 
 def _lead_change(req: dict, prefix) -> dict:
     _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old", "model",
-                               "add_old_network", "model_qube"})
+                               "add_old_network", "model_qube", "lead_class"})
     project = _key(req["project"])
     remove = req.get("remove")
     if remove is True:
         if any(req.get(k) is not None for k in ("lead", "lead_netvm", "lead_name", "keep_old",
-                                                "model", "add_old_network", "model_qube")):
+                                                "model", "add_old_network", "model_qube",
+                                                "lead_class")):
             raise Invalid("remove: takes no other lead field")
         return {"project": project, "remove": True, "lead": None, "lead_netvm": None,
                 "lead_name": None, "keep_old": None}
@@ -472,6 +490,7 @@ def _lead_change(req: dict, prefix) -> dict:
            "lead_name": _lead_name(req.get("lead_name"), lead, prefix),
            "keep_old": _bool(req["keep_old"], "keep_old")}
     _optional(out, req, model_qube_none=True)
+    _lead_class(out, req, lead)
     if out.get("add_old_network") and not out["keep_old"]:
         raise Invalid("add_old_network: only with keep_old true")
     return out
@@ -861,6 +880,8 @@ def command(p: dict) -> str | None:
         if p.get("hub_sees"):
             argv.append("--hub-sees")
         argv += [f"--lead-{p['lead']['from']}", p["lead"]["qube"]]
+        if p.get("lead_class") is not None:
+            argv += ["--lead-class", p["lead_class"]]
         if p["lead_netvm"] is not None:
             argv += ["--lead-netvm", p["lead_netvm"]]
         if p["lead_name"] is not None:
@@ -883,6 +904,8 @@ def command(p: dict) -> str | None:
             argv.append("--remove")
         else:
             argv += [f"--lead-{p['lead']['from']}", p["lead"]["qube"]]
+            if p.get("lead_class") is not None:
+                argv += ["--lead-class", p["lead_class"]]
             if p["lead_netvm"] is not None:
                 argv += ["--lead-netvm", p["lead_netvm"]]
             if p["lead_name"] is not None:
@@ -1115,7 +1138,8 @@ def _execute(app, p: dict) -> list:
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
                                     p["dump"], p["lead_name"], p.get("model"),
                                     p.get("model_qube"), bool(p.get("anonymous")),
-                                    bool(p.get("hub_sees")))
+                                    bool(p.get("hub_sees")),
+                                    lead_class=p.get("lead_class", "appvm"))
     if t == "project-edit":
         return fleet.edit_project_changes(app, p["project"], p["add_templates"],
                                           p["remove_templates"], p["add_networks"],
@@ -1127,7 +1151,8 @@ def _execute(app, p: dict) -> list:
             return fleet.remove_lead(app, p["project"])
         return fleet.set_lead(app, p["project"], p["lead"]["from"], p["lead"]["qube"],
                               p["lead_netvm"], p["keep_old"], p["lead_name"], p.get("model"),
-                              bool(p.get("add_old_network")), p.get("model_qube"))
+                              bool(p.get("add_old_network")), p.get("model_qube"),
+                              p.get("lead_class", "appvm"))
     if t == "project-firewall":
         return fleet.set_lead_firewall(app, p["project"], p.get("model"), p.get("rules"),
                                        model_qube=p.get("model_qube"))

@@ -487,7 +487,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_enum(self):
         self.assert_rejected("qubes_spawn", {"name": "ai-a", "template": "t",
-                                             "klass": "StandaloneVM"}, "must be one of")
+                                             "klass": "TemplateVM"}, "must be one of")
 
     def test_value_types(self):
         self.assert_rejected("qubes_feature_set", {"name": "ai-a", "feature": "service.x",
@@ -1315,6 +1315,10 @@ PAYLOAD_CASES = [
             "title": "A self-hosted model", "label": "sealed",
             "lead": {"from": "template", "qube": "deb"}, "networks": ["none"], "quota": 1,
             "model_qube": "ai-hub-model"}),
+        ("qubes_propose_project", "project-create", {
+            "title": "A standalone lead", "label": "tools",
+            "lead": {"from": "template", "qube": "deb"}, "lead_class": "standalone",
+            "networks": ["none"], "quota": 40 * GiB}),
         ("qubes_propose_project_edit", "project-edit", MINIMAL_PROPOSALS["qubes_propose_project_edit"]),
         ("qubes_propose_project_edit", "project-edit", {
             "title": "Tor first", "project": "osint", "add_templates": ["ai-deb"],
@@ -1349,6 +1353,10 @@ PAYLOAD_CASES = [
         ("qubes_propose_lead", "project-lead", {
             "title": "No model qube", "project": "osint",
             "lead": {"from": "template", "qube": "deb"}, "keep_old": False, "model_qube": "none"}),
+        ("qubes_propose_lead", "project-lead", {
+            "title": "A standalone lead", "project": "osint",
+            "lead": {"from": "template", "qube": "deb"}, "lead_class": "standalone",
+            "keep_old": True}),
         ("qubes_propose_lead_firewall", "project-firewall",
          MINIMAL_PROPOSALS["qubes_propose_lead_firewall"]),
         ("qubes_propose_lead_firewall", "project-firewall", {

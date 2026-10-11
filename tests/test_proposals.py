@@ -263,6 +263,32 @@ class Shape(unittest.TestCase):
         self.assertIsNone(proposals.command(edit))
 
 
+    def test_a_standalone_lead(self):
+        # Stored only as "standalone", so a proposal from before 0.9.27, or one
+        # that says "appvm", reads back as it always did.
+        p = proposals.normalise(create(lead_class="standalone"), "ai-")
+        self.assertEqual(p["lead_class"], "standalone")
+        self.assertIn("--lead-template ai-debian-13 --lead-class standalone",
+                      proposals.command(p))
+        self.assertEqual(proposals.normalise(create(lead_class="appvm"), "ai-"),
+                         proposals.normalise(create(), "ai-"))
+        self.assertNotIn("lead_class", proposals.normalise(create(), "ai-"))
+        for bad, why in ((create(lead_class="hvm"), '"appvm" or "standalone"'),
+                         (create(lead={"from": "clone", "qube": "ai-work2"},
+                                 lead_class="standalone"), "keeps its own class")):
+            with self.assertRaisesRegex(proposals.Invalid, why):
+                proposals.normalise(bad, "ai-")
+        lead = proposals.normalise({"type": "project-lead", "title": "t", "project": "osint",
+                                    "lead": {"from": "template", "qube": "ai-debian-13"},
+                                    "lead_class": "standalone", "keep_old": True}, "ai-")
+        self.assertEqual(proposals.command(lead),
+                         "qmcp project lead osint --lead-template ai-debian-13 --lead-class "
+                         "standalone --keep-old")
+        with self.assertRaisesRegex(proposals.Invalid, "takes no other lead field"):
+            proposals.normalise({"type": "project-lead", "title": "t", "project": "osint",
+                                 "remove": True, "lead_class": "standalone"}, "ai-")
+
+
 # ======================================================================= the services
 
 class Services(PBase):
@@ -570,6 +596,13 @@ class Accept(PBase):
         self.assertFalse((self.store() / "000001.accepting").exists())
         with self.assertRaisesRegex(proposals.Refused, "already accepted"):
             self.accept(pid, sha=dec["sha256"])
+
+    def test_accepting_a_standalone_lead_makes_one(self):
+        pid = self.submit(create(lead_class="standalone", quota=40 * GiB))["id"]
+        ok, report = self.accept(pid)
+        self.assertTrue(ok, report)
+        p = projects.find(self.records(), "scrape")
+        self.assertEqual(self.app.domains[p.lead].klass, "StandaloneVM")
 
     def test_another_fingerprint_is_refused_even_for_a_valid_proposal(self):
         pid = self.submit()["id"]

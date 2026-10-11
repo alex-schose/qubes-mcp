@@ -193,6 +193,47 @@ def main() -> int:
         check("copy between two of the hub's p00 qubes, no dialog", r.get("ok") is True, json.dumps(r))
         call("qubes_shutdown", name=c)
 
+    # ---------------------------------------------------------------- standalones
+    # A StandaloneVM keeps its own copy of the template's root, the in-qube
+    # services included: a write there survives a restart, and its clone
+    # carries it. Each holds the template root's size against the pool cap.
+    sa, r = spawn("sa", klass="StandaloneVM", netvm=None)
+    if check("spawn a StandaloneVM from the managed template", r.get("ok") is True, json.dumps(r)):
+        row = next((q for q in call("qubes_list").get("qubes", []) if q["name"] == sa), {})
+        check("it is a StandaloneVM in p00", row.get("klass") == "StandaloneVM"
+              and row.get("slot") == "p00", json.dumps(row))
+        r = call("qubes_props_get", name=sa, properties=["tags", "netvm", "default_dispvm"])
+        v = r.get("values", {})
+        check("the standalone is born managed, offline, default_dispvm none",
+              v.get("tags") == ["ai-managed"] and v.get("netvm") is None
+              and v.get("default_dispvm") is None, json.dumps(r))
+        mark = f"seat-{RUN}"
+        r = call("qubes_run", name=sa, cmd=f"id -u && echo {mark} > /etc/qmcp-seat-mark",
+                 shell=True, timeout=120)
+        check("exec as root in the standalone (the services came with its root)",
+              r.get("ok") and r.get("stdout", "").strip() == "0", json.dumps(r)[:200])
+        call("qubes_shutdown", name=sa)
+        for _ in range(30):
+            if call("qubes_state", name=sa).get("power_state") == "Halted":
+                break
+            time.sleep(2)
+        r = call("qubes_run", name=sa, cmd=["cat", "/etc/qmcp-seat-mark"], timeout=120)
+        check("a write to its root survives a restart", r.get("stdout", "").strip() == mark,
+              json.dumps(r)[:200])
+        call("qubes_shutdown", name=sa)
+        for _ in range(30):
+            if call("qubes_state", name=sa).get("power_state") == "Halted":
+                break
+            time.sleep(2)
+        sc = f"{PREFIX}-sc"
+        r = call("qubes_clone", source=sa, name=sc)
+        if check("clone the standalone", r.get("ok") is True, json.dumps(r)):
+            created.append(sc)
+            r = call("qubes_run", name=sc, cmd=["cat", "/etc/qmcp-seat-mark"], timeout=120)
+            check("its clone carries its root", r.get("stdout", "").strip() == mark,
+                  json.dumps(r)[:200])
+            call("qubes_shutdown", name=sc)
+
     # ---------------------------------------------------------------- disposables
     d, r = spawn("dvm", klass="DispVMTemplate")
     if check("the hub builds a disposable template", r.get("ok") is True, json.dumps(r)):

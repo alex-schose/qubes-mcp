@@ -21,7 +21,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import anon, audit, birth, budget, core, fleet, gateways, projects, proposals, services  # noqa: E402
+from qmcp import anon, audit, birth, budget, core, firewall, fleet, gateways, inqube, projects, proposals, services  # noqa: E402
 import fakequbes  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
@@ -512,7 +512,9 @@ class Creates(Base):
         src.tags.discard("qmcp-owner_mcp-control")
         r = self.clone()
         self.assertEqual(r, {"ok": True, "name": "ai-hub-clone"})
-        self.assertEqual(self.tags("ai-hub-clone"), {"ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p00",
+        # ai-work is in no slot, so its clone joins none (a clone lands where
+        # its source is); the operator's own tag is copied.
+        self.assertEqual(self.tags("ai-hub-clone"), {"ai-managed", "qmcp-owner_mcp-control",
                                                      "operator-note"})
         vm = self.app.domains["ai-hub-clone"]
         self.assertEqual(vm.netvm.name, "ai-net-router")   # the source answers for itself
@@ -589,6 +591,203 @@ class FakeDispatcher:
             subj = self.app.domains._vms.get(subject, subject)
             for h in self.handlers:
                 h(subj, event, **kwargs)
+
+
+class Standalones(Base):
+    """A StandaloneVM made from a template (0.9.27), and every copy dom0 makes:
+    built in dom0's own order, so nothing of ours is on it before its stamp."""
+
+    def setUp(self):
+        super().setUp()
+        self.egress("ai-net-router")
+        tpl = self.app.domains["ai-tpl-g"]
+        tpl.volumes["root"].size = 20 * GiB
+        tpl.__dict__["_rpc"] = {"qmcp.RunInAIManaged": b"v1"}
+        tpl.__dict__["_devices"] = ["pci:00_1f.3"]
+        tpl._props["memory"] = 800
+        for key, value in (("qrexec", "1"), ("qmcp-services", "sha256:v1"),
+                           ("preload-dispvm", "x")):
+            dict.__setitem__(tpl.features, key, value)
+        tpl.tags.add("updates-group")              # the operator's own tag on the template
+        self.tpl = tpl
+
+    def spawn(self, **req):
+        req.setdefault("name", "ai-hub-sa")
+        req.setdefault("template", "ai-tpl-g")
+        req.setdefault("klass", "StandaloneVM")
+        return self.call("qmcp.SpawnAIManagedQube", req)
+
+    def test_the_hub_spawns_a_standalone(self):
+        r = self.spawn(label="blue")
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-sa"})
+        vm = self.app.domains["ai-hub-sa"]
+        self.assertEqual(vm.klass, "StandaloneVM")
+        # The hub's standalones join p00, as its AppVMs do; nothing of the
+        # template's but what Qubes keeps itself: not guarded, and without the
+        # operator's tag.
+        self.assertEqual(self.tags("ai-hub-sa"), {"ai-managed", "qmcp-owner_mcp-control",
+                                                  "qmcp-proj-p00"})
+        self.assertEqual(vm.label.name, "blue")
+        self.assertEqual(vm.volumes["root"].size, 20 * GiB)
+        self.assertEqual(vm.volumes["private"].size, 2 * GiB)
+        self.assertEqual(vm.rpc_files(), {"qmcp.RunInAIManaged": b"v1"})
+        self.assertEqual(vm.__dict__["_devices"], [])
+        self.assertEqual(vm.memory, 800)            # what an AppVM follows from its template
+        features = dict(dict.items(vm.features))
+        self.assertEqual(features["qrexec"], "1")
+        self.assertEqual(features["qmcp-services"], "sha256:v1")    # the template was halted
+        self.assertEqual(features["qmcp-id"], vm.uuid)
+        self.assertNotIn("preload-dispvm", features)
+        self.assertEqual(vm.netvm.name, "ai-net-router")
+        self.assertIsNone(vm.default_dispvm)
+        self.assertEqual(core.state(vm), "managed")
+
+    def test_it_takes_only_what_an_appvm_follows_from_its_template(self):
+        # memory is one an AppVM follows; autostart is the template's own.
+        self.tpl._props["autostart"] = True
+        self.assertTrue(self.spawn()["ok"])
+        vm = self.app.domains["ai-hub-sa"]
+        self.assertEqual(vm.memory, 800)
+        self.assertFalse(vm.autostart)
+
+    def test_the_platform_copies_the_template_s_tags_first(self):
+        # Teeth: qubesadmin's own standalone (`qvm-create --standalone`) puts
+        # the template's ai-managed and its guard on the new qube before anything
+        # else, and the operator's tags with them.
+        self.app.clone_vm(self.tpl, "ai-raw", new_cls="StandaloneVM",
+                          ignore_volumes=("private",))
+        first = next(tags for name, tags in self.app.tag_log if name == "ai-raw")
+        self.assertEqual(first, {"ai-managed"})
+        self.assertIn("updates-group", self.app.domains["ai-raw"].tags)
+        self.assertEqual(self.app.domains["ai-raw"].__dict__["_devices"], ["pci:00_1f.3"])
+
+    def test_nothing_of_ours_is_on_it_before_its_stamp(self):
+        # Every tag it ever wore is one it ends with: the template's guard and
+        # the operator's tag never touch it, and nothing comes off later.
+        pathlib.Path(core.MODE_PATH).write_text("anonymous\n")
+        self.app.tag_log.clear()
+        self.assertTrue(self.spawn(netvm=None)["ok"], self.app.tag_log)
+        final = self.tags("ai-hub-sa")
+        self.assertIn("qmcp-anon", final)
+        mine = [tags for name, tags in self.app.tag_log if name == "ai-hub-sa"]
+        self.assertTrue(mine)
+        self.assertTrue(all(t <= final for t in mine), mine)
+        # In anonymous mode `qmcp-anon` is on before it is in AI space.
+        self.assertTrue(all("qmcp-anon" in t for t in mine if "ai-managed" in t), mine)
+
+    def test_a_running_template_s_copy_is_marked_behind(self):
+        # The copy gets the root the template had when it started; the refresh
+        # may have written newer services into it since, and labelled it.
+        self.tpl.start()
+        self.tpl.__dict__["_rpc"]["qmcp.RunInAIManaged"] = b"v2"
+        dict.__setitem__(self.tpl.features, "qmcp-services", "sha256:v2")
+        self.assertTrue(self.spawn()["ok"])
+        vm = self.app.domains["ai-hub-sa"]
+        self.assertEqual(vm.rpc_files(), {"qmcp.RunInAIManaged": b"v1"})
+        self.assertEqual(dict.__getitem__(vm.features, "qmcp-services"), inqube.UNKNOWN)
+
+    def test_a_template_that_ran_before_the_copy_and_stopped_during_it(self):
+        # Read before the copy as well as after: halted only at the second
+        # read, the root copied may be the older one.
+        copied = []
+        real_halted, real_fill = inqube.halted, birth.fill_copy
+        inqube.halted = lambda vm: bool(copied)        # running until the copy, then halted
+
+        def fill(*a, **kw):
+            real_fill(*a, **kw)
+            copied.append(True)
+        birth.fill_copy = fill
+        try:
+            self.assertTrue(self.spawn()["ok"])
+        finally:
+            inqube.halted, birth.fill_copy = real_halted, real_fill
+        self.assertEqual(dict.__getitem__(self.app.domains["ai-hub-sa"].features,
+                                          "qmcp-services"), inqube.UNKNOWN)
+
+    def test_the_root_counts_against_the_cap(self):
+        used = budget.persistent_sum(self.app)
+        pathlib.Path(budget.CAP_PATH).write_text(str(used + 21 * GiB) + "\n")
+        self.assertEqual(self.spawn()["error"], "pool cap exceeded")
+        self.assertNotIn("ai-hub-sa", self.app.domains)
+        self.assertTrue(self.spawn(klass="AppVM", template="ai-tpl-g")["ok"])
+
+    def test_a_standalone_comes_from_a_template_only(self):
+        r = self.spawn(template="ai-dvm")
+        self.assertEqual(r["error"], "template 'ai-dvm' must be a TemplateVM for klass=StandaloneVM")
+
+    def test_a_failed_copy_is_rolled_back(self):
+        for step, key in (("copy", "volume.clone"), ("copy", "feature.set"),
+                          ("services label", "feature.get"), ("birth stamp", "tag.add")):
+            self.app.fail = {key}
+            if key == "feature.get":
+                self.tpl.start()                    # only a running template's copy reads it
+                self.app.fail = set()
+                self.app.fail_reads("feature.get", "ok ok fail")
+            r = self.spawn(name=f"ai-hub-{key.replace('.', '-')}")
+            self.assertIn("(rolled back)", r["error"], key)
+            self.assertNotIn(f"ai-hub-{key.replace('.', '-')}", self.app.domains, key)
+            self.assertNotIn(SECRET, json.dumps(r))
+            self.app.fail = set()
+            self.app.fail_plan.clear()
+            self.tpl.shutdown()
+
+    def clone(self, source, name):
+        return self.call("qmcp.CloneAIManagedQube", {"source": source, "name": name})
+
+    def test_a_clone_of_a_standalone_copies_its_root_and_private(self):
+        self.assertTrue(self.spawn()["ok"])
+        sa = self.app.domains["ai-hub-sa"]
+        sa.volumes["private"].size = 5 * GiB
+        firewall.restore_rules(self.app, "ai-hub-sa", ["action=accept dsthost=example.org",
+                                                       "action=drop"])
+        r = self.clone("ai-hub-sa", "ai-hub-sa2")
+        self.assertEqual(r, {"ok": True, "name": "ai-hub-sa2"})
+        vm = self.app.domains["ai-hub-sa2"]
+        self.assertEqual(vm.klass, "StandaloneVM")
+        self.assertEqual(vm.volumes["root"].size, 20 * GiB)
+        self.assertEqual(vm.volumes["private"].size, 5 * GiB)
+        self.assertEqual(vm.rpc_files(), {"qmcp.RunInAIManaged": b"v1"})
+        self.assertEqual(firewall.read_rules(self.app, "ai-hub-sa2"),
+                         firewall.read_rules(self.app, "ai-hub-sa"))
+        self.assertEqual(dict.__getitem__(vm.features, "qmcp-id"), vm.uuid)
+        self.assertEqual(self.tags("ai-hub-sa2"), self.tags("ai-hub-sa"))    # p00, as its source
+
+    def test_a_running_standalone_s_clone_is_marked_behind(self):
+        self.assertTrue(self.spawn()["ok"])
+        self.app.domains["ai-hub-sa"].start()
+        self.assertTrue(self.clone("ai-hub-sa", "ai-hub-sa2")["ok"])
+        self.assertEqual(dict.__getitem__(self.app.domains["ai-hub-sa2"].features,
+                                          "qmcp-services"), inqube.UNKNOWN)
+
+    def test_a_copy_keeps_its_source_s_pools_notes_and_virt_mode(self):
+        self.tpl.volumes["root"].pool = "big-pool"
+        self.tpl._props["virt_mode"] = "hvm"
+        self.assertTrue(self.spawn()["ok"])
+        sa = self.app.domains["ai-hub-sa"]
+        self.assertEqual(sa.volumes["root"].pool, "big-pool")
+        self.assertEqual(sa.volumes["private"].pool, "vm-pool")        # new, the default
+        self.assertEqual(sa.virt_mode, "hvm")
+        work = self.app.domains["ai-work"]
+        work.volumes["private"].pool = "big-pool"
+        work.set_notes("the operator's note")
+        self.assertTrue(self.clone("ai-work", "ai-hub-w")["ok"])
+        w = self.app.domains["ai-hub-w"]
+        self.assertEqual((w.volumes["private"].pool, w.get_notes()),
+                         ("big-pool", "the operator's note"))
+
+    def test_a_disposable_s_clone_copies_no_volume(self):
+        # A disposable keeps nothing across a restart, so its clone takes no
+        # volume, as qubesadmin's clone_vm did.
+        name = self.app.qubesd_call("ai-dvm", "admin.vm.CreateDisposable").decode()
+        self.app.domains.clear_cache()
+        self.assertEqual(birth.copied_volumes(self.app.domains[name], False), ())
+        self.assertEqual(birth.copied_volumes(self.app.domains["ai-work"], False), ("private",))
+        self.assertEqual(birth.copied_volumes(self.tpl, False), ("root", "private"))
+
+    def test_a_clone_takes_no_device(self):
+        self.app.domains["ai-work"].__dict__["_devices"] = ["usb:2-1"]
+        self.assertTrue(self.clone("ai-work", "ai-hub-w")["ok"])
+        self.assertEqual(self.app.domains["ai-hub-w"].__dict__["_devices"], [])
 
 
 class Events(Base):

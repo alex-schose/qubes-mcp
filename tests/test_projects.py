@@ -21,7 +21,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, budget, core, fleet, projects, services  # noqa: E402
+from qmcp import audit, budget, core, fleet, inqube, projects, services  # noqa: E402
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB, Base  # noqa: E402
 from qmcp import gateways  # noqa: E402
@@ -750,13 +750,24 @@ class AuditFixes(ProjectBase):
             fleet.move(self.app, "ai-work", "other", confirm=True)
         self.assertIn("network", str(cm.exception))
 
-    def test_the_hub_clones_project_content_into_no_slot(self):
-        for source, want in (("ai-osint-w1", set()), (LEAD, set()), ("ai-hubq", {"p00"}),
-                             ("ai-work2", {"p00"})):
-            name = f"ai-hub-c-{source[-4:]}"
+    def test_a_clone_lands_where_its_source_is(self):
+        # A project member's clone joins that project, in its name space; a
+        # lead's clone joins no slot; a p00 qube's joins p00, and one in no
+        # slot (ai-work2) joins none.
+        for source, name, want in (("ai-osint-w1", "ai-osint-hc1", {"p01"}),
+                                   (LEAD, "ai-hub-c-lead", set()),
+                                   ("ai-hubq", "ai-hub-c-hubq", {"p00"}),
+                                   ("ai-work2", "ai-hub-c-ork2", set())):
             r = self.call("qmcp.CloneAIManagedQube", {"source": source, "name": name})
             self.assertTrue(r["ok"], (source, r))
             self.assertEqual(projects.member_slots(self.tags(name)), want, source)
+        self.assertNotIn(projects.LEAD, self.tags("ai-hub-c-lead"))
+
+    def test_the_hubs_clone_of_a_member_is_named_in_its_project(self):
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-osint-w1", "name": "ai-hub-c1"})
+        self.assertEqual(r["error"], "name must start with 'ai-osint-': that namespace is "
+                                     "reserved for AI-created qubes")
+        self.assertNotIn("ai-hub-c1", self.app.domains)
 
     def test_a_failed_promote_restores_the_exact_badges(self):
         before = self.tags("ai-work")
@@ -976,6 +987,309 @@ class HardwareFindings(ProjectBase):
         for kind in ("f", "z"):
             self.assertIn((kind, "/run/qmcp/create.lock", "0660", "root", "qubes"), rules)
         self.assertIn('LOCK_PATH = "/run/qmcp/create.lock"', (HERE.parent / "dom0" / "qmcp" / "budget.py").read_text())
+
+
+
+# ======================================================================= standalones (0.9.27)
+
+class Standalones(ProjectBase):
+    """A StandaloneVM as a project's worker or lead: spawned or cloned by its
+    lead, made the lead from a template, promoted or cloned from one of the
+    hub's, and moved in by the operator."""
+
+    def setUp(self):
+        super().setUp()
+        a = self.app
+        a.domains["ai-debian-13"].volumes["root"].size = 10 * GiB
+        a.vm("ai-hub-sa", klass="StandaloneVM", netvm=None, root=8 * GiB,
+             tags={"ai-managed", "qmcp-proj-p00"})
+        a.vm("ai-hub-sb", klass="StandaloneVM", netvm=None, root=8 * GiB, tags={"ai-managed"})
+
+    def spawn(self, name, klass="StandaloneVM", template="ai-debian-13", **req):
+        return self.lcall("qmcp.SpawnAIManagedQube",
+                          dict(req, name=name, template=template, klass=klass, netvm=None))
+
+    def test_a_lead_spawns_a_standalone_worker(self):
+        r = self.spawn("ai-osint-sa")
+        self.assertEqual(r, {"ok": True, "name": "ai-osint-sa"})
+        vm = self.app.domains["ai-osint-sa"]
+        self.assertEqual(vm.klass, "StandaloneVM")
+        self.assertEqual(self.tags("ai-osint-sa"), {"ai-managed", "qmcp-proj-p01",
+                                                    f"qmcp-owner_{LEAD}"})
+        self.assertEqual(vm.volumes["root"].size, 10 * GiB)
+
+    def test_its_root_counts_against_the_quota(self):
+        # 20 GiB quota; the two workers hold 4. A standalone holds 12 (its own
+        # 10 GiB root and a 2 GiB private), so a second one is over.
+        self.assertTrue(self.spawn("ai-osint-sa")["ok"])
+        self.assertEqual(self.spawn("ai-osint-sb")["error"], budget.ERR_QUOTA_EXCEEDED)
+        self.assertNotIn("ai-osint-sb", self.app.domains)
+        self.assertTrue(self.spawn("ai-osint-ab", klass="AppVM")["ok"])
+
+    def test_only_from_an_approved_template(self):
+        r = self.spawn("ai-osint-sa", template="ai-tpl-g")
+        self.assertEqual(r["error"], "template is not on this project's approved list")
+
+    def test_a_lead_clones_its_standalone_worker(self):
+        self.assertTrue(self.spawn("ai-osint-sa")["ok"])
+        r = self.lcall("qmcp.CloneAIManagedQube", {"source": "ai-osint-sa", "name": "ai-osint-sc"})
+        self.assertEqual(r["error"], budget.ERR_QUOTA_EXCEEDED)         # 4 + 12 + 12 > 20
+        rec = json.loads(json.dumps(RECORDS))
+        rec["slots"]["p01"]["quota"] = 40 * GiB
+        self.write_records(rec)
+        r = self.lcall("qmcp.CloneAIManagedQube", {"source": "ai-osint-sa", "name": "ai-osint-sc"})
+        self.assertEqual(r, {"ok": True, "name": "ai-osint-sc"})
+        self.assertEqual(self.app.domains["ai-osint-sc"].klass, "StandaloneVM")
+        self.assertIn("qmcp-proj-p01", self.tags("ai-osint-sc"))
+
+    def test_the_hubs_clone_of_a_member_counts_against_its_project(self):
+        self.assertTrue(self.spawn("ai-osint-sa")["ok"])
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-osint-sa", "name": "ai-osint-hc"})
+        self.assertEqual(r["error"], budget.ERR_QUOTA_EXCEEDED)
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-osint-w1", "name": "ai-osint-hc"})
+        self.assertEqual(r, {"ok": True, "name": "ai-osint-hc"})
+        self.assertEqual(projects.member_slots(self.tags("ai-osint-hc")), {"p01"})
+
+    def test_a_standalone_lead_from_a_template(self):
+        fleet.create_project(self.app, "tools", "template", "ai-debian-13", networks=["none"],
+                             quota="40G", lead_class="standalone")
+        p = projects.find(self.records(), "tools")
+        vm = self.app.domains[p.lead]
+        self.assertEqual(vm.klass, "StandaloneVM")
+        self.assertEqual(vm.volumes["root"].size, 10 * GiB)
+        self.assertEqual(self.tags(p.lead), {"ai-managed", "qmcp-lead", f"qmcp-lead-{p.slot}",
+                                             "qmcp-owner_dom0"})
+        self.assertEqual(p.templates, ("ai-debian-13",))
+        self.assertTrue(self.lcall("qmcp.ListAIManagedQubes", lead=p.lead)["ok"])
+
+    def test_a_standalone_lead_comes_from_a_template_only(self):
+        for source, origin in (("clone", "ai-hub-sa"), ("promote", "ai-hub-sa")):
+            with self.assertRaisesRegex(fleet.ProjectError, "keeps the class", msg=source):
+                fleet.create_project(self.app, "tools", source, origin, networks=["none"],
+                                     quota="1G", lead_class="standalone")
+        with self.assertRaisesRegex(fleet.ProjectError, "one of: appvm, standalone"):
+            fleet.create_project(self.app, "tools", "template", "ai-debian-13",
+                                 networks=["none"], quota="1G", lead_class="hvm")
+        self.assertIsNone(projects.find(self.records(), "tools"))
+
+    def test_a_hub_standalone_is_promoted_or_cloned_into_a_lead(self):
+        # A standalone has no template to join the approved list: name one.
+        with self.assertRaisesRegex(fleet.ProjectError, "at least one approved template"):
+            fleet.create_project(self.app, "prom", "promote", "ai-hub-sa", networks=["none"],
+                                 quota="1G")
+        fleet.create_project(self.app, "prom", "promote", "ai-hub-sa", networks=["none"],
+                             quota="1G", templates=["ai-debian-13"])
+        self.assertEqual(projects.find(self.records(), "prom").lead, "ai-hub-sa")
+        self.assertEqual(self.app.domains["ai-hub-sa"].klass, "StandaloneVM")
+        self.assertNotIn("qmcp-proj-p00", self.tags("ai-hub-sa"))
+        fleet.create_project(self.app, "clon", "clone", "ai-hub-sb", networks=["none"],
+                             quota="1G", templates=["ai-debian-13"])
+        lead = projects.find(self.records(), "clon").lead
+        self.assertEqual(lead, "ai-clon-lead")
+        self.assertEqual(self.app.domains[lead].klass, "StandaloneVM")
+        self.assertEqual(self.app.domains[lead].volumes["root"].size, 8 * GiB)
+
+    def test_a_new_standalone_lead(self):
+        fleet.set_lead(self.app, "osint", "template", "ai-debian-13", keep_old=True,
+                       lead_name="ai-osint-boss", lead_class="standalone")
+        self.assertEqual(projects.find(self.records(), "osint").lead, "ai-osint-boss")
+        self.assertEqual(self.app.domains["ai-osint-boss"].klass, "StandaloneVM")
+        self.assertIn("qmcp-proj-p01", self.tags(LEAD))          # the old one, kept as a worker
+
+    def test_the_operator_moves_a_standalone_in(self):
+        fleet.move(self.app, "ai-hub-sb", "osint", confirm=True)
+        self.assertEqual(projects.member_slots(self.tags("ai-hub-sb")), {"p01"})
+        fleet.move(self.app, "ai-hub-sb", "none", confirm=True)
+        self.assertEqual(projects.member_slots(self.tags("ai-hub-sb")), set())
+
+    def test_the_check_warns_on_a_standalone_in_no_slot(self):
+        vms = list(self.app.domains)
+        f = {x.check: x for x in fleet.project_findings(vms, {v.name: v for v in vms},
+                                                         self.records(), "ai-")}
+        self.assertIn("ai-hub-sb", f["managed qubes in no slot"].detail)
+        self.assertNotIn("ai-hub-sa", f["managed qubes in no slot"].detail)
+
+    def test_a_clone_keeps_its_source_s_template(self):
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-osint-w1", "name": "ai-osint-ct"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.app.domains["ai-osint-ct"].template.name, "ai-debian-13")
+
+    def test_a_source_that_moved_while_the_clone_waited_is_refused(self):
+        # The slot a clone lands in is read before the create lock and again
+        # under it: a project command in between must not land it elsewhere.
+        real = budget.acquire_create_lock
+
+        def moving(*a, **kw):
+            fd = real(*a, **kw)
+            src = self.app.domains["ai-osint-w1"]
+            src.tags.discard("qmcp-proj-p01")
+            src.tags.add("qmcp-proj-p00")
+            return fd
+        budget.acquire_create_lock = moving
+        try:
+            r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-osint-w1",
+                                                       "name": "ai-osint-cm"})
+        finally:
+            budget.acquire_create_lock = real
+        self.assertEqual(r["error"], "the source moved while this call waited; try again")
+        self.assertNotIn("ai-osint-cm", self.app.domains)
+
+    def test_a_standalone_lead_from_a_running_template_reads_behind(self):
+        tpl = self.app.domains["ai-debian-13"]
+        dict.__setitem__(tpl.features, "qmcp-services", "sha256:v1")
+        tpl.start()
+        fleet.create_project(self.app, "tools", "template", "ai-debian-13", networks=["none"],
+                             quota="40G", lead_class="standalone")
+        lead = projects.find(self.records(), "tools").lead
+        self.assertEqual(dict.__getitem__(self.app.domains[lead].features, "qmcp-services"),
+                         inqube.UNKNOWN)
+
+    def test_the_command_takes_lead_class(self):
+        import contextlib
+        from qmcp import cli
+        saved = cli._app, os.geteuid
+        cli._app, os.geteuid = (lambda: self.app), (lambda: 0)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                rc = cli.main(["project", "create", "tools", "--lead-template", "ai-debian-13",
+                               "--lead-class", "standalone", "--network", "none",
+                               "--quota", "40G"])
+                self.assertEqual(rc, 0, out.getvalue())
+                self.assertEqual(self.app.domains["ai-tools-lead"].klass, "StandaloneVM")
+                rc = cli.main(["project", "lead", "tools", "--lead-template", "ai-debian-13",
+                               "--lead-class", "standalone", "--lead-name", "ai-tools-boss"])
+                self.assertEqual(rc, 0, out.getvalue())
+                rc = cli.main(["project", "create", "toolc", "--lead-clone", "ai-hub-sb",
+                               "--lead-class", "standalone", "--network", "none",
+                               "--quota", "1G"])
+        finally:
+            cli._app, os.geteuid = saved
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("keeps the class", out.getvalue())
+        self.assertEqual(self.app.domains["ai-tools-boss"].klass, "StandaloneVM")
+
+
+class CopyRechecks(ProjectBase):
+    """What a copy checks under the create lock (0.9.27's audit): its source
+    and the template it builds on are read again there, as a spawn's are."""
+
+    def waiting(self, change):
+        """Run `change` once the call holds the create lock."""
+        real = budget.acquire_create_lock
+
+        def taken(*a, **kw):
+            fd = real(*a, **kw)
+            change()
+            return fd
+        budget.acquire_create_lock = taken
+        self.addCleanup(setattr, budget, "acquire_create_lock", real)
+
+    def clone(self, source, name, lead=None):
+        req = {"source": source, "name": name}
+        return self.lcall("qmcp.CloneAIManagedQube", req, lead=lead) if lead \
+            else self.call("qmcp.CloneAIManagedQube", req)
+
+    def test_a_lead_from_a_whonix_template_keeps_anon_vm(self):
+        self.app.domains["ai-debian-13"].tags.add("anon-vm")
+        for cls, label in (("standalone", "tools"), ("appvm", "toolb")):
+            fleet.create_project(self.app, label, "template", "ai-debian-13",
+                                 networks=["none"], quota="40G", lead_class=cls)
+            lead = projects.find(self.records(), label).lead
+            self.assertIn("anon-vm", self.tags(lead), cls)
+
+    def test_a_clone_on_a_stopped_or_held_template_is_refused(self):
+        tpl = self.app.domains["ai-debian-13"]
+        tpl.tags.add("qmcp-blocked")
+        self.assertEqual(self.clone("ai-hubq", "ai-hub-c1"), core.BLOCKED_REFUSAL)
+        tpl.tags.discard("qmcp-blocked")
+        dict.__setitem__(tpl.features, "qmcp-id", "another-uuid")      # not held yet
+        self.assertEqual(self.clone("ai-hubq", "ai-hub-c1"), core.QUARANTINE_REFUSAL)
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-s1", "template": "ai-debian-13",
+                                                  "klass": "StandaloneVM", "netvm": None})
+        self.assertEqual(r, core.QUARANTINE_REFUSAL)
+        self.assertNotIn("ai-hub-c1", self.app.domains)
+
+    def test_a_lead_clones_only_on_an_approved_template(self):
+        rec = json.loads(json.dumps(RECORDS))
+        rec["slots"]["p01"]["templates"] = ["ai-dvm"]
+        self.write_records(rec)
+        r = self.clone("ai-osint-w1", "ai-osint-c1", lead=LEAD)
+        self.assertEqual(r["error"], "the source's template is not on this project's approved list")
+
+    def test_a_restored_source_not_yet_held_is_not_copied(self):
+        dict.__setitem__(self.app.domains["ai-osint-w1"].features, "qmcp-id", "another-uuid")
+        self.assertEqual(self.clone("ai-osint-w1", "ai-osint-c1"), core.QUARANTINE_REFUSAL)
+        self.assertEqual(self.clone("ai-osint-w1", "ai-osint-c2", lead=LEAD),
+                         core.QUARANTINE_REFUSAL)
+        a = self.app
+        a.vm("ai-hub-sx", klass="StandaloneVM", netvm=None, tags={"ai-managed"},
+             features={"qmcp-id": "another-uuid"})
+        with self.assertRaisesRegex(fleet.ProjectError, "waits for your review"):
+            fleet.create_project(a, "tools", "clone", "ai-hub-sx", networks=["none"],
+                                 quota="1G", templates=["ai-debian-13"])
+        dict.__setitem__(a.domains["ai-debian-13"].features, "qmcp-id", "another-uuid")
+        with self.assertRaisesRegex(fleet.ProjectError, "waits for your review"):
+            fleet.create_project(a, "toolb", "template", "ai-debian-13", networks=["none"],
+                                 quota="1G", lead_class="standalone")
+
+    def test_a_lead_s_source_that_left_its_project_meanwhile(self):
+        def move():
+            w = self.app.domains["ai-osint-w1"]
+            w.tags.discard("qmcp-proj-p01")
+            w.tags.add("qmcp-proj-p02")
+        self.waiting(move)
+        self.assertEqual(self.clone("ai-osint-w1", "ai-osint-c1", lead=LEAD), core.NOT_FOUND)
+        self.assertNotIn("ai-osint-c1", self.app.domains)
+
+    def test_a_source_stopped_or_held_meanwhile(self):
+        for badge, want in (("qmcp-blocked", core.BLOCKED_REFUSAL),
+                            ("qmcp-quarantine", core.QUARANTINE_REFUSAL)):
+            w = self.app.domains["ai-osint-w1"]
+            self.waiting(lambda: w.tags.add(badge))
+            self.assertEqual(self.clone("ai-osint-w1", "ai-osint-c1"), want, badge)
+            w.tags.discard(badge)
+            self.assertNotIn("ai-osint-c1", self.app.domains)
+
+    def test_the_project_record_read_under_the_lock_decides(self):
+        def shrink():
+            rec = json.loads(json.dumps(RECORDS))
+            rec["slots"]["p01"]["quota"] = GiB
+            self.write_records(rec)
+        self.waiting(shrink)
+        r = self.clone("ai-osint-w1", "ai-osint-c1")
+        self.assertEqual(r["error"], budget.ERR_QUOTA_EXCEEDED)
+
+    def test_a_hidden_project_s_member_answers_as_missing(self):
+        rec = json.loads(json.dumps(RECORDS))
+        rec["slots"]["p03"] = {"label": "x7k2m9qa", "lead": None, "templates": ["ai-debian-13"],
+                               "networks": [None], "quota": 10 * GiB, "dump": None,
+                               "anonymous": True, "hidden": True}
+        self.write_records(rec)
+        # It lost its hidden badge (the check fails on that), not its slot's.
+        self.app.vm("ai-x7k2m9qa-w1", template=self.app.domains["ai-debian-13"], netvm=None,
+                    tags={"ai-managed", "qmcp-proj-p03", "qmcp-anon"})
+        for name in ("ai-hub-zz", "ai-x7k2m9qa-c"):
+            r = self.clone("ai-x7k2m9qa-w1", name)
+            self.assertEqual(r, core.NOT_FOUND, name)
+            self.assertNotIn("x7k2m9qa", json.dumps(r))
+
+    def test_the_hub_s_clone_stays_on_the_project_s_networks(self):
+        self.app.domains["ai-osint-w2"]._props["netvm"] = self.app.domains["ai-gw-unbadged"]
+        self.enroll("ai-gw-unbadged")
+        r = self.clone("ai-osint-w2", "ai-osint-c1")
+        self.assertEqual(r["error"], "the source's network is not one of this project's "
+                                     "worker networks")
+
+    def test_a_disposable_template_s_clone_does_not_preload(self):
+        dvm = self.app.domains["ai-dvm"]
+        dict.__setitem__(dvm.features, "preload-dispvm-max", "2")
+        self.assertTrue(self.clone("ai-dvm", "ai-hub-dvm2")["ok"])
+        self.assertNotIn("preload-dispvm-max", dict.keys(self.app.domains["ai-hub-dvm2"].features))
+
+    def test_a_property_the_copy_s_class_lacks_is_skipped(self):
+        self.app.domains["ai-hubq"]._props["only_on_source"] = 1
+        self.assertTrue(self.clone("ai-hubq", "ai-hub-c1")["ok"])
 
 
 if __name__ == "__main__":

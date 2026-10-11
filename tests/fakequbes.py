@@ -5,7 +5,13 @@ return values: in 0.9.x a mock whose clone returned a clean qube kept a
 self-escalation bug green through a whole stage. So:
 
 - `clone_vm` copies the source's tags (all but `created-by-*`), properties,
-  features and volume sizes;
+  label, features, firewall, device assignments (unless `ignore_devices`) and
+  volume sizes. With `new_cls="StandaloneVM"` and `ignore_volumes=("private",)`
+  it is qubesadmin's template-based standalone (what `qvm-create --standalone
+  -t T` runs): the new qube gets the source's root and a fresh default private.
+  A root is copied as it was when its qube last stopped: a running qube's
+  changes since it started are not in it (both measured 2026-10-10 on Qubes
+  4.3.1);
 - `admin.vm.CreateDisposable` copies the disposable template's tags and
   network, and the new qube stays invisible to `app.domains` until
   `clear_cache()` (qubesadmin's cache lags CreateDisposable by seconds);
@@ -94,13 +100,23 @@ class FakeLabel:
 
 
 class FakeVolume:
-    def __init__(self, vm, name, size):
+    def __init__(self, vm, name, size, save_on_stop=True, pool="vm-pool"):
         self._vm, self._name, self.size = vm, name, size
+        self.save_on_stop, self.pool = save_on_stop, pool
 
     def resize(self, size):
         self._vm.app._maybe_fail("resize")
         if size > self.size:
             self.size = size
+
+    def clone(self, source):
+        """admin.vm.volume.CloneFrom/CloneTo: this volume becomes a copy of
+        `source`, at its size. A root holds what its qube had when it last
+        stopped."""
+        self._vm.app._maybe_fail("volume.clone")
+        self.size = source.size
+        if self._name == "root":
+            self._vm.__dict__["_rpc"] = source._vm.committed_files()
 
 
 class FakeTags:
@@ -138,6 +154,7 @@ class FakeTags:
         if not _TAG_RE.match(tag):
             raise ValueError("disallowed characters")
         self._tags.add(tag)
+        self._vm.app.tag_log.append((self._vm.__dict__["name"], frozenset(self._tags)))
         # qubesd sets the tag, then saves and fires its event: either can
         # fail after the tag is set, so a write can land and still raise.
         self._vm.app._maybe_fail(f"tag.add.landed:{tag}")
@@ -177,6 +194,11 @@ class FakeFeatures(dict):
     def __contains__(self, key):
         self._read()
         return dict.__contains__(self, key)
+
+    def items(self):
+        """admin.vm.feature.List, then a Get for each: a read that can fail."""
+        self._read()
+        return list(dict.items(self))
 
     def __setitem__(self, key, value):
         self._vm.app._maybe_fail("feature.set")
@@ -230,16 +252,22 @@ class FakeVM:
                  provides_network=False, template_for_dispvms=False,
                  default_dispvm=None, label="gray", private=2 * GiB, root=10 * GiB,
                  power="Halted", features=None, memory=400, maxmem=4000, vcpus=2,
-                 auto_cleanup=False):
+                 auto_cleanup=False, devices=()):
         d = self.__dict__
         d["app"], d["name"], d["klass"] = app, name, klass
         d["tags"] = FakeTags(self, tags)
         d["features"] = FakeFeatures(self, features)
-        d["volumes"] = {"private": FakeVolume(self, "private", private),
-                        "root": FakeVolume(self, "root", root)}
+        # As Qubes 4.3's classes have them: a template-based root is
+        # copy-on-write and not kept; a disposable keeps nothing.
+        own_root = klass in ("TemplateVM", "StandaloneVM", "AdminVM")
+        d["volumes"] = {"private": FakeVolume(self, "private", private,
+                                              save_on_stop=klass != "DispVM"),
+                        "root": FakeVolume(self, "root", root, save_on_stop=own_root)}
+        d["_notes"] = ""
         d["_power"] = power
         d["auto_cleanup"] = auto_cleanup
         d["_firewall"] = ["action=accept"]
+        d["_devices"] = list(devices)
         props = {"label": FakeLabel(label), "netvm": netvm,
                  "provides_network": provides_network,
                  "default_dispvm": default_dispvm, "memory": memory,
@@ -302,11 +330,27 @@ class FakeVM:
 
     def start(self):
         self.app._maybe_fail("start")
-        self.__dict__["_power"] = "Running"
+        self._went_up()
 
     def shutdown(self, force=False, wait=False):
         self.app._maybe_fail("shutdown")
+        self._went_down()
+
+    def _went_up(self):
+        """A start: what its disk holds now is what a clone gets until it stops."""
+        if not self.is_running():
+            self.__dict__["_rpc_saved"] = dict(self.__dict__.setdefault("_rpc", {}))
+        self.__dict__["_power"] = "Running"
+
+    def _went_down(self):
+        """A stop, a kill included: Qubes commits a persistent root then."""
+        self.__dict__.pop("_rpc_saved", None)
         self.__dict__["_power"] = "Halted"
+
+    def committed_files(self) -> dict:
+        """The in-qube files in the root a clone would copy now."""
+        saved = self.__dict__.get("_rpc_saved")
+        return dict(saved if saved is not None else self.__dict__.get("_rpc", {}))
 
     def run_service(self, service, user=None, autostart=True, **kw):
         """qubesadmin's run_service, for `qubes.VMShell` as root: the process it
@@ -320,9 +364,17 @@ class FakeVM:
         if not self.is_running():
             if not autostart:
                 raise Injected("QubesVMNotRunningError")
-            self.__dict__["_power"] = "Running"
+            self._went_up()
         self.app.calls.append((name, "run_service", service, user))
         return FakeProc(self, self.app.vmshell.get(name, "ok"))
+
+    def get_notes(self) -> str:
+        self.app._maybe_fail("notes.get")
+        return self.__dict__["_notes"]
+
+    def set_notes(self, notes: str) -> None:
+        self.app._maybe_fail("notes.set")
+        self.__dict__["_notes"] = notes
 
     def rpc_files(self) -> dict:
         return dict(self.__dict__.setdefault("_rpc", {}))
@@ -331,7 +383,7 @@ class FakeVM:
         self.app._maybe_fail("kill")
         if not self.is_running():
             raise Injected("QubesVMNotStartedError")
-        self.__dict__["_power"] = "Halted"
+        self._went_down()
         if self.__dict__.get("auto_cleanup"):
             self.app.domains._drop(self.name)
 
@@ -440,6 +492,9 @@ class FakeApp:
         self.calls: list = []
         #: `run_service` per qube: "ok" (the default), "timeout" or "exit1".
         self.vmshell: dict = {}
+        #: Every tag add, in order: (qube, its tags right after). What a qube
+        #: wore at each moment of its creation is read from here.
+        self.tag_log: list = []
 
     def fail_reads(self, key, pattern: str):
         """Fail some of the reads under `key`, in order: "ok fail" lets the
@@ -468,8 +523,9 @@ class FakeApp:
         return vm
 
     # -- creates
-    def add_new_vm(self, klass, name, label, template=None):
+    def add_new_vm(self, klass, name, label, template=None, pool=None, pools=None):
         self._maybe_fail("add_new_vm")
+        self.created_pools = dict(pools or {})
         if not _NAME_RE.match(name):
             raise Injected("QubesValueError: invalid name")
         if name in self.domains._vms:
@@ -485,24 +541,46 @@ class FakeApp:
                 provides_network=tpl._props["provides_network"],
                 default_dispvm=tpl._props["default_dispvm"],
                 private=tpl.volumes["private"].size))
-        return self.domains._add(FakeVM(self, name, klass=klass, template=tpl, label=label,
-                                        netvm=self.default_netvm,
-                                        default_dispvm=self.default_dispvm))
+        vm = self.domains._add(FakeVM(self, name, klass=klass, template=tpl, label=label,
+                                      netvm=self.default_netvm,
+                                      default_dispvm=self.default_dispvm))
+        for volume, pool_name in (pools or {}).items():
+            vm.volumes[volume].pool = pool_name
+        return vm
 
-    def clone_vm(self, src, new_name):
+    def clone_vm(self, src, new_name, new_cls=None, *, pool=None, pools=None,
+                 ignore_errors=False, ignore_volumes=None, ignore_devices=False):
+        """qubesadmin's clone_vm (4.3.35): create `new_cls` (default: the
+        source's class), then copy properties, the label, tags but
+        `created-by-*`, features, the firewall and device assignments, then
+        every persistent volume not in `ignore_volumes`."""
         self._maybe_fail("clone_vm")
+        if isinstance(src, str):
+            src = self.domains[src]
         p = src._props
-        vm = FakeVM(self, new_name, klass=src.klass,
-                    tags=[t for t in src.tags if not t.startswith("created-by-")],
-                    template=p.get("template"), netvm=p["netvm"],
-                    provides_network=p["provides_network"],
+        klass = new_cls or src.klass
+        ignore = set(ignore_volumes or ())
+        tags = [t for t in src.tags if not t.startswith("created-by-")]
+        vm = FakeVM(self, new_name, klass=klass,
+                    template=p.get("template") if klass in ("AppVM", "DispVM") else None,
+                    netvm=p.get("netvm"),
+                    provides_network=p.get("provides_network", False),
                     template_for_dispvms=p.get("template_for_dispvms", False),
-                    default_dispvm=p["default_dispvm"], label=p["label"].name,
-                    private=src.volumes["private"].size, root=src.volumes["root"].size,
-                    features=dict(src.features))
+                    default_dispvm=p.get("default_dispvm"), label=p["label"].name,
+                    private=2 * GiB if "private" in ignore else src.volumes["private"].size,
+                    root=src.volumes["root"].size,
+                    features=dict(src.features),
+                    devices=() if ignore_devices else src.__dict__["_devices"])
         # qubesadmin's clone_vm copies the firewall too.
         vm.__dict__["_firewall"] = list(src.__dict__["_firewall"])
-        return self.domains._add(vm)
+        if "root" not in ignore and klass in ("TemplateVM", "StandaloneVM"):
+            vm.__dict__["_rpc"] = src.committed_files()
+        self.domains._add(vm)
+        # One by one, in the order admin.vm.tag.List gives them (sorted), as
+        # qubesadmin does, right after the create: `ai-managed` lands first.
+        for tag in tags:
+            vm.tags.add(tag)
+        return vm
 
     # -- the raw admin calls the disposable path uses
     def qubesd_call(self, dest, method, arg=None, payload=None):

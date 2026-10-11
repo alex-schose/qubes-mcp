@@ -26,6 +26,110 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.27] — 2026-10-10
+
+**Linux standalones.** A project's worker or lead, and one of the hub's own
+qubes, may be a StandaloneVM: its own copy of a template's root, so the tools
+installed in it stay across restarts. A clone now lands where its source is.
+And every copy dom0 makes is built in its own order, so a new copy is in AI
+space only from the moment dom0 stamps it (a named disposable's clone excepted,
+below).
+
+### Added
+
+- `qmcp.SpawnAIManagedQube` takes `klass: StandaloneVM`, for the hub and for a
+  lead: a StandaloneVM from a TemplateVM (a lead's from its approved
+  templates), under an AppVM's create checks (name space, birth network, cap,
+  quota, create lock). It takes the template's features, as Qubes' own
+  `qvm-create --standalone` does; the template's own values of the properties
+  an AppVM follows from its template (memory, vCPUs, kernel, kernel options,
+  virt mode and the like; not its boot mode, which an AppVM takes from the
+  template's `appvm_default_bootmode`); and a copy of its root, as the template
+  was when it last shut down (measured on Qubes 4.3.1), in the template root's
+  pool. Its private volume is new. It takes none of the template's tags but
+  `anon-vm`, no firewall rules and no device assignments. An AppVM built on a
+  Whonix template also gets what Whonix's own addon puts on it
+  (`sdwdate-gui-client`, measured for a lead); a standalone does not.
+  Its root counts against the pool cap and a lead's quota at the template
+  root's full size. The hub's standalone joins p00 and a lead's its project.
+- A standalone's copy of the in-qube services comes with its root. Its
+  `qmcp-services` label is the template's when the template read as halted,
+  with that same label, just before and just after the copy; otherwise the
+  template may have been refreshed since it started, so the label reads
+  `unknown: copied from a running qube`, which
+  `qmcp check` reports as behind and the refresh brings up to date the next
+  time the standalone runs. A template never prepared gives a copy with no
+  label. The same holds for a clone of a template or a standalone.
+- **Standalone leads.** `qmcp project create` and `qmcp project lead` take
+  `--lead-class standalone` with `--lead-template`; the `project-create` and
+  `project-lead` proposals take `lead_class`, stored only when it is
+  `standalone`, so a proposal stored before 0.9.27 reads back with the same
+  fingerprint; the window's New project and Change lead forms have the tick,
+  and its proposal pane shows the field. A cloned or promoted lead keeps its
+  source's class, and its source may now be one of the hub's StandaloneVMs as
+  well as one of its AppVMs. A lead made from a template or a clone carries the
+  `anon-vm` of the qube it is made from, which a template-based AppVM lead
+  otherwise had only from Whonix's own addon and a standalone would not have.
+- `qmcp project move` takes a managed StandaloneVM, into p00 or a project:
+  moving a standalone the operator built into a project is the operator's
+  approval of what it runs, as approving a template is. `qmcp check` warns
+  about a managed standalone in no slot, as about an AppVM.
+- The hub's `qubes_spawn` offers `StandaloneVM`; `qubes_propose_project` and
+  `qubes_propose_lead` take `lead_class`.
+- Standalone sections in `tests/seat_suite.py` and `tests/lead_seat.py`: a
+  standalone spawned, run as root, a write to its root kept across a restart,
+  and its clone (from the lead, refused by the quota). `lead_seat.py` now asks
+  for a quota with room for one standalone worker.
+
+### Changed
+
+- **BREAKING: a clone lands where its source is, for the hub and a lead
+  alike.** A clone of a p00 qube joins p00 and a clone of a project's member
+  joins that project: for the hub it is then named inside the project's names
+  (`ai-osint-…`, not `ai-hub-…`) and counts against its quota. A clone of a
+  lead, of a template or of a qube in no slot joins no slot; 0.9.26 put the
+  hub's clone of an AppVM in no slot in p00. Taking a project's qube into p00
+  stays the operator's move (`qmcp project move`): p00's qubes copy files
+  among themselves without a dialog.
+- **Every copy dom0 makes is built in dom0's own order:** the hub's and a
+  lead's clones, a standalone, and a lead cloned from one of the hub's qubes.
+  dom0 creates the qube with none of the source's tags, copies properties,
+  features, notes, the operator's tags and restrictions, firewall rules and
+  the volumes the source keeps (each in its source's pool) into it, and only
+  then labels and stamps it, restricting badges first. A named disposable's
+  clone is the one exception: qubesd gives it its disposable template's tags
+  in the create call itself. qubesadmin's `clone_vm`, used before, also copied
+  device assignments and menu entries; a clone no longer gets those. Nor does a
+  clone of a disposable template get its `preload-dispvm-max`, which would
+  start preloading disposables from the copy before it is finished; the
+  operator sets it.
+- A clone checks the template it is built on: not one the anonymity gate
+  stopped, not one the restore check holds or would hold, and for a lead one
+  on its project's approved list. The hub's clone
+  into a project stays on that project's worker networks.
+
+### Fixed
+
+- A clone could be in AI space before its restricting badges. qubesadmin's
+  `clone_vm` copies the source's tags one by one, in the sorted order qubesd
+  lists them (read from both projects' source), so `ai-managed` landed before
+  `qmcp-anon` and `qmcp-hubblind`: a lead's clone of a member of a hidden
+  anonymous project wore `ai-managed` without `qmcp-hubblind` for a moment,
+  when the hub's list could show it, and the hub's clone in anonymous mode
+  lacked `qmcp-anon` for that moment. Reproduced against a test fake that
+  copies tags in that order; the hub seeing such a clone was not measured on
+  hardware. Every copy is now built in dom0's own order (above).
+- A create could copy a qube that came back from a backup, or was copied by
+  hand, in the seconds before the gate's pass held it, and the copy, labelled
+  with its own UUID, was never held. Every create now refuses to copy or build
+  on a qube in AI space whose `qmcp-id` label is not its own, under the create
+  lock, which the gate's pass takes too; so do `qmcp project create` and `lead`
+  for a lead's source or template.
+- A clone checked its source only before waiting for the create lock: a source
+  the gate stopped, the restore check held or a move took into another slot
+  during that wait was still copied. The source, the template it is built on
+  and the project it lands in are now read again under the lock.
+
 ## [0.9.26] — 2026-10-10
 
 **The operator's tools, first of 1.0's releases.** qmcp's in-qube services are

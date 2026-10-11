@@ -29,7 +29,7 @@ import re
 import sys
 import time
 
-from qmcp import birth, budget, core, gateways, projects, proposals, restored, scope
+from qmcp import birth, budget, core, gateways, inqube, projects, proposals, restored, scope
 from qmcp.core import refuse
 
 LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple", "black"})
@@ -48,10 +48,13 @@ _FEATURE_SUFFIX_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,64}\Z")
 MAX_FEATURE_VALUE = 4096
 
 LIFECYCLE_ACTIONS = frozenset({"start", "shutdown", "kill", "pause", "unpause", "remove"})
-#: DispVMTemplate is here because the hub may build disposable templates.
-SPAWN_KLASSES = frozenset({"AppVM", "DispVMTemplate", "DispVM"})
+#: DispVMTemplate is here because the hub may build disposable templates. A
+#: StandaloneVM is made from a TemplateVM and keeps its own copy of its root.
+SPAWN_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVMTemplate", "DispVM"})
 #: A lead builds workloads only: disposable templates are never project members.
-LEAD_SPAWN_KLASSES = frozenset({"AppVM", "DispVM"})
+LEAD_SPAWN_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVM"})
+#: The classes that join a slot.
+WORKLOAD_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVM"})
 
 #: How long a failed rollback keeps retrying the removal of a disposable.
 DISPOSE_TRIES = 20
@@ -117,30 +120,44 @@ def hub_space(prefix: str) -> str:
 def _create_name_refusal(name, who) -> str | None:
     """Judged on the name and the prefix alone, before any qube is looked up,
     so a create is no oracle over names. A lead creates only inside its
-    project's space (`ai-<label>-`), the hub only inside its own (`ai-hub-`):
-    a name says who owns the qube, so a lead collides only with its own
-    workers or with a qube the operator named inside its space or moved out
-    of it."""
+    project's space (`ai-<label>-`), the hub inside its own (`ai-hub-`), but
+    for its clone of a project's member, which is named inside that project's
+    space once the source is known (`_clone_name_refusal`): a name says which
+    slot holds the qube, so a lead collides only with its own workers or with
+    a qube the operator named inside its space or moved out of it."""
     prefix = birth.read_name_prefix()
     space = hub_space(prefix) if who.is_hub() else who.project.space(prefix)
     return birth.name_refusal(name, space)
 
 
-def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False, source_tags=()):
-    """The slot badge a new qube wears. A lead's workloads join its project.
-    The hub's AppVMs join p00; its disposables do not, since one often opens
-    hostile content and in p00 it could drop files into the hub's other qubes
-    without a dialog, and nor does its clone of a project's qube or a lead, for
-    the same reason. Templates and disposable templates join no slot."""
-    if new_klass not in ("AppVM", "DispVM") or template_for_dispvms:
+def _slot_badge(who, new_klass: str, template_for_dispvms: bool = False):
+    """The slot badge a spawned qube wears. A lead's workloads join its
+    project. The hub's AppVMs and standalones join p00; its disposables do
+    not, since one often opens hostile content and in p00 it could drop files
+    into the hub's other qubes without a dialog. Templates and disposable
+    templates join no slot."""
+    if new_klass not in WORKLOAD_KLASSES or template_for_dispvms:
         return None
     if not who.is_hub():
         return projects.member_badge(who.slot)
-    tags = set(source_tags)
-    if projects.member_slots(tags) - {projects.HUB_SLOT} or projects.lead_slots(tags) \
-            or projects.LEAD in tags:
+    return projects.member_badge(projects.HUB_SLOT) if new_klass != "DispVM" else None
+
+
+def _clone_slot(source_tags, src_is_template: bool) -> str | None:
+    """The slot a clone lands in: its source's, for the hub and a lead alike.
+    A p00 qube's clone joins p00, a project member's that project, and a clone
+    of a qube in no slot joins none. So do a template's clone and a lead's:
+    a lead's carries its agent and model credential, and a second holder of a
+    lead badge is what the check refuses. The hub never takes a project's
+    qube into p00 by cloning it: p00's qubes copy files among themselves
+    without a dialog, so that move stays the operator's."""
+    if src_is_template:
         return None
-    return projects.member_badge(projects.HUB_SLOT) if new_klass == "AppVM" else None
+    tags = set(source_tags)
+    if projects.LEAD in tags or projects.lead_slots(tags):
+        return None
+    slots = projects.member_slots(tags)
+    return next(iter(slots)) if len(slots) == 1 else None
 
 
 def _hub_mode() -> bool:
@@ -151,14 +168,16 @@ def _hub_mode() -> bool:
         raise refuse("anonymous mode cannot be read") from None
 
 
-def _project_badges(who) -> set:
+def _project_badges(who, project=None) -> set:
     """What a new qube wears besides its slot badge: a lead's, its project's
     anonymous badges; the hub's, `qmcp-anon` in anonymous mode (so the
     rulebook's OpenURL and OpenInVM denies cover it, and a disposable template
-    passes it to its disposables) and nothing otherwise. Read before the
+    passes it to its disposables) and nothing otherwise, plus `project`'s
+    anonymous badges when its clone lands in a project. Read before the
     create, so a mode that cannot be read makes nothing."""
     if who.is_hub():
-        return {projects.ANON} if _hub_mode() else set()
+        return ({projects.ANON} if _hub_mode() else set()) \
+            | (project.badges() if project is not None else set())
     return who.project.badges()
 
 
@@ -522,8 +541,8 @@ def _rollback(app, call, name, step, exc) -> core.Refusal:
 
 def _create_failed(app, call, name, what, exc) -> core.Refusal:
     """A create call that raised made nothing this call can prove is its own,
-    so nothing is removed: qubesd rolls back a failed admin.vm.Create itself,
-    and clone_vm removes its own partial clone. Deleting by name here could
+    so nothing is removed: qubesd rolls back a failed admin.vm.Create or
+    CreateInPool itself, which is a copy's create too. Deleting by name here could
     take a qube someone else created under that name in the meantime."""
     call.error_class = type(exc).__name__
     if _exists(app, name):
@@ -648,12 +667,15 @@ def _estimate(fn, *args) -> int:
                            error_class=type(e).__name__) from None
 
 
-def _check_budget(app, call, estimate: int) -> None:
-    """Under the create lock: a lead's project quota first, so a request over
-    its quota never reaches the fleet cap, then the fleet cap."""
+def _check_budget(app, call, estimate: int, project=None) -> None:
+    """Under the create lock: the quota of the project the new qube joins
+    first (a lead's own, or the project the hub's clone lands in), so a request
+    over its quota never reaches the fleet cap, then the fleet cap."""
     who = call.principal
     if not who.is_hub():
-        budget.check_quota(app, projects.member_badge(who.slot), who.project.quota, estimate)
+        project = who.project
+    if project is not None:
+        budget.check_quota(app, projects.member_badge(project.slot), project.quota, estimate)
     budget.check_cap(app, estimate)
 
 
@@ -689,7 +711,7 @@ def svc_spawn(app, call, req):
         raise refuse(f"label must be one of: {sorted(LABELS)}")
     private_size = _private_size(req)
     tpl = core.reference(app, template, "template", who)
-    if klass in ("AppVM", "DispVMTemplate"):
+    if klass in ("AppVM", "StandaloneVM", "DispVMTemplate"):
         if tpl.klass != "TemplateVM":
             raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
     elif not core.is_dvmt(tpl):
@@ -702,21 +724,42 @@ def svc_spawn(app, call, req):
     call.fds.append(budget.acquire_create_lock())
     _recheck(app, call, template=template, netvm=netvm)
     _claim_name(app, call, name)
-    _check_budget(app, call, budget.estimate_new_private(private_size))
+    estimate = budget.estimate_new_private(private_size)
+    if klass == "StandaloneVM":
+        # A standalone's root is its own, counted at the template root's size.
+        estimate += _estimate(budget._vol_size, tpl, "root")
+    _check_budget(app, call, estimate)
     # Read after the lock, right before the create: a restriction the template
     # carries (`anon-vm`) must reach the child, including one added while this
     # call waited, and a read that fails refuses here, before anything is made.
     tpl_tags = core.tags_of(tpl)
+    _reviewed(tpl)
     extra = _project_badges(who)
+    # Read BEFORE the copy, and again after it (`inqube.after_copy`): the root
+    # copied is the one the template had when it last stopped.
+    tpl_halted = klass != "StandaloneVM" or inqube.halted(tpl)
 
     create_klass = "AppVM" if klass == "DispVMTemplate" else klass
     try:
-        vm = app.add_new_vm(create_klass, name, label, template=template)
+        if klass == "StandaloneVM":
+            vm = birth.create_copy(app, tpl, name, "StandaloneVM", label, standalone=True)
+        else:
+            vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
         raise _create_failed(app, call, name, "create", e)
     step = "label"
     try:
-        restored.label(vm)
+        if klass == "StandaloneVM":
+            # Filled before it is in AI space: the stamp below is its first
+            # badge of ours (`birth`, "A copy is built in dom0's own order").
+            step = "copy"
+            birth.fill_copy(app, vm, tpl, standalone=True)
+            step = "label"
+            restored.label(vm)
+            step = "services label"
+            inqube.after_copy(vm, tpl, tpl_halted)
+        else:
+            restored.label(vm)
         step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
                     _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
@@ -743,11 +786,88 @@ def svc_spawn(app, call, req):
     return {"ok": True, "name": name}
 
 
+def _reviewed(vm) -> None:
+    """A qube a create copies or builds on must not be one the restore check
+    holds, or would hold on its next pass: in scope with a label that is not
+    its own (it came back from a backup or a copy). Asked under the create
+    lock, which that pass takes too, so a copy, which gets a label of its own,
+    never carries a restored qube past review. A read that fails refuses."""
+    try:
+        tags = core.tags_of(vm)
+        if core.QUARANTINE in tags or (restored.in_scope(tags) and not restored.known(vm)):
+            raise core.Refusal(core.QUARANTINE_REFUSAL)
+    except core.Unreadable:
+        raise core.Refusal(core.QUARANTINE_REFUSAL) from None
+
+
+def _clone_base(who, src) -> None:
+    """The template a clone is built on (an AppVM's, or a named DispVM's
+    disposable template) is checked as a spawn checks its template: never one
+    the anonymity gate stopped or the restore check holds or would hold, and
+    for a lead one on its project's approved list."""
+    tpl = core.template_of(src)
+    if tpl is None:
+        return
+    if core.tags_of(tpl) & {projects.BLOCKED, projects.STOPPED}:
+        raise core.Refusal(core.BLOCKED_REFUSAL)
+    _reviewed(tpl)
+    if not who.is_hub() and core.name_of(tpl) not in who.project.templates:
+        raise refuse("the source's template is not on this project's approved list")
+
+
+def _clone_target(app, who, src):
+    """(the slot a clone of `src` lands in, its project record or None for
+    p00 and no slot). A project the source names that has no record refuses:
+    the check reports such a badge, and a clone must not land on it. A hidden
+    project is not the hub's: its member answers as a qube that does not
+    exist, even one that lost its hidden badge."""
+    if not who.is_hub():
+        # A lead clones only its own members, so the clone joins its project
+        # whatever stray badge the source wears.
+        return who.slot, who.project
+    slot = _clone_slot(core.tags_of(src), core.is_template(src))
+    if slot is None or slot == projects.HUB_SLOT:
+        return slot, None
+    try:
+        p = projects.load().get(slot)
+    except Exception as e:
+        raise core.Refusal({"ok": False, "error": "project records cannot be read"},
+                           error_class=type(e).__name__) from None
+    if p is not None and p.hidden:
+        raise core.Refusal(core.NOT_FOUND)
+    if p is None:
+        raise refuse("the source's project has no record")
+    return slot, p
+
+
+def _clone_network(who, project, netvm) -> None:
+    """The hub's clone into a project sits on one of the project's worker
+    networks, as the project's members do (a lead's clone is judged by
+    `_lead_netvm`)."""
+    if who.is_hub() and project is not None and netvm is not None \
+            and netvm not in project.named_networks():
+        raise refuse("the source's network is not one of this project's worker networks")
+
+
+def _clone_name_refusal(name, who, project) -> str | None:
+    """A clone's name sits in the space of the slot it lands in: a lead's in its
+    project's, the hub's in its own, or in the source's project's when the clone
+    lands there. Judged once the source is resolved, which the hub can already
+    list, so it tells the hub nothing new."""
+    if project is None or not who.is_hub():
+        return _create_name_refusal(name, who)
+    return birth.name_refusal(name, project.space(birth.read_name_prefix()))
+
+
 def svc_clone(app, call, req):
     source, name = req.get("source"), req.get("name")
     call.summary.update({"source": _clip(source), "name": _clip(name)})
     who = call.principal
-    err = _create_name_refusal(name, who)
+    # The name's shape, and for a lead its project's space, are judged before
+    # anything is looked up. The hub's space follows the source, so its
+    # name is judged against the prefix here and the space once it is known.
+    err = _create_name_refusal(name, who) if not who.is_hub() \
+        else birth.name_refusal(name, birth.read_name_prefix())
     if err:
         raise refuse(err)
     if not isinstance(source, str):
@@ -761,30 +881,56 @@ def svc_clone(app, call, req):
     if src_is_template and not who.is_hub():
         # Templates and disposable templates are never project members.
         raise core.Refusal(core.NOT_FOUND)
+    slot, project = _clone_target(app, who, src)
+    err = _clone_name_refusal(name, who, project)
+    if err:
+        raise refuse(err)
     _claim_name(app, call, name)
     # A clone is the same kind of qube as its source, so the source always
     # answers for its own network — a cloned template stays off the network.
     netvm = _birth_netvm(app, call, {}, src, authoritative=True)
+    _clone_network(who, project, netvm)
 
     call.fds.append(budget.acquire_create_lock())
     _recheck(app, call, netvm=netvm)
+    who = call.principal
     _claim_name(app, call, name)
-    _check_budget(app, call, _estimate(budget.persistent_bytes, src))
+    # Under the lock everything about the source is read again: a move, a
+    # stop, a hold or a project command while this call waited must not be
+    # copied past. The project's record is the one read now.
+    src = core.operand(app, source, who)
+    _reviewed(src)
+    _clone_base(who, src)
+    again, now = _clone_target(app, who, src)
+    if again != slot or core.is_template(src) != src_is_template \
+            or (now is None) != (project is None) \
+            or (now is not None and now.label != project.label):
+        raise refuse("the source moved while this call waited; try again")
+    project = now
+    _clone_network(who, project, netvm)
+    _check_budget(app, call, _estimate(budget.persistent_bytes, src),
+                  project if who.is_hub() else None)
 
     source_tags = core.tags_of(src)
-    extra = _project_badges(who)
+    extra = _project_badges(who, project if who.is_hub() else None)
+    # Read BEFORE the copy, and again after it (`inqube.after_copy`): the root
+    # copied is the one the source had when it last stopped.
+    src_halted = inqube.halted(src)
     try:
-        vm = app.clone_vm(src, name)
+        vm = birth.create_copy(app, src, name, core.klass_of(src), _name_of(src.label))
     except Exception as e:
         raise _create_failed(app, call, name, "clone", e)
-    # A clone carries its source's label (features are copied): it is
-    # labelled with its own UUID before anything else, inside the create lock.
-    step = "label"
+    # Filled before it is in AI space: the stamp is its first badge of ours.
+    step = "copy"
     try:
+        birth.fill_copy(app, vm, src, standalone=False)
+        step = "label"
         restored.label(vm)
+        step = "services label"
+        inqube.after_copy(vm, src, src_halted)
         step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
-                    _slot_badge(who, core.klass_of(src), src_is_template, source_tags), extra)
+                    None if slot is None else projects.member_badge(slot), extra)
         step = "network check"
         if core.is_gateway(vm):
             raise RuntimeError("the new qube provides network")
@@ -845,6 +991,7 @@ def svc_spawn_disposable(app, call, req):
     call.fds.append(budget.acquire_create_lock())
     _recheck(app, call, template=template, netvm=netvm)
     _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
+    _reviewed(dvmt)
 
     source_tags = core.tags_of(dvmt)
     extra = _project_badges(who)

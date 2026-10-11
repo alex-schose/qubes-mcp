@@ -23,8 +23,9 @@ the lead's own: the client, the lead's slot lines in the policy, the dom0
 library reading the lead's project record, the platform. Then the suite runs
 probes as root inside its own workers, the way a compromised worker would.
 
-The project should have a quota of 11 GiB, two named worker networks, an
-approved disposable template, and nothing in it yet; the suite
+The project should have a quota of 11 GiB plus room for one standalone worker
+(its approved template's root and 2 GiB: 33 GiB for a 20 GiB root), two named
+worker networks, an approved disposable template, and nothing in it yet; the suite
 reads its prefix, templates, networks and dump sink from qubes_get_pool_stats.
 Fixtures are named `<project prefix>st<run id>-*`; the suite refuses to start
 if any such qube exists and removes only what it created.
@@ -323,6 +324,32 @@ def main() -> int:
     r = call("qubes_clone", source=w1, name=c1)
     if check("clone a worker", r.get("ok") is True, json.dumps(r)):
         created.append(c1)
+    # ------------------------------------------------------------ a standalone worker
+    # Its root is its own, counted at the template root's size; a write there
+    # survives a restart. The quota leaves room for one, so its clone is refused.
+    sa = f"{base}-sa"
+    r = call("qubes_spawn", name=sa, template=appvm_template, klass="StandaloneVM", netvm=None)
+    if r.get("error") == "project quota exceeded":
+        not_run("a standalone worker", "the project's quota has no room for one (see the docstring)")
+    elif check("spawn a standalone worker", r.get("ok") is True, json.dumps(r)):
+        created.append(sa)
+        mark = f"lead-seat-{RUN}"
+        r = call("qubes_run", name=sa, cmd=f"id -u && echo {mark} > /etc/qmcp-seat-mark",
+                 shell=True, timeout=120)
+        check("exec as root in the standalone worker",
+              r.get("ok") and r.get("stdout", "").strip() == "0", json.dumps(r)[:200])
+        call("qubes_shutdown", name=sa)
+        wait_power(sa, "Halted")
+        r = call("qubes_run", name=sa, cmd=["cat", "/etc/qmcp-seat-mark"], timeout=120)
+        check("a write to the standalone's root survives a restart",
+              r.get("stdout", "").strip() == mark, json.dumps(r)[:200])
+        call("qubes_shutdown", name=sa)
+        wait_power(sa, "Halted")
+        r = call("qubes_clone", source=sa, name=f"{base}-sc")
+        check("its clone is refused: its root counts against the quota",
+              r.get("error") == "project quota exceeded", json.dumps(r))
+        if r.get("ok"):
+            created.append(f"{base}-sc")
     if dvmt:
         r = call("qubes_run_disposable", template=dvmt, cmd=["id", "-u"], timeout=120)
         check("run in a disposable from an approved disposable template",

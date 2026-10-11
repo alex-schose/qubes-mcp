@@ -871,6 +871,51 @@ class Commands(AnonBase):
         self.assertFalse(hub_sees)
         self.assertLessEqual({"qmcp-anon", "qmcp-hubblind", f"qmcp-proj-{p.slot}"}, self.tags(name))
 
+    def hidden_from_its_first_moment(self, name):
+        """Every moment the qube wore `ai-managed`, it wore `qmcp-hubblind` too."""
+        mine = [t for n, t in self.app.tag_log if n == name]
+        self.assertTrue(mine, name)
+        self.assertTrue(all("qmcp-hubblind" in t for t in mine if "ai-managed" in t), mine)
+
+    def test_the_platform_s_clone_would_show_a_hidden_member(self):
+        # Teeth: qubesadmin's clone_vm copies tags in sorted order, so a hidden
+        # project's member's copy wears ai-managed before qmcp-hubblind.
+        p = self.make()
+        self.app.tag_log.clear()
+        self.app.clone_vm(self.app.domains[f"ai-{p.label}-w1"], "ai-raw")
+        first = next(t for n, t in self.app.tag_log if n == "ai-raw")
+        self.assertEqual(first, {"ai-managed"})
+
+    def test_a_hidden_project_s_standalones_and_clones_are_born_hidden(self):
+        p = self.make(quota="40G")
+        self.app.tag_log.clear()
+        r = self.lcall("qmcp.SpawnAIManagedQube", {"name": f"ai-{p.label}-sa", "template": "ai-tpl-g",
+                                                   "klass": "StandaloneVM"}, lead=p.lead)
+        self.assertTrue(r["ok"], r)
+        self.hidden_from_its_first_moment(f"ai-{p.label}-sa")
+        r = self.lcall("qmcp.CloneAIManagedQube", {"source": f"ai-{p.label}-w1",
+                                                   "name": f"ai-{p.label}-c1"}, lead=p.lead)
+        self.assertTrue(r["ok"], r)
+        self.hidden_from_its_first_moment(f"ai-{p.label}-c1")
+        self.green(projects.find(self.records(), p.slot))
+
+    def test_the_hub_s_clone_into_a_visible_one_wears_its_badges(self):
+        p = self.make(hub_sees=True, quota="40G")
+        self.app.tag_log.clear()
+        name = f"ai-{p.label}-hc"
+        r = self.call("qmcp.CloneAIManagedQube", {"source": f"ai-{p.label}-w2", "name": name})
+        self.assertTrue(r["ok"], r)
+        self.assertIn("qmcp-anon", self.tags(name))
+        self.assertEqual(projects.member_slots(self.tags(name)), {p.slot})
+        mine = [t for n, t in self.app.tag_log if n == name]
+        self.assertTrue(all("qmcp-anon" in t for t in mine if "ai-managed" in t), mine)
+
+    def test_a_hidden_project_s_standalone_lead_is_born_hidden(self):
+        self.app.tag_log.clear()
+        p = self.make(lead_class="standalone", quota="40G")
+        self.assertEqual(self.app.domains[p.lead].klass, "StandaloneVM")
+        self.hidden_from_its_first_moment(p.lead)
+
     def test_check_fails_on_a_gate_that_cannot_run_or_has_stopped(self):
         import os
         p = self.make()

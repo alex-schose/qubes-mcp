@@ -878,8 +878,7 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
                 or projects.member_slots(tags) or projects.model_slots(tags):
             continue            # a model qube joins no slot: the model checks judge it
         try:
-            if core.klass_of(vm) == "AppVM" and not core.is_template(vm) \
-                    and not core.is_gateway(vm):
+            if _workload(vm):
                 unslotted.append(vm.name)
         except core.Unreadable as e:
             unread.append(str(e))
@@ -2776,20 +2775,37 @@ def shared_routers(app, records: dict, p) -> list:
     return sorted(n for n in (mine & theirs) if n)
 
 
-def _hubs_own_appvm(app, name, what: str):
-    """A managed AppVM of the hub's (p00 or no slot): a lead's clone source or a
-    qube to promote. Never a template, gateway, guarded qube, lead, drop box
-    or another project's member."""
+#: The classes the operator's commands take as a lead's source or a qube to
+#: move between slots (a lead's named disposables are members too, by birth).
+WORKLOAD_KLASSES = ("AppVM", "StandaloneVM")
+#: `--lead-class`: what a fresh lead made from a template is.
+LEAD_CLASSES = ("appvm", "standalone")
+
+
+def _workload(vm) -> bool:
+    """An AppVM or a StandaloneVM that is no template, disposable template or
+    gateway: a qube the operator's commands take as a lead's source or move
+    between slots. Raises Unreadable."""
+    return core.klass_of(vm) in WORKLOAD_KLASSES and not core.is_template(vm) \
+        and not core.is_gateway(vm)
+
+
+def _hubs_own_qube(app, name, what: str):
+    """A managed AppVM or StandaloneVM of the hub's (p00 or no slot): a lead's
+    clone source or a qube to promote. Never a template, gateway, guarded qube,
+    lead, drop box or another project's member."""
     vm = _vm(app, name)
     tags = set() if vm is None else _tags(vm)
     if core.UMBRELLA not in tags:
         raise ProjectError(f"no qube '{name}' in AI space")
-    if core.klass_of(vm) != "AppVM" or core.is_template(vm) or core.is_gateway(vm):
-        raise ProjectError(f"{what} must be an AppVM, not a template or gateway")
+    if not _workload(vm):
+        raise ProjectError(f"{what} must be an AppVM or a StandaloneVM, not a template or gateway")
     if core.GUARDED in tags or projects.DROP_BOX in tags:
         raise ProjectError(f"'{name}' is guarded or a drop box")
     if _held(tags):
         raise ProjectError(f"'{name}' {HELD_WHY}")
+    if not restored.known(vm):
+        raise ProjectError(f"'{name}' {WAITS_WHY}")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' already leads a project")
     if projects.model_slots(tags):
@@ -2799,6 +2815,12 @@ def _hubs_own_appvm(app, name, what: str):
     return vm
 
 
+def _label_name(vm) -> str:
+    """A qube's label colour, by name."""
+    label = vm.label
+    return str(getattr(label, "name", label))
+
+
 def _lead_template(app, name):
     """A fresh lead's template: any TemplateVM. One outside AI space is the
     stronger choice, since the hub cannot edit it; it then stays off the
@@ -2806,8 +2828,13 @@ def _lead_template(app, name):
     vm = _vm(app, name)
     if vm is None or core.klass_of(vm) != "TemplateVM":
         raise ProjectError(f"'{name}' is not a TemplateVM")
-    if _held(_read_tags(vm)):
+    tags = _read_tags(vm)
+    # One in scope whose label is not its own is held on the gate's next pass:
+    # a standalone lead copied from it now would escape that review.
+    if _held(tags):
         raise ProjectError(f"'{name}' {HELD_WHY}")
+    if restored.in_scope(tags) and not restored.known(vm):
+        raise ProjectError(f"'{name}' {WAITS_WHY}")
     return vm
 
 
@@ -2848,6 +2875,9 @@ def _removal_order(tag: str) -> tuple:
 
 
 HELD_WHY = "is held for your review: it came back from a backup or was copied by hand (qmcp restored)"
+#: The same, for one the gate's next pass will hold: its label is not its own.
+WAITS_WHY = ("waits for your review: its qmcp-id label is not its own, so it came back from a "
+             "backup or was copied by hand (qmcp restored)")
 
 
 def _held(tags) -> bool:
@@ -2908,14 +2938,21 @@ def _remove_qube(app, name) -> str:
 
 
 def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
-               freed: str | None = None, model=None) -> str:
+               freed: str | None = None, model=None, lead_class: str = "appvm") -> str:
     """Everything about a new lead that can be checked without changing
     anything; returns the name it will have. `freed` is a name that will be
-    free by the time the lead is made (an old lead that is removed first)."""
+    free by the time the lead is made (an old lead that is removed first).
+    `lead_class` "standalone" makes a fresh lead from a template a
+    StandaloneVM; a clone or a promoted lead keeps its source's class."""
+    if lead_class not in LEAD_CLASSES:
+        raise ProjectError(f"the lead's class is one of: {', '.join(LEAD_CLASSES)}")
+    if lead_class != "appvm" and source != "template":
+        raise ProjectError("--lead-class standalone goes with --lead-template: a cloned or "
+                           "promoted lead keeps the class of the qube it comes from")
     if source == "template":
         _lead_template(app, origin)
     elif source in ("clone", "promote"):
-        _hubs_own_appvm(app, origin, "the lead")
+        _hubs_own_qube(app, origin, "the lead")
         # Its template joins the approved list, which never takes a held one.
         tpl = _template_name(_vm(app, origin))
         if tpl and (vm := _vm(app, tpl)) is not None and _held(_read_tags(vm)):
@@ -2938,7 +2975,7 @@ _UNCHANGED = object()
 
 
 def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, model=None,
-               badges=frozenset()):
+               badges=frozenset(), lead_class: str = "appvm"):
     """Make `name` the lead of `slot`, as planned by `_plan_lead`. Returns
     (name, created, badges the qube had, accepted rules, rules it had, network
     it had) so a later failure can undo exactly. A fresh lead is born on
@@ -2952,11 +2989,15 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
     a wider firewall or the network it is leaving. On failure it undoes what it
     did (`_undo_lead`: a fresh lead is removed; a promoted one gets back its
     badges, then its rules, then its network), stops at the first step it
-    cannot undo, and names it."""
+    cannot undo, and names it.
+
+    A clone, and a standalone lead made from a template, are built in dom0's
+    own order (`birth.create_copy`, `fill_copy`): the new qube is in AI space
+    only from its stamp on."""
     want = {core.UMBRELLA, projects.LEAD, projects.lead_badge(slot)}
     _, rules = _lead_rules(app, source, origin, lead_netvm, model)
     if source == "promote":
-        vm = _hubs_own_appvm(app, origin, "a promoted lead")
+        vm = _hubs_own_qube(app, origin, "a promoted lead")
         netvm = _lead_network(app, source, origin, lead_netvm)
         before = {projects.member_badge(s) for s in projects.member_slots(_tags(vm))}
         old_rules = firewall.read_rules(app, origin) if rules else None
@@ -2991,16 +3032,34 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
             raise
         return origin, False, before, stored, old_rules, old_net
     netvm = _check_lead_netvm(app, lead_netvm)
+    standalone = source == "template" and lead_class == "standalone"
     if source == "template":
-        _lead_template(app, origin)
-        vm = app.add_new_vm("AppVM", name, LEAD_LABEL, template=origin)
+        src = _lead_template(app, origin)
     else:
-        vm = app.clone_vm(_hubs_own_appvm(app, origin, "a lead's clone source"), name)
+        src = _hubs_own_qube(app, origin, "a lead's clone source")
+    copied = standalone or source == "clone"
+    # Read before the create: a restriction its template or source wears
+    # (`anon-vm`) must reach the lead. A template-based AppVM gets it from
+    # Whonix's own addon as well; a standalone has no template for that.
+    restrictions = {t for t in _tags(src) if birth.is_restriction(t)}
+    # Read BEFORE the copy, and again after it: a copied root is the one its
+    # source had when it last stopped (`inqube.after_copy`).
+    src_halted = inqube.halted(src) if copied else True
+    if standalone:
+        vm = birth.create_copy(app, src, name, "StandaloneVM", LEAD_LABEL, standalone=True)
+    elif copied:
+        vm = birth.create_copy(app, src, name, core.klass_of(src), _label_name(src))
+    else:
+        vm = app.add_new_vm("AppVM", name, LEAD_LABEL, template=origin)
     stored = None
     try:
-        # A clone carries its source's label: its own goes on first.
+        if copied:
+            birth.fill_copy(app, vm, src, standalone=standalone)
+        # Its own label, never its source's.
         restored.label(vm)
-        birth.stamp(birth.TagIO.for_vm(vm), _tags(vm), "dom0", None, badges)
+        if copied:
+            inqube.after_copy(vm, src, src_halted)
+        birth.stamp(birth.TagIO.for_vm(vm), _tags(vm) | restrictions, "dom0", None, badges)
         # `qmcp-lead` before the rules (see promote above), the slot's badge last.
         _set_tags(vm, add={projects.LEAD})
         if rules:
@@ -3125,15 +3184,18 @@ def create_project(app, label: str | None, lead_source: str, lead_origin: str, t
                    networks=(), quota=None, lead_netvm=None, dump: bool = False,
                    lead_name: str | None = None, model: str | None = None,
                    model_qube: str | None = None, anonymous: bool = False,
-                   hub_sees: bool = False, note: str | None = None) -> list:
+                   hub_sees: bool = False, note: str | None = None,
+                   lead_class: str = "appvm") -> list:
     """Make a project; returns the report lines. The record is written last, so
     the lead is no principal until everything else is in place. With
     `model_qube` the lead has no network, and the qube becomes the project's
     model qube once the project is recorded (`_set_model_qube`). An
     `anonymous` project gets a random label from dom0 (none is given), is
-    hidden from the hub unless `hub_sees`, and may carry the operator's `note`."""
+    hidden from the hub unless `hub_sees`, and may carry the operator's `note`.
+    `lead_class` "standalone" makes a lead from a template a StandaloneVM."""
     return _run(_create_project, app, label, lead_source, lead_origin, templates, networks,
-                quota, lead_netvm, dump, lead_name, model, model_qube, anonymous, hub_sees, note)
+                quota, lead_netvm, dump, lead_name, model, model_qube, anonymous, hub_sees, note,
+                lead_class)
 
 
 def _model_qube_lead_netvm(model, model_qube, lead_netvm):
@@ -3151,7 +3213,7 @@ def _model_qube_lead_netvm(model, model_qube, lead_netvm):
 
 def _create_project(report, app, label, lead_source, lead_origin, templates, networks, quota,
                     lead_netvm, dump, lead_name, model=None, model_qube=None, anonymous=False,
-                    hub_sees=False, note=None):
+                    hub_sees=False, note=None, lead_class="appvm"):
     prefix = birth.read_name_prefix()
     if not anonymous and anonymous_mode():
         if label:
@@ -3206,7 +3268,8 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
                  or _vm(app, sink) is not None):
         raise ProjectError(f"the dump sink '{sink}' would be inside '{prefix}', is no qube name, "
                            f"or exists")
-    name = _plan_lead(app, space, lead_source, lead_origin, lead_netvm, lead_name, model=model)
+    name = _plan_lead(app, space, lead_source, lead_origin, lead_netvm, lead_name, model=model,
+                      lead_class=lead_class)
     model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
     lead_tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead_origin))
     tpls = list(templates)
@@ -3224,7 +3287,7 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         _hide_disposable_templates(report, app, new)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, slot, lead_source,
                                                                  lead_origin, name, lead_netvm,
-                                                                 model, new.badges())
+                                                                 model, new.badges(), lead_class)
     report.append(f"{slot}: lead {lead} ({'created' if fresh else 'promoted'})"
                   + (f", firewall: {firewall.endpoint_summary(model)}" if stored else ""))
     try:
@@ -3311,7 +3374,8 @@ def _remove_lead(report, app, key):
 
 def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
              keep_old: bool = False, lead_name: str | None = None, model: str | None = None,
-             add_old_network: bool = False, model_qube: str | None = None) -> list:
+             add_old_network: bool = False, model_qube: str | None = None,
+             lead_class: str = "appvm") -> list:
     """Give a project a new lead. Everything about the new lead is checked
     before the old one is touched. The old one is removed, or kept as a worker
     of the same project, never as one of the hub's qubes. A kept lead keeps
@@ -3322,13 +3386,14 @@ def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
     project's model qube stays for a new lead with no network; `model_qube`
     changes it (a qube: the new lead then has no network; "none": the
     project's model qube is taken away, nothing else); a remote `model`
-    takes it away before the old lead is touched."""
+    takes it away before the old lead is touched. `lead_class` "standalone"
+    makes a lead from a template a StandaloneVM."""
     return _run(_set_lead, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
-                model, add_old_network, model_qube)
+                model, add_old_network, model_qube, lead_class)
 
 
 def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, lead_name,
-              model=None, add_old_network=False, model_qube=None):
+              model=None, add_old_network=False, model_qube=None, lead_class="appvm"):
     prefix = birth.read_name_prefix()
     records = _load_records()
     p = _project(records, key)
@@ -3368,7 +3433,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
             and (lead_name or f"{p.space(prefix)}lead") == p.lead):
         raise ProjectError(f"the old lead keeps the name {p.lead}; pass --lead-name for the new one")
     name = _plan_lead(app, p.space(prefix), lead_source, lead_origin, lead_netvm, lead_name, freed,
-                      model=model)
+                      model=model, lead_class=lead_class)
     model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
     if model_qube not in (None, "none"):
         if lead_source == "promote" and model_qube == lead_origin:
@@ -3411,7 +3476,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                 _not_removed(report, p.slot, old, err)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, p.slot, lead_source,
                                                                  lead_origin, name, lead_netvm,
-                                                                 model, p.badges())
+                                                                 model, p.badges(), lead_class)
     try:
         tpl = lead_origin if lead_source == "template" else _template_name(_vm(app, lead))
         if tpl and tpl not in p.templates and (vm := _vm(app, tpl)) is not None \
@@ -3821,7 +3886,9 @@ def move_warnings(records: dict, current: set, slot) -> list:
 
 
 def move(app, name: str, target: str, confirm: bool = False) -> list:
-    """Move one of AI space's AppVMs into p00, a project, or no slot. Its network
+    """Move one of AI space's AppVMs or StandaloneVMs into p00, a project, or no
+    slot. Moving a standalone the operator built into a project is the
+    operator's approval of its OS, as approving a template is. Its network
     is not changed, so a project takes it only on one of its worker networks.
     Taking a qube out of one slot into another carries that slot's content
     across a trust boundary, and needs `confirm`; so does a move into, out of
@@ -3840,9 +3907,9 @@ def _move(report, app, name, target, confirm):
     tags = set() if vm is None else _tags(vm)
     if core.UMBRELLA not in tags:
         raise ProjectError(f"no qube '{name}' in AI space")
-    if core.klass_of(vm) != "AppVM" or core.is_template(vm) or core.is_gateway(vm) \
-            or core.GUARDED in tags:
-        raise ProjectError(f"'{name}' is not a managed AppVM; templates and gateways join no slot")
+    if not _workload(vm) or core.GUARDED in tags:
+        raise ProjectError(f"'{name}' is not a managed AppVM or StandaloneVM; templates and "
+                           f"gateways join no slot")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' is a lead; use qmcp project lead")
     if projects.model_slots(tags) and target != "none":

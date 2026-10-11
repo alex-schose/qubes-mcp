@@ -164,6 +164,44 @@ class InQube(ToolsBase):
         for key in ("behind-halted", "never", "blocked", "held", "current"):
             self.assertEqual(q[key].rpc_files(), {}, key)
 
+    def test_a_copy_made_while_its_source_ran_is_brought_up_to_date(self):
+        # A copy of a running qube is labelled UNKNOWN, never a version: the
+        # check reads it as behind, and the refresh writes into it once it runs.
+        sa = self.app.vm("ai-copy", klass="StandaloneVM", power="Running", tags={"ai-managed"},
+                         features={inqube.LABEL: inqube.UNKNOWN})
+        self.assertEqual(inqube.label_state(sa, self.version), "behind")
+        self.assertEqual(dict(inqube.refresh(self.app)).get("ai-copy"), "updated")
+        self.assertEqual((dict.get(sa.features, inqube.LABEL), sa.rpc_files()),
+                         (self.version, self.files))
+
+    def test_after_copy_keeps_a_halted_source_s_label_only(self):
+        def copy_of(src_power, label="sha256:x", src_label="sha256:x", before=True):
+            src = self.app.vm(f"ai-s-{len(self.app.domains._vms)}", klass="TemplateVM",
+                              power=src_power, features={inqube.LABEL: src_label})
+            vm = self.app.vm(f"ai-c-{len(self.app.domains._vms)}", klass="StandaloneVM",
+                             features={inqube.LABEL: label})
+            inqube.after_copy(vm, src, before)
+            return dict.get(vm.features, inqube.LABEL)
+        self.assertEqual(copy_of("Halted"), "sha256:x")
+        # Running before the copy, or started during it, or relabelled during it:
+        # the root may not hold what the label says.
+        self.assertEqual(copy_of("Halted", before=False), inqube.UNKNOWN)
+        self.assertEqual(copy_of("Running"), inqube.UNKNOWN)
+        self.assertEqual(copy_of("Halted", src_label="sha256:y"), inqube.UNKNOWN)
+        bare = self.app.vm("ai-c-bare", klass="StandaloneVM")
+        inqube.after_copy(bare, self.app.domains["ai-debian-13"], False)
+        self.assertNotIn(inqube.LABEL, dict.keys(bare.features))
+        # A power state that cannot be read is not halted: qubesadmin's "NA",
+        # or a read that raises.
+        gone = self.app.vm("ai-c-gone", klass="StandaloneVM")
+        self.app.domains._drop("ai-c-gone")
+        self.assertFalse(inqube.halted(gone))
+
+        class Raises:
+            def get_power_state(self):
+                raise RuntimeError("qubesd did not answer")
+        self.assertFalse(inqube.halted(Raises()))
+
     def test_refresh_never_starts_a_qube(self):
         q = self.fleet_for_refresh()
         inqube.refresh(self.app)

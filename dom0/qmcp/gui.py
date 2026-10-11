@@ -440,8 +440,8 @@ class LeadFields:
     none, which the form shows in the network field and in its command."""
 
     SOURCES = (("template", "a fresh qube from a template"),
-               ("clone", "a clone of one of the hub's AppVMs"),
-               ("promote", "one of the hub's AppVMs, promoted in place"))
+               ("clone", "a clone of one of the hub's AppVMs or standalones"),
+               ("promote", "one of the hub's AppVMs or standalones, promoted in place"))
     MODELS = (("remote", "a remote endpoint, host:port, reached through the lead's network"),
               ("qube", "a self-hosted model qube: the lead then has no network"))
 
@@ -467,6 +467,12 @@ class LeadFields:
             self.source[ident] = rb
         self.row("The lead is", box)
         self.origin = self.combo("Made from", [])
+        self.standalone = _check(esc("a standalone: its own copy of the template's root, so what "
+                                     "is installed in it stays after a restart, and so does "
+                                     "anything a compromised agent leaves there"))
+        _named(self.standalone, esc("lead class standalone"))
+        self.standalone.connect("toggled", self.update)
+        self.row("Standalone lead", self.standalone)
         name_box = Gtk.Box(spacing=2)
         self.lead_space = _label(esc(space()))
         _named(self.lead_space, esc("lead name prefix"))
@@ -590,10 +596,20 @@ class LeadFields:
         self.lead_space.set_sensitive(named)
         _placeholder(self.lead_name, esc("named by dom0" if self._fresh_only else "lead"))
 
+    def lead_class(self) -> str:
+        """"standalone" when ticked for a lead from a template, else "appvm": a
+        cloned or promoted lead keeps its source's class."""
+        return "standalone" if self.lead_source() == "template" \
+            and self.standalone.get_active() else "appvm"
+
     def _source_changed(self, *_):
         source = self.lead_source()
+        # Only a lead from a template has a class to choose.
+        self.standalone.set_sensitive(source == "template")
+        if source != "template":
+            self.standalone.set_active(False)
         names = (gm.lead_templates(self._fleet) if source == "template"
-                 else gm.hubs_appvms(self._fleet, self._hub))
+                 else gm.hubs_own_qubes(self._fleet, self._hub))
         _fill(self.origin, [(n, esc(n)) for n in names])
         if names:
             self.origin.set_active(0)
@@ -785,7 +801,7 @@ class ProjectForm(Form, LeadFields, NetworkFields):
             None if anonymous else label, source, origin, name, netvm, templates,
             gm.check_networks(self.network_values(), self._gateways), self.quota.get_text(),
             self.dump.get_active(), model, qube, anonymous,
-            anonymous and self.hub_sees.get_active(), note)
+            anonymous and self.hub_sees.get_active(), note, self.lead_class())
 
 
 class EditForm(Form, NetworkFields):
@@ -938,7 +954,7 @@ class LeadForm(Form, LeadFields):
         gm.anonymous_model_qube(qube, self.record.get("slot"), anonymous, self._fleet,
                                 self._projects)
         return gm.change_lead(self.record.get("label"), source, origin, name, netvm, keep,
-                              model, add, qube)
+                              model, add, qube, self.lead_class())
 
 
 class DumpForm(Form):

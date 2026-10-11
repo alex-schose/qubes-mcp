@@ -106,7 +106,8 @@ PROPOSALS = {
                 "lead": {"from": "template", "qube": "ai-debian-13"}, "networks": ["none"],
                 "quota": 5 * GiB, "model_qube": MODEL},
     "qlead": {"type": "project-lead", "title": "a sealed lead for other", "project": "other",
-              "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_name": "ai-other-l3",
+              "lead": {"from": "template", "qube": "ai-debian-13"}, "lead_class": "standalone",
+              "lead_name": "ai-other-l3",
               "keep_old": True, "model_qube": MODEL},
     "qfw": {"type": "project-firewall", "title": "a model qube for osint", "project": "osint",
             "model_qube": MODEL},
@@ -498,6 +499,8 @@ SAMPLES = {
              model="api.anthropic.com:443"),
         dict(label="newt", lead_source="template", lead_origin="ai-debian-13", lead_netvm="none",
              networks=["none"], quota="1G", model_qube=MODEL),
+        dict(label="newu", lead_source="template", lead_origin="ai-debian-13",
+             lead_class="standalone", networks=["none"], quota="40G"),
         # Anonymous: no label, dom0 picks it; one the hub may see, with a note.
         dict(label=None, lead_source="template", lead_origin="ai-tpl-g", networks=["none"],
              quota="1G", anonymous=True),
@@ -516,7 +519,9 @@ SAMPLES = {
                      dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
                           lead_netvm="none", model_qube=MODEL),
                      dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
-                          model_qube="none")],
+                          model_qube="none"),
+                     dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
+                          lead_class="standalone")],
     gm.add_dump: [dict(key="other", sink_name="other-sink")],
     gm.move: [dict(qube="ai-work2", target="osint", confirm=True)],
     gm.delete_plan: [dict(key="osint")],
@@ -848,7 +853,7 @@ class Model(GuiBase):
                 self.assertEqual([n.data.get("attention") for n in placed], ["unreadable"])
                 self.assertEqual(gm.actions(placed[0], {}), {"new_project", "add_to_ai_space"})
                 self.assertNotIn(name, gm.approved_template_choices(rows))
-                self.assertNotIn(name, gm.hubs_appvms(rows, HUB))
+                self.assertNotIn(name, gm.hubs_own_qubes(rows, HUB))
                 self.assertNotIn(name, gm.enroll_choices(rows, []))
         # A template, and a qube outside AI space, that cannot be read are offered
         # by no form either.
@@ -929,7 +934,7 @@ class Model(GuiBase):
     def test_choices_for_the_forms(self):
         rows = self.read_json("list", "--all", "--json")
         self.assertIn("debian-13", gm.lead_templates(rows))           # outside AI space too
-        self.assertEqual(gm.hubs_appvms(rows, HUB), ["ai-hubq", "ai-on-operator-tpl", "ai-work", "ai-work2"])
+        self.assertEqual(gm.hubs_own_qubes(rows, HUB), ["ai-hubq", "ai-on-operator-tpl", "ai-work", "ai-work2"])
         self.assertEqual(gm.approved_template_choices(rows),
                          ["ai-debian-13", "ai-dvm", "ai-dvm-g", "ai-tpl-g"])
         # The networks a project or a lead may use are the enrolled gateways,
@@ -2472,7 +2477,7 @@ class ModelQubes(GuiBase):
         serve(self.app)
         self.run_ok(gm.role("manage", MODEL))
         rows = self.rows()
-        self.assertNotIn(MODEL, gm.hubs_appvms(rows, HUB))
+        self.assertNotIn(MODEL, gm.hubs_own_qubes(rows, HUB))
         result = self.runner.execute(gm.create_project("x", "clone", MODEL, networks=["none"],
                                                        quota="1G"))
         self.assertEqual(result.rc, 1)
@@ -3612,7 +3617,7 @@ class Widgets(GuiBase):
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "templates": "templates",
                 "networks": "nets", "quota": "quota", "dump": "dump", "model": "model",
                 "model_qube": "model_qube", "anonymous": "anonymous", "hub_sees": "hub_sees",
-                "note": "note"}),
+                "note": "note", "lead_class": "standalone"}),
             gm.edit_project: (self.gui.EditForm(self.win, self.win.fleet, self.win.gateways,
                                                 record), {
                 "key": "record", "templates": "templates", "networks": "nets", "quota": "quota"}),
@@ -3620,7 +3625,8 @@ class Widgets(GuiBase):
                                                record), {
                 "key": "record", "lead_source": "source", "lead_origin": "origin",
                 "lead_name": "lead_name", "lead_netvm": "lead_netvm", "keep_old": "old_lead",
-                "model": "model", "add_old_network": "add_old", "model_qube": "model_qube"}),
+                "model": "model", "add_old_network": "add_old", "model_qube": "model_qube",
+                "lead_class": "standalone"}),
             # The registry's forms; the qube and its current values come from the row.
             gm.enroll_gateway: (self.gui.EnrollForm(self.win, self.win.fleet, self.win.gateways,
                                                     HUB), {
@@ -3765,7 +3771,7 @@ class Widgets(GuiBase):
         form = self.win.act("new_project")
         form.source["promote"].set_active(True)
         self.assertFalse(form.lead_name.get_sensitive())
-        self.assertEqual(form.origin.get_active_id(), gm.hubs_appvms(self.win.fleet, HUB)[0])
+        self.assertEqual(form.origin.get_active_id(), gm.hubs_own_qubes(self.win.fleet, HUB)[0])
 
     def test_edit_sends_only_what_changed(self):
         self.select("project:p01")
@@ -3977,6 +3983,7 @@ class Widgets(GuiBase):
             return f
         forms = [project("template", "ai-debian-13", "ai-newp-boss"),
                  project("clone", "ai-work2", "ai-newp-boss"), project("promote", "ai-work2", None)]
+        forms[0].standalone.set_active(True)            # a standalone lead from the template
         f = project("template", "ai-debian-13", None)    # its model a self-hosted qube
         f.model.set_text("")
         f.model_kind["qube"].set_active(True)
@@ -4008,6 +4015,7 @@ class Widgets(GuiBase):
                 f.lead_netvm.set_active_id("ai-net-router")
                 f.model.set_text("api.anthropic.com:443")
                 f.add_old.set_active(True)
+                f.standalone.set_active(True)
             else:
                 f.lead_netvm.set_active_id("none")
             forms.append(f)

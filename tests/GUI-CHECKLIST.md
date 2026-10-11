@@ -606,8 +606,8 @@ and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
     from the Qubes tab. `qvm-prefs ai-<label>-lead autostart` still prints
     `False`.
 45. **Its other forms.** Select the project, *Change lead...*. Expect *a clone
-    of one of the hub's AppVMs* and *one of the hub's AppVMs, promoted in
-    place* greyed out, *Lead name* greyed out reading `named by dom0`, with
+    of one of the hub's AppVMs or standalones* and *one of the hub's AppVMs or
+    standalones, promoted in place* greyed out, *Lead name* greyed out reading `named by dom0`, with
     `ai-<label>-` in front, and the form's text saying dom0 names the new lead.
     Cancel.
     *Set model qube...*: expect the red paragraph `WARNING: a hidden project
@@ -807,3 +807,15 @@ qube, first; its timer does the same every 15 seconds.
     ai-t10b ai-t10x` (`qvm-shutdown --wait` first for any that runs), and
     remove the export file from step 61 unless you keep it. Refresh. Expect
     none of them in the tree, and `qmcp check` GREEN.
+64. **A standalone lead.** *New project...*: *Label* `t11`, *The lead is* a
+    fresh qube from a template, *Made from* `<template>`, tick *Standalone
+    lead*, *Lead network* `none`, tick `none` under *Worker networks*, and
+    `1G` as *Workers' disk quota*. Expect the command
+    `/usr/bin/sudo -n /usr/local/bin/qmcp project create t11 --lead-template
+    <template> --lead-class standalone --lead-netvm none --network none
+    --quota 1G`. Choose *a clone of one of the hub's AppVMs or standalones*:
+    expect *Standalone lead* unticked and greyed out. Choose the template
+    again, tick *Standalone lead*, OK. Expect a report `p0N: lead ai-t11-lead
+    (created)`, and in the lead's details pane *Class* `StandaloneVM`. Select
+    the project, *Delete project...*, OK; expect `p0N: free` and `qmcp check`
+    GREEN.

@@ -307,7 +307,7 @@ def cmd_project(args) -> int:
                                           args.network or (), args.quota, args.lead_netvm,
                                           args.dump, args.lead_name, args.model,
                                           args.model_qube, args.anonymous, args.hub_sees,
-                                          args.note)
+                                          args.note, args.lead_class)
         elif what == "edit":
             report = fleet.edit_project(app, args.name, args.template, args.network, args.quota)
         elif what == "lead":
@@ -320,7 +320,7 @@ def cmd_project(args) -> int:
                                              "--lead-clone or --lead-promote")
                 report = fleet.set_lead(app, args.name, source, origin, args.lead_netvm,
                                         args.keep_old, args.lead_name, args.model,
-                                        args.add_old_network, args.model_qube)
+                                        args.add_old_network, args.model_qube, args.lead_class)
         elif what == "firewall":
             report = fleet.set_lead_firewall(app, args.name, args.model, args.rule or None,
                                              args.accept_current, args.model_qube)
@@ -599,8 +599,14 @@ def cmd_proposal(args) -> int:
 
 def _add_lead_options(p) -> None:
     p.add_argument("--lead-template", metavar="TEMPLATE", help="a fresh lead from this TemplateVM")
-    p.add_argument("--lead-clone", metavar="QUBE", help="a fresh lead cloned from one of the hub's AppVMs")
-    p.add_argument("--lead-promote", metavar="QUBE", help="make one of the hub's AppVMs the lead, in place")
+    p.add_argument("--lead-class", choices=fleet.LEAD_CLASSES, default="appvm",
+                   help="with --lead-template: standalone makes the lead a StandaloneVM with its "
+                        "own copy of the template's root, so what is installed in it survives a "
+                        "restart (default: appvm)")
+    p.add_argument("--lead-clone", metavar="QUBE",
+                   help="a fresh lead cloned from one of the hub's AppVMs or StandaloneVMs")
+    p.add_argument("--lead-promote", metavar="QUBE",
+                   help="make one of the hub's AppVMs or StandaloneVMs the lead, in place")
     p.add_argument("--lead-netvm", metavar="QUBE|none", help="the lead's network (a fresh lead is born on it)")
     p.add_argument("--lead-name", metavar="NAME", help="a fresh lead's name (default: <space>lead)")
     p.add_argument("--model", metavar="HOST:PORT",
@@ -816,7 +822,8 @@ def build_parser() -> argparse.ArgumentParser:
     q = psub.add_parser("dump", help="create a dump sink for a project or p00 (root)")
     q.add_argument("name", help="label, slot, or p00")
     q.add_argument("--name", dest="sink_name", metavar="NAME")
-    q = psub.add_parser("move", help="move an AppVM into p00, a project, or no slot (root)")
+    q = psub.add_parser("move", help="move an AppVM or a StandaloneVM into p00, a project, or no "
+                                     "slot (root)")
     q.add_argument("name", metavar="QUBE")
     q.add_argument("target", help="p00, a project's label or slot, or none")
     q.add_argument("--yes", action="store_true",
@@ -940,6 +947,9 @@ def operator_line(args):
         for key in ("lead_netvm", "lead_name", "model", "model_qube"):
             if getattr(args, key) is not None:
                 summary[key] = str(getattr(args, key))[:128]
+        # Only when not the default, so the line of an ordinary create keeps its shape.
+        if args.lead_class != "appvm":
+            summary["lead_class"] = args.lead_class
     if w == "create":
         summary.update({"templates": _names(args.template), "networks": _names(args.network),
                         "dump": bool(args.dump)})

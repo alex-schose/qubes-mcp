@@ -10,18 +10,43 @@ timing separates them anyway. The only fix is to make the third impossible.
 Residual, stated: a qube outside AI space whose name sits inside the prefix
 stays detectable; `qmcp check` reports such qubes.
 
-**Strip on create.** `clone_vm` copies the source's tags and
-`admin.vm.CreateDisposable` copies the disposable template's, so a created
+**Strip on create.** `admin.vm.CreateDisposable`, and qubesd's create of a
+named DispVM, give the new qube its disposable template's tags, so a created
 qube must not be assumed clean. `stamp()` adds what the child must carry —
-the umbrella, a provenance badge and, for a workload, the creator's slot
-badge — carries the platform's Whonix marker forward, removes every other tag
-in our controlled vocabulary (`qmcp-guarded` included: a child spawned from a
-guarded template is managed; every role and slot badge, so a clone of a lead or
-of another project's member is neither; and v0.9.16's `qmcp-egress-locked_*`,
-which nothing reads since no network moves), and then reads the tags back and
-asserts the exact result, both ways. The caller rolls the qube back if it
-raises. Tags outside our vocabulary (the operator's own, `created-by-*`) are
-left alone.
+the umbrella, a provenance badge and, for a workload, its slot badge (a
+spawn's is its creator's, a clone's its source's) — carries the platform's
+Whonix marker forward, removes every other tag in our controlled vocabulary
+(`qmcp-guarded` included: a child spawned from a guarded template is managed;
+every role and slot badge, so a clone of a lead is no lead; and v0.9.16's
+`qmcp-egress-locked_*`, which nothing reads since no network moves), and then
+reads the tags back and asserts the exact result, both ways. The caller rolls
+the qube back if it raises. Tags outside our vocabulary (the operator's own,
+`created-by-*`) are left alone.
+
+**A copy is built in dom0's own order** (`create_copy`, then `fill_copy`):
+a clone, a standalone made from a template, and a lead cloned from one of the
+hub's qubes. qubesadmin's `clone_vm`, which `qvm-clone` and `qvm-create
+--standalone -t T` run, creates the qube, copies its source's properties, then
+its tags one by one in the sorted order qubesd lists them (source-read), so
+`ai-managed` lands before `qmcp-anon` and `qmcp-hubblind`, then features and
+volumes, which took seconds for a standalone (5.6 s measured on Qubes 4.3.1,
+2026-10-10). A hidden project's member's clone was thus in AI space without
+`qmcp-hubblind` for a moment, and a standalone made from a template the
+project's badges are not on would have been, through `clone_vm`, for those
+seconds. So dom0 creates the qube with none of the source's tags, copies
+properties, features, notes, the operator's tags and the volumes into it, and
+only then labels and stamps it: the stamp is the first moment the qube is in
+AI space, and its restricting badges go on first. (A named DispVM's clone is
+the exception: qubesd gives it its disposable template's tags in the create
+call itself.) A standalone made from a template takes the template's features,
+as `qvm-create --standalone` does, the template's own values of the
+properties an AppVM follows from its template (`TEMPLATE_PROPS`), and a copy
+of its root, in the template root's pool; its private volume is new. It takes
+none of the template's tags, firewall rules or device assignments: its stamp
+then carries `anon-vm` from the template (an AppVM on a Whonix template also
+gets what Whonix's addon puts on it; a standalone does not). A clone takes what
+`clone_vm` copies, keeping each volume's pool, but device assignments, menu
+entries and a disposable template's `preload-dispvm*`.
 
 **Birth network** (the hub's creates; a lead's follow its project's list).
 A hub request for no network is always granted (`services._birth_netvm`).
@@ -145,6 +170,97 @@ def controlled(tag: str) -> bool:
 
 def is_restriction(tag: str) -> bool:
     return tag in RESTRICTION_TAGS
+
+
+#: Tags Qubes itself keeps on every qube, from its creator or from its own
+#: properties: a fresh qube already has its own, so these are never copied.
+QUBES_TAG_PREFIXES = ("created-by-", "audiovm-", "guivm-", "relayvm-")
+
+#: The properties an AppVM follows from its template while it has none of its
+#: own (Qubes' `_default_with_template`, and `virt_mode` and `kernelopts`,
+#: whose defaults read the template too), but `bootmode`, which an AppVM takes
+#: from the template's `appvm_default_bootmode`. A standalone made from a template
+#: takes the template's own values of these, so it boots as an AppVM of it would.
+TEMPLATE_PROPS = ("kernel", "kernelopts", "virt_mode", "memory", "maxmem", "vcpus",
+                  "default_user", "qrexec_timeout", "shutdown_timeout", "management_dispvm")
+#: What a clone never copies from its source: its identity, and what the create
+#: itself sets (`clone_vm` leaves out the same).
+NOT_COPIED = frozenset({"name", "qid", "uuid", "label", "template", "installed_by_rpm"})
+#: The volumes a copy can take: those its source keeps across a restart.
+VOLUMES = ("root", "private")
+
+
+def operators(tag: str) -> bool:
+    """A tag that is the operator's own: not ours, no restriction, and none
+    that Qubes keeps itself."""
+    return not controlled(tag) and not is_restriction(tag) \
+        and not tag.startswith(QUBES_TAG_PREFIXES)
+
+
+def copied_volumes(source, standalone: bool) -> tuple:
+    """The volumes a copy takes from `source`: a standalone made from a template
+    its root alone (its private volume is new); a clone every volume its source
+    keeps across a restart (`save_on_stop`), as `clone_vm` copies them: a
+    template's or a standalone's root and private, an AppVM's private, nothing
+    of a disposable's. Raises when a volume cannot be read."""
+    if standalone:
+        return ("root",)
+    return tuple(v for v in VOLUMES if v in source.volumes and source.volumes[v].save_on_stop)
+
+
+def create_copy(app, source, name: str, klass: str, label: str, standalone: bool = False):
+    """Create the qube a copy fills, with none of its source's tags but a named
+    DispVM's (below): `klass`, on the
+    source's template for an AppVM or a DispVM, each copied volume in the pool
+    its source's is in (as `clone_vm` keeps it). qubesd gives a named DispVM its
+    disposable template's tags at create, in the one call. The caller fills it
+    (`fill_copy`), then labels and stamps it, and rolls it back on any failure
+    after this returns."""
+    from qmcp import core
+    template = core.template_of(source) if klass in ("AppVM", "DispVM") else None
+    pools = {v: str(source.volumes[v].pool) for v in copied_volumes(source, standalone)}
+    return app.add_new_vm(klass, name, label, template=template, pools=pools or None)
+
+
+def fill_copy(app, vm, source, standalone: bool) -> None:
+    """Copy `source` into the qube `create_copy` made, before it is in AI space.
+    A standalone made from a template (`standalone`) takes the template's own
+    values of `TEMPLATE_PROPS`, its features and its root. A clone takes every
+    property the source does not leave at its default, its features, the
+    operator's tags and restrictions, its firewall rules, its notes, and every
+    volume the source keeps (`copied_volumes`). The `qmcp-id` label is never
+    copied: the caller writes the qube's own. Raises on any failure, so the
+    caller rolls the qube back."""
+    from qmcp import core, firewall
+    have = set(source.property_list())
+    names = TEMPLATE_PROPS if standalone else sorted(have - NOT_COPIED)
+    for prop in names:
+        if prop not in have or source.property_is_default(prop):
+            continue
+        value = getattr(source, prop)
+        try:
+            setattr(vm, prop, value)
+        except AttributeError:
+            # A property the new qube's class lacks, or a write qubesd answered
+            # with no reply (QubesPropertyAccessError is an AttributeError):
+            # `clone_vm` skips both the same way. The read above is strict.
+            continue
+    for key, value in source.features.items():
+        # `preload-dispvm*` is a disposable template's queue of its own
+        # disposables, and its maximum would start preloading from the copy
+        # while it is half-built and outside AI space; the operator sets it.
+        if key == core.ID_FEATURE or key.startswith("preload-dispvm"):
+            continue
+        vm.features[key] = value
+    if not standalone:
+        for tag in sorted(t for t in core.tags_of(source) if operators(t) or is_restriction(t)):
+            vm.tags.add(tag)
+        firewall.restore_rules(app, vm.name, firewall.read_rules(app, source.name))
+        notes = source.get_notes()
+        if notes:
+            vm.set_notes(notes)
+    for name in copied_volumes(source, standalone):
+        vm.volumes[name].clone(source.volumes[name])
 
 
 def expected_tags(source_tags, principal: str, slot_badge: str | None = None,

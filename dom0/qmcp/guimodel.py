@@ -205,10 +205,21 @@ def _key(key) -> str:
     return key
 
 
-def _lead(source, origin, lead_name, lead_netvm) -> list:
+#: Why a standalone lead comes only from a template, in the command's words.
+STANDALONE_FROM_TEMPLATE = ("a cloned or promoted lead keeps the class of the qube it comes "
+                            "from: a standalone lead is made from a template")
+
+
+def _lead(source, origin, lead_name, lead_netvm, lead_class="appvm") -> list:
     if source not in ("template", "clone", "promote"):
         raise FormError("say where the lead comes from")
+    if lead_class not in fleet.LEAD_CLASSES:
+        raise FormError("the lead is an AppVM or a standalone")
     out = [f"--lead-{source}", _qube(origin, "the lead's source")]
+    if lead_class != "appvm":
+        if source != "template":
+            raise FormError(STANDALONE_FROM_TEMPLATE)
+        out += ["--lead-class", lead_class]
     if lead_name:
         if source == "promote":
             raise FormError("a promoted lead keeps its own name")
@@ -324,7 +335,8 @@ FRESH_LEAD = ("an anonymous project's lead is only ever made fresh from a templa
 
 def create_project(label, lead_source, lead_origin, lead_name=None, lead_netvm=None,
                    templates=(), networks=(), quota=None, dump=False, model=None,
-                   model_qube=None, anonymous=False, hub_sees=False, note=None) -> list:
+                   model_qube=None, anonymous=False, hub_sees=False, note=None,
+                   lead_class="appvm") -> list:
     """`model` is the lead's model endpoint, or None. Whether the lead needs
     one depends on its network, which `lead_model()` judges with the fleet.
     `model_qube` is a self-hosted model qube instead; then the lead has no
@@ -346,7 +358,7 @@ def create_project(label, lead_source, lead_origin, lead_name=None, lead_netvm=N
             raise FormError("--hub-sees and --note go with --anonymous")
     if not networks:
         raise FormError("tick at least one worker network (a gateway, or none)")
-    lead = _lead(lead_source, lead_origin, lead_name, lead_netvm)
+    lead = _lead(lead_source, lead_origin, lead_name, lead_netvm, lead_class)
     if anonymous and lead_source != "template":
         raise FormError(FRESH_LEAD)
     argv = write_cmd("project", "create", *([] if anonymous else [label]))
@@ -393,14 +405,15 @@ def remove_lead(key) -> list:
 
 
 def change_lead(key, lead_source, lead_origin, lead_name=None, lead_netvm=None,
-                keep_old=False, model=None, add_old_network=False, model_qube=None) -> list:
+                keep_old=False, model=None, add_old_network=False, model_qube=None,
+                lead_class="appvm") -> list:
     """`model` None: a new lead with a network takes the project's model, and
     one without keeps the project's model qube. `model_qube` names another
     model qube, or `none` takes the project's away; either way the new lead
     has no network. `add_old_network` goes with `keep_old` only, as the
     command has it."""
     argv = write_cmd("project", "lead", _key(key),
-                     *_lead(lead_source, lead_origin, lead_name, lead_netvm))
+                     *_lead(lead_source, lead_origin, lead_name, lead_netvm, lead_class))
     if add_old_network and not keep_old:
         raise FormError("the old lead's network can be added only when it is kept as a worker")
     if keep_old:
@@ -1417,7 +1430,8 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         if node.data.get("klass") in OWN_ROOT and not stopped_qube(node.data):
             out.add("prepare")
         if (role in ("worker", "hub's qube", "hub's qube, no slot")
-                and node.data.get("klass") == "AppVM" and not stopped_qube(node.data)):
+                and node.data.get("klass") in fleet.WORKLOAD_KLASSES
+                and not stopped_qube(node.data)):
             out.add("move")
         if state == "guarded" and role != "gateway":
             out.add("manage")
@@ -1587,7 +1601,8 @@ PROPOSAL_OPTIONS = (
     ("label", "Label"), ("project", "Project"),
     ("anonymous", "Anonymous (dom0 picks its label; the hub is never told it)"),
     ("hub_sees", "The hub may see it"),
-    ("lead", "Lead"), ("lead_name", "Lead name"), ("lead_netvm", "Lead network"),
+    ("lead", "Lead"), ("lead_class", "Lead class (standalone: its own copy of the root)"),
+    ("lead_name", "Lead name"), ("lead_netvm", "Lead network"),
     ("model", "Lead's model endpoint"), ("model_qube", "Lead's model qube"),
     ("remove", "Remove the lead"), ("keep_old", "Keep the old lead as a worker"),
     ("add_old_network", "Add the old lead's network to the worker networks"),
@@ -3283,13 +3298,14 @@ def lead_templates(fleet_rows) -> list:
                   and not unread_row(r))
 
 
-def hubs_appvms(fleet_rows, hub=None) -> list:
-    """Managed AppVMs of the hub's (p00 or no slot): a lead's clone source or a
-    qube to promote. Never a model qube, even one managed for its maintenance:
-    the command refuses it (`fleet._hubs_own_appvm`)."""
+def hubs_own_qubes(fleet_rows, hub=None) -> list:
+    """Managed AppVMs and StandaloneVMs of the hub's (p00 or no slot): a lead's
+    clone source or a qube to promote. Never a model qube, even one managed for
+    its maintenance: the command refuses it (`fleet._hubs_own_qube`)."""
     out = []
     for r in fleet_rows:
-        if (r.get("state") == "managed" and r.get("klass") == "AppVM" and not r.get("dvmt")
+        if (r.get("state") == "managed" and r.get("klass") in fleet.WORKLOAD_KLASSES
+                and not r.get("dvmt")
                 and not r.get("gateway") and not r.get("lead") and not r.get("model")
                 and (r.get("slot") in (None, projects.HUB_SLOT)) and r.get("name") != hub):
             out.append(r["name"])
