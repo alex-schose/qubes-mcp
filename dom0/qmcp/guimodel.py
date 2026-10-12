@@ -49,8 +49,10 @@ command, never a second implementation of it:
   not held yet is placed there from that row, since `qmcp check` fails on it;
 - the in-qube services are written into a TemplateVM or a StandaloneVM by
   `template prepare`, from its row or from a list of every such qube, in AI
-  space or not; and the operator files change through `settings set`, and
-  travel through `export` and `import`, from the Settings tab.
+  space or not; packages go into a TemplateVM in AI space by their exact names
+  (`template install`), from its row; and the operator files change through
+  `settings set`, and travel through `export` and `import`, from the Settings
+  tab.
 
 It cannot go stale: `tests/test_gui.py` walks the command's parser and the
 JSON each read returns, and fails on any command, option or field the window
@@ -626,6 +628,20 @@ def prepare_template(qube) -> list:
     return write_cmd("template", "prepare", _qube(qube, "the template or standalone"))
 
 
+def install_packages(template, packages) -> list:
+    """Install packages, by their exact names, into a TemplateVM in AI space.
+    `packages` is the text the operator typed, the names separated by
+    whitespace; the list is checked with the command's own check
+    (`inqube.packages_refusal`), so the form never sends one the command
+    refuses, or refuses one it takes."""
+    name = _qube(template, "the template")
+    names = packages.split() if isinstance(packages, str) else None
+    why = inqube.packages_refusal(names)
+    if why:
+        raise FormError(why)
+    return write_cmd("template", "install", name, *names)
+
+
 def restored_accept(qubes) -> list:
     """Accept the qubes the operator reviewed: one name, or the list an Accept
     all form showed. Never `--all`, which accepts whatever is held when the
@@ -674,7 +690,7 @@ BUILDERS = (create_project, edit_project, remove_lead, change_lead, add_dump, mo
             reject_proposal, enroll_gateway, change_gateway, remove_gateway,
             show_lead_firewall, set_lead_model, set_lead_model_qube, set_lead_rules,
             accept_lead_rules, unblock_project, settings_set, prepare_template,
-            restored_accept, restored_reject, export_config, import_config)
+            install_packages, restored_accept, restored_reject, export_config, import_config)
 
 #: Commands and options the window does not offer, and why the operator types
 #: them. An entry covers everything under it. Adding one is a decision, not a
@@ -1429,6 +1445,10 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         # refuses; a held one is under Needs attention, returned above.
         if node.data.get("klass") in OWN_ROOT and not stopped_qube(node.data):
             out.add("prepare")
+        # Packages go into a template's root, and only in AI space, which a
+        # row with no state is not; the gate's stop is refused as for Prepare.
+        if node.data.get("klass") == "TemplateVM" and not stopped_qube(node.data):
+            out.add("packages")
         if (role in ("worker", "hub's qube", "hub's qube, no slot")
                 and node.data.get("klass") in fleet.WORKLOAD_KLASSES
                 and not stopped_qube(node.data)):
@@ -1580,7 +1600,7 @@ PROPOSAL_FIELDS = (
     ("needs_closing", "Needs closing"),
 )
 #: The list's columns.
-PROPOSAL_COLUMNS = (("id", "#"), ("state", "State"), ("type", "Type"), ("subject", "Project"),
+PROPOSAL_COLUMNS = (("id", "#"), ("state", "State"), ("type", "Type"), ("subject", "Subject"),
                     ("title", "Title (written by AI)"), ("submitted", "Submitted (UTC)"))
 #: What `proposal show --json` adds to a list row and the pane shows on a line
 #: of its own. The second tick's reasons are also in red beside the tick box.
@@ -1588,7 +1608,8 @@ PROPOSAL_SHOW_FIELDS = (("command", "Equivalent command"), ("second_tick", "Seco
                         ("tick", "Second tick digest"), ("plan", "Plan"))
 #: What it adds and the pane shows a line per part.
 PROPOSAL_BY_PART = {
-    "proposal": "a line per option (PROPOSAL_OPTIONS)",
+    "proposal": "a line per option (PROPOSAL_OPTIONS), headed for its type "
+                "(PROPOSAL_OPTION_HEADINGS)",
     "before": "a line per part, now -> after (EDIT_FIELDS); a lead firewall's, the rules "
               "now and after (FIREWALL_CHANGE)",
     "after": "a line per part, now -> after (EDIT_FIELDS); a lead firewall's, the rules "
@@ -1613,9 +1634,25 @@ PROPOSAL_OPTIONS = (
     ("add_networks", "Worker networks to add"), ("remove_networks", "Worker networks to remove"),
     ("default_network", "New default worker network"),
     ("rules", "Lead firewall rules"),
-    ("qube", "Guarded qube to open"), ("for", "The window lasts"),
+    ("qube", "Qube"), ("for", "The window lasts"),
     ("firewall", "Also lets the hub write that qube's firewall rules"),
+    ("shutdown", "Shut down"),
+    ("template", "Template to install into"), ("packages", "Packages (exact names)"),
 )
+#: Where an option's heading depends on the type: the qube a proposal names is
+#: opened, managed or revoked, and the pane says which.
+PROPOSAL_OPTION_HEADINGS = {
+    ("qube-open", "qube"): "Guarded qube to open",
+    ("qube-manage", "qube"): "Qube to manage",
+    ("qube-revoke", "qube"): "Qube to revoke",
+}
+
+
+def option_heading(ptype, key) -> str:
+    """The pane's heading for option `key` of a proposal of type `ptype`."""
+    return PROPOSAL_OPTION_HEADINGS.get((ptype, key)) or dict(PROPOSAL_OPTIONS).get(key, key)
+
+
 #: An edit's project record now and after accepting, a line per part.
 EDIT_FIELDS = (("templates", "Templates, now -> after"),
                ("networks", "Worker networks, now -> after"),
@@ -1782,6 +1819,11 @@ def _option_text(key, value) -> Shown:
         return esc(_plain(key, value))      # exact: what the operator accepts is what runs
     if key == "model_qube" and value == "none":
         return esc("none: the project's model qube is taken away")
+    if key == "packages" and isinstance(value, list):
+        return esc(" ".join(str(p) for p in value))        # as the command line names them
+    if key == "shutdown" and isinstance(value, bool):
+        return esc("yes: the command shuts it down if it runs" if value else
+                   "no: it keeps running (--no-shutdown)")
     return field_text(key, value)
 
 
@@ -1841,8 +1883,8 @@ def proposal_details(doc) -> list:
         out.append((heading, esc(value)))
     options = doc.get("proposal") if isinstance(doc.get("proposal"), dict) else {}
     named = {key for key, _ in PROPOSAL_OPTIONS} | {"type", "title"}
-    out += [(heading, _option_text(key, options[key])) for key, heading in PROPOSAL_OPTIONS
-            if key in options]
+    out += [(option_heading(doc.get("type"), key), _option_text(key, options[key]))
+            for key, _ in PROPOSAL_OPTIONS if key in options]
     out += [(key, esc(options[key])) for key in sorted(options) if key not in named]
     headings = dict(PROPOSAL_SHOW_FIELDS)
     if doc.get("command") is not None:
@@ -1896,6 +1938,9 @@ def accept_intro(doc) -> str:
     if doc.get("type") == "project-firewall":
         runs += (" It changes what the lead can reach on the network: compare its firewall "
                  "now and after accepting, beside the list.")
+    if doc.get("type") == "template-install":
+        runs += (" An install may take many minutes: the window waits for it, and makes no "
+                 "other change until it ends.")
     tick = (" The second tick goes with it: if the command finds other reasons than the ones "
             "in red, it refuses and runs nothing; if it finds none, one click was enough and "
             "it runs." if tick_of(doc) else "")
@@ -3659,7 +3704,9 @@ def prepare_text(row) -> str:
 
 
 def prepare_power(row) -> str:
-    """What the prepare does to the qube's power, as its row shows it."""
+    """What a prepare or a package install does to the qube's power, as its
+    row shows it: both start a halted qube for the write and shut it down
+    again after, and leave a running one running."""
     if not isinstance(row, dict):
         return ""
     name, power = row.get("name"), row.get("power")
@@ -3671,6 +3718,69 @@ def prepare_power(row) -> str:
         return (f"whether {name} runs cannot be read now: the command reads it again, and starts "
                 f"it for this if it is halted.")
     return ""
+
+
+# ======================================================================= packages into a template
+
+INSTALL_INTRO = (
+    "Installs the packages you name, and what they depend on, into this TemplateVM as root, "
+    "with its own package manager (apt-get, dnf or pacman, which the command finds by a probe), "
+    "from the repositories the template already trusts, through its update proxy. Recommended "
+    "and weak dependencies stay out; an install that would remove an installed package is "
+    "refused, though one may be upgraded when a new one needs it (and on Arch, -Su replaces "
+    "what the repositories say). Each name must be a "
+    "package's exact "
+    "name: inside the template, every name is first checked against its repositories, so that "
+    "no pattern, version, group or provided name is widened into other packages, and one name "
+    "that fails refuses the whole install before anything is installed. On Arch the install "
+    "also upgrades the whole template (pacman -Sy, then -Su with the names), as Qubes' own "
+    "updater does. The install scripts of each package and each dependency run as root, and a "
+    "package can itself add a repository or download more software when it is installed (one "
+    "that configures repositories, such as Fedora's fedora-workstation-repositories, or an "
+    "-installer package, such as Debian's ttf-mscorefonts-installer): read the names. A halted "
+    "template is started for this and shut "
+    "down again after; a running one keeps running, and the qubes built on it get the packages "
+    "once it has shut down and they start again. dom0 decides on the install's exit status "
+    "alone, and the report ends with the last lines the package manager wrote, escaped. It may "
+    "take many minutes: the window waits for it, and makes no other change until it ends. "
+    f"After {inqube.INSTALL_TIMEOUT_S // 60} minutes the command stops waiting and reports a "
+    "failed step: a template it started is shut down, which stops the install part-way; in one "
+    "that was already running, the install may still be running, or may have stopped "
+    "part-way.")
+
+
+def _install_why(row) -> str | None:
+    """Why the command refuses to install into the qube of `row`
+    (`inqube.install_refusal`, then its power), as far as its `list` row shows
+    it, in the command's order and words."""
+    if unread_row(row):
+        return "cannot be read now; refresh"
+    klass = row.get("klass")
+    if klass != "TemplateVM":
+        return (f"is a {klass}: packages go into a TemplateVM, whose qubes take its root at every "
+                f"start")
+    if row.get("state") is None:
+        return "is not in AI space: qmcp installs packages only in AI space's templates"
+    tags = set(row.get("badges") or ())
+    if tags & {projects.BLOCKED, projects.STOPPED}:
+        return ("was stopped by the anonymity gate, and an install would start it: clear it "
+                "first (qmcp project unblock)")
+    if core.QUARANTINE in tags:
+        return "is held for your review: accept or reject it first (qmcp restored)"
+    if projects.HUBBLIND in tags:
+        return "is a hidden project's qube"
+    power = row.get("power")
+    if isinstance(power, str) and power not in ("Running", "Halted") + POWER_UNREAD:
+        return f"is {power}: install while it runs or is halted"
+    return None
+
+
+def install_refusal(row) -> str | None:
+    """Why the command refuses an install into the qube of `row`, or None."""
+    if not isinstance(row, dict):
+        return "choose a TemplateVM in AI space"
+    why = _install_why(row)
+    return None if why is None else f"'{row.get('name')}' {why}"
 
 
 # ======================================================================= settings, export, import

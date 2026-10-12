@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.27 — Linux standalones.** Besides the hub, up to 15
+**Status: 0.9.28 — the last proposal types.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -48,8 +48,11 @@ rules, never its network. The window ends by itself, at every boot, and on
 The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
 command with forms: every change it makes is a command it shows first. The hub
 may ask for a project, a change to one, a new lead, a lead's new firewall, a
-deletion or a window on a guarded qube; nothing happens until the operator
-accepts it in dom0, in that window or with `qmcp proposal accept`. The two
+deletion, a window on a guarded qube, a qube brought into AI space or out of
+the guarded state, a qube taken out of AI space, or exact packages installed
+into a template by its own package manager;
+nothing happens until the operator accepts it in dom0, in that window or with
+`qmcp proposal accept`. The two
 in-qube services need python3 and `qvm-copy-to-vm` and nothing else; measured
 on Qubes 4.3.1, a lead and its workers run on Debian 13, Fedora 43 and Arch
 templates alike, and dom0 keeps its own copy of them, so
@@ -57,7 +60,7 @@ templates alike, and dom0 keeps its own copy of them, so
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
 `qmcp export` puts qmcp's settings where a Qubes backup carries them. Next:
-the last proposal types, an audit round, then 1.0.0. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+an audit round, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -102,16 +105,18 @@ the last proposal types, an audit round, then 1.0.0. 0.9.17 replaced the tier mo
   worker's reach with its firewall rules. The lead's own reach is its
   firewall, which is yours.
 - **Proposals.** The hub cannot create a project, change or remove a lead,
-  delete a project, change a project's templates, networks or quota, or
-  change a lead's firewall. It
-  may propose each of those, as the options of one `qmcp project` command,
+  delete a project, change a project's templates, networks or quota, change
+  a lead's firewall, open a guarded qube, bring a qube into AI space or take
+  one out, or install packages into a guarded template. It
+  may propose each of those, as the options of one `qmcp` command,
   and the operator accepts or rejects it in dom0, in the window or with
   `qmcp proposal accept` or `reject`: accepting runs that command's own
   code, refused if the stored proposal is not the one shown. Removing a lead
   or a project, a network AI space does not use yet, promoting one of the
   hub's qubes, an over-committed quota, a model endpoint no project uses,
   giving a project a different model endpoint, every change to a lead's
-  firewall, and naming a model qube or taking one away need a second tick. The hub learns
+  firewall, naming a model qube or taking one away, and every window,
+  manage, revoke and package install need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
 - **Anonymous projects.** dom0's anonymity gate judges each one every 15
@@ -169,6 +174,7 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_events` | a window of events for qubes in scope |
 | `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use and its model (an endpoint, or a model qube and its port) |
 | `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_lead_firewall`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a lead's new firewall, a deletion |
+| `qubes_propose_open`, `qubes_propose_manage`, `qubes_propose_revoke`, `qubes_propose_packages` | the hub asks for a window on a guarded qube, a qube brought into AI space or out of the guarded state, a qube taken out of AI space, or exact packages installed into a template in AI space |
 | `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
 The hub and a lead run the same server and see the same tools; dom0 scopes
@@ -199,7 +205,7 @@ through `qrexec-client-vm`, which every qube has.
 `qubes-prefs default_template` names — measured on Qubes 4.3.1: the Debian 13
 xfce template ships git, the Fedora 43 xfce and Arch templates do not. Install
 git in the hub's template, or skip the clone and copy the release in from dom0
-the way step 4 does for a lead.
+the way step 5 does for a lead.
 
 **2. dom0.** The installer runs as root, so fetch it somewhere AI cannot
 write: a fresh disposable, not the hub. Any disposable template with curl and
@@ -207,7 +213,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.27.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.28.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -238,6 +244,16 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
+Coming from 0.9.27? Install over it. Besides the new proposal types and
+`sudo qmcp template install`: `qmcp manage`, `guard`, `revoke` and `open`
+refuse dom0, and every name while `/etc/qmcp/hub` cannot be read (a seal still
+takes a window off then, and only skips the kill); `template prepare` refuses
+while an install or another prepare runs in the same qube; managing an open
+qube ends its window with no kill; the window's proposal list heads its subject
+column "Subject". The CHANGELOG's 0.9.28 entry has the whole list. To roll back,
+run this release's `uninstall.sh` before 0.9.27's installer; a pending
+proposal of a new type then reads as unreadable, and `qmcp proposal reject N`
+closes it.
 Coming from 0.9.26? Install over it. Clones, the hub's and a lead's, change:
 a clone lands where its source is, so the hub's clone of a project's member
 joins that project (named inside its names, counted against its quota, on its
@@ -548,7 +564,19 @@ it replaces and ends with `qmcp check`. Then:
   it is halted.
 - **Restart the window** if it is open: one opened before the install runs the
   old code.
-- **Update the hub's copy** of `qubes_mcp/` (step 1) and each lead's.
+- **Update the hub's copy** of `qubes_mcp/` (step 1) and each lead's. A hub
+  cloned with git: `git -C ~/qubes-mcp pull` in the hub (the head of
+  `main` is always the newest release). One without git, and
+  each lead, from step 2's tarball in dom0 (name the lead in place of
+  `mcp-control`; nothing in `~/qubes-mcp` is kept):
+
+  ```sh
+  qvm-run --pass-io mcp-control \
+    'rm -rf ~/qubes-mcp && mkdir ~/qubes-mcp && tar -xzf - -C ~/qubes-mcp --strip-components=1' \
+    < /tmp/qmcp.tgz
+  ```
+
+  Then restart its agent's MCP client, which starts the server afresh.
 
 The CHANGELOG's entry for each version says what else an update from the one
 before it needs.

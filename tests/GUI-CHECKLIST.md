@@ -819,3 +819,135 @@ qube, first; its timer does the same every 15 seconds.
     (created)`, and in the lead's details pane *Class* `StandaloneVM`. Select
     the project, *Delete project...*, OK; expect `p0N: free` and `qmcp check`
     GREEN.
+
+### Packages, and the hub's proposals about one qube (0.9.28)
+
+Steps 65 to 72 cover *Install packages...* and the three proposals the hub
+can make about one qube: install packages into a template, manage a qube,
+revoke one. Run them in normal mode, with `qmcp check` GREEN. They need
+`<base-template>`, a Debian or Fedora TemplateVM outside AI space whose
+updates work (Qubes Update updates it), and `<package>`, a package its
+repositories carry and it does not have yet, such as `sl`. Steps 68 to 71
+play the hub's part as well, from a terminal in the hub, as in step 18. The
+names `ai-t12-tpl`, `ai-t12` and `ai-t12-gone` must not exist yet.
+
+An install starts a halted template and refreshes its package lists through
+its update proxy, so each one takes minutes. While it runs, every change
+button is greyed out and the window waits for the report; that is not a hang.
+
+65. **The form, and the names it refuses.** Clone a template to work on, so
+    that no template you use changes: `qvm-clone <base-template> ai-t12-tpl`.
+    Press Refresh, *Add a qube to AI space...*, choose `ai-t12-tpl`, leave
+    *guarded*, OK. Select `ai-t12-tpl` under *Templates*, *Install
+    packages...*. Expect the form to say: it installs the packages you name
+    and what they depend on into this TemplateVM as root, with its own
+    package manager, from the repositories the template already trusts; each
+    name must be a package's exact name, and one name that fails refuses the
+    whole install before anything is installed; on Arch it also upgrades the
+    whole template; an install that would remove an installed package is
+    refused; the install scripts of each package and each
+    dependency run as root, and a package can itself add a repository or
+    download more software, ending `read the names`; the window waits for it; and after 30
+    minutes the command stops waiting and reports a failed step. *Power* reads `ai-t12-tpl is halted: the command
+    starts it for this and shuts it down again after.` With *Packages* empty,
+    OK is greyed out: `name 1 to 32 packages`. Type each of these into
+    *Packages* in turn; OK stays greyed out, with the command's reason:
+    `<package>-` gives `'<package>-' ends in '-', which apt reads as removing
+    the package`; `<package>*` gives `'<package>*' is not a package name:
+    letters, digits, '.', '_', '+' and '-', a letter or digit first, at most
+    100`; `<package> <package>` gives `a package is named twice`. Cancel.
+    Select any AppVM in AI space: *Install packages...* is greyed out (an
+    AppVM takes its root from its template).
+66. **A name the template does not know.** Select `ai-t12-tpl`, *Install
+    packages...*, type `<package> qmcp-no-such-package` into *Packages*.
+    Expect the command `/usr/bin/sudo -n /usr/local/bin/qmcp template install
+    ai-t12-tpl <package> qmcp-no-such-package`: the name has a package's
+    shape, so only the template can tell it is not one. OK. Expect, after a
+    few minutes, a report marked FAILED: `ai-t12-tpl: refused inside the
+    template before anything was installed, by its report: a name is not a package's exact
+    name in its repositories (its output, below, says which): <package>
+    qmcp-no-such-package`, then `ai-t12-tpl was started for this and shut
+    down again` (nothing more: nothing was installed), then `the last lines
+    apt-get wrote in ai-t12-tpl,
+    escaped:` (`dnf` on Fedora), with `not a package name here:
+    qmcp-no-such-package` among them. That is the template's own check
+    refusing the whole list: `<package>` was not installed either.
+    `qvm-ls ai-t12-tpl` shows it Halted again.
+67. **Install it.** *Install packages...*, type `<package>`, OK. Expect a
+    report marked done: `ai-t12-tpl: installed with apt-get in N s (the
+    template's exit status): <package>` (`dnf` on Fedora), the line saying it was started for this and
+    shut down again, and the last lines the package manager wrote, each on a
+    line of its own, the last one `installed: <package> <version>` (on Debian
+    the lines before it list the template's pending upgrades: Qubes' own hook
+    prints them after every install). On the Audit tab, a `qmcp template install` line with
+    caller `operator`, naming `ai-t12-tpl` and `<package>`.
+68. **The hub proposes an install.** In the hub:
+
+    ```sh
+    printf '%s' '{"type": "template-install", "title": "<package> for ai-t12-tpl",
+      "template": "ai-t12-tpl", "packages": ["<package>"]}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Expect `"ok": true`. Refresh, select it. Expect the list's row to read
+    `template-install` under *Type* and `ai-t12-tpl` under *Subject*, and the
+    pane: *Template to install into* `ai-t12-tpl`; *Packages (exact names)*
+    `<package>`; *Equivalent command* `qmcp template install ai-t12-tpl
+    <package>`; *Second tick* `needed: the reasons are in red below`. The red
+    text starts `INSTALLS 1 package(s) into the template ai-t12-tpl as root,
+    with its own package manager, from the repositories it already trusts,
+    and what they depend on: <package>`, says that every qube built on it runs
+    them from its first start after the template has shut down and that on
+    Arch the whole template is upgraded, and that the install scripts of each
+    package and each dependency run as root, ending `read the names`.
+    *Accept...* is greyed out until you tick the box. Tick it, *Accept...*:
+    the form says an install may take many minutes and the window waits for
+    it, repeats the red text, and its command ends in `--yes` and the *Second
+    tick digest*. OK. Expect, after the install, a report with the install's
+    lines (the package is already there since step 67, and the last line is
+    still `installed: <package> <version>`), then `proposal N: accepted`.
+69. **The hub proposes managing a qube.** In dom0,
+    `qvm-create --class AppVM --template <base-template> --label gray ai-t12`,
+    then `qvm-prefs ai-t12 netvm ''`, and Refresh: `ai-t12` has no row (it is
+    outside AI space). In the hub:
+
+    ```sh
+    printf '%s' '{"type": "qube-manage", "title": "adopt ai-t12", "qube": "ai-t12"}' \
+      | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Refresh, select it. Expect *Qube to manage* `ai-t12` (never *Guarded
+    qube to open*), *Equivalent command* `qmcp manage ai-t12`, and in red
+    `MANAGES ai-t12: the hub may then run commands in it as root, copy files
+    out of it, write its firewall rules, clone it and remove it, with no time
+    limit` and `brings ai-t12 into AI space: today the hub cannot see it`.
+    Tick the box, *Accept...*, OK. Expect a report `ai-t12: managed`, then
+    `proposal N: accepted`, and `ai-t12` under the hub's "no slot".
+70. **The hub proposes revoking it.** `qvm-start ai-t12`. In the hub:
+
+    ```sh
+    printf '%s' '{"type": "qube-revoke", "title": "done with ai-t12", "qube": "ai-t12",
+      "shutdown": false}' | qrexec-client-vm dom0 qmcp.SubmitProposal
+    ```
+
+    Refresh, select it. Expect *Qube to revoke* `ai-t12`, *Shut down* `no: it
+    keeps running (--no-shutdown)`, and *Plan* `the hub could run commands in
+    ai-t12, so a hub's proposal to revoke it shuts it down, so accepting it
+    will fail and change nothing`: `ai-t12` is managed, and the hub's
+    processes in it would run on outside AI space. *Reject...*, OK. Send it
+    again without `"shutdown": false`. Expect *Shut down* `yes: the command
+    shuts it down if it runs`, *Equivalent command* `qmcp revoke ai-t12`, and
+    in red `REVOKES ai-t12: every qmcp badge comes off, so it leaves AI space
+    and any slot it is in; after that the hub reaches it only through your
+    dialogs, and what it left on its disk stays; it is shut down`. Tick the
+    box, *Accept...*, OK. Expect `ai-t12: revoked, shutdown requested`, then
+    `proposal N: accepted`; `ai-t12` gone from the tree, and `qvm-ls ai-t12`
+    listing it Halted soon after.
+71. **A qube that is not there.** In the hub, send step 70's request again
+    with `ai-t12-gone` as the qube. Expect `"ok": true`: the hub's request is
+    checked for its shape only. Refresh, select it. Expect *Plan* `there is no
+    qube ai-t12-gone now: accepting it will fail`, and the red text all the
+    same: these proposals always need the second tick. *Reject...*, OK.
+    Expect `proposal N: rejected`.
+72. **Clean up.** In dom0, `qvm-remove -f ai-t12 ai-t12-tpl` (step 70 shut
+    `ai-t12` down). Refresh. Expect neither in the tree, and `qmcp check` GREEN.

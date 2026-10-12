@@ -368,6 +368,18 @@ class UnusableGateways(ProjectBase):
 
 
 class RoleActions(ProjectBase):
+    def test_dom0_is_refused_before_anything_is_written(self):
+        # revoke pinned dom0's own default disposable template before its
+        # shutdown failed; every role action now refuses dom0 first.
+        dom0 = self.app.domains["dom0"]
+        dom0.default_dispvm = self.app.domains["default-dvm"]
+        before = (set(dom0.tags), dom0.default_dispvm)
+        for action in (fleet.manage, fleet.guard, fleet.revoke):
+            with self.assertRaises(fleet.RoleError) as cm:
+                action(self.app, "dom0")
+            self.assertIn("is dom0", str(cm.exception))
+        self.assertEqual((set(dom0.tags), dom0.default_dispvm), before)
+
     def test_a_qube_joins_ai_space_only_on_an_enrolled_network(self):
         with self.assertRaises(fleet.RoleError) as cm:
             fleet.manage(self.app, "personal")                    # on sys-firewall

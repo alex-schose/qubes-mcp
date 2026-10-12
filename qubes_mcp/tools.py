@@ -1319,6 +1319,139 @@ def _qubes_propose_open(args: dict) -> dict:
     return _submit("qube-open", args)
 
 
+@_register("qubes_propose_manage", _proposal_doc("""
+    Propose managing a qube: adopting it into AI space, or un-guarding it.
+
+    Accepting runs `qmcp manage QUBE`. A qube outside AI space, which this
+    hub cannot see today, joins it managed; a guarded qube leaves the guarded
+    state. There is no time limit: from then on this hub may run commands in
+    it as root, copy files out of it, write its firewall rules, clone it and
+    remove it, until the operator guards or revokes it. It does not change
+    the qube's network, and a qube adopted this way joins no slot.
+
+    For a bounded stretch in a guarded qube, qubes_propose_open is the way
+    in; ask for this only when the qube should stay the hub's. Say in the
+    title which qube it is and what it is for: this always needs the
+    operator's second tick, and those words are what they read.
+
+    - qube: the qube to manage. The command refuses dom0, the hub, a drop
+      box, a gateway (gateways are always guarded), a qube held for review, a
+      qube wearing qmcp badges whose dom0 label is not its own, one on a
+      network that is not an enrolled gateway, and, from this hub, a qube that
+      holds a PCI device (a USB or network controller) or whose devices cannot
+      be read. Managing a template lets this
+      hub change what every qube built on it runs, from their first start
+      after the template has shut down.
+
+    A qube of a hidden project fails at accept exactly as a name that does
+    not exist.
+    """), {
+        "title": _TITLE,
+        "qube": _prop("string", "The qube to manage: one outside AI space to adopt, or a guarded "
+                                "one to take out of the guarded state."),
+    }, required=("title", "qube"))
+def _qubes_propose_manage(args: dict) -> dict:
+    return _submit("qube-manage", args)
+
+
+@_register("qubes_propose_revoke", _proposal_doc("""
+    Propose revoking a qube: handing it back to the operator, out of reach.
+
+    Accepting runs `qmcp revoke QUBE`: every qmcp badge comes off, so the
+    qube leaves AI space and any project slot it is in, with what it holds,
+    and its default disposable template is set to none. From then on dom0
+    answers this hub and every lead about it as about a name that does not
+    exist; bringing it back takes the operator, or an accepted
+    qubes_propose_manage. It is shut down
+    unless shutdown is false, though Qubes refuses to shut down a gateway
+    while a qube on it runs. Nothing is removed: the qube and its files
+    stay, outside AI space.
+
+    The command refuses a lead (a lead is removed or replaced with
+    qubes_propose_lead) and a qube held for review, and accepting fails for a
+    qube outside AI space: this hub revokes only what it can see. Say in the title which
+    qube it is and why it goes back: this always needs the operator's second
+    tick, and those words are what they read.
+
+    - qube: the qube to revoke.
+    - shutdown: false to leave it running, which only a guarded qube that is
+      not open may be: one this hub could run commands in is always shut
+      down, so what this hub started in it does not run on outside AI space,
+      and false makes the accept fail. Omitted or null, it is shut down; the
+      stored proposal always holds which.
+
+    A qube of a hidden project fails at accept exactly as a name that does
+    not exist.
+    """), {
+        "title": _TITLE,
+        "qube": _prop("string", "The qube to revoke."),
+        "shutdown": _prop(["boolean", "null"], "false leaves the qube running. Omitted or null, "
+                                               "it is shut down (true)."),
+    }, required=("title", "qube"))
+def _qubes_propose_revoke(args: dict) -> dict:
+    return _submit("qube-revoke", args)
+
+
+@_register("qubes_propose_packages", _proposal_doc("""
+    Propose installing exact distro packages into a template in AI space.
+
+    Accepting runs `qmcp template install TEMPLATE PKG...`: dom0 installs
+    those packages and what they depend on (not recommended or weak
+    dependencies) into the TemplateVM, as root, with the template's own
+    package manager (apt-get, dnf or pacman, whichever it has), from the
+    repositories the template already trusts, over the path its updates
+    already take. First the template checks that each name is a package's
+    exact name in those repositories; one that is not refuses the whole
+    install, and nothing is installed. An install that would remove an
+    installed package is refused too, though one may be upgraded when a new
+    one needs it, and on Arch -Su may replace a package as the repositories
+    say. On Arch the install also upgrades the
+    whole template (pacman -Sy, then -Su with the names), as Qubes' own
+    updater does. Every qube built on the template runs the packages from
+    its first start after the template has shut down. A halted template is
+    started for the install and shut down again; an install may take
+    minutes, and the proposal reads pending while it runs. After 30 minutes
+    dom0 stops waiting and the proposal reads failed, though in a template
+    that was already running the install may still be going on, or may have
+    stopped part-way.
+
+    This hub chooses the names, and the install runs no command this hub
+    wrote. But the install scripts of each package and each dependency run
+    there as root, and a package can itself add a repository or download more
+    software when it is installed (one that configures repositories, or an
+    "-installer" package): name only packages whose installing does what the
+    work needs. Use it to get distro packages
+    into a guarded template without opening it: qubes_propose_open gives
+    root in a qube for a while, this gives exactly a package list. Say in the
+    title what the packages are for: this always needs the operator's second
+    tick, and those words are what they read.
+
+    - template: a TemplateVM in AI space, guarded or managed (not a
+      disposable template or a standalone), not stopped by the anonymity gate,
+      not held for review, and with no other install or prepare running in it.
+    - packages: 1-32 names, each exactly as the repositories name the
+      package, each once: letters, digits, '.', '_', '+' and '-', a letter or
+      digit first, at most 100 characters, not ending in '-'. No versions,
+      groups, globs, patterns or architecture suffixes: apt would read an
+      unknown name with a '.' as a regex, and dnf a versioned name as a
+      downgrade, so the template refuses any name that is not a package's
+      own.
+
+    A template of a hidden project fails at accept exactly as a name that
+    does not exist.
+    """), {
+        "title": _TITLE,
+        "template": _prop("string", "The TemplateVM in AI space, guarded or managed."),
+        "packages": _prop("array", "1-32 exact package names, each once: letters, digits, '.', "
+                                   "'_', '+' and '-', a letter or digit first, at most 100 "
+                                   "characters, not ending in '-'. No versions, groups, globs or "
+                                   "architecture suffixes.",
+                          items={"type": "string"}),
+    }, required=("title", "template", "packages"))
+def _qubes_propose_packages(args: dict) -> dict:
+    return _submit("template-install", args)
+
+
 @_register("qubes_proposals", """
     List the hub's proposals and what became of them, or show one in full.
 
@@ -1326,9 +1459,11 @@ def _qubes_propose_open(args: dict) -> dict:
     expires, sha256}, ...]}, newest first. With id, the reply is that one
     entry's fields plus "proposal": the options as dom0 stored them, which
     is what the operator reads and accepts. dom0 fills in every optional
-    field but model and model_qube, which appear only when given, and
-    add_old_network, which appears only when true; a firewall proposal holds
-    whichever of model, model_qube and rules it was given.
+    field (a revoke always holds shutdown) but model and model_qube, which
+    appear only when given, add_old_network, anonymous and hub_sees, which
+    appear only when true, and lead_class, which appears only as
+    "standalone"; a firewall proposal holds whichever of model, model_qube
+    and rules it was given.
 
     state is one of:
     - pending: waiting for the operator (an accept running now reads pending).

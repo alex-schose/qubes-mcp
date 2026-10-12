@@ -36,13 +36,30 @@ lead can write it: their feature allowlist holds only `menu-items`,
 `default-menu-items`, `service.*` and `vm-config.*`, and no rule gives the hub
 or AI space an `admin.vm.feature` method. dom0 reads nothing back but the exit status. The qube may be
 hostile, so its output is discarded and every write has a timeout.
+
+- `install(app, name, packages)`, the operator's `qmcp template install` and
+  an accepted `template-install` proposal (0.9.28), installs exact package
+  names into a TemplateVM in AI space with the template's own package manager,
+  from the repositories it already trusts, over the path its updates already
+  use. dom0 runs one fixed script as root: a probe whose exit status names the
+  package manager, then that manager's install, which first checks inside the
+  template that every name is a package's exact name, not an expression its
+  package manager would widen (apt reads a name it does not know as a
+  regular expression, dnf a versioned name as a downgrade, pacman a group as
+  its members). dom0 decides on the exit status alone; the last lines of the
+  output are kept, read in bounded chunks, for the operator to read, escaped.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
+import re
+import shlex
 import subprocess
+import threading
+import time
 
 from qmcp import core, projects
 
@@ -64,6 +81,47 @@ UNKNOWN = "unknown: copied from a running qube"
 class InQubeError(Exception):
     """A prepare or a refresh that did not happen; the message names why, in
     fixed words, never the qube's own output."""
+
+
+class _OneWriter:
+    """One prepare or install in a qube at a time. Either may start a halted
+    qube and shut it down when it is done, which would stop the other one's
+    write part-way (a dpkg run, say), so the second refuses at once rather
+    than waiting. An flock on a file in /run/qmcp, released with the process.
+    The refresh never starts or stops a qube, so it takes none."""
+
+    def __init__(self, name: str) -> None:
+        self.path = os.path.join(core.RUN_DIR, f"inqube-{name}.lock")
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        import stat
+        old = os.umask(0o077)
+        try:
+            # Never through a link, and only a regular file of this process's
+            # owner: /run/qmcp is the services group's to write in.
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              0o600)
+        except OSError as e:
+            raise InQubeError(f"its lock cannot be opened ({type(e).__name__})") from None
+        finally:
+            os.umask(old)
+        st = os.fstat(self.fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(self.fd)
+            raise InQubeError(f"{self.path} is not a lock this command made: remove it")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            raise InQubeError("another prepare or install is running in it: try again when it "
+                              "has finished") from None
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        return False
 
 
 def read_services(directory: str | None = None) -> dict:
@@ -202,6 +260,11 @@ def prepare(app, name: str, timeout: float = TIMEOUT_S) -> dict:
                           f"(qmcp restored)")
     files = read_services()
     current = version(files)
+    with _OneWriter(name):
+        return _prepare(vm, name, files, current, timeout)
+
+
+def _prepare(vm, name, files, current, timeout) -> dict:
     power = vm.get_power_state()
     started = False
     if power == "Halted":
@@ -342,3 +405,315 @@ def findings(vms, records: dict, tags_by: dict, add, directory: str | None = Non
         add("pass", "in-qube services",
             f"{len(roots)} template(s) and standalone(s) qmcp runs commands in carry the "
             f"installed version")
+
+
+# ======================================================================= packages (0.9.28)
+
+#: A package name: letters, digits, `.`, `_`, `+` and `-`, a letter or digit
+#: first. No `/`, `:`, `=`, `@`, `*`, `?`, `(` or space, so no release, arch,
+#: version, group, glob, path, URL or provides expression gets past the shape;
+#: and never a `-` last, which apt reads as "remove this package". What is left
+#: is checked again inside the template (`install`), against its own
+#: repositories, because apt still reads a name with a `.` that it does not know
+#: as a regular expression and dnf a name with a version as that version.
+PACKAGE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]{0,99}\Z")
+MAX_PACKAGES = 32
+#: Seconds an install may take: a template's package lists refreshed through
+#: its update proxy, and on Arch the whole template upgraded (`-Su`).
+INSTALL_TIMEOUT_S = 1800
+#: Seconds the probe for the package manager may take.
+PROBE_TIMEOUT_S = 60
+#: Bytes of the install's output kept for the operator (the last ones), and the
+#: lines of that shown: room for a version line for each of MAX_PACKAGES, last.
+TAIL_BYTES = 64 * 1024
+TAIL_LINES = 40
+#: The probe's exit status for each package manager it finds, in this order.
+MANAGERS = {10: "apt-get", 11: "dnf", 12: "pacman"}
+PROBE = (b"if command -v apt-get >/dev/null 2>&1; then exit 10; fi\n"
+         b"if command -v dnf >/dev/null 2>&1; then exit 11; fi\n"
+         b"if command -v pacman >/dev/null 2>&1; then exit 12; fi\n"
+         b"exit 13\n")
+#: What the install script's own exit statuses mean; any other is the package
+#: manager's.
+NOT_A_NAME = 20
+NO_REFRESH = 21
+
+
+def package_refusal(name) -> str | None:
+    """Why `name` is not a package name dom0 passes on, or None."""
+    if not isinstance(name, str) or not PACKAGE_RE.match(name):
+        # Its own escapes inside plain quotes: the window escapes the message
+        # again, and JSON's quotes would show there as \".
+        if not isinstance(name, str):
+            return "a package name is text: letters, digits, '.', '_', '+' and '-'"
+        shown = json.dumps(name, ensure_ascii=True)[1:-1][:60]
+        return (f"'{shown}' is not a package name: letters, digits, '.', '_', '+' and '-', a "
+                f"letter or digit first, at most 100")
+    if name.endswith("-"):
+        return f"'{name}' ends in '-', which apt reads as removing the package"
+    return None
+
+
+def packages_refusal(packages) -> str | None:
+    """Why `packages` is not a list dom0 installs, or None."""
+    if not isinstance(packages, (list, tuple)) or not 1 <= len(packages) <= MAX_PACKAGES:
+        return f"name 1 to {MAX_PACKAGES} packages"
+    for name in packages:
+        why = package_refusal(name)
+        if why:
+            return why
+    if len(set(packages)) != len(packages):
+        return "a package is named twice"
+    return None
+
+
+def install_script(manager: str, packages) -> bytes:
+    """The script `qubes.VMShell` runs as root to install `packages`: check
+    that each one is a package's exact name in the template's repositories,
+    then install them non-interactively, keeping a changed configuration
+    file on apt as Qubes' own updater does, never recommended or weak
+    dependencies, refusing an install that would remove an installed package
+    (apt's `--no-remove`, since `-y` would otherwise remove one that conflicts;
+    dnf removes none without `--allowerasing`) and ignoring dnf's obsoletes,
+    and on Arch through `-Sy` then `-Su`, never a partial upgrade. Every name has passed `packages_refusal`, and is quoted
+    anyway. Its exit status is the install's; after a successful one it
+    prints each package's installed version last, because the lines before
+    can be anything (on Debian, Qubes' own hook lists every pending upgrade
+    after each run, measured: 20 of them buried the install)."""
+    names = " ".join(shlex.quote(p) for p in packages)
+    if manager == "apt-get":
+        # `apt-cache pkgnames` matches a prefix, never a pattern; the exact
+        # line must be there. A virtual package is no package name here.
+        lines = ["export DEBIAN_FRONTEND=noninteractive",
+                 f"apt-get -q update || exit {NO_REFRESH}",
+                 f"for n in {names}; do",
+                 '  apt-cache pkgnames "$n" | grep -qxF -- "$n" || '
+                 f'{{ echo "not a package name here: $n"; exit {NOT_A_NAME}; }}',
+                 "done",
+                 "apt-get install -y -q --no-remove -o Dpkg::Options::=--force-confdef "
+                 "-o Dpkg::Options::=--force-confold --no-install-recommends -- " + names
+                 + " || exit $?",
+                 "dpkg-query -W -f='installed: ${Package} ${Version}\\n' -- " + names
+                 + " || true"]
+    elif manager == "dnf":
+        # dnf5 refuses `--`; no name starts with `-`. A versioned or
+        # arch-qualified name resolves to another name, and is refused. The
+        # metadata is fetched first, so a name is never refused for lists it
+        # could not fetch; weak dependencies stay out, as apt's recommends do.
+        lines = [f"dnf -q makecache || exit {NO_REFRESH}",
+                 f"for n in {names}; do",
+                 '  [ "$(dnf -q repoquery --qf \'%{name}\\n\' "$n" 2>/dev/null | sort -u)" = "$n" ] || '
+                 f'{{ echo "not a package name here: $n"; exit {NOT_A_NAME}; }}',
+                 "done",
+                 "dnf -y -q --setopt=install_weak_deps=False --setopt=obsoletes=0 install "
+                 + names + " || exit $?",
+                 "rpm -q --qf 'installed: %{NAME} %{VERSION}-%{RELEASE}\\n' " + names
+                 + " || true"]
+    elif manager == "pacman":
+        # `-Sy`, the check, then `-Su` with the names: `-Syu` in two steps,
+        # never a partial upgrade. A group or a provided name is no package.
+        lines = [f"pacman --noconfirm -Sy || exit {NO_REFRESH}",
+                 f"for n in {names}; do",
+                 '  pacman -Si "$n" >/dev/null 2>&1 || '
+                 f'{{ echo "not a package name here: $n"; exit {NOT_A_NAME}; }}',
+                 "done",
+                 "pacman --noconfirm --needed -Su " + names + " || exit $?",
+                 "pacman -Q " + names + " | sed 's/^/installed: /' || true"]
+    else:
+        raise InQubeError(f"no install for the package manager {manager}")
+    return ("\n".join(["set -u"] + lines + ["exit 0"]) + "\n").encode("ascii")
+
+
+def _run_bounded(vm, script: bytes, timeout: float, keep: int = TAIL_BYTES) -> tuple:
+    """Run `script` as root in the RUNNING qube `vm` and return (exit status,
+    the last `keep` bytes of its output). The output is read in chunks and only
+    its tail kept, so a qube that writes without end costs dom0 `keep` bytes
+    and the timeout, never more. Raises InQubeError."""
+    try:
+        proc = vm.run_service("qubes.VMShell", user="root", autostart=False,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+    except Exception as e:
+        raise InQubeError(f"could not reach it ({type(e).__name__})") from None
+    tail = bytearray()
+
+    def read() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    return
+                tail.extend(chunk)
+                if len(tail) > keep:
+                    del tail[:len(tail) - keep]
+        except Exception:
+            return
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        proc.stdin.write(script)
+    except Exception:
+        pass                    # it stopped reading: its exit status says why
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        late = InQubeError(f"it did not finish in {int(timeout)} s")
+        late.timed_out = True
+        reader.join(5)
+        late.tail = bytes(tail)
+        raise late from None
+    finally:
+        reader.join(5)
+        # Closed only once the reader has finished: closing a pipe another
+        # thread is still blocked reading waits on that read, and a qube
+        # that kept the pipe open would hang the command for good. A reader
+        # still blocked is a daemon thread, gone when the command exits.
+        if not reader.is_alive():
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+    return rc, bytes(tail)
+
+
+def shown_tail(data: bytes, lines: int = TAIL_LINES) -> list:
+    """The last `lines` lines of a qube's output, each escaped as JSON escapes
+    a string (a control character, a bidi override, any non-ASCII as `\\uXXXX`),
+    so the operator reads its words and never its layout."""
+    text = data.decode("utf-8", errors="replace")
+    out = [json.dumps(line[:300], ensure_ascii=True)[1:-1]
+           for line in text.replace("\r", "\n").split("\n") if line.strip()]
+    return out[-lines:]
+
+
+def probe_manager(vm, timeout: float = PROBE_TIMEOUT_S) -> str:
+    """The template's package manager, by the probe's exit status alone."""
+    try:
+        rc, _ = _run_bounded(vm, PROBE, timeout, keep=0)
+    except InQubeError as e:
+        raise InQubeError(f"the probe for its package manager: {e}") from None
+    if rc not in MANAGERS:
+        raise InQubeError("it has none of apt-get, dnf and pacman" if rc == 13
+                          else f"the probe for its package manager exited {rc}")
+    return MANAGERS[rc]
+
+
+def install_refusal(vm, name: str) -> str | None:
+    """Why `install` refuses the qube `vm`, or None. Raises core.Unreadable."""
+    klass = core.klass_of(vm)
+    if klass != "TemplateVM":
+        return (f"'{name}' is a {klass}: packages go into a TemplateVM, whose qubes take its "
+                f"root at every start")
+    tags = core.tags_of(vm)
+    if core.UMBRELLA not in tags:
+        return f"'{name}' is not in AI space: qmcp installs packages only in AI space's templates"
+    if tags & {projects.BLOCKED, projects.STOPPED}:
+        return (f"'{name}' was stopped by the anonymity gate, and an install would start it: "
+                f"clear it first (qmcp project unblock)")
+    if core.QUARANTINE in tags:
+        return f"'{name}' is held for your review: accept or reject it first (qmcp restored)"
+    if projects.HUBBLIND in tags:
+        return f"'{name}' is a hidden project's qube"
+    return None
+
+
+def install(app, name: str, packages, timeout: float = INSTALL_TIMEOUT_S) -> dict:
+    """Install `packages` into the TemplateVM `name`. Returns {"qube",
+    "manager", "packages", "ok", "status", "started", "lines"}: `ok` is the
+    exit status alone, `lines` the escaped tail of the output, `stopped`
+    whether a template this started shut down again (None when it was already
+    running). A halted template is started for it and shut down again after; a
+    running one keeps running. Raises InQubeError or core.Unreadable before the install's script
+    ran, saying what became of a template it started (shut down again, or a
+    shutdown that did not complete); a script that did not finish in
+    `timeout` is a result, not an error, since it may have changed the
+    template."""
+    why = packages_refusal(packages)
+    if why:
+        raise InQubeError(why)
+    vm = core.lookup(app, name)
+    if vm is None or core.klass_of(vm) == "AdminVM":
+        raise InQubeError(f"no qube '{name}'")
+    why = install_refusal(vm, name)
+    if why:
+        raise InQubeError(why)
+    with _OneWriter(name):
+        return _install(vm, name, packages, timeout)
+
+
+def _install(vm, name, packages, timeout) -> dict:
+    power = vm.get_power_state()
+    started = False
+    if power == "Halted":
+        try:
+            vm.start()
+        except Exception as e:
+            raise InQubeError(f"'{name}' did not start ({type(e).__name__})") from None
+        started = True
+    elif power != "Running":
+        raise InQubeError(f"'{name}' is {power}: install while it runs or is halted")
+    late, stopped, early = None, None, None
+    try:
+        try:
+            manager = probe_manager(vm)
+            t0 = time.monotonic()
+            rc, out = _run_bounded(vm, install_script(manager, packages), timeout)
+        except InQubeError as e:
+            if not getattr(e, "timed_out", False):
+                early = e
+            else:
+                late, rc, out = e, None, e.tail
+        took = int(time.monotonic() - t0) if early is None else 0
+    finally:
+        if started:
+            try:
+                vm.shutdown(wait=True)
+                stopped = True
+            except Exception:
+                stopped = False
+    if early is not None:
+        # Stopped before the install's script ran (the probe, or reaching the
+        # qube): said with what became of a template this started.
+        tail = ("" if not started else
+                "; it was started for this and shut down again" if stopped else
+                f"; it was started for this, and its shutdown did not complete: qvm-kill {name}")
+        raise InQubeError(f"{early}{tail}") from None
+    if late is not None:
+        # Killing dom0's end stops nothing inside the qube: in a template that
+        # was running, the script runs on; one this started is shut down now,
+        # which stops it wherever it was.
+        if stopped:
+            then = ("the template was shut down, which stopped the install part-way, so it may "
+                    "need repair")
+        elif started:
+            then = (f"its shutdown did not complete, so the install may still be running: "
+                    f"qvm-kill {name}")
+        else:
+            then = ("dom0 stopped reading its output, so the install may still be running, or "
+                    "may have stopped part-way: check the template (dpkg --audit, dnf check, "
+                    "pacman -Dk) before relying on it")
+        status = f"{manager} did not finish in {took} s, and dom0 stopped waiting: {then}"
+    elif rc == 0:
+        status = f"installed with {manager} in {took} s (the template's exit status)"
+    elif rc == NOT_A_NAME:
+        status = (f"refused inside the template before anything was installed, by its report: a "
+                  f"name is not a package's exact name in its repositories (its output, below, "
+                  f"says which)")
+    elif rc == NO_REFRESH:
+        status = (f"{manager} could not refresh the package lists, by the template's report, so "
+                  f"nothing was installed: is its update proxy reachable (Global Config, "
+                  f"Updates)?")
+    else:
+        status = f"{manager} exited {rc} after {took} s: read its output below"
+    return {"qube": name, "manager": manager, "packages": list(packages), "ok": rc == 0,
+            "status": status, "started": started, "stopped": stopped, "lines": shown_tail(out)}

@@ -154,6 +154,14 @@ def from_hub(inside, lead=None, model=None):
     check("a proposal of an unknown type is refused", b"invalid proposal" in out, f"{out[:120]!r}")
     rc, out = raw("@adminvm", "qmcp.SubmitProposal", b'{"title":"' + b"x" * 70000 + b'"}')
     check("an oversized proposal is refused before parsing", b"request too large" in out, f"{out[:120]!r}")
+    # A package list holds names, never an expression a package manager would
+    # widen: a removal (apt's trailing "-"), a glob, a version, a group.
+    for expr in ("sl-", "bas*", "openssl=3.0", "@core", "-y"):
+        req = json.dumps({"type": "template-install", "title": "x", "template": GUARDED_QUBE,
+                          "packages": [expr]}).encode()
+        rc, out = raw("@adminvm", "qmcp.SubmitProposal", req)
+        check(f"a package expression {expr!r} is refused at submit",
+              b"invalid proposal" in out and b"packages" in out, f"{out[:120]!r}")
     rc, out = raw("@adminvm", "qmcp.ProposalStatus", b"{}")
     check("the hub reads its proposals' states", rc == 0 and b'"proposals"' in out, f"{out[:120]!r}")
     # A name says who owns a qube: the hub's are ai-hub-..., judged on the name alone.

@@ -1784,12 +1784,32 @@ def _label(vm, name) -> None:
                         f"changed") from None
 
 
-def _target(app, name):
+def _target(app, name, sealing: bool = False, from_hub: bool = False):
+    """The qube a role action or a window acts on. With the hub file unread,
+    any name may be the hub, so every action refuses but `sealing`: taking a
+    window off only ever lowers authority, and must work then too (the boot
+    seal and the expiry pass run it). `from_hub`: for an accepted proposal, a
+    hidden project's qube answers first, as a name that does not exist, on
+    the tags read here, before any refusal that would name what it is."""
     if not core.valid_qube_name(name) or name not in app.domains:
         raise RoleError(f"no qube named '{name}'")
-    if name == core.read_hub():
+    if from_hub and projects.HUBBLIND in _read_tags(app.domains[name]):
+        raise RoleError(f"no qube named '{name}'")
+    hub = core.read_hub()
+    if hub is None and not sealing:
+        raise RoleError(f"{core.HUB_PATH} cannot be read, so whether '{name}' is the hub is not "
+                        f"known; fix it first (qmcp check)")
+    if name == hub:
         raise RoleError(f"'{name}' is the hub; the hub is never in AI space")
     vm = app.domains[name]
+    try:
+        admin = core.klass_of(vm) == "AdminVM"
+    except core.Unreadable as e:
+        raise RoleError(f"{e}; try again") from None
+    if admin:
+        # Before any write: revoke would otherwise pin dom0's own default
+        # disposable template before its shutdown failed.
+        raise RoleError(f"'{name}' is dom0, which is never in AI space")
     if "ai-dump" in _read_tags(vm):
         raise RoleError(f"'{name}' is a drop box (ai-dump); a drop box is never in AI space")
     return vm
@@ -1851,9 +1871,29 @@ def _mode_badge(vm, name) -> None:
                             f"so it was not added to AI space") from None
 
 
-def manage(app, name) -> str:
-    vm = _target(app, name)
+def pci_devices(vm) -> int:
+    """How many PCI devices are assigned to the qube. Raises RoleError when
+    that cannot be read: a failed read is never "none"."""
+    try:
+        return len(list(vm.devices["pci"].get_assigned_devices()))
+    except Exception as e:
+        raise RoleError(f"'{core.name_of(vm)}''s devices cannot be read ({type(e).__name__}); "
+                        f"try again") from None
+
+
+def manage(app, name, from_hub: bool = False) -> str:
+    """`qmcp manage`. `from_hub`: the command an accepted `qube-manage` runs,
+    which also refuses a hidden project's qube (as a name that does not
+    exist) and a qube that holds a PCI device (the hub would have root over
+    a USB or network controller); the operator's own command takes both."""
+    vm = _target(app, name, from_hub=from_hub)
     _refuse_held(vm, name)
+    if from_hub:
+        held = pci_devices(vm)
+        if held:
+            raise RoleError(f"'{name}' holds {held} PCI device(s): a hub's proposal cannot manage "
+                            f"a qube that holds a device (qmcp manage {name} yourself if you "
+                            f"mean it)")
     if _is_gateway(vm):
         raise RoleError(f"'{name}' provides network; gateways are always guarded (qmcp guard)")
     _network_enrolled(vm, name)
@@ -1873,11 +1913,19 @@ def manage(app, name) -> str:
                         + f", but {e}; run qmcp manage {name} again") from None
     for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
         vm.tags.discard(t)
+    # An open window ends: a managed qube needs none, and a badge left on it
+    # would have the expiry pass kill it. No kill here: it is the hub's now.
+    ended = ""
+    if tags & {core.OPEN, core.OPEN_FW}:
+        for t in (core.OPEN_FW, core.OPEN):
+            vm.tags.discard(t)
+        clear_window(name)
+        ended = "; its open window ended, with no kill: it is managed now"
     serves = projects.model_slots(tags)
     kind = _model_qube_kind(vm) if serves else False
     if kind is False:
         # No model qube, whatever it wears: qmcp check fails on the badge.
-        return f"{name}: managed"
+        return f"{name}: managed" + ended
     return (f"{name}: managed; it is still the model qube of {', '.join(sorted(serves))}: "
             f"while it is managed the hub may operate it (qmcp guard {name} when its changes "
             f"are done" + (", which kills it if it runs)" if kind else ")"))
@@ -2021,13 +2069,26 @@ def _kill_model_qube(report, slot, vm, name, managed: bool, guard_failed: str = 
                            f"run the command again")
 
 
-def revoke(app, name, shutdown: bool = True) -> str:
+def revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
     """Strip every AI-space badge, pin default_dispvm, and shut the qube down
-    Restrictions such as an egress lock go too: revoke is yours."""
-    vm = _target(app, name)
-    if _held(_read_tags(vm)):
+    Restrictions such as an egress lock go too: revoke is yours. `from_hub`:
+    the command an accepted `qube-revoke` runs, which also refuses a hidden
+    project's qube (as a name that does not exist), a qube outside AI space
+    (the hub cannot see it), and keeping running a qube the hub could run
+    commands in (managed, or open), whose processes would run on outside AI
+    space."""
+    vm = _target(app, name, from_hub=from_hub)
+    before = _read_tags(vm)
+    if _held(before):
         raise RoleError(f"'{name}' is held for your review: reject it instead (qmcp restored "
                         f"reject {name}), which also removes its label")
+    if from_hub:
+        if core.UMBRELLA not in before:
+            raise RoleError(f"'{name}' is not in AI space: the hub revokes only a qube it can see")
+        reachable = (core.GUARDED not in before) or bool(before & {core.OPEN, core.OPEN_FW})
+        if reachable and not shutdown:
+            raise RoleError(f"the hub could run commands in '{name}', so a hub's proposal to "
+                            f"revoke it shuts it down: propose it without shutdown false")
     _not_in_a_slot(vm, name, "revoke")
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
@@ -2038,6 +2099,8 @@ def revoke(app, name, shutdown: bool = True) -> str:
                         f"again") from None
     if left:
         raise RoleError(f"'{name}' still wears {', '.join(left)}; run qmcp revoke {name} again")
+    if before & {core.OPEN, core.OPEN_FW}:
+        clear_window(name)              # its badges went with the rest
     try:
         _pin_dispvm(vm, name)
     except RoleError as e:
@@ -2248,7 +2311,7 @@ def seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
     run twice. `kill` is false only where a caller has decided the cost of a
     kill is not worth paying; the operator's own `qmcp seal` always pays it.
     """
-    vm = _target(app, name)
+    vm = _target(app, name, sealing=True)
     tags = _read_tags(vm)
     worn = sorted(tags & {core.OPEN, core.OPEN_FW}, key=_removal_order)
     if not worn:
@@ -2262,6 +2325,10 @@ def seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
     clear_window(name, dir_)
     if not kill:
         return f"{name}: sealed"
+    if core.read_hub() is None:
+        # The badges are off; only the kill needs to know this is not the hub.
+        return (f"{name}: sealed, but not killed: {core.HUB_PATH} cannot be read, so it may be "
+                f"the hub; if it is not, kill it by hand (qvm-kill {name})")
     done = _kill_if_running(vm)
     if done == "killed":
         return (f"{name}: sealed and killed, so nothing the hub started in it runs on; what it "

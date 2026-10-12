@@ -119,6 +119,14 @@ PROPOSALS = {
              "qube": "ai-tpl-g", "for": "2h"},
     "openfw": {"type": "qube-open", "title": "the model qube needs its rules",
                "qube": MODEL, "for": "30m", "firewall": True},
+    # A qube adopted into AI space, one revoked and left running, and exact
+    # packages for the guarded template: each always needs the second tick.
+    "manage": {"type": "qube-manage", "title": "adopt the operator's personal qube",
+               "qube": "personal"},
+    "revoke": {"type": "qube-revoke", "title": "done with ai-work2", "qube": "ai-work2",
+               "shutdown": False},
+    "install": {"type": "template-install", "title": "curl and jq for the reference template",
+                "template": "ai-tpl-g", "packages": ["curl", "jq"]},
 }
 HOSTILE = "ai-x\u202egnp.exe\nFAKE ok:true <b>bold</b> &amp; \x00\x7f\u200b\x1b[31m"
 
@@ -320,15 +328,16 @@ class GuiBase(ProjectBase):
     #: The fixtures `submit_every_proposal` decides as it goes: `dump` is
     #: accepted, the rest rejected, so a decision with a report is read as well
     #: and the pending ones stay under `proposals.MAX_PENDING`.
-    DECIDED = ("dump", "lead", "anon", "qfw", "qnone", "openfw")
+    DECIDED = ("dump", "lead", "anon", "qfw", "qnone", "openfw", "manage", "revoke")
 
     def submit_every_proposal(self):
         """One proposal of every shape in PROPOSALS, through the real service:
-        `dump` accepted and five rejected as soon as each is in, so a decision
-        with a report is read as well and the pending ones stay within the cap
-        (`proposals.MAX_PENDING`). The cap is checked at submit, and PROPOSALS
-        is half again as long as the cap, so the rejections are what keeps room
-        for the next shape added here. `open` stays PENDING: only a pending
+        `dump` accepted and the rest of DECIDED rejected as soon as each is in,
+        so a decision with a report is read as well and the pending ones stay
+        within the cap (`proposals.MAX_PENDING`). The cap is checked at submit,
+        and PROPOSALS is longer than the cap, so the rejections are what keeps
+        room for the next shape added here (with 18 shapes and 8 decided, the
+        last one fills it). `open` and `install` stay PENDING: only a pending
         proposal shows its second-tick reasons, which is what the tests below
         read."""
         ids = {}
@@ -549,6 +558,8 @@ SAMPLES = {
     gm.settings_set: [dict(pool_cap="2000G", private_cap="30G", birth_egress="ai-net-router"),
                       dict(birth_egress="none")],
     gm.prepare_template: [dict(qube="debian-13")],
+    gm.install_packages: [dict(template="ai-tpl-g", packages="curl jq"),
+                          dict(template="ai-debian-13", packages=" g++\tgir1.2-gtk-3.0\n")],
     gm.restored_accept: [dict(qubes="ai-back"), dict(qubes=["ai-back", "ai-back2"])],
     gm.restored_reject: [dict(qube="ai-back")],
     gm.export_config: [dict(), dict(file="/tmp/qmcp-export.json")],
@@ -706,19 +717,25 @@ class Parity(GuiBase):
         # Named is not enough: each field that carries something is on screen.
         self.assertEqual({"proposal", "before", "after", "decision"}, set(gm.PROPOSAL_BY_PART))
         self.assertTrue(any(doc["tick"] for doc in docs))
+        headed = set()
         for doc in docs:
             shown = {h for h, _ in gm.proposal_details(doc)}
             change = gm.FIREWALL_CHANGE if doc["type"] == "project-firewall" else gm.EDIT_FIELDS
-            parts = {"proposal": gm.PROPOSAL_OPTIONS, "before": change, "after": change,
-                     "decision": gm.DECISION_FIELDS}
+            parts = {"before": change, "after": change, "decision": gm.DECISION_FIELDS}
             for key, heading in gm.PROPOSAL_SHOW_FIELDS:
                 if doc[key] or (key == "second_tick" and doc["state"] == "pending"):
                     self.assertIn(heading, shown, (doc["id"], key))
+            # Every option under the heading its type gives it.
+            for key in set(doc["proposal"]) - {"type", "title"}:
+                self.assertIn(gm.option_heading(doc["type"], key), shown, (doc["id"], key))
+                headed.add((doc["type"], key))
             for key, table in parts.items():
                 if doc[key]:
                     self.assertTrue({h for _, h in table} & shown, (doc["id"], key))
             if doc["type"] == "project-firewall" and doc["before"] is not None:
                 self.assertLessEqual({h for _, h in gm.FIREWALL_CHANGE}, shown)
+        # A heading kept for a type and option no proposal carries is stale.
+        self.assertLessEqual(set(gm.PROPOSAL_OPTION_HEADINGS), headed)
 
 
 # ======================================================================= the model
@@ -1059,7 +1076,8 @@ class ProposalModel(GuiBase):
                 self.assertIsInstance(value, gm.Shown)
             want = {h for k, h in gm.PROPOSAL_FIELDS
                     if not (k in ("problem", "needs_closing") and not doc[k])}
-            want |= {h for k, h in gm.PROPOSAL_OPTIONS if k in doc["proposal"]}
+            want |= {gm.option_heading(doc["type"], k) for k, _ in gm.PROPOSAL_OPTIONS
+                     if k in doc["proposal"]}
             if doc["command"] is not None:
                 want.add("Equivalent command")
             if doc["state"] == "pending":
@@ -1353,6 +1371,56 @@ class ProposalModel(GuiBase):
         edit = self.show(self.submit_proposal("edit")["id"])
         self.assertIn("now -> after", gm.accept_intro(edit))
         self.assertIn("without running anything", gm.reject_intro(doc))
+
+    def test_a_qube_proposal_says_what_it_does_to_its_qube(self):
+        # Before 0.9.28 the one proposal naming a qube opened it, and the pane
+        # headed the qube "Guarded qube to open"; a manage or a revoke under that
+        # heading would say the opposite of what accepting does.
+        want = {"open": ("Guarded qube to open", "ai-tpl-g", "the window closes by itself"),
+                "manage": ("Qube to manage", "personal", "MANAGES personal: the hub may then "
+                                                         "run commands in it as root"),
+                "revoke": ("Qube to revoke", "ai-work2", "REVOKES ai-work2: every qmcp badge "
+                                                          "comes off")}
+        headings = {h for h, _, _ in want.values()}
+        for name, (heading, qube, reason) in want.items():
+            reply = self.submit_proposal(name)
+            doc = self.show(reply["id"])
+            shown = dict(gm.proposal_details(doc))
+            self.assertEqual(shown[heading], qube, name)
+            self.assertFalse((headings - {heading}) & set(shown), name)
+            self.assertNotIn(dict(gm.PROPOSAL_OPTIONS)["qube"], shown, name)
+            self.assertEqual(gm.proposal_cells(self.listing()[0])[3], qube)
+            self.assertEqual(shown["Second tick"], "needed: the reasons are in red below")
+            self.assertIn(reason, gm.second_tick_text(doc), name)
+        self.assertEqual(dict(gm.PROPOSAL_COLUMNS)["subject"], "Subject")
+        manage = dict(gm.proposal_details(self.show(self.listing()[1]["id"])))
+        self.assertEqual(manage["Equivalent command"], "qmcp manage personal")
+        # Revoke: whether it shuts the qube down, in words, and in the command.
+        revoke = dict(gm.proposal_details(self.show(self.listing()[0]["id"])))
+        self.assertEqual(revoke["Shut down"], "no: it keeps running (--no-shutdown)")
+        self.assertEqual(revoke["Equivalent command"], "qmcp revoke ai-work2 --no-shutdown")
+        stops = self.show(self.submit_proposal("revoke", shutdown=True)["id"])
+        self.assertEqual(dict(gm.proposal_details(stops))["Shut down"],
+                         "yes: the command shuts it down if it runs")
+        self.assertEqual(stops["command"], "qmcp revoke ai-work2")
+        self.assertIn("; it is shut down", gm.second_tick_text(stops))
+        # An install: the template, the names as the command line has them, and
+        # an accept form that says the window waits for it.
+        install = self.show(self.submit_proposal("install")["id"])
+        shown = dict(gm.proposal_details(install))
+        self.assertEqual((shown["Template to install into"], shown["Packages (exact names)"]),
+                         ("ai-tpl-g", "curl jq"))
+        self.assertEqual(shown["Equivalent command"], "qmcp template install ai-tpl-g curl jq")
+        self.assertIn("INSTALLS 2 package(s) into the template ai-tpl-g as root",
+                      gm.second_tick_text(install))
+        self.assertIn("may take many minutes: the window waits for it", gm.accept_intro(install))
+        self.assertNotIn("many minutes", gm.accept_intro(stops))
+        # A qube that is not there: the plan says accepting fails.
+        gone = self.show(self.submit_proposal("manage", qube="ai-no-such")["id"])
+        self.assertEqual(dict(gm.proposal_details(gone))["Plan"],
+                         "there is no qube ai-no-such now: accepting it will fail")
+        self.assertEqual(gm.option_heading("qube-manage", "qube"), "Qube to manage")
+        self.assertEqual(gm.option_heading("project-create", "label"), "Label")
 
 
 # ======================================================================= gateways: the model
@@ -3204,6 +3272,128 @@ class RestoredModel(GuiBase):
             self.assertTrue(text.isascii() and "\n" not in text, text)
 
 
+class PackagesModel(GuiBase):
+    """Packages into a template in AI space (`template install`): where the
+    window offers it, the command it builds, and what it refuses before OK,
+    each against the real command and the fake's package manager."""
+
+    def offers(self, name) -> bool:
+        return "packages" in gm.actions(self.node(f"qube:{name}"), {})
+
+    def rows(self):
+        return {r["name"]: r for r in self.read_json("list", "--all", "--json")}
+
+    def test_offered_on_a_template_in_ai_space_the_command_takes(self):
+        a = self.app
+        a.vm("ai-stand", klass="StandaloneVM", tags={"ai-managed"})
+        a.vm("ai-tpl-stopped", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded",
+                                                         projects.STOPPED})
+        a.vm("ai-tpl-paused", klass="TemplateVM", tags={"ai-managed"}, power="Paused")
+        self.came_back("ai-tpl-back", tags=("ai-managed", "qmcp-guarded"), klass="TemplateVM",
+                       template=None)
+        offers = {name: self.offers(name)
+                  for name in ("ai-debian-13", "ai-tpl-g", "ai-tpl-paused", "ai-stand", "ai-work",
+                               "ai-dvm", "ai-dvm-g", "ai-tpl-stopped", "ai-tpl-back")}
+        self.assertEqual(offers, {"ai-debian-13": True, "ai-tpl-g": True, "ai-tpl-paused": True,
+                                  "ai-stand": False, "ai-work": False, "ai-dvm": False,
+                                  "ai-dvm-g": False, "ai-tpl-stopped": False,
+                                  "ai-tpl-back": False})
+        # A template outside AI space has no row in the tree to offer it from.
+        self.assertEqual([n for n in gm.walk(self.tree()) if n.key == "qube:debian-13"], [])
+        rows = self.rows()
+        self.assertIsNone(gm.install_refusal(rows["ai-debian-13"]))
+        self.assertIsNone(gm.install_refusal(rows["ai-tpl-g"]))
+        # A power state that did not read refuses nothing: the command reads it again.
+        self.assertIsNone(gm.install_refusal(dict(rows["ai-tpl-g"], power="unknown")))
+        self.assertEqual(gm.install_refusal(None), "choose a TemplateVM in AI space")
+        self.assertEqual(gm.install_refusal(dict(rows["ai-tpl-g"], state=gm.UNREADABLE)),
+                         "'ai-tpl-g' cannot be read now; refresh")
+
+    def test_the_row_is_refused_in_the_commands_words(self):
+        a = self.app
+        a.vm("ai-tpl-stopped", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded",
+                                                         projects.STOPPED})
+        a.vm("ai-tpl-paused", klass="TemplateVM", tags={"ai-managed"}, power="Paused")
+        a.vm("ai-tpl-hid", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded",
+                                                     projects.HUBBLIND})
+        self.came_back("ai-tpl-back", tags=("ai-managed", "qmcp-guarded"), klass="TemplateVM",
+                       template=None)
+        rows = self.rows()
+        words = {name: gm.install_refusal(rows[name]) for name in
+                 ("ai-work", "debian-13", "ai-tpl-stopped", "ai-tpl-back", "ai-tpl-hid",
+                  "ai-tpl-paused")}
+        self.assertEqual(words["ai-work"], "'ai-work' is a AppVM: packages go into a TemplateVM, "
+                                           "whose qubes take its root at every start")
+        self.assertEqual(words["debian-13"], "'debian-13' is not in AI space: qmcp installs "
+                                             "packages only in AI space's templates")
+        self.assertTrue(words["ai-tpl-stopped"].startswith(
+            "'ai-tpl-stopped' was stopped by the anonymity gate, and an install would start it"))
+        self.assertEqual(words["ai-tpl-back"], "'ai-tpl-back' is held for your review: accept or "
+                                               "reject it first (qmcp restored)")
+        self.assertEqual(words["ai-tpl-hid"], "'ai-tpl-hid' is a hidden project's qube")
+        self.assertEqual(words["ai-tpl-paused"], "'ai-tpl-paused' is Paused: install while it "
+                                                 "runs or is halted")
+        for name, why in words.items():
+            result = self.runner.execute(gm.install_packages(name, "curl"))
+            self.assertEqual(result.rc, 1, name)
+            self.assertIn(why, result.err, name)
+            self.assertEqual(self.app.domains[name].installed_packages(), [], name)
+        self.assertEqual(self.app.vmshell_scripts, [])              # nothing ran in a qube
+
+    def test_the_builder_makes_exactly_the_typed_command(self):
+        w = ["/usr/bin/sudo", "-n", gm.QMCP]
+        self.assertEqual(gm.install_packages("ai-tpl-g", " curl\tjq\n g++ "),
+                         w + ["template", "install", "ai-tpl-g", "curl", "jq", "g++"])
+        ns = cli.build_parser().parse_args(gm.install_packages("ai-tpl-g", "curl jq")[3:])
+        self.assertEqual((ns.cmd, ns.what, ns.qube, ns.packages),
+                         ("template", "install", "ai-tpl-g", ["curl", "jq"]))
+        self.assertIn("ai-tpl-g", gm.shown(gm.install_packages("ai-tpl-g", "curl")))
+
+    def test_the_builder_refuses_what_the_command_would_in_its_words(self):
+        from qmcp import inqube
+        names = " ".join(f"p{i}" for i in range(inqube.MAX_PACKAGES + 1))
+        for text in ("", "   ", "curl curl", "sl-", "bas*", "@core", "-y", "x/y", "pkg=1.0",
+                     "pkg:amd64", "pkgconfig(x)", "curl, jq", names, chr(0x202E) + "curl"):
+            with self.assertRaises(gm.FormError, msg=ascii(text)) as cm:
+                gm.install_packages("ai-tpl-g", text)
+            why = inqube.packages_refusal(text.split())
+            self.assertEqual(str(cm.exception), why, ascii(text))
+            self.assertTrue(why.isascii(), ascii(text))          # a typed bidi override, escaped
+            words = text.split()
+            if words and not words[0].startswith("-"):            # one the parser takes
+                result = self.runner.execute([*gm.SUDO, gm.QMCP, "template", "install",
+                                              "ai-tpl-g", *words])
+                self.assertEqual(result.rc, 1, ascii(text))
+                self.assertIn(why, result.err, ascii(text))
+        for bad in (None, ["curl"], 3):
+            with self.assertRaises(gm.FormError, msg=repr(bad)):
+                gm.install_packages("ai-tpl-g", bad)
+        with self.assertRaises(gm.FormError):
+            gm.install_packages("--evil", "curl")
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), [])
+
+    def test_the_command_the_form_builds_installs_and_reports(self):
+        tpl = self.app.domains["ai-tpl-g"]
+        self.assertEqual(tpl.get_power_state(), "Halted")
+        result = self.runner.execute(gm.install_packages("ai-tpl-g", "curl jq"))
+        self.assertEqual(result.rc, 0, result.err)
+        self.assertEqual(tpl.installed_packages(), ["curl", "jq"])
+        self.assertEqual(tpl.get_power_state(), "Halted")       # started for it, shut down again
+        lines = result.out.splitlines()
+        self.assertTrue(lines[0].startswith("ai-tpl-g: installed with apt-get in "), lines[0])
+        self.assertIn("ai-tpl-g was started for this and shut down again", result.out)
+        self.assertIn("the last lines apt-get wrote in ai-tpl-g, escaped:", result.out)
+        # The template's own words arrive escaped; the window escapes them again.
+        self.assertIn("\\u001b[31mred\\u202eevil", result.out)
+        self.assertTrue(gm.esc_lines(result.out).isascii())
+        # A name its repositories do not have refuses the whole install inside it.
+        result = self.runner.execute(gm.install_packages("ai-tpl-g", "sl nosuch"))
+        self.assertEqual(result.rc, 1)
+        self.assertIn("refused inside the template before anything was installed", result.out)
+        self.assertIn("not a package name here: nosuch", result.out)
+        self.assertEqual(tpl.installed_packages(), ["curl", "jq"])
+
+
 class CliReads(GuiBase):
     def test_check_json_keeps_the_exit_status(self):
         result = self.read("check", "--json")
@@ -3662,6 +3852,9 @@ class Widgets(GuiBase):
             # The Check tab's list of every template; a template's row has a
             # confirmation for itself (test_prepare_from_a_row_or_the_list).
             gm.prepare_template: (self.gui.PrepareForm(self.win, self.win.fleet), {"qube": "qube"}),
+            # A template's row: the template comes from it, the names are typed.
+            gm.install_packages: (self.gui.InstallForm(self.win, self.node("qube:ai-tpl-g").data),
+                                  {"template": "row_data", "packages": "packages"}),
         }
         for builder, (form, fields) in forms.items():
             params = set(inspect.signature(builder).parameters)
@@ -3687,7 +3880,7 @@ class Widgets(GuiBase):
                                              "show_lead_firewall", "unblock_project",
                                              "seal_qube", "restored_accept", "restored_reject"},
                           "a builder without a form")
-        for ident in ("prepare", "accept_restored", "reject_restored"):
+        for ident in ("prepare", "packages", "accept_restored", "reject_restored"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
         self.assertEqual(set(self.win.check_buttons), {"prepare_template", "accept_all_restored"})
         self.assertEqual(set(self.win.settings_buttons), {"edit_settings", "export", "import"})
@@ -4155,6 +4348,13 @@ class Widgets(GuiBase):
             self.one_line(form)
             argvs.append(form.argv())
             form.destroy()
+        # Packages into a template, from its row, by the names typed.
+        self.select("qube:ai-tpl-g")
+        form = self.win.act("packages")
+        form.packages.set_text("curl jq")
+        self.one_line(form)
+        argvs.append(form.argv())
+        form.destroy()
         covered = set()
         for argv in argvs:
             covered |= covered_by(parser, argv)
@@ -6204,6 +6404,111 @@ class Widgets(GuiBase):
                                                 "or reject it first (qmcp restored)")
         form.destroy()
 
+    def test_install_packages_from_a_templates_row(self):
+        self.select("qube:ai-work")                             # an AppVM: its template's root
+        self.assertNotIn("packages", self.sensitive())
+        self.select("qube:ai-tpl-g")
+        self.assertIn("packages", self.sensitive())
+        form = self.win.act("packages")
+        self.assertEqual(form.get_title(), "Install packages into ai-tpl-g")
+        intro = form.intro.get_text()
+        self.assertEqual(intro, gm.INSTALL_INTRO)
+        for words in ("a package's exact name", "one name that fails refuses the whole install",
+                      "pacman -Sy, then -Su with the names", "and what they depend on",
+                      "each package and each dependency run as root",
+                      "read the names", "decides on the install's exit status alone",
+                      "the window waits for it", "stops waiting and reports a failed step",
+                      "the install may still be running"):
+            self.assertIn(words, intro)
+        self.assertEqual(form.power.get_text(), "ai-tpl-g is halted: the command starts it for "
+                                                "this and shuts it down again after.")
+        # Refused before OK in the command's words, and the line follows the names.
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(), "name 1 to 32 packages")
+        form.packages.set_text("curl sl-")
+        self.one_line(form, ok=False)
+        self.assertEqual(form.error.get_text(),
+                         "'sl-' ends in '-', which apt reads as removing the package")
+        form.packages.set_text("curl jq")
+        self.one_line(form)
+        self.assertEqual(form.preview.get_text(), "/usr/bin/sudo -n /usr/local/bin/qmcp template "
+                                                  "install ai-tpl-g curl jq")
+        self.runner.calls.clear()
+        self.runner.timeouts.clear()
+        result = self.submit(form)
+        # As shown, it ran, with no time limit: an install may take many minutes.
+        self.assertEqual((self.runner.calls[0], self.runner.timeouts[0]), (result.argv, None))
+        self.assertEqual(self.reports[-1][0], "Install packages")
+        self.assertIn("ai-tpl-g: installed with apt-get", result.out)
+        self.assertIn("\\u001b[31mred\\u202eevil", result.out)  # the template's words, escaped
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), ["curl", "jq"])
+        # A name its repositories do not have: refused inside it, nothing installed.
+        self.select("qube:ai-tpl-g")
+        form = self.win.act("packages")
+        form.packages.set_text("sl nosuch")
+        result = self.submit(form, ok=False)
+        self.assertIn("refused inside the template before anything was installed", result.out)
+        self.assertNotIn("sl", self.app.domains["ai-tpl-g"].installed_packages())
+
+    def test_a_refused_template_keeps_ok_off_whatever_is_typed(self):
+        self.app.vm("ai-tpl-paused", klass="TemplateVM", tags={"ai-managed"}, power="Paused")
+        self.win.refresh()
+        self.select("qube:ai-tpl-paused")
+        self.assertIn("packages", self.sensitive())
+        form = self.win.act("packages")
+        for text in ("", "curl"):
+            form.packages.set_text(text)
+            self.one_line(form, ok=False)
+            self.assertEqual(form.error.get_text(),
+                             "'ai-tpl-paused' is Paused: install while it runs or is halted")
+        form.destroy()
+
+    def test_an_install_whose_template_changed_after_its_form_opened_runs_nothing(self):
+        self.select("qube:ai-tpl-g")
+        form = self.win.act("packages")
+        form.packages.set_text("curl")
+        self.one_line(form)
+        self.app.domains["ai-tpl-g"].tags.add(projects.STOPPED)     # the gate stopped it meanwhile
+        self.win.refresh()
+        before = len(self.reports)
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(len(self.reports), before)
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("was stopped by the anonymity gate", form.error.get_text())
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), [])
+        self.assertEqual(self.app.vmshell_scripts, [])
+        form.destroy()
+        self.select("qube:ai-tpl-g")
+        self.assertNotIn("packages", self.sensitive())
+
+    def test_the_hubs_qube_proposals_from_the_tab_to_the_fleet(self):
+        # Each always takes the second tick, and runs the command's own code.
+        self.app.vm("scratch", netvm=None)                      # outside AI space
+        # Managed, so a hub's revoke of it shuts it down: --no-shutdown is
+        # refused for a qube the hub could run commands in.
+        self.app.domains["ai-work2"].start()
+        cases = (("manage", {"qube": "scratch"}, "Qube to manage", "scratch: managed",
+                  lambda: "ai-managed" in self.tags("scratch")),
+                 ("revoke", {"shutdown": True}, "Qube to revoke", "ai-work2: revoked",
+                  lambda: "ai-managed" not in self.tags("ai-work2")),
+                 ("install", {}, "Template to install into", "ai-tpl-g: installed with apt-get",
+                  lambda: self.app.domains["ai-tpl-g"].installed_packages() == ["curl", "jq"]))
+        for name, changes, heading, line, done in cases:
+            reply = self.propose(name, **changes)
+            self.assertIn(heading, self.pane(), name)
+            self.assertTrue(self.win.proposal_tick.get_visible(), name)
+            self.assertEqual(self.deciding(), {"reject_proposal"}, name)
+            self.win.proposal_tick.set_active(True)
+            form = self.win.act("accept_proposal")
+            self.assertEqual(form.warning.get_text(), self.win.proposal_warning.get_text())
+            self.runner.timeouts.clear()
+            result = self.submit(form)
+            self.assertIsNone(self.runner.timeouts[0], name)
+            self.assertIn(line, result.out, name)
+            self.assertIn(f"proposal {reply['id']}: accepted", result.out, name)
+            self.assertTrue(done(), name)
+        self.assertEqual(self.app.domains["ai-work2"].get_power_state(), "Halted")
+
     def test_settings_from_the_form_to_the_files(self):
         self.assertEqual(self.settings_on(), {"edit_settings", "export", "import"})
         form = self.win.act("edit_settings")
@@ -6292,7 +6597,7 @@ class Widgets(GuiBase):
         self.win.refresh()
         self.select("qube:ai-debian-13")
         for ident in ("edit_settings", "export", "import", "prepare_template", "prepare",
-                      "accept_all_restored"):
+                      "packages", "accept_all_restored"):
             form = self.win.act(ident)
             self.assertIsNotNone(form, ident)
             ok, why = self.shown_whole(form)

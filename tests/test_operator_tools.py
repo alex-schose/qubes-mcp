@@ -1121,5 +1121,327 @@ class Install(unittest.TestCase):
             self.assertIn(unit, self.TEXT)
 
 
+
+# ======================================================================= packages (0.9.28)
+
+class Packages(ToolsBase):
+    """`qmcp template install`: exact package names into a TemplateVM in AI
+    space, by the template's own package manager. dom0 decides on exit
+    statuses alone and keeps only the tail of what the template writes."""
+
+    TPL = "ai-tpl-g"
+
+    def tpl(self):
+        return self.app.domains[self.TPL]
+
+    def test_the_script_checks_every_name_then_installs_with_the_updaters_options(self):
+        apt = inqube.install_script("apt-get", ["curl", "g++"]).decode()
+        self.assertIn("export DEBIAN_FRONTEND=noninteractive", apt)
+        self.assertIn("apt-get -q update || exit 21", apt)
+        self.assertIn('apt-cache pkgnames "$n" | grep -qxF -- "$n"', apt)
+        # --no-remove: with -y, apt would remove a package that conflicts
+        # (measured: chrony removes systemd-timesyncd).
+        self.assertIn("\napt-get install -y -q --no-remove -o Dpkg::Options::=--force-confdef -o "
+                      "Dpkg::Options::=--force-confold --no-install-recommends -- curl g++ "
+                      "|| exit $?\n", apt)
+        self.assertIn("dpkg-query -W -f='installed: ${Package} ${Version}\\n' -- curl g++ "
+                      "|| true", apt)
+        dnf = inqube.install_script("dnf", ["curl"]).decode()
+        # dnf5 refuses `--` (measured on Fedora 43); a versioned name resolves
+        # to another name and is refused by the check.
+        self.assertNotIn(" -- ", dnf)
+        self.assertIn("repoquery --qf '%{name}\\n' \"$n\"", dnf)
+        self.assertIn("dnf -q makecache || exit 21", dnf)
+        self.assertIn("\ndnf -y -q --setopt=install_weak_deps=False --setopt=obsoletes=0 "
+                      "install curl || exit $?\n", dnf)
+        pac = inqube.install_script("pacman", ["curl"]).decode()
+        # Never `-Sy` with names: a partial upgrade. `-Sy`, the check, `-Su`.
+        self.assertIn("pacman --noconfirm -Sy || exit 21", pac)
+        self.assertIn('pacman -Si "$n" >/dev/null 2>&1 ||', pac)
+        self.assertIn("\npacman --noconfirm --needed -Su curl || exit $?\n", pac)
+        self.assertNotRegex(pac, r"-Sy[^u\n]*curl")
+        for text in (apt, dnf, pac):
+            # The check comes first, then the install, whose failure is the
+            # script's exit status; the versions are printed after a success
+            # only, and their failure changes nothing.
+            lines = text.rstrip("\n").split("\n")
+            check = next(i for i, line in enumerate(lines) if "not a package name here" in line)
+            install = next(i for i, line in enumerate(lines) if line.endswith("|| exit $?"))
+            self.assertLess(check, install)
+            self.assertTrue(lines[install + 1].endswith("|| true"), lines[install + 1])
+            self.assertIn("installed: ", lines[install + 1])
+            self.assertEqual(lines[-1], "exit 0")
+        with self.assertRaises(inqube.InQubeError):
+            inqube.install_script("zypper", ["curl"])
+
+    def test_the_last_lines_name_what_was_installed(self):
+        r = inqube.install(self.app, self.TPL, ["curl", "jq"])
+        self.assertEqual(r["lines"][-2:], ["installed: curl 1.0", "installed: jq 1.0"])
+
+    def test_the_shape_of_a_name(self):
+        good = ["curl", "g++", "gir1.2-gtk-3.0", "python3.13", "NetworkManager", "lib_x", "a"]
+        bad = ["", "-y", ".hidden", "sl-", "bas*", "x?", "@core", "x/y", "x:amd64", "x=1",
+               "pkgconfig(x)", "a b", "caf\u00e9", "x" * 101, None, 7, b"curl"]
+        for name in good:
+            self.assertIsNone(inqube.package_refusal(name), name)
+        for name in bad:
+            self.assertIsNotNone(inqube.package_refusal(name), name)
+        self.assertIsNotNone(inqube.packages_refusal(["curl"] * 2))
+        self.assertIsNotNone(inqube.packages_refusal([]))
+        self.assertIsNotNone(inqube.packages_refusal("curl"))
+        self.assertIsNotNone(inqube.packages_refusal(["p%d" % i for i in range(33)]))
+        self.assertIsNone(inqube.packages_refusal(["p%d" % i for i in range(32)]))
+
+    def test_an_install_starts_a_halted_template_and_stops_it_again(self):
+        self.assertEqual(self.tpl().get_power_state(), "Halted")
+        r = inqube.install(self.app, self.TPL, ["curl", "jq"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["manager"], r["started"]), ("apt-get", True))
+        self.assertEqual(self.tpl().installed_packages(), ["curl", "jq"])
+        self.assertEqual(self.tpl().get_power_state(), "Halted")
+        # The probe, then the install: two scripts, the probe first.
+        probe, script = self.app.vmshell_scripts[-2:]
+        self.assertEqual(probe, inqube.PROBE)
+        self.assertEqual(script, inqube.install_script("apt-get", ["curl", "jq"]))
+
+    def test_a_running_template_keeps_running_and_each_manager_is_used(self):
+        for manager in ("dnf", "pacman"):
+            tpl = self.app.vm(f"ai-{manager}", klass="TemplateVM", power="Running",
+                              tags={"ai-managed", "qmcp-guarded"})
+            self.app.pkgmgr[tpl.name] = manager
+            r = inqube.install(self.app, tpl.name, ["curl"])
+            self.assertTrue(r["ok"] and not r["started"], r)
+            self.assertEqual(r["manager"], manager)
+            self.assertEqual(self.app.vmshell_scripts[-1], inqube.install_script(manager, ["curl"]))
+            self.assertEqual(tpl.get_power_state(), "Running")
+
+    def test_refusals_come_before_anything_runs(self):
+        self.app.vm("ai-blocked", klass="TemplateVM", tags={"ai-managed", "qmcp-blocked"})
+        self.app.vm("ai-held", klass="TemplateVM", tags={"ai-managed", core.QUARANTINE})
+        self.app.vm("ai-hid-tpl", klass="TemplateVM", tags={"ai-managed", projects.HUBBLIND})
+        self.app.vm("ai-sa", klass="StandaloneVM", tags={"ai-managed"})
+        self.app.vm("ai-paused", klass="TemplateVM", power="Paused", tags={"ai-managed"})
+        for name, words in (("debian-13", "not in AI space"), ("ai-work", "is a AppVM"),
+                            ("ai-sa", "is a StandaloneVM"), ("ai-blocked", "anonymity gate"),
+                            ("ai-held", "held for your review"), ("ai-hid-tpl", "hidden project"),
+                            ("no-such", "no qube"), ("dom0", "no qube"),
+                            ("ai-paused", "is Paused")):
+            with self.subTest(name):
+                with self.assertRaises(inqube.InQubeError) as cm:
+                    inqube.install(self.app, name, ["curl"])
+                self.assertIn(words, str(cm.exception))
+        with self.assertRaises(inqube.InQubeError):
+            inqube.install(self.app, self.TPL, ["sl-"])
+        self.assertEqual(self.app.vmshell_scripts, [])
+        self.assertNotIn("run_service", [c[1] for c in self.app.calls])
+        self.assertEqual(self.app.domains["ai-blocked"].get_power_state(), "Halted")
+
+    def test_a_name_the_repositories_do_not_hold_refuses_the_whole_install(self):
+        r = inqube.install(self.app, self.TPL, ["curl", "nosuch"])
+        self.assertFalse(r["ok"])
+        self.assertIn("refused inside the template", r["status"])
+        self.assertEqual(r["lines"], ["not a package name here: nosuch"])
+        self.assertEqual(self.tpl().installed_packages(), [])
+
+    def test_each_failure_is_said_in_words_and_stops_a_template_it_started(self):
+        for mode, words in (("exit1", "apt-get exited 1"),
+                            ("norefresh", "could not refresh the package lists")):
+            tpl = self.app.vm(f"ai-{mode}", klass="TemplateVM", tags={"ai-managed"})
+            self.app.vmshell[tpl.name] = mode
+            r = inqube.install(self.app, tpl.name, ["curl"])
+            self.assertFalse(r["ok"])
+            self.assertIn(words, r["status"])
+            self.assertEqual(tpl.get_power_state(), "Halted")
+        self.app.pkgmgr[self.TPL] = None
+        with self.assertRaises(inqube.InQubeError) as cm:
+            inqube.install(self.app, self.TPL, ["curl"])
+        self.assertIn("none of apt-get, dnf and pacman", str(cm.exception))
+        self.assertEqual(self.tpl().get_power_state(), "Halted")
+
+    def test_a_hung_probe_raises_and_stops_the_template(self):
+        tpl = self.app.vm("ai-hang", klass="TemplateVM", tags={"ai-managed"})
+        self.app.vmshell[tpl.name] = "timeout"
+        with self.assertRaises(inqube.InQubeError) as cm:
+            inqube.install(self.app, tpl.name, ["curl"], timeout=0.01)
+        self.assertIn("the probe for its package manager", str(cm.exception))
+        self.assertEqual(tpl.get_power_state(), "Halted")
+
+    def test_a_probe_that_fails_says_what_became_of_a_template_it_started(self):
+        tpl = self.app.vm("ai-hang-p", klass="TemplateVM", tags={"ai-managed"})
+        self.app.vmshell[tpl.name] = "timeout"
+        with self.assertRaises(inqube.InQubeError) as cm:
+            inqube.install(self.app, tpl.name, ["curl"])
+        self.assertIn("was started for this and shut down again", str(cm.exception))
+        self.app.fail.add("shutdown")
+        try:
+            with self.assertRaises(inqube.InQubeError) as cm:
+                inqube.install(self.app, tpl.name, ["curl"])
+        finally:
+            self.app.fail.discard("shutdown")
+        self.assertIn("its shutdown did not complete: qvm-kill ai-hang-p", str(cm.exception))
+
+    def test_a_hung_install_is_a_failed_result_that_says_what_it_did(self):
+        # dom0 killing its end stops nothing inside the qube: a template this
+        # started is shut down, which stops the install where it was; one that
+        # was running keeps running it. Either way the tail so far is kept.
+        halted = self.app.vm("ai-hang", klass="TemplateVM", tags={"ai-managed"})
+        running = self.app.vm("ai-hang-r", klass="TemplateVM", power="Running",
+                              tags={"ai-managed"})
+        for tpl, words, power in ((halted, "stopped the install part-way", "Halted"),
+                                  (running, "dom0 stopped reading its output", "Running")):
+            self.app.vmshell[tpl.name] = "hanginstall"
+            r = inqube.install(self.app, tpl.name, ["curl"], timeout=0.01)
+            self.assertFalse(r["ok"])
+            self.assertIn("dom0 stopped waiting", r["status"])
+            self.assertIn(words, r["status"])
+            self.assertEqual(r["lines"], ["Reading package lists..."])
+            self.assertEqual(tpl.get_power_state(), power)
+        rc, out, err = self.cli("template", "install", "ai-hang-r", "curl")
+        self.assertEqual(rc, 1)
+        self.assertIn("check the template", out)
+
+    def test_a_shutdown_that_does_not_complete_is_said_and_fails_the_report(self):
+        self.app.fail.add("shutdown")
+        try:
+            rc, out, err = self.cli("template", "install", self.TPL, "curl")
+        finally:
+            self.app.fail.discard("shutdown")
+        self.assertEqual(rc, 1)
+        self.assertIn("installed with apt-get", out)
+        self.assertIn("its shutdown did not complete", out)
+        self.assertNotIn("shut down again", out)
+        self.app.vmshell["ai-hang"] = "hanginstall"
+        self.app.vm("ai-hang", klass="TemplateVM", tags={"ai-managed"})
+        self.app.fail.add("shutdown")
+        try:
+            r = inqube.install(self.app, "ai-hang", ["curl"], timeout=0.01)
+        finally:
+            self.app.fail.discard("shutdown")
+        self.assertIn("its shutdown did not complete, so the install may still be running",
+                      r["status"])
+        self.assertIs(r["stopped"], False)
+
+    def test_every_packages_version_fits_in_the_tail(self):
+        names = [f"p{i}" for i in range(inqube.MAX_PACKAGES)]
+        self.app.repo.update(names)
+        r = inqube.install(self.app, self.TPL, names)
+        self.assertEqual(r["lines"][-len(names):], [f"installed: {n} 1.0" for n in names])
+
+    def test_the_lock_is_never_followed_through_a_link_or_taken_from_another(self):
+        target = self.tmp / "elsewhere"
+        target.write_text("")
+        link = os.path.join(core.RUN_DIR, f"inqube-{self.TPL}.lock")
+        os.makedirs(core.RUN_DIR, exist_ok=True)
+        os.symlink(target, link)
+        with self.assertRaises(inqube.InQubeError):
+            inqube.install(self.app, self.TPL, ["curl"])
+        self.assertEqual(target.read_text(), "")
+        self.assertEqual(self.app.vmshell_scripts, [])
+        os.unlink(link)
+        self.assertTrue(inqube.install(self.app, self.TPL, ["curl"])["ok"])
+
+    def test_one_writer_at_a_time_in_a_qube(self):
+        # An install or a prepare that started a qube shuts it down at the end,
+        # which would stop another's write part-way: the second refuses at once.
+        with inqube._OneWriter(self.TPL):
+            with self.assertRaises(inqube.InQubeError) as cm:
+                inqube.install(self.app, self.TPL, ["curl"])
+            self.assertIn("another prepare or install", str(cm.exception))
+            with self.assertRaises(inqube.InQubeError):
+                inqube.prepare(self.app, self.TPL)
+        self.assertEqual(self.app.vmshell_scripts, [])
+        self.assertEqual(self.tpl().get_power_state(), "Halted")
+        self.assertTrue(inqube.install(self.app, self.TPL, ["curl"])["ok"])
+
+    def test_endless_output_costs_dom0_a_bounded_tail(self):
+        self.app.vmshell[self.TPL] = "flood"
+        r = inqube.install(self.app, self.TPL, ["curl"])
+        self.assertTrue(r["ok"])
+        self.assertLessEqual(len(r["lines"]), inqube.TAIL_LINES)
+        self.assertTrue(all(len(line) <= 300 for line in r["lines"]))
+        # A megabyte written; a thousand bytes kept.
+        rc, tail = inqube._run_bounded(self._running(), b"flood", 5, keep=1000)
+        self.assertEqual(len(tail), 1000)
+
+    def test_a_qube_that_keeps_its_output_open_never_hangs_the_command(self):
+        # The process ends but the pipe stays open (a child of it holds it):
+        # the reader stays blocked, and closing that pipe from the command
+        # would wait on the read for good. The command returns instead.
+        import threading
+        import time as _time
+        r, w = os.pipe()
+
+        class Held:
+            stdout = os.fdopen(r, "rb")
+            returncode = 0
+
+            class stdin:
+                @staticmethod
+                def write(data):
+                    return len(data)
+
+                @staticmethod
+                def close():
+                    os.write(w, b"partial output\n")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        vm = self._running()
+        vm.__dict__["run_service"] = lambda *a, **kw: Held()
+        done = {}
+        worker = threading.Thread(target=lambda: done.update(
+            out=inqube._run_bounded(vm, b"x", 5)), daemon=True)
+        t0 = _time.monotonic()
+        worker.start()
+        worker.join(20)
+        try:
+            self.assertFalse(worker.is_alive(), "the command hung on a pipe left open")
+            self.assertLess(_time.monotonic() - t0, 15)
+            self.assertEqual(done["out"], (0, b"partial output\n"))
+        finally:
+            os.close(w)                 # frees the reader the command left behind
+
+    def _running(self):
+        vm = self.app.vm("ai-flood", klass="TemplateVM", power="Running", tags={"ai-managed"})
+        self.app.vmshell[vm.name] = "flood"
+        return vm
+
+    def test_the_templates_words_are_escaped_never_laid_out(self):
+        r = inqube.install(self.app, self.TPL, ["curl"])
+        shown = "\n".join(r["lines"])
+        self.assertNotIn("\x1b", shown)
+        self.assertNotIn(chr(0x202E), shown)
+        self.assertIn("\\u001b[31mred\\u202eevil", shown)
+
+    def test_the_command_reports_and_exits_on_the_status(self):
+        rc, out, err = self.cli("template", "install", self.TPL, "curl", "jq")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ai-tpl-g: installed with apt-get", out)
+        self.assertIn("started for this and shut down again", out)
+        self.assertIn("escaped:", out)
+        rc, out, err = self.cli("template", "install", self.TPL, "nosuch")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused inside the template", out)
+        self.assertNotIn("get the packages", out)
+        rc, out, err = self.cli("template", "install", self.TPL, "sl-")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("removing the package", err)
+        rc, out, err = self.cli("template", "install", self.TPL, "curl", root=False)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.tpl().installed_packages(), ["curl", "jq"])
+
+    def test_each_run_leaves_one_operator_line_with_its_packages(self):
+        self.cli("template", "install", self.TPL, "curl")
+        self.cli("template", "install", self.TPL, "nosuch")
+        lines = [l for l in self.audit_lines() if l["service"] == "qmcp template install"]
+        self.assertEqual([(l["ok"], l["args"]) for l in lines],
+                         [(True, {"qube": self.TPL, "packages": ["curl"]}),
+                          (False, {"qube": self.TPL, "packages": ["nosuch"]})])
+
+
 if __name__ == "__main__":
     unittest.main()

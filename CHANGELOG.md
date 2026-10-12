@@ -26,6 +26,143 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.28] — 2026-10-12
+
+**The last proposal types.** The hub may now ask the operator to manage a qube
+(bring it into AI space, or take a guarded one out of the guarded state), to
+revoke one, and to install exact packages into a template in AI space.
+`qmcp template install` is the operator's own command for the last of those.
+Each always needs the second tick, and nothing changes until the operator
+accepts.
+
+### Added
+
+- Proposal type `qube-manage`: the options of `qmcp manage QUBE`. Accepting
+  refuses a qube that holds a PCI device, or whose devices cannot be read (the
+  hub would have root over a USB or network controller); the operator's own
+  `qmcp manage` still takes one. The second
+  tick names what accepting would do to that qube as the fleet is now, if
+  the command takes it: that it
+  comes into AI space or out of the guarded state, that it is a template and
+  which projects approve it, the qubes built on it (the hub and enrolled
+  gateways named), that a disposable template's disposables would join AI
+  space managed (and, for one adopted into AI space, that the rulebook then
+  refuses every qube a disposable from it), the projects whose model qube it
+  is, any anonymous project the anonymity gate would then stop, and that an
+  open qube's window ends.
+- Proposal type `qube-revoke`: the options of `qmcp revoke QUBE
+  [--no-shutdown]` (`shutdown`, true unless given false, always stored). The
+  second tick names the slot it leaves, the projects that lose it as their
+  model qube or as an approved template, and whether it is shut down. The
+  command still refuses a lead, and accepting refuses a qube outside AI space:
+  `qmcp revoke` would still pin its default disposable template and shut it
+  down, which is the operator's to ask for, not the hub's, which cannot see it;
+  and it refuses `shutdown` false for a qube the hub could run commands in
+  (managed, or open), whose processes would run on outside AI space. The
+  second tick also names an open window it ends, that Qubes refuses to shut
+  down a gateway with a qube running on it, and a disposable that Qubes
+  removes when it stops.
+- Proposal type `template-install`: a TemplateVM in AI space and 1 to 32
+  exact package names, the options of `qmcp template install`. The second
+  tick names the packages and the projects that approve the template, and
+  says that their dependencies come too, that every qube built on it runs them
+  from its first start after the template has shut down, that on Arch the
+  install upgrades the template, and that the install scripts of each package
+  and dependency run as root and can add a repository or download more.
+- `qmcp template install TEMPLATE PACKAGE...` (root): exact packages, and
+  what they depend on (never recommended or weak dependencies; an install that
+  would remove an installed package is refused, though one may be upgraded
+  when a new one needs it, and on Arch `-Su` may replace a package as the
+  repositories say), into a TemplateVM in AI space, guarded or managed,
+  with its own package manager,
+  from the repositories it already trusts, over its update proxy. A halted
+  template is started for it and shut down again. dom0 finds the package
+  manager by a probe's exit status (apt-get, dnf or pacman) and runs one fixed
+  script as root. A name is letters, digits, `.`, `_`, `+` and `-`, a letter or
+  digit first, never a `-` last; then, inside the template and before anything
+  is installed, each name must be a package's exact name in its repositories,
+  or the whole install is refused. Measured on Qubes 4.3.1's templates: apt
+  reads a name it does not know that holds a `.` as a regular expression and a
+  trailing `-` as a removal, and dnf a name with a version as that version, a
+  downgrade included. apt-get runs non-interactive and keeps a changed
+  configuration file, as Qubes' own updater runs it, with
+  `--no-install-recommends` and `--no-remove` (with `-y` alone it removes a
+  package that conflicts: measured, `chrony` removes `systemd-timesyncd`); dnf
+  refreshes its metadata first, so a name is never refused for lists it
+  could not fetch, takes no weak dependencies, ignores obsoletes, removes
+  nothing (it never does without `--allowerasing`) and takes no `--`, which
+  dnf5 refuses; on Arch it runs `pacman -Sy`, the check, then `pacman --needed
+  -Su` with the names, so the install upgrades the template, never a partial
+  upgrade (517 s on an Arch template two months behind). dom0 decides on the
+  exit status alone. The last 40 lines the package manager wrote follow,
+  escaped, ending after a successful install with each package's installed
+  version (on Debian, Qubes' own hook lists every pending upgrade after each
+  run, which filled the whole 20-line tail of an earlier build on the dev
+  box); dom0 reads the output in bounded
+  chunks and keeps 64 KiB of it. It
+  waits up to 30 minutes; one that does not finish is a failed step, saying
+  whether dom0 shut the template down (stopping the install part-way), its
+  shutdown did not complete, or, in a template that was already running, the
+  install may still be running or may have stopped part-way. A started
+  template whose shutdown does not complete fails the report too, and an
+  install stopped before its script ran (the probe, say) says what became of
+  a template it started. It
+  refuses another class, a template outside AI space, one the anonymity gate
+  stopped, one held for review and a hidden project's. One operator audit line per run, with the template and the
+  package names.
+- MCP tools `qubes_propose_manage`, `qubes_propose_revoke` and
+  `qubes_propose_packages`.
+- The window: Install packages on a template row in AI space, a form that
+  shows the command as the names are typed and refuses a bad name before OK;
+  the proposal pane names each new option.
+- A qube of a hidden project named by `qube-manage`, `qube-revoke` or
+  `template-install` fails at accept with the command's own words for a name
+  that does not exist; its second tick holds only what the proposal itself
+  says. A qube that cannot be looked up, or whose badges cannot be read, at
+  accept refuses. `show`'s plan names a refusal the command will make that it
+  can see first (a lookup that failed, dom0, the hub or an unreadable hub
+  file, a drop box, a held qube, for a manage a qube holding a PCI device and
+  a gateway, for a revoke a lead, a qube outside AI space and `shutdown` false
+  for a qube the hub could run commands in, a template the install refuses);
+  the rest only the command finds at accept.
+- An accepted `template-install` lets the project commands' locks go once the
+  proposal is marked, before the install runs: those include the create lock,
+  which every create of the hub and the leads waits on, and an install can take
+  many minutes. Every other type holds them through its command.
+- `tests/redteam_suite.py` submits package expressions (a removal, a glob, a
+  version, a group, an option) and checks each is refused at submit.
+
+### Changed
+
+- The window's proposal list heads its subject column "Subject" (it read
+  "Project", though `qube-open` already named a qube there).
+- One `qmcp template prepare` or `install` at a time in a qube: a second
+  refuses at once, since either may shut down a qube it started, which would
+  stop the other's write part-way. Its lock is never opened through a link.
+- `qmcp manage` of an open qube ends its window, with no kill (a badge left on
+  it had the expiry pass kill a qube that was now managed); `qmcp revoke`
+  clears an open qube's window record with its badges.
+- `qmcp manage`, `guard`, `revoke` and `open` refuse every name while
+  `/etc/qmcp/hub` cannot be read: with the file unread, any name may be the
+  hub. `qmcp seal`, the expiry pass and the boot seal still take a window off
+  then, and only skip the kill.
+- An accept interrupted (Ctrl-C) while its command runs records the
+  proposal as failed, with an audit line, before the interrupt goes on.
+- A proposal is the options of one `qmcp` command (it was "one `qmcp project`
+  command", which `qube-open` already was not).
+- README, "Updating": the commands that update the hub's copy, with git or
+  from the release tarball, and each lead's.
+
+### Fixed
+
+- `qmcp manage`, `guard` and `revoke` did not refuse dom0 (source-read, not
+  run on dom0): `manage dom0` and `guard dom0` would label dom0 and put
+  `ai-managed` (and `qmcp-guarded`) on it, and `manage` and `revoke` would set
+  its default disposable template to none, `revoke` before its shutdown
+  failed. Every role action now refuses dom0 before it writes anything.
+- README step 1 sent a hub without git to "the way step 4 does for a lead";
+  the copy from dom0 into a lead is in step 5.
+
 ## [0.9.27] — 2026-10-10
 
 **Linux standalones.** A project's worker or lead, and one of the hub's own

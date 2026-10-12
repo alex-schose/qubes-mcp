@@ -521,7 +521,7 @@ class Creates(Base):
         self.assertIsNone(vm.default_dispvm)
 
     def test_clone_needs_a_managed_source(self):
-        self.assertEqual(self.clone(source="ai-tpl-g"), core.GUARDED_REFUSAL)    # 2.11
+        self.assertEqual(self.clone(source="ai-tpl-g"), core.GUARDED_REFUSAL)
         self.assertEqual(self.clone(source="ai-dvm-g"), core.GUARDED_REFUSAL)
         self.assertEqual(self.clone(source="personal"), core.NOT_FOUND)
         self.assertEqual(self.clone(source="ai-gw-unbadged"), core.GUARDED_REFUSAL)
@@ -1399,6 +1399,33 @@ class Windows(Base):
         self.assertTrue(any("ai-net-router" in l and "provides network" in l for l in lines),
                         lines)
         self.assertNotIn(core.OPEN, a.domains["ai-net-router"].tags.raw())
+
+    def test_an_unreadable_hub_file_never_stops_a_seal(self):
+        # The role actions refuse every name while the hub file does not read
+        # (any name may be the hub); taking a window off only lowers authority,
+        # so the boot seal, the expiry pass and `qmcp seal` still do it, and
+        # skip only the kill, which needs to know the qube is not the hub.
+        from unittest import mock
+        self.app.domains[self.TPL].start()
+        for sweep in ("every", "expired", "named"):
+            with self.subTest(sweep):
+                fleet.open_window(self.app, self.TPL, 1 if sweep == "expired" else 3600)
+                with mock.patch.object(core, "read_hub", return_value=None):
+                    if sweep == "named":
+                        line = fleet.seal(self.app, self.TPL)
+                    else:
+                        if sweep == "expired":
+                            import time as _t
+                            _t.sleep(1.1)
+                        lines = fleet.expire_windows(self.app, every=sweep == "every")
+                        line = " ".join(lines)
+                    with self.assertRaises(fleet.RoleError):
+                        fleet.open_window(self.app, self.TPL, 60)
+                self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, line)
+                self.assertIn("not killed", line)
+                self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Running")
+                with self.assertRaises(Exception):
+                    fleet.read_window(self.TPL)
 
     def test_the_boot_seal_takes_a_healthy_window_too(self):
         fleet.open_window(self.app, self.TPL, fleet.WINDOW_MAX_S, firewall=True)

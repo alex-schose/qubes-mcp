@@ -36,6 +36,7 @@ import sys
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
@@ -44,7 +45,7 @@ sys.path.insert(0, str(HERE))
 from qmcp import audit, budget, cli, core, fleet, projects, proposals, services  # noqa: E402
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
-from test_projects import LEAD, ProjectBase  # noqa: E402
+from test_projects import LEAD, RECORDS, ProjectBase  # noqa: E402
 
 DAY = 24 * 3600
 #: The installed paths, read before any test points the modules at a temp dir.
@@ -111,6 +112,9 @@ class Shape(unittest.TestCase):
             "project-firewall": ({"project"}, {"model", "rules"}),
             "project-delete": ({"project"}, set()),
             "qube-open": ({"qube", "for", "firewall"}, set()),
+            "qube-manage": ({"qube"}, set()),
+            "qube-revoke": ({"qube", "shutdown"}, set()),
+            "template-install": ({"template", "packages"}, set()),
         }
         samples = [
             create(), create(lead={"from": "promote", "qube": "ai-work2"}, lead_netvm="none",
@@ -135,6 +139,11 @@ class Shape(unittest.TestCase):
             {"type": "qube-open", "title": "t", "qube": "ai-tpl-g", "for": "2h"},
             {"type": "qube-open", "title": "t", "qube": "ai-tpl-g", "for": "45s",
              "firewall": True},
+            {"type": "qube-manage", "title": "t", "qube": "work-outside"},
+            {"type": "qube-revoke", "title": "t", "qube": "ai-work"},
+            {"type": "qube-revoke", "title": "t", "qube": "ai-work", "shutdown": False},
+            {"type": "template-install", "title": "t", "template": "ai-tpl-g",
+             "packages": ["curl", "gir1.2-gtk-3.0", "g++"]},
         ]
         self.assertEqual({s["type"] for s in samples}, set(proposals.TYPES))
         for req in samples:
@@ -1348,6 +1357,480 @@ class OpenProposal(PBase):
         ok, report = self.accept(1, yes=True)
         self.assertTrue(ok, report)
         self.assertGreater(fleet.window_left(self.TPL), 7100)
+
+
+
+class QubeProposals(PBase):
+    """0.9.28's three: manage a qube (adopt it, or un-guard it), revoke one,
+    and install exact packages into a template. Each always needs the second
+    tick, runs the command's own code at accept, and treats a qube of a
+    hidden project exactly as a name that does not exist."""
+
+    def ask(self, kind, **over):
+        req = {"type": kind, "title": "the hub asks"}
+        req.update(over)
+        reply = self.submit(req)
+        self.assertTrue(reply["ok"], reply)
+        return reply["id"]
+
+    def test_each_always_needs_the_second_tick_and_one_click_changes_nothing(self):
+        self.app.vm("scratch", netvm=None)
+        cases = (("qube-manage", {"qube": "scratch"}, "MANAGES scratch",
+                  lambda: "ai-managed" in self.app.domains["scratch"].tags),
+                 ("qube-revoke", {"qube": "ai-work2"}, "REVOKES ai-work2",
+                  lambda: "ai-managed" not in self.app.domains["ai-work2"].tags),
+                 ("template-install", {"template": "ai-tpl-g", "packages": ["curl"]},
+                  "INSTALLS 1 package(s) into the template ai-tpl-g",
+                  lambda: self.app.domains["ai-tpl-g"].installed_packages()))
+        for kind, fields, words, changed in cases:
+            with self.subTest(kind):
+                pid = self.ask(kind, **fields)
+                doc = proposals.show(self.app, pid)
+                self.assertIsNotNone(doc["tick"])
+                self.assertIn(words, " ".join(doc["second_tick"]))
+                with self.assertRaises(proposals.Refused) as cm:
+                    self.accept(pid)
+                self.assertIn("needs the second tick", str(cm.exception))
+                self.assertFalse(changed())
+                self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+
+    def test_the_equivalent_commands(self):
+        for fields, command in (
+                ({"type": "qube-manage", "qube": "ai-work2"}, "qmcp manage ai-work2"),
+                ({"type": "qube-revoke", "qube": "ai-work2"}, "qmcp revoke ai-work2"),
+                ({"type": "qube-revoke", "qube": "ai-work2", "shutdown": False},
+                 "qmcp revoke ai-work2 --no-shutdown"),
+                ({"type": "template-install", "template": "ai-tpl-g", "packages": ["curl", "g++"]},
+                 "qmcp template install ai-tpl-g curl g++")):
+            p = proposals.normalise(dict(fields, title="t"), "ai-")
+            self.assertEqual(proposals.command(p), command)
+            self.assertEqual(proposals.subject(p), fields.get("qube") or fields.get("template"))
+
+    def test_a_package_list_the_command_would_refuse_is_refused_at_submit(self):
+        for bad in ([], ["curl"] * 2, ["sl-"], ["bas*"], ["@core"], ["-y"], ["x/y"], ["a b"],
+                    ["pkg=1.0"], ["pkg:amd64"], ["pkgconfig(x)"], [1], "curl",
+                    ["p%d" % i for i in range(33)]):
+            reply = self.submit({"type": "template-install", "title": "t",
+                                 "template": "ai-tpl-g", "packages": bad})
+            self.assertFalse(reply["ok"], bad)
+            self.assertIn("packages", reply["error"], bad)
+        self.assertFalse(self.submit({"type": "qube-revoke", "title": "t", "qube": "ai-work2",
+                                      "shutdown": "no"})["ok"])
+        self.assertFalse(self.submit({"type": "qube-manage", "title": "t", "qube": "none"})["ok"])
+        self.assertEqual(len(list(self.store().glob("*.json"))), 0)
+
+    def test_submit_looks_no_name_up(self):
+        before = self.app.domains.lookups
+        for kind, fields in (("qube-manage", {"qube": "operator-secret"}),
+                             ("qube-revoke", {"qube": "operator-secret"}),
+                             ("template-install", {"template": "operator-secret",
+                                                   "packages": ["curl"]})):
+            self.ask(kind, **fields)
+        self.assertEqual(self.app.domains.lookups, before)
+
+    def test_managing_adopts_a_qube_and_un_guards_a_guarded_one(self):
+        self.app.vm("scratch", netvm=None)
+        pid = self.ask("qube-manage", qube="scratch")
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("brings scratch into AI space", reasons)
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertIn("ai-managed", self.app.domains["scratch"].tags)
+        self.assertEqual(proposals.show(self.app, pid)["state"], "accepted")
+        pid = self.ask("qube-manage", qube="ai-dvm-g")
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("takes ai-dvm-g out of the guarded state", reasons)
+        self.assertIn("is a template", reasons)
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertNotIn(core.GUARDED, self.app.domains["ai-dvm-g"].tags)
+
+    def test_managing_a_template_names_the_projects_that_approve_it(self):
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("is a template", reasons)
+        self.assertIn("the projects other approve it", reasons)
+
+    def test_managing_an_anonymous_projects_template_says_the_gate_stops_it(self):
+        records = json.loads(json.dumps(RECORDS))
+        records["slots"]["p02"]["anonymous"] = True
+        self.write_records(records)
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("the anonymity gate stops other right after", reasons)
+        records["slots"]["p02"]["anonymous"] = False
+        del records["slots"]["p02"]["anonymous"]
+        self.write_records(records)
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertNotIn("anonymity gate", reasons)
+
+    def test_a_class_that_cannot_be_read_is_said_never_dropped(self):
+        # Whether the qube is a template decides a reason line; a read that
+        # fails puts its own line in, so the tick covers the doubt.
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        # The fake keeps a qube's class as a plain attribute, so the read that
+        # fails is the helper's.
+        with mock.patch.object(core, "is_template",
+                               side_effect=core.Unreadable("cannot read the class of ai-tpl-g")):
+            reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("whether ai-tpl-g is a template could not be read", reasons)
+        self.assertNotIn("ai-tpl-g is a template:", reasons)
+        self.assertIn("ai-tpl-g is a template:", " ".join(proposals.show(self.app, pid)["second_tick"]))
+
+    def test_the_command_refuses_at_accept_what_submit_never_looked_up(self):
+        # A gateway: manage refuses it, and the proposal closes as failed.
+        pid = self.ask("qube-manage", qube="ai-net-router")
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("provides network", " ".join(report))
+        self.assertEqual(proposals.show(self.app, pid)["state"], "failed")
+        self.assertIn(core.GUARDED, self.app.domains["ai-net-router"].tags)
+        # A lead: revoke refuses it.
+        pid = self.ask("qube-revoke", qube=LEAD)
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("is a lead", " ".join(report))
+        self.assertIn("qmcp-lead-p01", self.app.domains[LEAD].tags)
+
+    def test_revoking_takes_a_member_out_of_its_slot_and_shuts_it_down(self):
+        w2 = self.app.domains["ai-osint-w2"]
+        self.assertEqual(w2.get_power_state(), "Running")
+        pid = self.ask("qube-revoke", qube="ai-osint-w2")
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("it leaves p01", reasons)
+        self.assertIn("it is shut down", reasons)
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertFalse({"ai-managed", "qmcp-proj-p01"} & set(w2.tags))
+        self.assertEqual(w2.get_power_state(), "Halted")
+
+    def test_a_qube_the_hub_could_run_commands_in_never_keeps_running(self):
+        # Revoked but running, the hub's processes in it would run on outside
+        # AI space. A guarded one, never open, may keep running: the hub had
+        # no way in. The operator's own `qmcp revoke --no-shutdown` is theirs.
+        w2 = self.app.domains["ai-osint-w2"]
+        pid = self.ask("qube-revoke", qube="ai-osint-w2", shutdown=False)
+        self.assertIn("so a hub's proposal to revoke it shuts it down",
+                      proposals.show(self.app, pid)["plan"])
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("ai-managed", w2.tags)
+        self.assertEqual(w2.get_power_state(), "Running")
+        g = self.app.vm("ai-gq", tags={"ai-managed", core.GUARDED}, power="Running")
+        pid = self.ask("qube-revoke", qube="ai-gq", shutdown=False)
+        self.assertIn("it keeps running", " ".join(proposals.show(self.app, pid)["second_tick"]))
+        self.assertTrue(self.accept(pid, yes=True)[0])
+        self.assertEqual((set(g.tags), g.get_power_state()), (set(), "Running"))
+        g2 = self.app.vm("ai-gq2", tags={"ai-managed", core.GUARDED}, power="Running")
+        fleet.open_window(self.app, "ai-gq2", 3600)
+        pid = self.ask("qube-revoke", qube="ai-gq2", shutdown=False)
+        self.assertFalse(self.accept(pid, yes=True)[0])
+        self.assertIn(core.OPEN, g2.tags)
+
+    def test_installing_runs_the_command_and_names_the_packages(self):
+        pid = self.ask("template-install", template="ai-tpl-g", packages=["curl", "jq"])
+        doc = proposals.show(self.app, pid)
+        reasons = " ".join(doc["second_tick"])
+        self.assertIn("curl jq", reasons)
+        self.assertIn("pacman -Su", reasons)
+        self.assertIn("the projects other approve ai-tpl-g", reasons)
+        self.assertEqual(doc["command"], "qmcp template install ai-tpl-g curl jq")
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), ["curl", "jq"])
+        self.assertIn("installed with apt-get", report[0])
+
+    def test_an_install_refused_inside_the_template_closes_it_as_failed(self):
+        pid = self.ask("template-install", template="ai-tpl-g", packages=["curl", "nosuch"])
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("refused inside the template", report[0])
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), [])
+        self.assertEqual(proposals.show(self.app, pid)["state"], "failed")
+        self.assertEqual(self.status({"id": pid})["state"], "failed")
+
+    def test_a_long_install_holds_no_project_lock_and_a_manage_does(self):
+        # Teeth: a manage runs under the project commands' locks, as every
+        # other command does; the install lets them go once it is marked, so
+        # the hub's and the leads' creates do not wait half an hour on it.
+        seen = {}
+        real_install, real_manage = proposals.inqube.install, fleet.manage
+
+        def install(*a, **kw):
+            seen["install"] = fleet._HELD[0]
+            return real_install(*a, **kw)
+
+        def manage(*a, **kw):
+            seen["manage"] = fleet._HELD[0]
+            return real_manage(*a, **kw)
+
+        self.app.vm("scratch", netvm=None)
+        with mock.patch.object(proposals.inqube, "install", install), \
+                mock.patch.object(fleet, "manage", manage):
+            pid = self.ask("template-install", template="ai-tpl-g", packages=["curl"])
+            self.assertTrue(self.accept(pid, yes=True)[0])
+            pid = self.ask("qube-manage", qube="scratch")
+            self.assertTrue(self.accept(pid, yes=True)[0])
+        self.assertEqual(seen["install"], 0)
+        self.assertGreater(seen["manage"], 0)
+        self.assertEqual(fleet._HELD[0], 0)
+
+    def test_a_hidden_projects_qube_fails_as_a_name_that_does_not_exist(self):
+        hidden = self.app.vm("ai-hid-w1", netvm=None,
+                             tags={"ai-managed", "qmcp-proj-p05", projects.ANON, projects.HUBBLIND})
+        hid_tpl = self.app.vm("ai-hid-tpl", klass="TemplateVM",
+                              tags={"ai-managed", "qmcp-guarded", projects.HUBBLIND})
+        for kind, fields, real in (("qube-manage", {"qube": "ai-hid-w1"}, hidden),
+                                   ("qube-revoke", {"qube": "ai-hid-w1"}, hidden),
+                                   ("template-install", {"template": "ai-hid-tpl",
+                                                         "packages": ["curl"]}, hid_tpl)):
+            with self.subTest(kind):
+                before = set(real.tags)
+                pid = self.ask(kind, **fields)
+                ghost = self.ask(kind, **{k: ("ai-no-such" if k in ("qube", "template") else v)
+                                          for k, v in fields.items()})
+                doc, ghost_doc = proposals.show(self.app, pid), proposals.show(self.app, ghost)
+                # The second tick says nothing of it: the same lines as for a
+                # name that does not exist, the name aside.
+                self.assertEqual(len(doc["second_tick"]), len(ghost_doc["second_tick"]))
+                self.assertIn("hidden project", doc["plan"])
+                ok, report = self.accept(pid, yes=True)
+                ok2, report2 = self.accept(ghost, yes=True)
+                self.assertFalse(ok or ok2)
+                name = fields.get("qube") or fields.get("template")
+                self.assertEqual(report[-1].replace(name, "X"), report2[-1].replace("ai-no-such", "X"))
+                self.assertEqual(set(real.tags), before)
+                self.assertEqual(real.installed_packages(), [])
+                self.assertEqual(self.status({"id": pid})["state"], "failed")
+
+    def test_badges_that_cannot_be_read_refuse_rather_than_guess(self):
+        # The second tick reads them once and gets them; the hidden check at
+        # accept reads them again and fails: the accept refuses, and the qube
+        # is not managed on the strength of a read that did not happen.
+        self.app.vm("scratch", netvm=None)
+        pid = self.ask("qube-manage", qube="scratch")
+        doc = proposals.show(self.app, pid)
+        self.app.fail_reads("tag.List:scratch", "ok fail")
+        ok, report = proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertEqual(self.app.failed["tag.List:scratch"], 1)
+        self.assertFalse(ok)
+        self.assertIn("badges cannot be read", report[-1])
+        self.assertNotIn("ai-managed", self.app.domains["scratch"].tags)
+        self.assertEqual(proposals.show(self.app, pid)["state"], "failed")
+
+    def test_the_hub_revokes_only_a_qube_in_ai_space(self):
+        # `qmcp revoke` on a qube outside AI space still pins its default
+        # disposable template and shuts it down: the operator may, the hub's
+        # proposal may not. A positive control first: one in AI space is.
+        personal = self.app.domains["personal"]
+        personal.default_dispvm = self.app.domains["default-dvm"]
+        personal.start()
+        before = (set(personal.tags), personal.default_dispvm, personal.get_power_state())
+        pid = self.ask("qube-revoke", qube="personal")
+        self.assertIn("is not in AI space", proposals.show(self.app, pid)["plan"])
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("not in AI space", report[-1])
+        self.assertEqual((set(personal.tags), personal.default_dispvm,
+                          personal.get_power_state()), before)
+        pid = self.ask("qube-revoke", qube="ai-work2")
+        self.assertIsNone(proposals.show(self.app, pid)["plan"])
+        self.assertTrue(self.accept(pid, yes=True)[0])
+        self.assertNotIn("ai-managed", self.app.domains["ai-work2"].tags)
+
+    def test_the_hub_cannot_name_dom0(self):
+        dom0 = self.app.domains["dom0"]
+        before = (set(dom0.tags), dom0.default_dispvm)
+        for kind in ("qube-manage", "qube-revoke"):
+            pid = self.ask(kind, qube="dom0")
+            ok, report = self.accept(pid, yes=True)
+            self.assertFalse(ok, kind)
+        self.assertEqual((set(dom0.tags), dom0.default_dispvm), before)
+
+    def test_show_names_a_refusal_the_command_will_make(self):
+        self.app.vm("ai-held-x", tags={"ai-managed", core.QUARANTINE})
+        for kind, fields, words in (
+                ("qube-manage", {"qube": "dom0"}, "dom0 is dom0"),
+                ("qube-manage", {"qube": "mcp-control"}, "mcp-control is the hub"),
+                ("qube-manage", {"qube": "ai-sink"}, "ai-sink is a drop box"),
+                ("qube-manage", {"qube": "ai-net-router"}, "provides network"),
+                ("qube-manage", {"qube": "ai-held-x"}, "held for your review"),
+                ("qube-revoke", {"qube": LEAD}, f"{LEAD} is a lead"),
+                ("template-install", {"template": "ai-work", "packages": ["curl"]},
+                 "is a AppVM")):
+            with self.subTest(fields):
+                pid = self.ask(kind, **fields)
+                plan = proposals.show(self.app, pid)["plan"] or ""
+                self.assertIn(words, plan)
+                self.assertIn("accepting it will fail", plan)
+                ok, report = self.accept(pid, yes=True)
+                self.assertFalse(ok)
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        self.assertIsNone(proposals.show(self.app, pid)["plan"])
+
+    def test_a_failed_lookup_never_skips_the_hubs_refusals(self):
+        # A lookup that fails is not "no such qube": wherever it fails, a
+        # hidden project's qube is never managed and a qube outside AI space
+        # never revoked. A positive control first: with no failure, both
+        # refuse for their own reasons.
+        hidden = self.app.vm("ai-hub-model", netvm=None, tags={
+            "ai-managed", core.GUARDED, "qmcp-model-p05", projects.HUBBLIND})
+        personal = self.app.domains["personal"]
+        personal.start()
+        cases = (("qube-manage", "ai-hub-model",
+                  lambda: core.GUARDED in hidden.tags),
+                 ("qube-revoke", "personal",
+                  lambda: personal.get_power_state() == "Running"))
+        for kind, name, unchanged in cases:
+            for pattern in ("", "fail", "ok fail", "ok ok fail", "ok fail ok", "fail fail ok",
+                            "ok ok ok fail"):
+                with self.subTest(kind=kind, pattern=pattern):
+                    pid = self.ask(kind, qube=name)
+                    doc = proposals.show(self.app, pid)
+                    if pattern:
+                        self.app.fail_reads(f"lookup:{name}", pattern)
+                    try:
+                        ok, report = proposals.accept(self.app, pid, doc["sha256"],
+                                                      tick=doc["tick"])
+                    except proposals.Refused:
+                        ok = False          # the tick moved: refused, nothing ran
+                    self.app.fail_plan.pop(f"lookup:{name}", None)
+                    self.assertFalse(ok)
+                    self.assertTrue(unchanged())
+
+    def test_a_hidden_qube_answers_as_missing_before_any_refusal_that_names_it(self):
+        # A hidden project's dump sink is also a drop box, and a restored one
+        # may be held: neither refusal may come first and name what it is.
+        sink = self.app.vm("x7dump", tags={"ai-dump", "qmcp-dump-p05", projects.HUBBLIND})
+        held = self.app.vm("ai-x7-w1", tags={"ai-managed", "qmcp-proj-p05", projects.HUBBLIND,
+                                             core.QUARANTINE})
+        for kind, name in (("qube-manage", "x7dump"), ("qube-revoke", "x7dump"),
+                           ("qube-manage", "ai-x7-w1"), ("qube-revoke", "ai-x7-w1")):
+            with self.subTest(kind=kind, name=name):
+                ok, report = self.accept(self.ask(kind, qube=name), yes=True)
+                self.assertFalse(ok)
+                self.assertEqual(report[-1], f"stopped: no qube named '{name}'")
+        self.assertEqual((set(sink.tags), set(held.tags)),
+                         ({"ai-dump", "qmcp-dump-p05", projects.HUBBLIND},
+                          {"ai-managed", "qmcp-proj-p05", projects.HUBBLIND, core.QUARANTINE}))
+
+    def test_show_says_a_failed_lookup_and_never_that_the_qube_is_gone(self):
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        self.app.fail.add("lookup:ai-tpl-g")
+        try:
+            doc = proposals.show(self.app, pid)
+        finally:
+            self.app.fail.discard("lookup:ai-tpl-g")
+        self.assertIn("could not be looked up", doc["plan"])
+        self.assertIn("could not be looked up", " ".join(doc["second_tick"]))
+        self.assertNotIn("there is no qube", doc["plan"])
+
+    def test_a_hub_cannot_manage_a_qube_that_holds_a_device(self):
+        usb = self.app.vm("sys-usb-x", netvm=None, devices=["pci:00_14.0"])
+        pid = self.ask("qube-manage", qube="sys-usb-x")
+        self.assertIn("holds 1 PCI device(s)", proposals.show(self.app, pid)["plan"])
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertNotIn("ai-managed", usb.tags)
+        # A device list that cannot be read refuses too; the operator's own
+        # command takes the qube.
+        self.app.vm("plain-x", netvm=None)
+        pid = self.ask("qube-manage", qube="plain-x")
+        self.app.fail.add("devices:plain-x")
+        try:
+            ok, report = self.accept(pid, yes=True)
+        finally:
+            self.app.fail.discard("devices:plain-x")
+        self.assertFalse(ok)
+        self.assertIn("devices cannot be read", report[-1])
+        self.assertIn("managed", fleet.manage(self.app, "sys-usb-x"))
+
+    def test_managing_an_open_qube_ends_its_window_with_no_kill(self):
+        g = self.app.vm("ai-gq", tags={"ai-managed", core.GUARDED}, power="Running")
+        fleet.open_window(self.app, "ai-gq", 3600)
+        pid = self.ask("qube-manage", qube="ai-gq")
+        self.assertIn("open to the hub now: managing it ends the window",
+                      " ".join(proposals.show(self.app, pid)["second_tick"]))
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertFalse(set(g.tags) & {core.OPEN, core.OPEN_FW, core.GUARDED})
+        with self.assertRaises(Exception):
+            fleet.read_window("ai-gq")
+        fleet.expire_windows(self.app)
+        self.assertEqual(g.get_power_state(), "Running")
+
+    def test_revoking_an_open_qube_clears_its_record(self):
+        self.app.vm("ai-gq", tags={"ai-managed", core.GUARDED}, power="Running")
+        fleet.open_window(self.app, "ai-gq", 3600)
+        pid = self.ask("qube-revoke", qube="ai-gq")
+        self.assertIn("open to the hub now: revoking it ends the window",
+                      " ".join(proposals.show(self.app, pid)["second_tick"]))
+        self.assertTrue(self.accept(pid, yes=True)[0])
+        with self.assertRaises(Exception):
+            fleet.read_window("ai-gq")
+
+    def test_the_tick_names_what_else_a_template_or_a_gateway_carries(self):
+        # A guarded template a gateway is built on, a disposable template, a
+        # gateway with clients, a disposable.
+        tpl = self.app.vm("ai-gw-tpl", klass="TemplateVM", tags={"ai-managed", core.GUARDED})
+        self.app.domains["ai-net-router"]._props["template"] = tpl
+        pid = self.ask("template-install", template="ai-gw-tpl", packages=["curl"])
+        reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
+        self.assertIn("1 qube(s) are built on ai-gw-tpl, among them ai-net-router", reasons)
+        def tick(kind, **fields):
+            return " ".join(proposals.show(self.app, self.ask(kind, **fields))["second_tick"])
+
+        # A guarded disposable template's disposables come out managed; one
+        # adopted into AI space takes every other qube's disposables away (the
+        # rulebook's @dispvm:@tag:ai-managed deny).
+        self.assertIn("a disposable dom0 or the hub starts from it takes its tags",
+                      tick("qube-manage", qube="ai-dvm-g"))
+        self.app.vm("my-dvm", template_for_dispvms=True, netvm=None)
+        self.assertIn("the rulebook refuses every qube a disposable from it",
+                      tick("qube-manage", qube="my-dvm"))
+        self.assertIn("Qubes refuses to shut it down while a qube on it runs",
+                      tick("qube-revoke", qube="ai-net-router"))
+        # A disposable Qubes made for one use is removed when it stops; a
+        # named one is kept, and the tick says nothing of a removal.
+        self.app.vm("disp1234", klass="DispVM", tags={"ai-managed"}, power="Running",
+                    auto_cleanup=True)
+        self.assertIn("removed when it stops", tick("qube-revoke", qube="disp1234"))
+        self.app.vm("ai-hub-named", klass="DispVM", tags={"ai-managed"}, power="Running")
+        self.assertNotIn("removed when it stops", tick("qube-revoke", qube="ai-hub-named"))
+
+    def test_an_unreadable_hub_file_lets_no_name_through(self):
+        self.app.vm("scratch", netvm=None)
+        pid = self.ask("qube-manage", qube="scratch")
+        doc = proposals.show(self.app, pid)
+        with mock.patch.object(core, "read_hub", return_value=None):
+            self.assertIn("cannot be read", proposals.show(self.app, pid)["plan"])
+            ok, report = proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertFalse(ok)
+        self.assertNotIn("ai-managed", self.app.domains["scratch"].tags)
+
+    def test_an_interrupted_accept_is_recorded_then_raised(self):
+        self.app.vm("scratch", netvm=None)
+        pid = self.ask("qube-manage", qube="scratch")
+        with mock.patch.object(proposals, "_execute", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.accept(pid, yes=True)
+        doc = proposals.show(self.app, pid)
+        self.assertEqual(doc["state"], "failed")
+        self.assertIn("interrupted", " ".join(doc["decision"]["report"]))
+        line = [l for l in self.operator_lines() if l["service"] == "qmcp proposal accept"][-1]
+        self.assertFalse(line["ok"])
+        self.assertIn("interrupted", line["error"])
+
+    def test_show_says_when_the_named_qube_is_gone(self):
+        pid = self.ask("qube-revoke", qube="ai-gone")
+        self.assertIn("there is no qube ai-gone now", proposals.show(self.app, pid)["plan"])
+
+    def test_each_accept_is_one_operator_line_naming_the_qube(self):
+        pid = self.ask("template-install", template="ai-tpl-g", packages=["curl"])
+        self.accept(pid, yes=True)
+        line = [l for l in self.operator_lines() if l["service"] == "qmcp proposal accept"][-1]
+        self.assertEqual((line["args"]["type"], line["args"]["subject"]),
+                         ("template-install", "ai-tpl-g"))
 
 
 if __name__ == "__main__":

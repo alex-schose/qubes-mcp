@@ -16,8 +16,9 @@ qube by its anonymity badges, and the forms that make or change a hidden
 project say in red what its safety rests on. A qube back from a backup or a
 copy is under Needs attention, held, with its row of `qmcp restored list`,
 until it is accepted or rejected (one at a time from its row, or all of them
-from the Check tab, which also prepares any template); the Settings tab
-changes the caps and birth egress, and exports and imports the operator files.
+from the Check tab, which also prepares any template); a template in AI space
+takes packages by their exact names from its row; the Settings tab changes
+the caps and birth egress, and exports and imports the operator files.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()`,
@@ -1128,6 +1129,31 @@ class PrepareForm(Form):
         return gm.prepare_template(name)
 
 
+class InstallForm(Form):
+    """Install packages into a TemplateVM in AI space, from its row. The names
+    are typed, separated by spaces, and the command line follows them as they
+    change; OK stays off, with the command's own reason, while the list or the
+    template's row is one the command refuses. The command may run for many
+    minutes, and the window waits for it (`Window.write` gives a change no time
+    limit)."""
+
+    def __init__(self, parent, row):
+        super().__init__(parent, f"Install packages into {row.get('name')}", "Install",
+                         gm.INSTALL_INTRO)
+        self.row_data = dict(row)
+        self.packages = self.entry("Packages", "exact names, separated by spaces: curl jq")
+        self.power = _label(esc(gm.prepare_power(row)), wrap=True)
+        self.row("Power", self.power)
+        self.done_building()
+
+    def build(self):
+        # The template's reason first: no name typed can lift it.
+        why = gm.install_refusal(self.row_data)
+        if why:
+            raise gm.FormError(why)
+        return gm.install_packages(self.row_data.get("name"), self.packages.get_text())
+
+
 class SettingsForm(Form):
     """The pool cap, the private-volume cap and birth egress: only what
     changed is sent. A field left as it was read is unchanged, and birth
@@ -1508,6 +1534,7 @@ class Window(Gtk.Window):
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
         ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
         ("unblock", "Unblock..."), ("prepare", "Prepare..."),
+        ("packages", "Install packages..."),
         ("accept_restored", "Accept restored..."), ("reject_restored", "Reject restored..."),
     )
     #: The Check tab's: write the in-qube services into any template, and
@@ -2444,6 +2471,10 @@ class Window(Gtk.Window):
                 gm.prepare_template(name),
                 refusal=gm.prepare_refusal(node.data)), "Prepare",
                 check=lambda: self._prepare_now(name))
+        if ident == "packages":
+            # Asked again at OK, against the template's row as the latest refresh read it.
+            return self._open(InstallForm(self, node.data), "Install packages",
+                              check=lambda: self._install_now(name))
         if ident in ("accept_restored", "reject_restored"):
             return self.review(ident, name)
         if ident == "seal":
@@ -2481,6 +2512,13 @@ class Window(Gtk.Window):
         if name is not None and self.fleet_row(name) is None:
             return f"'{name}' is not in the fleet as last read: refresh"
         return gm.prepare_refusal(self.fleet_row(name))
+
+    def _install_now(self, name):
+        """Why the command refuses to install into `name`, as the latest
+        refresh read its row, or None: asked at OK."""
+        if name is not None and self.fleet_row(name) is None:
+            return f"'{name}' is not in the fleet as last read: refresh"
+        return gm.install_refusal(self.fleet_row(name))
 
     def check_action(self, ident):
         """The Check tab's: prepare any template, from a list preselected with

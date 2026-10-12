@@ -354,11 +354,26 @@ def cmd_project(args) -> int:
 
 def cmd_template(args) -> int:
     """`prepare`: the operator writes the in-qube services into one qube.
+    `install`: exact packages into a TemplateVM in AI space, with its own
+    package manager; the last lines it wrote follow, escaped (0.9.28).
     `refresh`: the timer brings every running prepared qube up to date, and
     leaves one audit line per qube it wrote into, as caller "refresh". A qube
     it could not judge or write into is printed (the unit's journal) and makes
     the run exit 3, with no line: the chain records changes, and a qube that
     keeps failing would otherwise add one every minute."""
+    if args.what == "install":
+        _need_root("install", "template")
+        try:
+            report = proposals.install_report(_app(), args.qube, args.packages)
+        except fleet.RoleError as e:
+            print(f"qmcp template install: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"qmcp template install: {type(e).__name__}", file=sys.stderr)
+            return 1
+        for line in report:
+            print(line)
+        return 1 if report.failed else 0
     if args.what == "prepare":
         _need_root("prepare", "template")
         try:
@@ -703,6 +718,12 @@ def build_parser() -> argparse.ArgumentParser:
     q = tsub.add_parser("prepare", help="write them into a TemplateVM or StandaloneVM, starting "
                                         "it if halted (root)")
     q.add_argument("qube")
+    q = tsub.add_parser("install", help="install exact packages into a TemplateVM in AI space "
+                                        "with its own package manager, starting a halted one "
+                                        "for it; on Arch it also upgrades the template (root)")
+    q.add_argument("qube", metavar="TEMPLATE")
+    q.add_argument("packages", nargs="+", metavar="PACKAGE",
+                   help="a package's exact name: letters, digits, '.', '_', '+' and '-'")
     tsub.add_parser("refresh", help="bring every RUNNING prepared qube up to the installed "
                                     "services; never starts one (its timer runs this)")
     p = sub.add_parser("restored", help="qubes back from a backup or a copy, held for review")
@@ -891,8 +912,12 @@ def operator_line(args):
                                      else str(args.birth_egress)[:128]}
     if c == "template":
         # The refresh is the timer's: it writes one line per qube it changed.
-        return None if args.what == "refresh" else ("qmcp template prepare",
-                                                    {"qube": str(args.qube)[:128]})
+        if args.what == "refresh":
+            return None
+        if args.what == "install":
+            return "qmcp template install", {"qube": str(args.qube)[:128],
+                                             "packages": _names(args.packages)}
+        return "qmcp template prepare", {"qube": str(args.qube)[:128]}
     if c == "restored":
         if args.what == "list":
             return None

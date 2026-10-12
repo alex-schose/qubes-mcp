@@ -1,8 +1,10 @@
 """qmcp.proposals — the hub asks, the operator accepts.
 
-A proposal is the options of one `qmcp project` command, never a plan or a list
-of commands: create a project, edit one, add a dump sink, change or remove a
-lead, change a lead's firewall, delete a project. Only the hub submits them (`qmcp.SubmitProposal`) and
+A proposal is the options of one `qmcp` command, never a plan or a list of
+commands: create a project, edit one, add a dump sink, change or remove a
+lead, change a lead's firewall, delete a project, open a guarded qube for a
+while, manage a qube (adopt it into AI space, or un-guard it), revoke one, and
+install exact packages into a template in AI space (0.9.28). Only the hub submits them (`qmcp.SubmitProposal`) and
 polls them (`qmcp.ProposalStatus`); the operator accepts or rejects them in the
 window, which runs `qmcp proposal accept N --sha256 H` or `qmcp proposal reject
 N`, or with those commands in a dom0 terminal. Nothing changes until the
@@ -40,7 +42,10 @@ lead a network by itself.
   different model endpoint, every change to a lead's firewall, which the
   window shows as the old and new rules, and anything that makes a qube a
   model qube or takes one away (it touches a guarded qube; a model qube that
-  would serve a second project is named, with what sharing one means). The window shows
+  would serve a second project is named, with what sharing one means), and
+  every `qube-open`, `qube-manage`, `qube-revoke` and `template-install`,
+  always, with what each would do to that qube as the fleet is now if the
+  command takes it (`show`'s plan names the refusals it can see). The window shows
   the reasons, and `accept` refuses without `--yes TICK`, the digest of the
   reasons shown, while there are any.
 - **The hub learns a state word only**: pending, accepted, rejected, expired or
@@ -52,6 +57,9 @@ lead a network by itself.
   was created; its lead comes from a template; it always takes the second
   tick. After that only the operator changes a hidden one: accepting a
   proposal that names it fails as for a project that does not exist.
+- **A qube of a hidden project** named by `qube-manage`, `qube-revoke` or
+  `template-install` fails at accept exactly as a name that does not exist
+  does, and the second tick says nothing about it.
 - **At most 10 pending, each for 7 days.** Expiry is read, not run: a pending
   proposal older than that is expired whenever it is looked at. No timer.
 - **Announced** by a desktop notification whose text is fixed (the number,
@@ -78,7 +86,7 @@ import re
 import shlex
 import time
 
-from qmcp import audit, budget, core, firewall, projects
+from qmcp import audit, budget, core, firewall, inqube, projects
 
 PROPOSALS_DIR = "/var/lib/qmcp/proposals"
 LOCK_PATH = "/run/qmcp/proposals.lock"
@@ -103,7 +111,10 @@ REPORT_WIDTH = 300
 NOTIFY_TIMEOUT_S = 5.0
 
 TYPES = ("project-create", "project-edit", "project-dump", "project-lead", "project-firewall",
-         "project-delete", "qube-open")
+         "project-delete", "qube-open", "qube-manage", "qube-revoke", "template-install")
+#: The types that name one qube rather than a project: the field it is in.
+QUBE_FIELD = {"qube-open": "qube", "qube-manage": "qube", "qube-revoke": "qube",
+              "template-install": "template"}
 #: The states the hub may learn.
 STATES = ("pending", "accepted", "rejected", "expired", "failed")
 DECIDED = ("accepted", "rejected", "failed")
@@ -463,6 +474,34 @@ def _open_window(req: dict, prefix) -> dict:
             "firewall": False if firewall is None else _bool(firewall, "firewall")}
 
 
+def _manage(req: dict, prefix) -> dict:
+    """`qmcp manage QUBE`: adopt a qube into AI space, or take a guarded one
+    out of the guarded state. The shape only, as for every type."""
+    _fields(req, {"qube"}, set())
+    return {"qube": _qube(req["qube"], "qube")}
+
+
+def _revoke(req: dict, prefix) -> dict:
+    """`qmcp revoke QUBE [--no-shutdown]`. The normal form carries `shutdown`
+    whether or not it was sent, so it reads back as itself."""
+    _fields(req, {"qube"}, {"shutdown"})
+    shutdown = req.get("shutdown")
+    return {"qube": _qube(req["qube"], "qube"),
+            "shutdown": True if shutdown is None else _bool(shutdown, "shutdown")}
+
+
+def _install(req: dict, prefix) -> dict:
+    """`qmcp template install TEMPLATE PKG...`: exact package names, in the
+    order sent. The shape here is the command's own (`inqube.packages_refusal`);
+    whether each is a package's exact name is checked inside the template."""
+    _fields(req, {"template", "packages"}, set())
+    name = _qube(req["template"], "template")
+    why = inqube.packages_refusal(req["packages"])
+    if why:
+        raise Invalid(f"packages: {why}")
+    return {"template": name, "packages": list(req["packages"])}
+
+
 def _lead_change(req: dict, prefix) -> dict:
     _fields(req, {"project"}, {"remove", "lead", "lead_netvm", "lead_name", "keep_old", "model",
                                "add_old_network", "model_qube", "lead_class"})
@@ -527,7 +566,8 @@ def _delete(req: dict, prefix) -> dict:
 
 _NORMALISE = {"project-create": _create, "project-edit": _edit, "project-dump": _dump,
               "project-lead": _lead_change, "project-firewall": _lead_firewall,
-              "project-delete": _delete, "qube-open": _open_window}
+              "project-delete": _delete, "qube-open": _open_window, "qube-manage": _manage,
+              "qube-revoke": _revoke, "template-install": _install}
 
 
 def normalise(req, prefix: str | None = None) -> dict:
@@ -548,8 +588,8 @@ def normalise(req, prefix: str | None = None) -> dict:
 
 def subject(p: dict) -> str | None:
     """What a proposal is about: the new project's label, the project it names,
-    or the qube a window would open."""
-    return p.get("label") or p.get("project") or p.get("qube")
+    or the qube it names."""
+    return p.get("label") or p.get("project") or p.get("qube") or p.get("template")
 
 
 # ======================================================================= the store
@@ -868,8 +908,8 @@ def listing(now: float | None = None, directory: str | None = None) -> list:
 # ======================================================================= what accepting does
 
 def command(p: dict) -> str | None:
-    """The `qmcp project` command a proposal is the options of, as the operator
-    would type it. None for an edit: it is applied to the record as it is at
+    """The `qmcp` command a proposal is the options of, as the operator would
+    type it. None for an edit: it is applied to the record as it is at
     accept, so `show` gives before and after instead of a command."""
     t = p["type"]
     argv = None
@@ -936,6 +976,12 @@ def command(p: dict) -> str | None:
         argv = ["qmcp", "open", p["qube"], "--for", p["for"]]
         if p["firewall"]:
             argv.append("--firewall")
+    elif t == "qube-manage":
+        argv = ["qmcp", "manage", p["qube"]]
+    elif t == "qube-revoke":
+        argv = ["qmcp", "revoke", p["qube"]] + ([] if p["shutdown"] else ["--no-shutdown"])
+    elif t == "template-install":
+        argv = ["qmcp", "template", "install", p["template"]] + list(p["packages"])
     return None if argv is None else shlex.join(argv)
 
 
@@ -1029,6 +1075,194 @@ def _model_qube_reasons(app, p: dict, target) -> list:
     return out
 
 
+def _named_qube(app, p: dict):
+    """(qube, its tags) for a proposal that names one qube: (None, None) when
+    no such qube exists, (vm, None) when its tags cannot be read. Raises
+    core.Unreadable when the lookup itself fails: a lookup that failed is
+    never "no such qube", which would skip every check that needs the qube."""
+    name = p.get(QUBE_FIELD.get(p["type"], ""))
+    if not isinstance(name, str):
+        return None, None
+    try:
+        if name not in app.domains:
+            return None, None
+        vm = app.domains[name]
+    except Exception as e:
+        raise core.Unreadable(f"cannot look up {name}") from e
+    try:
+        return vm, core.tags_of(vm)
+    except core.Unreadable:
+        return vm, None
+
+
+def _built_on(app, name: str):
+    """(how many qubes come from `name` through their template chain, the
+    enrolled gateways and the hub among them), or None when the fleet could
+    not be read: a chain it cannot read is never a short one."""
+    from qmcp import fleet, gateways
+    hub = core.read_hub()
+    try:
+        enrolled = set(gateways.load())
+    except gateways.GatewaysUnreadable:
+        return None
+    count, named = 0, []
+    try:
+        for vm in list(app.domains):
+            if core.name_of(vm) == name or core.klass_of(vm) == "AdminVM":
+                continue
+            if name in {t.name for t in fleet._template_chain(vm)}:
+                count += 1
+                if vm.name == hub or vm.name in enrolled:
+                    named.append(vm.name)
+    except (core.Unreadable, core.Gone):
+        return None
+    except Exception:
+        return None
+    return count, sorted(named)
+
+
+def _approving(records: dict, name: str) -> list:
+    """The projects that approve `name` as a template, a hidden one marked."""
+    return sorted(f"{r.label or r.slot}" + (" (hidden)" if r.hidden else "")
+                  for r in records.values() if name in r.templates)
+
+
+def _qube_reasons(app, p: dict, records: dict) -> list:
+    """Why `qube-manage`, `qube-revoke` and `template-install` take the second
+    tick: always, with what each would do to that qube as the fleet is now, if
+    the command takes it (`show`'s plan names the refusals it can see). A qube
+    of a hidden project gets only the lines that come from the proposal itself,
+    none read from the fleet: accepting fails as for a name that does not
+    exist, which the plan says."""
+    t = p["type"]
+    q = p.get(QUBE_FIELD[t])
+    try:
+        vm, tags = _named_qube(app, p)
+        unknown = False
+    except core.Unreadable:
+        vm, tags, unknown = None, None, True
+    hidden = tags is not None and projects.HUBBLIND in tags
+    out = []
+    if t == "qube-manage":
+        out.append(f"MANAGES {q}: the hub may then run commands in it as root, copy files out of "
+                   f"it, write its firewall rules, clone it and remove it, with no time limit "
+                   f"(an open window is the bounded way into a guarded qube)")
+    elif t == "qube-revoke":
+        out.append(f"REVOKES {q}: every qmcp badge comes off, so it leaves AI space and any slot "
+                   f"it is in; after that the hub reaches it only through your dialogs, and "
+                   f"what it left on its disk stays"
+                   + ("; it is shut down" if p["shutdown"] else "; it keeps running"))
+    else:
+        out.append(f"INSTALLS {len(p['packages'])} package(s) into the template {q} as root, "
+                   f"with its own package manager, from the repositories it already trusts, "
+                   f"and what they depend on: {' '.join(p['packages'])}")
+        out.append("every qube built on it runs them from its first start after the template "
+                   "has shut down; on Arch the install also upgrades the whole template "
+                   "(pacman -Su), as Qubes' own updater does")
+        out.append("the install scripts of each package and each dependency run as root, and a "
+                   "package can itself add a repository or download more software when it is "
+                   "installed (an -installer package, or one that configures repositories): "
+                   "read the names")
+        out.append("an install that would remove an installed package is refused (apt-get "
+                   "--no-remove; dnf never removes one without --allowerasing), and dnf ignores "
+                   "obsoletes; an installed package may still be upgraded when a new one needs "
+                   "it, and on Arch -Su upgrades and replaces what the repositories say")
+    if unknown:
+        out.append(f"{q} could not be looked up, so what this changes is not known")
+        return out
+    if vm is None or hidden:
+        return out
+    if tags is None:
+        out.append(f"{q}'s badges could not be read, so what else this changes is not known")
+        return out
+    try:
+        is_template = core.is_template(vm)
+    except core.Unreadable:
+        # Never "not a template": the line goes into the reasons, and so into
+        # the tick, so a read that failed is said, not dropped.
+        is_template = None
+        out.append(f"whether {q} is a template could not be read, so whether every qube built "
+                   f"on it would run what changes in it is not known")
+    users = _approving(records, q) if is_template is not False else []
+    serves = sorted(projects.model_slots(tags))
+    is_open = bool(tags & {core.OPEN, core.OPEN_FW})
+    if is_template is not False and t in ("qube-manage", "template-install"):
+        built = _built_on(app, q)
+        if built is None:
+            out.append(f"which qubes are built on {q} could not be read")
+        elif built[0]:
+            out.append(f"{built[0]} qube(s) are built on {q}"
+                       + (f", among them {', '.join(built[1])} (the hub or an enrolled gateway, "
+                          f"which applies AI space's egress rules)" if built[1] else ""))
+    if t == "qube-manage":
+        if core.UMBRELLA not in tags:
+            out.append(f"brings {q} into AI space: today the hub cannot see it")
+        elif core.GUARDED in tags:
+            out.append(f"takes {q} out of the guarded state")
+        if is_template:
+            out.append(f"{q} is a template: what the hub puts in it runs in every qube built on it"
+                       + (f"; the projects {', '.join(users)} approve it" if users else ""))
+        try:
+            dvmt = core.is_dvmt(vm)
+        except core.Unreadable:
+            dvmt = None
+            out.append(f"whether {q} is a disposable template could not be read")
+        if dvmt and core.UMBRELLA not in tags:
+            out.append(f"{q} is a disposable template: once it is in AI space the rulebook "
+                       f"refuses every qube a disposable from it, so a qube whose default "
+                       f"disposable template it is loses its disposables; one dom0 or the hub "
+                       f"starts from it joins AI space managed")
+        elif dvmt:
+            out.append(f"{q} is a disposable template: a disposable dom0 or the hub starts from "
+                       f"it takes its tags, so joins AI space managed, not guarded, and the hub "
+                       f"may run commands in it")
+        if is_open:
+            out.append(f"{q} is open to the hub now: managing it ends the window, with no kill")
+        if serves:
+            out.append(f"{q} is the model qube of {', '.join(serves)}: while it is managed the hub "
+                       f"may operate it, and qmcp check warns until it is guarded again")
+        stopped = sorted(f"{r.label or r.slot}" + (" (hidden)" if r.hidden else "")
+                         for r in records.values()
+                         if r.anonymous and (q in r.templates or r.model_qube == q))
+        if stopped:
+            out.append(f"the anonymity gate stops {', '.join(stopped)} right after: an anonymous "
+                       f"project's templates and model qube must be guarded")
+    elif t == "qube-revoke":
+        slots = sorted(projects.member_slots(tags))
+        if slots:
+            out.append(f"it leaves {', '.join(slots)}, with what it holds")
+        if is_open:
+            out.append(f"{q} is open to the hub now: revoking it ends the window")
+        try:
+            gateway = core.is_gateway(vm)
+            disposable = core.klass_of(vm) == "DispVM"
+            # A named disposable is kept when it stops; one Qubes made for a
+            # single use is removed (its auto_cleanup).
+            cleaned = bool(vm.auto_cleanup) if disposable else False
+        except Exception:
+            gateway = disposable = cleaned = None
+            out.append(f"whether {q} is a gateway or a disposable removed when it stops could "
+                       f"not be read")
+        if gateway and p["shutdown"]:
+            out.append(f"{q} provides network: Qubes refuses to shut it down while a qube on it "
+                       f"runs, and the report then says to kill it, which cuts their network")
+        if cleaned and p["shutdown"]:
+            out.append(f"{q} is a disposable that is removed when it stops: shutting it down "
+                       f"removes it")
+        if serves:
+            out.append(f"{', '.join(serves)} lose their model qube: the record still names it, and "
+                       f"qmcp check warns until it is set again")
+        if users:
+            out.append(f"{q} is a template the projects {', '.join(users)} approve: their leads can "
+                       f"no longer spawn from it")
+    else:
+        if users:
+            out.append(f"the projects {', '.join(users)} approve {q}")
+        if core.UMBRELLA in tags and core.GUARDED not in tags:
+            out.append(f"{q} is managed: the hub could install them itself")
+    return out
+
+
 def second_tick(app, p: dict, records: dict) -> list:
     """Why accepting `p` needs the second tick, against the fleet as it is.
     Empty when one click is enough."""
@@ -1048,9 +1282,9 @@ def second_tick(app, p: dict, records: dict) -> list:
         if not p.get("hub_sees"):
             reasons.append(f"WARNING: {fleet.HIDDEN_WARNING}")
     if t == "qube-open":
-        # Always: 2.9 needs the second tick for anything touching a guarded or
-        # sealed qube, and this is the only proposal that opens one. The
-        # window shows these words in red, which is 242's disclaimer.
+        # Always: anything touching a guarded or sealed qube needs the
+        # second tick, and this is the only proposal that opens one. The
+        # window shows these words in red: they are the disclaimer.
         reasons.append(f"OPENS the guarded qube {p['qube']} to the hub for "
                        f"{p['for']}: while it is open the hub may run "
                        f"commands in it as root and copy files in, which is what guarded "
@@ -1060,6 +1294,10 @@ def second_tick(app, p: dict, records: dict) -> list:
                            f"otherwise yours alone")
         reasons.append("the window closes by itself, at every boot, and on Seal, which kills "
                        "the qube if it is running")
+    if t in ("qube-manage", "qube-revoke", "template-install"):
+        # Always: adopting or revoking a qube needs the second tick, and so
+        # does a template's root, which every qube built on it runs.
+        reasons += _qube_reasons(app, p, records)
     if t == "project-delete":
         reasons.append(f"deletes the project {p['project']}: its lead and every worker are removed "
                        f"with everything in them; its dump sink is kept")
@@ -1163,8 +1401,116 @@ def _execute(app, p: dict) -> list:
         # submit: the stored proposal holds the hub's own words.
         return fleet.open_window_report(app, p["qube"], fleet.duration_seconds(p["for"]),
                                         firewall=p["firewall"])
+    if t in ("qube-manage", "qube-revoke", "template-install"):
+        _refuse_hidden_qube(app, p)
+    if t == "qube-manage":
+        report = fleet.Report()
+        report.append(fleet.manage(app, p["qube"], from_hub=True))
+        return report
+    if t == "qube-revoke":
+        report = fleet.Report()
+        report.append(fleet.revoke(app, p["qube"], shutdown=p["shutdown"], from_hub=True))
+        return report
+    if t == "template-install":
+        return install_report(app, p["template"], p["packages"])
     raise Refused(f"unknown type {t}")
 
+
+def _refusal_seen(app, p: dict, vm, tags):
+    """A refusal the command would make that `show` can see without writing
+    anything, in words, or None. Informational: the command checks again at
+    accept, and a read that fails here proves nothing either way."""
+    from qmcp import fleet
+    name = p[QUBE_FIELD[p["type"]]]
+    try:
+        if p["type"] == "template-install":
+            return inqube.install_refusal(vm, name)
+        if core.klass_of(vm) == "AdminVM":
+            return f"{name} is dom0"
+        hub = core.read_hub()
+        if hub is None:
+            return f"{core.HUB_PATH} cannot be read, so whether {name} is the hub is not known"
+        if name == hub:
+            return f"{name} is the hub"
+        if tags is None:
+            return None
+        if "ai-dump" in tags:
+            return f"{name} is a drop box"
+        if core.QUARANTINE in tags:
+            return f"{name} is held for your review"
+        if p["type"] == "qube-revoke" and (projects.LEAD in tags or projects.lead_slots(tags)):
+            return f"{name} is a lead"
+        # In the command's own order (`fleet.manage`): the devices first.
+        if p["type"] == "qube-manage":
+            held = fleet.pci_devices(vm)
+            if held:
+                return f"{name} holds {held} PCI device(s), which a hub's proposal cannot manage"
+        if p["type"] == "qube-manage" and core.is_gateway(vm):
+            return f"{name} provides network, and gateways are always guarded"
+        if p["type"] == "qube-revoke" and not p["shutdown"] and (
+                core.GUARDED not in tags or tags & {core.OPEN, core.OPEN_FW}):
+            return (f"the hub could run commands in {name}, so a hub's proposal to revoke it "
+                    f"shuts it down")
+    except (core.Unreadable, fleet.RoleError):
+        return None
+    return None
+
+
+def _refuse_hidden_qube(app, p: dict) -> None:
+    """A qube of a hidden project, named by the hub, fails as a name that does
+    not exist: the same message as the command gives for one. A qube whose
+    tags cannot be read refuses too, since it may be one. The command makes
+    the hub's other refusals itself, on the tags it reads (`from_hub`)."""
+    from qmcp import fleet
+    name = p[QUBE_FIELD[p["type"]]]
+    try:
+        vm, tags = _named_qube(app, p)
+    except core.Unreadable:
+        raise fleet.RoleError(f"'{name}' cannot be looked up; try again") from None
+    if vm is not None and tags is None:
+        raise fleet.RoleError(f"'{name}''s badges cannot be read; try again")
+    if p["type"] == "template-install" and tags is not None and projects.HUBBLIND in tags:
+        # The install's own words for a name that does not exist (its own
+        # refusal of a hidden project's template names it as one). For a
+        # manage or a revoke the command refuses it itself, on its own read.
+        raise fleet.RoleError(f"no qube '{name}'")
+
+
+def install_report(app, name: str, packages) -> "list":
+    """`qmcp template install`, as a report: a refusal before the install's
+    script ran is a RoleError, a script that failed or did not finish a failed
+    step, and the template's own last lines follow, escaped and said to be its
+    words."""
+    from qmcp import fleet
+    try:
+        r = inqube.install(app, name, packages)
+    except (inqube.InQubeError, core.Unreadable) as e:
+        raise fleet.RoleError(str(e)) from None
+    report = fleet.Report()
+    line = f"{r['qube']}: {r['status']}: {' '.join(r['packages'])}"
+    if r["ok"]:
+        report.append(line)
+    else:
+        report.fail(line)
+    if r["started"] and r.get("stopped"):
+        report.append(f"{r['qube']} was started for this and shut down again"
+                      + (": the qubes built on it get the packages at their next start"
+                         if r["ok"] else ""))
+    elif r["started"]:
+        report.fail(f"{r['qube']} was started for this, and its shutdown did not complete: "
+                    f"qvm-shutdown {r['qube']}, or qvm-kill {r['qube']}")
+    elif r["ok"]:
+        report.append(f"{r['qube']} keeps running: the qubes built on it get the packages once "
+                      f"it has shut down and they start again")
+    if r["lines"]:
+        report.append(f"the last lines {r['manager']} wrote in {r['qube']}, escaped:")
+        report += [f"  {line}" for line in r["lines"]]
+    return report
+
+
+#: The types whose command may run for minutes: their accept lets the project
+#: commands' locks go once the proposal is marked.
+LONG_TYPES = frozenset({"template-install"})
 
 #: Every field of `qmcp proposal show --json`. The window shows each one.
 SHOW_FIELDS = ("id", "state", "type", "title", "subject", "caller", "submitted", "expires",
@@ -1235,6 +1581,26 @@ def show(app, pid: int, now: float | None = None, directory: str | None = None) 
                             "model_qube": None if p.get("model") else view["model_qube"],
                             "rules": firewall.endpoint_rules(p["model"]) if p.get("model")
                             else list(p["rules"])}
+    if p["type"] in ("qube-manage", "qube-revoke", "template-install"):
+        name = p[QUBE_FIELD[p["type"]]]
+        try:
+            vm, tags = _named_qube(app, p)
+        except core.Unreadable:
+            vm, tags = False, None
+        if vm is False:
+            doc["plan"] = f"{name} could not be looked up now: read it again before you decide"
+        elif vm is None:
+            doc["plan"] = f"there is no qube {name} now: accepting it will fail"
+        elif tags is not None and projects.HUBBLIND in tags:
+            doc["plan"] = (f"{name} is a qube of a hidden project: accepting it fails, as for a "
+                           f"name that does not exist, and the hub is told only that")
+        elif p["type"] == "qube-revoke" and tags is not None and core.UMBRELLA not in tags:
+            doc["plan"] = (f"{name} is not in AI space: the hub revokes only a qube it can see, "
+                           f"so accepting it will fail and change nothing")
+        else:
+            why = _refusal_seen(app, p, vm, tags)
+            if why:
+                doc["plan"] = f"{why}, so accepting it will fail and change nothing"
     if p["type"] == "project-delete":
         # The command's own plan, which also covers finishing a half-done delete.
         doc["plan"] = fleet.delete_plan(app, records, p["project"])[1]
@@ -1340,7 +1706,7 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
     from qmcp import fleet
     now = time.time() if now is None else now
     summary = {"id": pid, "sha256": str(sha256)[:64], "yes": tick is not None}
-    held = None
+    held, interrupted = None, None
     try:
         if not valid_fingerprint(sha256):
             raise Refused("--sha256 wants the proposal's 64-character fingerprint, as shown")
@@ -1386,16 +1752,32 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
         # The store's lock is free while the command runs: the mark keeps every
         # other accept and reject of this proposal out, and a submit never waits
         # on a running command (so it cannot tell that one is running).
+        if p["type"] in LONG_TYPES and held is not None:
+            # An install may take half an hour, and the project commands' locks
+            # include the create lock every create of the hub and the leads
+            # waits on. Nothing the install does rests on a project record, and
+            # its reasons were judged under the locks; the mark keeps it from
+            # running twice.
+            h, held = held, None
+            h.__exit__(None, None, None)
         try:
             report = _execute(app, p)
             failure = "a step did not complete" if getattr(report, "failed", None) else None
             ok, report = failure is None, list(report)
-        except Exception as err:
+        except BaseException as err:
             report = list(getattr(err, "report", []))
             # The command's own message, as `qmcp project` prints it; any other
-            # exception by its class only.
-            failure = str(err) if isinstance(err, (fleet.RoleError, RuntimeError)) \
-                else type(err).__name__
+            # exception by its class only. An interrupt (Ctrl-C, a signal turned
+            # into SystemExit) is recorded as one, then raised again: the
+            # command stopped part-way, and a long install may have left the
+            # template needing repair.
+            if not isinstance(err, Exception):
+                interrupted = err
+                failure = ("interrupted while its command ran: check what it was doing (an "
+                           "install may have left the template needing repair)")
+            else:
+                failure = str(err) if isinstance(err, (fleet.RoleError, RuntimeError)) \
+                    else type(err).__name__
             report.append(f"stopped: {failure}")
             ok = False
         try:
@@ -1424,6 +1806,8 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
         if held is not None:
             held.__exit__(None, None, None)
     _audit("qmcp proposal accept", summary, ok, failure)
+    if interrupted is not None:
+        raise interrupted
     return ok, _report(report)
 
 

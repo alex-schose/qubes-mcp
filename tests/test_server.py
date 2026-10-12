@@ -48,7 +48,8 @@ EXPECTED_TOOLS = [
     "qubes_run_disposable", "qubes_feature_set", "qubes_events", "qubes_get_pool_stats",
     "qubes_propose_project", "qubes_propose_project_edit", "qubes_propose_dump",
     "qubes_propose_lead", "qubes_propose_lead_firewall", "qubes_propose_project_delete",
-    "qubes_propose_open", "qubes_proposals",
+    "qubes_propose_open", "qubes_propose_manage", "qubes_propose_revoke",
+    "qubes_propose_packages", "qubes_proposals",
 ]
 # Each proposal tool and the dom0 proposal type it submits.
 PROPOSAL_TYPES = {
@@ -59,6 +60,9 @@ PROPOSAL_TYPES = {
     "qubes_propose_lead_firewall": "project-firewall",
     "qubes_propose_project_delete": "project-delete",
     "qubes_propose_open": "qube-open",
+    "qubes_propose_manage": "qube-manage",
+    "qubes_propose_revoke": "qube-revoke",
+    "qubes_propose_packages": "template-install",
 }
 SUBMIT = "qmcp.SubmitProposal"
 STATUS = "qmcp.ProposalStatus"
@@ -75,6 +79,10 @@ MINIMAL_PROPOSALS = {
     "qubes_propose_project_delete": {"title": "Done", "project": "osint"},
     "qubes_propose_open": {"title": "Install curl in the reference template",
                            "qube": "ai-tpl-g", "for": "2h"},
+    "qubes_propose_manage": {"title": "Adopt the scratch qube", "qube": "scratch"},
+    "qubes_propose_revoke": {"title": "Hand the report qube back", "qube": "ai-hub-report"},
+    "qubes_propose_packages": {"title": "curl for the scrapers", "template": "ai-tpl-g",
+                               "packages": ["curl"]},
 }
 REMOVED_TOOLS = ["qubes_device_list", "qubes_device_attach", "qubes_device_detach",
                  "qubes_install_pkg"]
@@ -362,7 +370,7 @@ class VersionTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_exactly_the_25_tools(self):
+    def test_exactly_the_29_tools(self):
         self.assertEqual(list(tools.TOOLS), EXPECTED_TOOLS)
         for name in REMOVED_TOOLS:
             self.assertNotIn(name, tools.TOOLS)
@@ -1374,6 +1382,23 @@ PAYLOAD_CASES = [
         ("qubes_propose_open", "qube-open", {
             "title": "Update the model qube", "qube": "ai-hub-model", "for": "30m",
             "firewall": True}),
+        ("qubes_propose_manage", "qube-manage", MINIMAL_PROPOSALS["qubes_propose_manage"]),
+        ("qubes_propose_manage", "qube-manage", {
+            "title": "Keep the model qube for good", "qube": "ai-hub-model"}),
+        # shutdown omitted: dom0 stores true.
+        ("qubes_propose_revoke", "qube-revoke", MINIMAL_PROPOSALS["qubes_propose_revoke"]),
+        ("qubes_propose_revoke", "qube-revoke", {
+            "title": "Hand it back running", "qube": "ai-hub-report", "shutdown": False}),
+        ("qubes_propose_revoke", "qube-revoke", {
+            "title": "Hand it back", "qube": "ai-osint-w2", "shutdown": True}),
+        # null is "not given", as everywhere: stored as leaving it out is.
+        ("qubes_propose_revoke", "qube-revoke", {
+            "title": "Hand it back", "qube": "ai-osint-w2", "shutdown": None}),
+        ("qubes_propose_packages", "template-install",
+         MINIMAL_PROPOSALS["qubes_propose_packages"]),
+        ("qubes_propose_packages", "template-install", {
+            "title": "GTK and a compiler", "template": "ai-tpl-g",
+            "packages": ["gir1.2-gtk-3.0", "g++", "python3-requests", "libc6-dev"]}),
      )
 ] + [
     ("qubes_proposals", {}, [(A, STATUS, {})]),
@@ -1623,7 +1648,14 @@ class ProposalContractTests(unittest.TestCase):
                 normal = self.proposals.normalise(payload, "ai-")
                 optional = self.proposals.OPTIONAL.get(payload["type"], frozenset())
                 for key, value in payload.items():
-                    if key in normal:
+                    if key in normal and value is None and normal[key] is not None:
+                        # A field the normal form always carries (a revoke's
+                        # shutdown): null is "not given", so it is stored
+                        # exactly as leaving the field out stores it.
+                        omitted = {k: v for k, v in payload.items() if k != key}
+                        self.assertEqual(normal[key],
+                                         self.proposals.normalise(omitted, "ai-")[key], key)
+                    elif key in normal:
                         self.assertEqual(normal[key], value, key)
                     else:
                         # A field added in 0.9.21 is stored only when given:

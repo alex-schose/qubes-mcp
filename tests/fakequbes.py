@@ -376,8 +376,30 @@ class FakeVM:
         self.app._maybe_fail("notes.set")
         self.__dict__["_notes"] = notes
 
+    @property
+    def devices(self):
+        """qubesadmin's `vm.devices[CLASS]`, over the "class:ident" entries of
+        `_devices`: `get_assigned_devices()` lists one class's. A read of them
+        fails under the key "devices:<qube>"."""
+        app, name = self.__dict__["app"], self.__dict__["name"]
+        entries = self.__dict__["_devices"]
+
+        class _Class:
+            def __init__(self, cls):
+                self.cls = cls
+
+            def get_assigned_devices(self):
+                app._maybe_fail("devices")
+                app._maybe_fail(f"devices:{name}")
+                return [e for e in entries if str(e).startswith(self.cls + ":")]
+
+        return {cls: _Class(cls) for cls in ("pci", "usb", "block", "mic")}
+
     def rpc_files(self) -> dict:
         return dict(self.__dict__.setdefault("_rpc", {}))
+
+    def installed_packages(self) -> list:
+        return list(self.__dict__.get("_packages", []))
 
     def kill(self):
         self.app._maybe_fail("kill")
@@ -394,16 +416,112 @@ class FakeVM:
         self.__dict__["_power"] = "Running"
 
 
+class _FakeStdin:
+    """The process's stdin: what is written is the script, run when it closes."""
+
+    def __init__(self, proc):
+        self.proc, self.buf = proc, bytearray()
+
+    def write(self, data):
+        self.buf.extend(data)
+        return len(data)
+
+    def close(self):
+        self.proc._run(bytes(self.buf))
+
+
 class FakeProc:
     """The process `run_service` returns. It reads the qmcp prepare script's
-    `# qmcp file NAME` blocks and writes each file into the qube."""
+    `# qmcp file NAME` blocks and writes each file into the qube
+    (`communicate`). Fed through `stdin` and read from `stdout` (0.9.28's
+    package install), it runs the package-manager probe and the install script
+    as a template would: the probe exits with the status of `app.pkgmgr`'s
+    entry for the qube (apt-get, the default, dnf, pacman, or None for none);
+    the install refuses a name not in `app.repo` with the script's own status
+    20, else records the names in the qube (`installed_packages`). Modes, from
+    `app.vmshell`: "ok", "timeout" (it never ends until killed), "hanginstall"
+    (the probe answers, the install never ends), "exit1", "norefresh" (status
+    21) and "flood" (a megabyte of output first)."""
+
+    MANAGERS = {"apt-get": 10, "dnf": 11, "pacman": 12, None: 13}
 
     def __init__(self, vm, mode):
+        import os
         self.vm, self.mode, self.returncode, self.killed = vm, mode, None, False
+        self.hung = mode == "timeout"
+        self.stdin = _FakeStdin(self)
+        r, self._w = os.pipe()
+        self.stdout = os.fdopen(r, "rb")
+        self.scripts = vm.app.vmshell_scripts
+
+    def _emit(self, data: bytes) -> None:
+        import os
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self._w, view):]
+
+    def _end(self) -> None:
+        import os
+        if self._w is not None:
+            os.close(self._w)
+            self._w = None
+
+    def _run(self, script: bytes) -> None:
+        self.scripts.append(script)
+        text = script.decode("ascii", errors="replace")
+        if self.mode == "hanginstall" and not text.startswith("if command -v apt-get"):
+            self.hung = True
+            self._emit(b"Reading package lists...\n")
+        if self.hung:
+            return                      # ends only when killed
+        app, name = self.vm.app, self.vm.__dict__["name"]
+        if self.mode == "flood":
+            self._emit((b"noise " * 170 + b"\n") * 1024)
+        if text.startswith("if command -v apt-get"):
+            self.returncode = self.MANAGERS[app.pkgmgr.get(name, "apt-get")]
+        elif self.mode == "exit1":
+            self._emit(b"E: the package manager failed\n")
+            self.returncode = 1
+        elif self.mode == "norefresh":
+            self._emit(b"E: could not reach the update proxy\n")
+            self.returncode = 21
+        else:
+            last = next((line for line in text.split("\n")
+                         if line.startswith(("apt-get install", "dnf -y -q ",
+                                             "pacman --noconfirm --needed -Su"))), text)
+            last = last.split(" || ")[0]
+            names = [w.strip("'") for w in last.split()
+                     if not w.startswith("-") and ":" not in w and "=" not in w
+                     and w not in ("apt-get", "install", "dnf", "pacman")]
+            missing = [n for n in names if n not in app.repo]
+            if missing:
+                self._emit(f"not a package name here: {missing[0]}\n".encode())
+                self.returncode = 20
+            else:
+                done = self.vm.__dict__.setdefault("_packages", [])
+                for n in names:
+                    self._emit(f"Setting up {n} ...\n".encode())
+                    if n not in done:
+                        done.append(n)
+                self._emit(b"\x1b[31mred\xe2\x80\xaeevil\n")
+                for n in names:
+                    self._emit(f"installed: {n} 1.0\n".encode())
+                self.returncode = 0
+        self._end()
+
+    def wait(self, timeout=None):
+        import subprocess
+        if self.hung and not self.killed:
+            raise subprocess.TimeoutExpired("qrexec-client", timeout)
+        if self.hung:
+            self.returncode = -9
+        return self.returncode
 
     def communicate(self, input=None, timeout=None):
         import base64
         import subprocess
+        self._end()                     # the prepare reads no output
+        self.stdout.close()
         if self.mode == "timeout" and not self.killed:
             raise subprocess.TimeoutExpired("qrexec-client", timeout)
         if self.mode == "timeout":
@@ -426,6 +544,7 @@ class FakeProc:
 
     def kill(self):
         self.killed = True
+        self._end()
 
 
 class FakeDomains:
@@ -490,8 +609,15 @@ class FakeApp:
         self.default_template = None
         self._disp_counter = 1000
         self.calls: list = []
-        #: `run_service` per qube: "ok" (the default), "timeout" or "exit1".
+        #: `run_service` per qube: "ok" (the default), "timeout" or "exit1"
+        #: (and for an install "norefresh" and "flood"; see FakeProc).
         self.vmshell: dict = {}
+        #: Every script a `run_service` process was fed through its stdin.
+        self.vmshell_scripts: list = []
+        #: Each qube's package manager, as the probe finds it (default apt-get).
+        self.pkgmgr: dict = {}
+        #: The package names the templates' repositories hold.
+        self.repo: set = {"sl", "curl", "jq", "g++", "gir1.2-gtk-3.0"}
         #: Every tag add, in order: (qube, its tags right after). What a qube
         #: wore at each moment of its creation is read from here.
         self.tag_log: list = []
