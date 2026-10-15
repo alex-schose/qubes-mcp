@@ -151,7 +151,8 @@ def cmd_window(args) -> int:
                 return 0
             if args.qube is not None:
                 print(fleet.seal(_app(), args.qube))
-                return 0
+                # Sealed, with its kill not yet read back: the next pass tries it.
+                return 3 if fleet.kill_pending(args.qube) else 0
             lines = fleet.expire_windows(_app(), every=args.all)
     except fleet.RoleError as e:
         print(f"qmcp {args.cmd}: {e}", file=sys.stderr)
@@ -163,7 +164,9 @@ def cmd_window(args) -> int:
         print(line)
     # "NOT sealed" and "could not be judged" are the two a window may be left
     # open by; `qmcp check` fails on the badge either way.
-    return 3 if any("NOT sealed" in l or "could not be judged" in l for l in lines) else 0
+    # A kill that failed leaves a pending kill: the pass is not done either.
+    return 3 if (any("NOT sealed" in l or "could not be judged" in l for l in lines)
+                 or fleet.pending_kills()) else 0
 
 
 def _need_root(what: str, command: str = "project") -> None:
@@ -506,6 +509,12 @@ def cmd_gate(args) -> int:
                   file=sys.stderr)
         for name, err in held.failed:
             print(f"{name}: NOT held ({err}); tried again next run", file=sys.stderr)
+        for name in held.gone:
+            print(f"{name}: removed by a call that was already running when it was to be held",
+                  file=sys.stderr)
+        for name in held.unsettled:
+            print(f"{name}: held, while a call kept its lock past the wait, so that call may "
+                  f"have finished after the hold (qmcp restored shows the qube)", file=sys.stderr)
         if not held.judged:
             print("qmcp gate: a create held the lock, so no restored qube was looked for; the "
                   "next run looks", file=sys.stderr)
@@ -535,7 +544,8 @@ def cmd_gate(args) -> int:
                 print(f"  {line}")
     if any(v.status == anon.RED for v in verdicts):
         return 1
-    unjudged = held is None or not held.judged or bool(held.failed or held.unread)
+    unjudged = held is None or not held.judged or bool(held.failed or held.unread
+                                                         or held.unsettled)
     return 3 if unjudged or any(v.status == anon.UNREADABLE for v in verdicts) else 0
 
 

@@ -775,6 +775,9 @@ QUBE_PROPERTIES = frozenset({
 ALLOWED_TRY = {
     ("restored.py", "_reject"): "only a label already absent (KeyError) is passed over; any other "
                                "failure raises and the reject reports it, with the badges off",
+    ("restored.py", "_settle"): "the hold's read-back after its second wait: a read that fails "
+                                "is reported in the pass's result and on the audit chain as not "
+                                "held, and makes the gate exit 3, as in hold",
     ("restored.py", "hold"): "a hold that fails is reported in the pass's result and on the audit "
                              "chain, and tried again next run; the qube is never taken as reviewed",
     ("inqube.py", "refresh"): "a qube whose label cannot be read is reported as not judged and "

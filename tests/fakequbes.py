@@ -79,6 +79,15 @@ _CLASS_LACKS = {
 }
 
 
+
+_STARTS = [0]
+
+
+def _start_stamp() -> str:
+    """A distinct start_time per start, as qubesd's is."""
+    _STARTS[0] += 1
+    return f"1790000000.{_STARTS[0]:06d}"
+
 class Injected(Exception):
     pass
 
@@ -276,7 +285,10 @@ class FakeVM:
                  "virt_mode": "pvh", "management_dispvm": None,
                  "guivm": None, "audiovm": None,
                  "visible_gateway": "10.137.0.5", "dns": "10.139.1.1",
-                 "uuid": str(_uuid.uuid4())}
+                 "uuid": str(_uuid.uuid4()),
+                 # qubesd's start_time: when the running domain started, empty
+                 # while halted; a new value for each start.
+                 "start_time": _start_stamp() if power in ("Running", "Paused") else ""}
         if klass in ("AppVM", "DispVM"):
             props["template"] = template
         for p in _CLASS_LACKS.get(klass, ()):
@@ -353,12 +365,14 @@ class FakeVM:
         """A start: what its disk holds now is what a clone gets until it stops."""
         if not self.is_running():
             self.__dict__["_rpc_saved"] = dict(self.__dict__.setdefault("_rpc", {}))
+            self._props["start_time"] = _start_stamp()
         self.__dict__["_power"] = "Running"
 
     def _went_down(self):
         """A stop, a kill included: Qubes commits a persistent root then."""
         self.__dict__.pop("_rpc_saved", None)
         self.__dict__["_power"] = "Halted"
+        self._props["start_time"] = ""
 
     def committed_files(self) -> dict:
         """The in-qube files in the root a clone would copy now."""

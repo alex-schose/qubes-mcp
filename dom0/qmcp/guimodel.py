@@ -1439,6 +1439,11 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         # hold, had it come, has nothing left to do.
         if attention in ("held", "unheld"):
             out |= {"accept_restored", "reject_restored"}
+        # Seal shows whenever a badge is on, on any row: a drop box or a qube
+        # under Needs attention included. It only takes authority away, and
+        # it is how the operator takes a badge off without waiting for the pass.
+        if open_window_of(node.data) is not None:
+            out.add("seal")
         if attention or state is None:
             return out
         # Into its own root: never one the gate stopped, which the command
@@ -1458,13 +1463,9 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         # The window is the bounded alternative to Manage, on a guarded qube
         # the command will take: never a gateway, never one the gate stopped
         # or a hidden project's (`attention` and `state is None` returned
-        # above cover the rest). Seal shows whenever a badge is on, including
-        # on a qube Open refuses, which is how the operator takes one off by
-        # hand without waiting for the pass.
+        # above cover the rest). Seal is decided above, for every row.
         if state == "guarded" and role != "gateway" and not open_window_of(node.data):
             out.add("open")
-        if open_window_of(node.data) is not None:
-            out.add("seal")
         # A model qube is managed only for its maintenance window, which Guard closes.
         if state == "managed" and (role in ("hub's qube, no slot", "template", "disposable template")
                                    or role.startswith("model qube")):

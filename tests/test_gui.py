@@ -853,6 +853,17 @@ class Model(GuiBase):
                 keys = [n.key for n in gm.walk(tree)]
                 self.assertEqual(len(keys), len(set(keys)))
 
+    def test_a_drop_box_wearing_an_open_badge_can_be_sealed_from_the_window(self):
+        # `qmcp open` refuses a drop box, but a hand-written badge reaches one,
+        # and the rulebook's window lines match the badge alone; `qmcp seal`
+        # takes it off, and the window offers it on that row.
+        self.app.domains["osint-dump"].tags.add(core.OPEN)
+        placed = [n for n in gm.walk(self.tree()) if n.kind == "qube"
+                  and n.data.get("name") == "osint-dump"]
+        self.assertTrue(placed)
+        for node in placed:
+            self.assertIn("seal", gm.actions(node, {}))
+
     def test_a_qube_that_cannot_be_read_is_under_needs_attention(self):
         # A failed read is never state: the qube is shown, placed by none of
         # the values that failed, and offers nothing until it reads.

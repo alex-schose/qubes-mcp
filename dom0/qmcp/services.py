@@ -185,7 +185,13 @@ def _recheck(app, call, template=None, netvm=None) -> None:
     """Under the create lock or a qube's lock, the caller must still be what it
     was: a project command holds the same lock, so a call that waited for one
     must not run on authority it took away. A lead's template and network are checked again
-    against its record as it is now."""
+    against its record as it is now. The caller's acting lock is taken first
+    and held to the reply, so a lead's removal or change, which takes it
+    exclusively, waits for this call once it is past here, and a call that
+    reaches here while it runs is checked against what it left."""
+    if not call.acting:
+        call.fds.append(core.hold_acting(call.caller))
+        call.acting = True
     who = core.principal(app, call.caller, core.read_hub())
     if who.kind != call.principal.kind or who.slot != call.principal.slot:
         raise core.Refusal(core.NOT_AUTHORIZED)

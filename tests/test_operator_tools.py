@@ -17,6 +17,8 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -71,6 +73,41 @@ class ToolsBase(ProjectBase):
 
     def uuid(self, name):
         return self.app.domains[name]._props["uuid"]
+
+
+# ======================================================================= seals
+
+class SealExit(ToolsBase):
+    """A seal whose kill was not read back exits 3, named or swept (a named
+    seal for its own kill, a sweep for any), unless the kill failed on the
+    seal's second wait, which exits 1: the window's badges are off, but what
+    the hub started may still run."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.domains["ai-tpl-g"].__dict__["_power"] = "Running"
+        fleet.open_window(self.app, "ai-tpl-g", 3600)
+        self.app.fail.add("kill")
+
+    def test_a_named_seal_whose_kill_fails_exits_3(self):
+        rc, out, _ = self.cli("seal", "ai-tpl-g")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("could NOT be killed", out)
+
+    def test_a_sweep_with_a_pending_kill_exits_3_until_it_is_made(self):
+        self.assertEqual(self.cli("seal", "--all")[0], 3)
+        self.assertEqual(self.cli("seal", "--expired")[0], 3)
+        self.app.fail.discard("kill")
+        self.assertEqual(self.cli("seal", "--expired")[0], 0)
+
+    def test_check_fails_on_a_window_directory_the_services_cannot_write(self):
+        self.app.fail.discard("kill")
+        os.chmod(fleet.WINDOW_DIR, 0o2750)
+        self.addCleanup(os.chmod, fleet.WINDOW_DIR, 0o2770)
+        f = {x.check: x for x in fleet.check(self.app, legacy_paths=(),
+                                              system_info={"domains": {}})}
+        self.assertEqual(f["runtime dir"].status, "fail")
+        self.assertIn(str(fleet.WINDOW_DIR), f["runtime dir"].detail)
 
 
 # ======================================================================= in-qube services
@@ -360,6 +397,70 @@ class Hold(ToolsBase):
         r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-osint-w9", "action": "start"},
                       caller=LEAD)
         self.assertEqual(r, core.QUARANTINE_REFUSAL)
+
+    def waits(self, lock, settle):
+        for attr, value in (("HOLD_LOCK_WAIT_S", lock), ("HOLD_SETTLE_WAIT_S", settle)):
+            self.addCleanup(setattr, restored, attr, getattr(restored, attr))
+            setattr(restored, attr, value)
+
+    def hold_lock_then(self, name, after, then):
+        """A call holding `name`'s lock that does `then` after `after` seconds
+        and then finishes."""
+        fd = core.acquire_qube_lock(name, 1)
+
+        def run():
+            time.sleep(after)
+            then()
+            os.close(fd)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        return t
+
+    def test_a_remove_in_flight_when_the_hold_went_on_is_reported_not_held(self):
+        self.waits(0.1, 3.0)
+        self.restore_worker()
+        self.hold_lock_then("ai-osint-w9", 0.5, lambda: self.app.domains.__delitem__("ai-osint-w9"))
+        held = restored.hold(self.app)
+        self.assertEqual(held.gone, ["ai-osint-w9"])
+        self.assertEqual(held.held, [])
+
+    def test_a_remove_that_landed_before_the_hold_is_gone_not_failed(self):
+        self.restore_worker()
+        app = self.app
+
+        def removed_first(tag):
+            # A remove already running lands just before the hold's own write.
+            app.domains.__delitem__("ai-osint-w9")
+            raise RuntimeError("gone")
+        self.app.domains["ai-osint-w9"].tags.add = removed_first
+        held = restored.hold(self.app)
+        self.assertEqual((held.gone, held.failed, held.held), (["ai-osint-w9"], [], []))
+
+    def test_a_hold_made_without_the_lock_is_read_back_once_it_is_had(self):
+        self.waits(0.1, 3.0)
+        vm = self.restore_worker()
+        call = self.hold_lock_then("ai-osint-w9", 0.5, lambda: vm.tags.discard(core.QUARANTINE))
+        held = restored.hold(self.app)
+        call.join(5)                                    # what the call did has landed
+        self.assertEqual(held.held, ["ai-osint-w9"])
+        self.assertIn(core.QUARANTINE, self.tags("ai-osint-w9"))
+
+    def test_a_hold_whose_call_outlasts_both_waits_says_so(self):
+        self.waits(0.1, 0.1)
+        self.restore_worker()
+        fd = core.acquire_qube_lock("ai-osint-w9", 1)
+        self.addCleanup(os.close, fd)
+        held = restored.hold(self.app)
+        self.assertEqual((held.held, held.unsettled), (["ai-osint-w9"], ["ai-osint-w9"]))
+        self.assertIn(core.QUARANTINE, self.tags("ai-osint-w9"))
+
+    def test_a_reject_that_went_on_without_the_lock_says_so(self):
+        self.restore_worker()
+        restored.hold(self.app)
+        fd = core.acquire_qube_lock("ai-osint-w9", 1)
+        self.addCleanup(os.close, fd)
+        self.assertIn("went on without it", restored.reject(self.app, "ai-osint-w9"))
 
     def test_a_hand_copy_is_held_and_an_unlabelled_badged_qube_too(self):
         self.app.clone_vm(self.app.domains["ai-hubq"], "ai-hubq-copy")
@@ -1442,6 +1543,63 @@ class Packages(ToolsBase):
                          [(True, {"qube": self.TPL, "packages": ["curl"]}),
                           (False, {"qube": self.TPL, "packages": ["nosuch"]})])
 
+
+
+class InstallSealStep(unittest.TestCase):
+    """The installer's seal step, cut out of install.sh and run against stub
+    modules: it goes on past a seal whose kill is pending only when no qube
+    reads as wearing an open badge, and stops on anything else."""
+
+    TEXT = (HERE.parent / "deploy" / "install.sh").read_text()
+
+    def step(self, rc, left="", left_fails=False):
+        import tempfile
+        start = self.TEXT.index("# Exit 3 is also a kill a seal could not make yet")
+        end = self.TEXT.index("\n", self.TEXT.index('[ "$SEAL_RC" -eq 0 ] && [ -n "$SEAL_OUT" ]', start))
+        lib = pathlib.Path(tempfile.mkdtemp(prefix="qmcp-seal-step-"))
+        self.addCleanup(shutil.rmtree, lib)
+        (lib / "qmcp").mkdir()
+        (lib / "qubesadmin").mkdir()
+        (lib / "qmcp" / "__init__.py").write_text("")
+        (lib / "qmcp" / "cli.py").write_text(
+            f"def main(argv):\n    print('sealed ai-x')\n    return {rc}\n")
+        (lib / "qmcp" / "fleet.py").write_text(
+            "def open_badge_holders(app):\n"
+            + ("    raise RuntimeError('read')\n" if left_fails else f"    return {left.split()!r}\n"))
+        (lib / "qubesadmin" / "__init__.py").write_text("")
+        (lib / "qubesadmin" / "app.py").write_text("class QubesLocal:\n    pass\n")
+        script = ('set -euo pipefail\n'
+                  'die() { echo "install.sh: $*" >&2; exit 1; }\nsay() { echo "==> $*"; }\n'
+                  f'LIB="{lib}"\n' + self.TEXT[start:end] + '\necho GOES-ON\n')
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    def test_a_clean_seal_goes_on(self):
+        r = self.step(0)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("GOES-ON", r.stdout)
+
+    def test_a_pending_kill_with_no_badge_left_goes_on_and_says_so(self):
+        r = self.step(3)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("could not kill its qube yet", r.stdout)
+        self.assertIn("GOES-ON", r.stdout)
+
+    def test_a_badge_still_on_stops_the_install(self):
+        r = self.step(3, left="ai-x")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still open: ai-x", r.stderr)
+        self.assertNotIn("GOES-ON", r.stdout)
+
+    def test_a_read_that_fails_stops_the_install(self):
+        r = self.step(3, left_fails=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("GOES-ON", r.stdout)
+
+    def test_any_other_failure_stops_the_install(self):
+        r = self.step(1)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not be sealed", r.stderr)
+        self.assertNotIn("GOES-ON", r.stdout)
 
 if __name__ == "__main__":
     unittest.main()

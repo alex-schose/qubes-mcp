@@ -329,10 +329,76 @@ def qube_lock_path(name: str, run_dir: str | None = None) -> str:
                         f"{name}.lock")
 
 
-def acquire_qube_lock(name: str, timeout: float | None = None) -> int | None:
+def queue_path(lock_path: str) -> str:
+    """The turnstile beside a lock file: a qube's or the create lock's
+    `x.lock` -> `x.queue`; any other lock (a caller's acting lock) gets
+    `.queue` appended. A turnstile always ends in `.queue` and a lock never
+    does, so no name can make one file the other's."""
+    return lock_path[:-len(".lock")] + ".queue" if lock_path.endswith(".lock") \
+        else lock_path + ".queue"
+
+
+def _open_lock_file(path: str) -> int:
+    """Open (creating it group-writable) a lock file the services and the
+    operator's commands share. Raises OSError."""
+    old = os.umask(0o007)
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+    finally:
+        os.umask(old)
+
+
+def _wait_flock(fd: int, deadline: float, step: float, mode: int = fcntl.LOCK_EX) -> bool:
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(step)
+
+
+def take_queued_lock(path: str, timeout: float, step: float, queue: bool,
+                     mode: int = fcntl.LOCK_EX) -> int | None:
+    """A lock taken through its turnstile (`queue_path`): its descriptor, or
+    None when it was not had within `timeout`. Raises OSError when a file
+    cannot be opened.
+
+    flock is not fair, so a caller that keeps calls in flight could hold a
+    lock off the operator for as long as it liked. The turnstile ends that:
+    every taker passes through it first, and a `queue` taker (an operator's
+    command, the restore check) keeps it while it waits for the lock, so a
+    call that arrives after it waits behind it; a call already past the
+    turnstile goes first, and there are at most as many of those as the
+    callers that reach the qube have slots. A service passes straight through: it never holds the
+    turnstile while it waits, so services never queue behind each other.
+    `mode`: the lock itself is taken shared (`fcntl.LOCK_SH`) by the calls
+    that hold a caller's acting lock, and exclusively by everyone else."""
+    deadline = time.monotonic() + timeout
+    qfd = _open_lock_file(queue_path(path))
+    try:
+        if not _wait_flock(qfd, deadline, step):
+            return None
+        if not queue:
+            os.close(qfd)
+            qfd = None
+        fd = _open_lock_file(path)
+        if _wait_flock(fd, deadline, step, mode):
+            return fd
+        os.close(fd)
+        return None
+    finally:
+        if qfd is not None:
+            os.close(qfd)
+
+
+def acquire_qube_lock(name: str, timeout: float | None = None,
+                      queue: bool = False) -> int | None:
     """The lock of the qube `name`: its descriptor, or None when it was held
     past `timeout`. Released when the descriptor is closed, or the process
-    exits.
+    exits. `queue`: an operator's command, which waits in the qube's
+    turnstile, so calls arriving after it wait behind it (`take_queued_lock`).
 
     Taken only on a qube the caller may already see: a service resolves the
     qube first and checks again under the lock, so a name outside its reach
@@ -348,29 +414,60 @@ def acquire_qube_lock(name: str, timeout: float | None = None) -> int | None:
     path = qube_lock_path(name)
     old = os.umask(0o007)
     try:
-        try:
-            os.mkdir(os.path.dirname(path), 0o2770)
-        except FileExistsError:
-            pass
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+        os.mkdir(os.path.dirname(path), 0o2770)
+    except FileExistsError:
+        pass
     except OSError:
         raise refuse("qmcp runtime directory unavailable") from None
     finally:
         os.umask(old)
-    deadline = time.monotonic() + (QUBE_WAIT_S if timeout is None else timeout)
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except OSError:
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                return None
-            time.sleep(0.05)
+    try:
+        return take_queued_lock(path, QUBE_WAIT_S if timeout is None else timeout, 0.05, queue)
+    except OSError:
+        raise refuse("qmcp runtime directory unavailable") from None
+
+
+def acting_lock_path(caller: str, run_dir: str | None = None) -> str:
+    """The caller's acting lock, beside its call slots (`<caller>.<i>`), so
+    no name makes one file the other; its turnstile is `<caller>.acting.queue`."""
+    return os.path.join(RUN_DIR if run_dir is None else run_dir, "calls", f"{caller}.acting")
+
+
+def hold_acting(caller: str, timeout: float | None = None) -> int:
+    """The caller's acting lock, shared: every call that changes a qube
+    holds it from the moment its caller is checked again under a qube's lock or the create lock to its
+    reply, so a call is either checked after a command that takes the
+    caller's authority away (and refused), or finished before that command
+    goes on (`drain_caller`). Through the lock's turnstile, so a caller cannot
+    keep its acting lock held by overlapping its own calls: once a drain waits,
+    each new call waits behind it. Raises `Refusal`: busy when it was not had
+    within `timeout`, the runtime directory when it cannot be opened."""
+    try:
+        fd = take_queued_lock(acting_lock_path(caller),
+                              QUBE_WAIT_S if timeout is None else timeout, 0.05, False,
+                              fcntl.LOCK_SH)
+    except OSError:
+        raise refuse("qmcp runtime directory unavailable") from None
+    if fd is None:
+        raise Refusal(BUSY_REFUSAL)
+    return fd
+
+
+def drain_caller(caller: str, timeout: float | None = None) -> int | None:
+    """The caller's acting lock, exclusive, for a command that takes the
+    caller's authority away: it waits for every call of the caller already
+    past its check, and while it holds the lock, a call reaching its check
+    waits and is then checked against what the command left. The descriptor,
+    or None when a call still held it after `timeout`. It waits in the lock's
+    turnstile, so only the calls already past it hold it off. Raises OSError
+    when the lock cannot be opened."""
+    return take_queued_lock(acting_lock_path(caller),
+                            OPERATOR_WAIT_S if timeout is None else timeout, 0.05, True)
 
 
 class qube_lock:
-    """`with core.qube_lock(name) as held:` for an operator command. `must`:
+    """`with core.qube_lock(name) as held:` for an operator command, which
+    waits in the qube's turnstile (`take_queued_lock`). `must`:
     a command that grants authority refuses (`QubeBusy`) when the lock is held
     past the wait; one that only takes authority away goes on without it
     (`held` False) and says so."""
@@ -381,7 +478,7 @@ class qube_lock:
         self.fd = None
 
     def __enter__(self) -> bool:
-        self.fd = acquire_qube_lock(self.name, self.timeout)
+        self.fd = acquire_qube_lock(self.name, self.timeout, queue=True)
         if self.fd is None and self.must:
             raise QubeBusy(f"'{self.name}' is being changed by a call or another command "
                            f"(its lock was held for {self.timeout:.0f}s); try again")
@@ -703,7 +800,7 @@ def reference(app, name, what: str, who: Principal):
 class Call:
     """One invocation: what the audit line will say about it."""
 
-    __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds")
+    __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds", "acting")
 
     def __init__(self, service: str) -> None:
         self.service = service
@@ -718,6 +815,8 @@ class Call:
         #: VALUE cannot reach the log by omission.
         self.summary: dict = {}
         self.error_class = None
+        #: Whether `fds` holds the caller's acting lock (`hold_acting`).
+        self.acting = False
 
 
 def emit(call: Call, payload: dict, audit: bool, out=None) -> int:

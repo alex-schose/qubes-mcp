@@ -7,6 +7,7 @@ that the library does not let it through.
 """
 from __future__ import annotations
 
+import fcntl
 import grp
 import io
 import json
@@ -15,6 +16,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -45,6 +47,7 @@ class Base(unittest.TestCase):
             (core, "QUBE_WAIT_S", 0.3),
             (core, "OPERATOR_WAIT_S", 0.3),
             (fleet, "OPEN_LOCK_WAIT_S", 0.3),
+            (anon, "KILL_LOCK_WAIT_S", 0.3),
             (birth, "NAME_PREFIX_PATH", self.tmp / "name-prefix"),
             (birth, "BIRTH_EGRESS_PATH", self.tmp / "birth-egress"),
             (audit, "LOG_PATH", self.tmp / "audit.log"),
@@ -1431,6 +1434,321 @@ class Windows(Base):
                 self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Running")
                 with self.assertRaises(Exception):
                     fleet.read_window(self.TPL)
+                # The kill waits for the hub file, as a pending kill; this
+                # test's next round opens the qube again, so it goes here.
+                self.assertTrue(fleet.kill_pending(self.TPL))
+                fleet.clear_window(self.TPL)
+
+    def test_a_seal_takes_the_badges_off_a_drop_box_and_the_hub(self):
+        # `qmcp open` refuses both, but a hand-written tag reaches them, and the
+        # rulebook's window lines match the badge alone. Every seal takes it off;
+        # the hub is never killed.
+        a = self.app
+        a.domains["mcp-control"].start()
+        for sweep in ("named", "expired", "every"):
+            with self.subTest(sweep):
+                for name in ("ai-sink", "mcp-control"):
+                    a.domains[name].tags.add(core.OPEN)
+                    a.domains[name].tags.add(core.OPEN_FW)
+                if sweep == "named":
+                    lines = [fleet.seal(a, "ai-sink"), fleet.seal(a, "mcp-control")]
+                else:
+                    lines = fleet.expire_windows(a, every=sweep == "every")
+                for name in ("ai-sink", "mcp-control"):
+                    self.assertFalse(self.tags(name) & {core.OPEN, core.OPEN_FW}, lines)
+                self.assertFalse(any("NOT sealed" in line for line in lines), lines)
+                self.assertTrue(any("mcp-control" in line and "it is the hub" in line
+                                    for line in lines), lines)
+                self.assertEqual(a.domains["mcp-control"].get_power_state(), "Running")
+
+    def test_a_window_whose_refusal_read_fails_is_sealed_not_skipped(self):
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add(f"get.provides_network:{self.TPL}")
+        lines = fleet.expire_windows(self.app)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
+        self.assertTrue(any("cannot be told" in line for line in lines), lines)
+
+    def test_a_named_seal_needs_no_tag_read(self):
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail_reads(f"tag.List:{self.TPL}", "fail")
+        fleet.seal(self.app, self.TPL)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+
+    def test_a_seal_whose_kill_fails_is_named_and_tried_again(self):
+        vm = self.app.domains[self.TPL]
+        vm.__dict__["_power"] = "Running"
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add("kill")
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("could NOT be killed", msg)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertTrue(fleet.kill_pending(self.TPL))
+        self.assertEqual(fleet.pending_kills(), [self.TPL])
+        self.assertEqual(self.findings()["open windows"].status, "fail")
+        self.assertIn("NOT killed", " ".join(fleet.expire_windows(self.app)))
+        self.app.fail.discard("kill")
+        lines = fleet.expire_windows(self.app)
+        self.assertTrue(any("killed on a later pass" in line for line in lines), lines)
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertEqual(fleet.pending_kills(), [])
+        self.assertEqual(self.findings()["open windows"].status, "pass")
+
+    def test_a_seal_cut_short_after_its_badges_is_killed_by_the_next_pass(self):
+        vm = self.app.domains[self.TPL]
+        vm.__dict__["_power"] = "Running"
+        fleet.open_window(self.app, self.TPL, 3600)
+        real = fleet._kill_if_running
+        fleet._kill_if_running = lambda vm: (_ for _ in ()).throw(SystemExit("killed"))
+        try:
+            with self.assertRaises(SystemExit):
+                fleet.seal(self.app, self.TPL)          # the process dies before its kill
+        finally:
+            fleet._kill_if_running = real
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertEqual(vm.get_power_state(), "Running")
+        fleet.expire_windows(self.app)
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertEqual(fleet.pending_kills(), [])
+
+    def test_a_record_that_cannot_be_removed_never_ends_the_pass(self):
+        for name in (self.TPL, "ai-dvm-g"):
+            fleet.open_window(self.app, name, 3600)
+        real = fleet.clear_window
+
+        def stuck(name, dir_=None):
+            if name == self.TPL:
+                raise PermissionError(name)
+            return real(name, dir_)
+        fleet.clear_window = stuck
+        try:
+            lines = fleet.expire_windows(self.app, every=True)
+        finally:
+            fleet.clear_window = real
+        for name in (self.TPL, "ai-dvm-g"):
+            self.assertFalse(self.tags(name) & {core.OPEN, core.OPEN_FW}, lines)
+
+    def test_an_unexpected_error_in_one_seal_never_ends_the_pass(self):
+        for name in (self.TPL, "ai-dvm-g"):
+            fleet.open_window(self.app, name, 3600)
+        real = fleet._seal_target
+
+        def broken(app, name):
+            if name == self.TPL:
+                raise RuntimeError("qubesd")
+            return real(app, name)
+        fleet._seal_target = broken
+        try:
+            lines = fleet.expire_windows(self.app, every=True)
+        finally:
+            fleet._seal_target = real
+        self.assertIn(f"{self.TPL}: NOT sealed: RuntimeError", lines)
+        self.assertFalse(self.tags("ai-dvm-g") & {core.OPEN, core.OPEN_FW}, lines)
+
+    def pending_after_failed_kill(self):
+        vm = self.app.domains[self.TPL]
+        vm.start()
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add("kill")
+        fleet.seal(self.app, self.TPL)
+        self.app.fail.discard("kill")
+        self.assertTrue(fleet.kill_pending(self.TPL))
+        return vm
+
+    def test_a_pending_kill_spares_a_qube_started_again_since(self):
+        # The operator's own restart ended what the hub left running; a kill
+        # now would only end the operator's session.
+        vm = self.pending_after_failed_kill()
+        vm.kill()
+        vm.start()
+        lines = fleet.expire_windows(self.app)
+        self.assertTrue(any("started again since its seal" in l for l in lines), lines)
+        self.assertEqual(vm.get_power_state(), "Running")
+        self.assertEqual(fleet.pending_kills(), [])
+
+    def test_a_pending_kill_spares_another_qube_of_that_name(self):
+        self.pending_after_failed_kill()
+        self.app.domains[self.TPL]._props["uuid"] = "00000000-0000-4000-8000-000000000000"
+        lines = fleet.expire_windows(self.app)
+        self.assertTrue(any("another qube of that name" in l for l in lines), lines)
+        self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Running")
+
+    def test_the_hub_is_never_left_with_a_pending_kill(self):
+        a = self.app
+        a.domains["mcp-control"].start()
+        a.domains["mcp-control"].tags.add(core.OPEN)
+        fleet.seal(a, "mcp-control")
+        self.assertEqual(fleet.pending_kills(), [])
+        self.assertEqual(self.findings()["open windows"].status, "pass")
+
+    def test_the_hub_sealed_while_its_file_did_not_read_is_never_left_pending(self):
+        from unittest import mock
+        a = self.app
+        a.domains["mcp-control"].start()
+        a.domains["mcp-control"].tags.add(core.OPEN)
+        with mock.patch.object(core, "read_hub", return_value=None):
+            fleet.seal(a, "mcp-control")
+        self.assertEqual(fleet.pending_kills(), ["mcp-control"])   # it may not be the hub
+        lines = fleet.expire_windows(a)
+        self.assertIn("mcp-control: its pending kill was dropped: it is the hub", lines)
+        self.assertEqual(fleet.pending_kills(), [])
+        self.assertEqual(a.domains["mcp-control"].get_power_state(), "Running")
+
+    def test_a_settle_never_kills_a_qube_the_seal_may_not(self):
+        # Its class cannot be read, so whether it is dom0 is not known: no
+        # kill, on the first try or after a wait it lost.
+        vm = self.app.domains[self.TPL]
+        vm.start()
+        fleet.open_window(self.app, self.TPL, 3600)
+        real_klass = core.klass_of
+        core.klass_of = lambda v: (_ for _ in ()).throw(core.Unreadable("class")) \
+            if getattr(v, "name", None) == self.TPL else real_klass(v)
+        self.addCleanup(setattr, core, "klass_of", real_klass)
+        real, asked = core.acquire_qube_lock, []
+
+        def acquire(name, timeout=None, **kw):
+            if name == self.TPL:
+                asked.append(name)
+                if len(asked) == 1:
+                    return None
+            return real(name, timeout, **kw)
+        core.acquire_qube_lock = acquire
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("not killed", msg)
+        self.assertEqual(vm.get_power_state(), "Running")
+
+    def test_a_pending_kill_on_a_qube_that_only_stopped_says_so(self):
+        vm = self.pending_after_failed_kill()
+        vm.kill()
+        lines = fleet.expire_windows(self.app)
+        self.assertIn(f"{self.TPL}: down, after its seal's kill failed", lines)
+        self.assertEqual(fleet.pending_kills(), [])
+
+    def test_open_is_refused_while_a_kill_is_pending(self):
+        vm = self.pending_after_failed_kill()
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.open_window(self.app, self.TPL, 600)
+        self.assertIn("could not kill it yet", str(cm.exception))
+        self.assertTrue(fleet.kill_pending(self.TPL))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertEqual(vm.get_power_state(), "Running")
+
+    def test_a_settle_that_kills_clears_the_pending_kill(self):
+        vm = self.app.domains[self.TPL]
+        vm.__dict__["_power"] = "Running"
+        fleet.open_window(self.app, self.TPL, 3600)
+        real, asked = core.acquire_qube_lock, []
+
+        def acquire(name, timeout=None, **kw):
+            if name == self.TPL:
+                asked.append(name)
+                if len(asked) == 1:
+                    return None                     # a call holds it past the wait
+                if len(asked) == 2:
+                    vm.start()                      # ... and its start lands
+            return real(name, timeout, **kw)
+        core.acquire_qube_lock = acquire
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("killed again", msg)
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertEqual(fleet.pending_kills(), [])
+        # And when the seal's own kill failed, leaving a pending kill, a settle
+        # that kills clears it.
+        asked.clear()
+        core.acquire_qube_lock = real
+        fleet.open_window(self.app, self.TPL, 3600)
+        vm.start()
+        self.app.fail.add("kill")
+
+        def acquire2(name, timeout=None, **kw):
+            if name == self.TPL:
+                asked.append(name)
+                if len(asked) == 1:
+                    return None
+                if len(asked) == 2:
+                    self.app.fail.discard("kill")   # the kill works by the settle
+            return real(name, timeout, **kw)
+        core.acquire_qube_lock = acquire2
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("could NOT be killed", msg)
+        self.assertIn("its kill was made once the call that held its lock had finished", msg)
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertEqual(fleet.pending_kills(), [])
+
+    def settle_after_failed_kill(self, at_settle):
+        """A seal whose own kill fails and whose first lock wait is lost;
+        `at_settle` runs when the lock is had again."""
+        vm = self.app.domains[self.TPL]
+        vm.start()
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add("kill")
+        real, asked = core.acquire_qube_lock, []
+
+        def acquire(name, timeout=None, **kw):
+            if name == self.TPL:
+                asked.append(name)
+                if len(asked) == 1:
+                    return None
+                if len(asked) == 2:
+                    at_settle(vm)
+            return real(name, timeout, **kw)
+        core.acquire_qube_lock = acquire
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        return vm
+
+    def test_a_settle_whose_kill_fails_again_keeps_the_pending_kill_and_says_why(self):
+        self.settle_after_failed_kill(lambda vm: None)
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.seal(self.app, self.TPL)
+        self.assertIn("even once the call that held its lock had finished", str(cm.exception))
+        self.assertNotIn("started it again", str(cm.exception))
+        self.assertEqual(fleet.pending_kills(), [self.TPL])
+
+    def test_a_settle_that_finds_the_qube_down_says_so_and_clears_it(self):
+        def down(vm):
+            self.app.fail.discard("kill")
+            vm.kill()
+        self.settle_after_failed_kill(down)
+        msg = fleet.seal(self.app, self.TPL)
+        self.assertIn("it was down once the call that held its lock had finished", msg)
+        self.assertEqual(fleet.pending_kills(), [])
+
+    def test_one_failing_pending_kill_never_ends_the_pass(self):
+        self.pending_after_failed_kill()
+        fleet.mark_kill_pending("ai-dvm-g", vm=self.app.domains["ai-dvm-g"])
+        self.app.domains["ai-dvm-g"].start()
+        real = fleet._retry_kill
+
+        def broken(app, name, dir_):
+            if name == "ai-dvm-g":
+                raise RuntimeError("qubesd")
+            return real(app, name, dir_)
+        fleet._retry_kill = broken
+        try:
+            lines = fleet.retry_kills(self.app)
+        finally:
+            fleet._retry_kill = real
+        self.assertIn("ai-dvm-g: NOT killed (RuntimeError); tried again on the next pass", lines)
+        self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Halted")
+
+    def test_open_badge_holders_names_what_wears_a_badge(self):
+        fleet.open_window(self.app, self.TPL, 600)
+        self.assertEqual(fleet.open_badge_holders(self.app), [self.TPL])
+        fleet.seal(self.app, self.TPL)
+        self.assertEqual(fleet.open_badge_holders(self.app), [])
+
+    def test_a_failed_reopen_seals_the_old_window_and_kills(self):
+        vm = self.app.domains[self.TPL]
+        vm.__dict__["_power"] = "Running"
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add(f"tag.add:{core.OPEN_FW}")
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.open_window(self.app, self.TPL, 7200, firewall=True)
+        self.assertIn("sealed instead", str(cm.exception))
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW})
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertEqual(fleet.pending_kills(), [])
 
     def test_the_boot_seal_takes_a_healthy_window_too(self):
         fleet.open_window(self.app, self.TPL, fleet.WINDOW_MAX_S, firewall=True)
@@ -1640,9 +1958,9 @@ class TakingAuthorityAway(Base):
         # A guard that lands while the call waits for the lock is honoured.
         real = core.acquire_qube_lock
 
-        def guard_meanwhile(name, timeout=None):
+        def guard_meanwhile(name, timeout=None, **kw):
             self.app.domains[name].tags.add(core.GUARDED)
-            return real(name, timeout)
+            return real(name, timeout, **kw)
         core.acquire_qube_lock = guard_meanwhile
         self.addCleanup(setattr, core, "acquire_qube_lock", real)
         r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "remove"})
@@ -1652,9 +1970,9 @@ class TakingAuthorityAway(Base):
     def test_a_service_checks_its_caller_again_under_the_lock(self):
         real = core.acquire_qube_lock
 
-        def hub_file_gone(name, timeout=None):
+        def hub_file_gone(name, timeout=None, **kw):
             (self.tmp / "hub").write_text("someone-else\n")
-            return real(name, timeout)
+            return real(name, timeout, **kw)
         core.acquire_qube_lock = hub_file_gone
         self.addCleanup(setattr, core, "acquire_qube_lock", real)
         r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "start"})
@@ -1674,13 +1992,13 @@ class TakingAuthorityAway(Base):
         command asks again."""
         real, asked = core.acquire_qube_lock, []
 
-        def acquire(name, timeout=None):
+        def acquire(name, timeout=None, **kw):
             asked.append(name)
             if len(asked) == 1:
                 return None                         # held past the wait
             if len(asked) == 2:
                 landing()
-            return real(name, timeout)
+            return real(name, timeout, **kw)
         core.acquire_qube_lock = acquire
         self.addCleanup(setattr, core, "acquire_qube_lock", real)
         return asked
@@ -1732,6 +2050,128 @@ class TakingAuthorityAway(Base):
         self.assertEqual(os.stat(os.path.dirname(core.qube_lock_path("ai-work2"))).st_mode
                          & 0o7777, 0o2770)
 
+
+
+class Turnstile(Base):
+    """A lock is taken through its turnstile: an operator's command waits in
+    it, so a caller that keeps calls in flight cannot keep taking the lock
+    first each time it comes free (flock is not fair)."""
+
+    def busy_caller(self, take, stop):
+        """A caller that takes the lock, holds it briefly and takes it again at
+        once, until `stop` is set."""
+        def run():
+            while not stop.is_set():
+                fd = take()
+                if fd is None:
+                    continue
+                time.sleep(0.03)
+                os.close(fd)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(stop.set)
+        time.sleep(0.1)
+        return t
+
+    def test_an_operator_gets_a_qube_lock_a_busy_caller_keeps_taking(self):
+        stop = threading.Event()
+        self.busy_caller(lambda: core.acquire_qube_lock("ai-work2", 5), stop)
+        t0 = time.monotonic()
+        fd = core.acquire_qube_lock("ai-work2", 3, queue=True)
+        waited = time.monotonic() - t0
+        stop.set()
+        self.assertIsNotNone(fd, "the operator never got the lock")
+        os.close(fd)
+        self.assertLess(waited, 1.0)
+
+    def test_an_operator_command_waits_in_the_turnstile(self):
+        # `core.qube_lock`, which every operator command takes, holds the
+        # turnstile while it waits.
+        held = core.acquire_qube_lock("ai-work2", 1)
+        lock = core.qube_lock("ai-work2", must=False, timeout=1)
+        waiter = threading.Thread(target=lock.__enter__, daemon=True)
+        waiter.start()
+        self.addCleanup(waiter.join, 5)
+        time.sleep(0.2)
+        q = os.open(core.queue_path(core.qube_lock_path("ai-work2")), os.O_RDWR)
+        self.addCleanup(os.close, q)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(q, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(held)
+        waiter.join(5)
+        self.assertIsNotNone(lock.fd)
+        lock.__exit__(None, None, None)
+
+    def test_an_operator_gets_the_create_lock_a_busy_caller_keeps_taking(self):
+        def take():
+            try:
+                return budget.acquire_create_lock(timeout=5)
+            except core.Refusal:
+                return None
+        stop = threading.Event()
+        self.busy_caller(take, stop)
+        fd = budget.acquire_create_lock(timeout=3, queue=True)
+        stop.set()
+        os.close(fd)
+
+    def test_a_service_never_holds_the_turnstile_while_it_waits(self):
+        # Services pass straight through: one waiting for the lock never makes
+        # another, or an operator's command, wait behind it in the turnstile.
+        held = core.acquire_qube_lock("ai-work2", 1)
+        self.addCleanup(os.close, held)
+        waiter = threading.Thread(target=lambda: core.acquire_qube_lock("ai-work2", 1),
+                                  daemon=True)
+        waiter.start()
+        self.addCleanup(waiter.join, 5)
+        time.sleep(0.2)
+        q = os.open(core.queue_path(core.qube_lock_path("ai-work2")), os.O_RDWR)
+        self.addCleanup(os.close, q)
+        fcntl.flock(q, fcntl.LOCK_EX | fcntl.LOCK_NB)        # free: raises if it were held
+
+    def test_a_call_arriving_behind_a_waiting_operator_waits_behind_it(self):
+        held = core.acquire_qube_lock("ai-work2", 1)
+        order = []
+
+        def operator():
+            fd = core.acquire_qube_lock("ai-work2", 5, queue=True)
+            order.append("operator")
+            time.sleep(0.1)
+            os.close(fd)
+
+        def service():
+            fd = core.acquire_qube_lock("ai-work2", 5)
+            order.append("service")
+            os.close(fd)
+        a = threading.Thread(target=operator, daemon=True)
+        a.start()
+        time.sleep(0.2)
+        b = threading.Thread(target=service, daemon=True)
+        b.start()
+        time.sleep(0.2)
+        os.close(held)
+        a.join(5)
+        b.join(5)
+        self.assertEqual(order, ["operator", "service"])
+
+    def test_the_turnstile_files_are_the_services_groups(self):
+        old = os.umask(0o077)
+        try:
+            os.close(core.acquire_qube_lock("ai-work2", 1, queue=True))
+            os.close(budget.acquire_create_lock(timeout=1, queue=True))
+        finally:
+            os.umask(old)
+        for path in (core.queue_path(core.qube_lock_path("ai-work2")),
+                     core.queue_path(str(budget.LOCK_PATH))):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o660, path)
+
+    def test_no_qube_name_makes_a_lock_file_another_qubes_turnstile(self):
+        # Every lock file ends in .lock and every turnstile in .queue.
+        for name in ("x", "x.queue", "x.lock", "a.b"):
+            lock = core.qube_lock_path(name)
+            self.assertTrue(lock.endswith(".lock"))
+            self.assertTrue(core.queue_path(lock).endswith(".queue"))
+            self.assertNotEqual(core.queue_path(lock), core.qube_lock_path("x"))
 
 class CreatesUnderTheLock(Base):
     """A create judges its template again once it holds the create lock, sets

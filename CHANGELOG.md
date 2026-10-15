@@ -26,6 +26,89 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.30] — 2026-10-15
+
+**The audit round's medium findings, first half.** Dialogs into a hidden
+project from the rest of AI space; operator commands that a busy hub could
+hold off a lock; a lead's removal that its own calls could outlast; and
+windows that a failed read, a hand-written badge or a failed kill kept open.
+The other medium findings follow in 0.9.31, the low ones and the docs in
+0.9.32.
+
+### Changed
+
+- **BREAKING:** the rulebook refuses every qube of AI space, outside a hidden
+  project's own slot, every service into that project's qubes, dialogs
+  included: a copy, a file or URL opened there, an app started there, a
+  window's image read. Before, the rulebook refused those dialogs into its
+  members only from the hub, and the hub runs commands in all of AI space, so any qube it
+  operated could put a copy dialog naming a hidden qube in front of the
+  operator. A made-up name
+  and `@default` still get the dialog, so the refusal tells a source the hub
+  operates no more than the hub's own refused call does (measured on Qubes
+  4.3.1's policy engine). A hidden project's lead loses its dialog copy into
+  its own dump sink (its members copy there with no dialog), and StartApp and
+  GetImageRGBA lose their dialogs inside a hidden project. `qmcp check` checks
+  52 claims of the rulebook (51 before).
+- Qube locks, the create lock and the new acting locks are taken through a
+  turnstile (`<name>.queue` beside each lock; `/run/qmcp/create.queue` is
+  declared in tmpfiles, and `qmcp check` fails when the services group cannot
+  write it). A service passes through; an operator's command, the restore
+  check and the gate wait in it, so calls that arrive after them wait behind
+  them. A hub that kept calls going on a qube could hold its lock, or the
+  create lock, off the operator's commands until they refused.
+- A lead's removal or change, and a project's delete, wait for every call of
+  the old lead's to a dom0 service that changes something and is already
+  past its check: each such call now holds its caller's acting lock
+  (`/run/qmcp/calls/<caller>.acting`) from its check under a lock to its
+  reply, and the command takes it exclusively, in its turnstile, so the lead
+  cannot hold it off by overlapping its calls. The command runs under the old
+  lead's lock and kills again a start of the hub's that lands after. A call
+  still running 60 s after the command starts waiting for it can finish after
+  the command, which says so. A
+  promotion, by `project lead` or `project create --lead-promote`, holds the
+  promoted qube's lock from before its plan to the end. The demotion's kill
+  is read back.
+- The anonymity gate kills at once, as before, then takes the locks of the
+  qubes it stops, waiting at most 5 s in all for one run, and kills again any
+  that runs once it has them or the 5 s are up, so a start that a call in
+  flight makes within those 5 s is killed by the same run rather than the
+  next.
+- The restore check's hold, when it went on without a qube's lock, waits
+  again and reads the hold back. A qube a call already running removed is
+  reported and not counted as held or failed; a hold whose call outlasted
+  both waits is reported and makes `qmcp gate` exit 3. `qmcp restored reject`
+  says when it went on without the lock.
+
+### Fixed
+
+- `qmcp seal`, the expiry pass and the boot seal refused a drop box and the
+  hub, and stopped on a failed read that only `qmcp open` needs (its tags,
+  whether it provides network), so a hand-written open badge on a drop box
+  gave the hub root in it until it was removed by hand. A seal now refuses
+  only a missing name and dom0, takes the badges off any other qube, and never
+  kills the hub. The expiry pass seals a window on a qube whether it provides
+  network cannot be read, and one failing seal no longer ends the pass. The
+  window offers Seal on any qube row wearing an open badge.
+- A seal whose kill failed exited 0 and was audited as sealed; neither it nor
+  a seal cut short after its badges was ever tried again. The window's record now becomes a
+  pending kill (the qube's UUID and start time) before the badges come off,
+  and goes only once the kill is read back. Every expiry pass and boot seal
+  tries it again, under the qube's lock when it is had within 2 s, and drops
+  it without a kill once the qube is down, has been started again (when its
+  start time reads, at the seal and now) or is another qube of that name;
+  `qmcp check` fails on it, `qmcp open` refuses the qube, and `qmcp seal`
+  exits 3 while it is pending (a named seal for its own, or 1 when its second
+  kill fails; a sweep for any). One recorded on the hub while its file did
+  not read is dropped once it reads. The installer's seal step goes
+  on past a pending kill once no qube reads as wearing an open badge, and
+  says so.
+- A re-open whose badge write failed took the old window's badges off without
+  a kill. It now seals the old window, kill included, and says so.
+- `qmcp check` now also fails when `/run/qmcp/open` is not the services
+  group's to write: a pass that cannot rewrite a record cannot keep a pending
+  kill.
+
 ## [0.9.29] — 2026-10-15
 
 **The audit round's high findings.** The audit of 0.9.28 found authority that

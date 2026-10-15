@@ -638,8 +638,19 @@ install -m 0644 "$SRC/deploy/qubes-vm-qmcp-seal.conf" \
     /etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf
 systemctl daemon-reload
 systemctl enable qmcp-seal.service >/dev/null
-SEAL_OUT="$(PYTHONPATH="$LIB" python3 -c 'import sys; from qmcp import cli; sys.exit(cli.main(["seal", "--all"]))' 2>&1)"     || die "an open window could not be sealed ($SEAL_OUT); the new policy is NOT installed: run qmcp seal --all by hand, then install again"
-[ -n "$SEAL_OUT" ] && say "sealed what was open: $SEAL_OUT"
+# Exit 3 is also a kill a seal could not make yet, with every badge off: the
+# policy may go in then, once no qube is read wearing an open badge. Any other
+# failure, or a badge still on, stops the install.
+SEAL_RC=0
+SEAL_OUT="$(PYTHONPATH="$LIB" python3 -c 'import sys; from qmcp import cli; sys.exit(cli.main(["seal", "--all"]))' 2>&1)" || SEAL_RC=$?
+if [ "$SEAL_RC" -ne 0 ]; then
+    [ "$SEAL_RC" -eq 3 ] || die "an open window could not be sealed ($SEAL_OUT); the new policy is NOT installed: run qmcp seal --all by hand, then install again"
+    LEFT="$(PYTHONPATH="$LIB" python3 -c 'import qubesadmin.app; from qmcp import fleet; print(" ".join(fleet.open_badge_holders(qubesadmin.app.QubesLocal())))' 2>&1)" \
+        || die "whether any qube still wears an open badge could not be read ($LEFT); the new policy is NOT installed: run qmcp seal --all by hand, then install again"
+    [ -z "$LEFT" ] || die "an open window could not be sealed ($SEAL_OUT; still open: $LEFT); the new policy is NOT installed: run qmcp seal --all by hand, then install again"
+    say "WARN: a seal could not kill its qube yet; the gate's timer tries again and qmcp check names it ($SEAL_OUT)"
+fi
+[ "$SEAL_RC" -eq 0 ] && [ -n "$SEAL_OUT" ] && say "sealed what was open: $SEAL_OUT"
 say "every boot seals the open guarded qubes before any user session (qmcp-seal.service)"
 
 # --- the updates ticks, before the gate's timer runs the new code

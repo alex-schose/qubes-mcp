@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (0.9.29). Read it first in any
+**This file describes the code at this version (0.9.30). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -57,8 +57,10 @@ These are load-bearing. Do not change them without the operator's sign-off.
   a time, and with `--firewall` write that qube's firewall rules as well. It
   can never change which network the qube is on. `qmcp seal QUBE` ends the
   window at once and kills the qube if it is running, so nothing the hub
-  started in it runs on; a dom0 timer ends one that has run out, and every boot
-  ends every window. The hub may ask for a window with a proposal, which always
+  started in it runs on; a kill that fails is tried again by every pass of the
+  gate's timer, and `qmcp check` fails until it is made. A dom0 timer ends a
+  window that has run out, and every boot ends every window. A re-open whose
+  badge write fails seals the window it was to replace, kill included. The hub may ask for a window with a proposal, which always
   needs the operator's second tick; it can never open one itself. There is no
   indefinite window: that is `qmcp manage`, which takes the qube out of the
   guarded state altogether.
@@ -173,13 +175,14 @@ would get a label of its own), until the operator accepts it (`qmcp restored
 - **The rulebook is static.** `/etc/qubes/policy.d/30-mcp-control.policy` is
   installed once and never written at runtime. Before it is installed it is
   parsed by qrexec's own parser against the box's real policy directory, and
-  51 of its claims are checked to be decided by it, not by a file that sorts
+  52 of its claims are checked to be decided by it, not by a file that sorts
   earlier.
 - **An anonymous project is checked, not trusted.** dom0's anonymity gate
   judges every anonymous project every 15 seconds and after every `qmcp`
   command that changes qubes, projects or gateways, and stops one whose path stops being
-  anonymous. A hidden one is not the hub's: the rulebook keeps the hub out of
-  every qube wearing `qmcp-hubblind`, and the services answer the hub about
+  anonymous. A hidden one is not the hub's: the rulebook keeps the hub, and
+  every qube of AI space outside the project, out of every qube wearing
+  `qmcp-hubblind`, dialogs included, and the services answer the hub about
   one exactly as about a name that does not exist (see "Anonymous projects").
   In anonymous mode the gate judges the hub too, with every qube in AI space
   that is not an anonymous project's lead, member or model qube, guarded
@@ -251,8 +254,8 @@ that does not exist, at the same cost.
 
 **Workers** call no qmcp service. They cannot reach their lead, the hub or
 another lead; they copy among themselves and into their sink without a dialog,
-reach another project only by a copy through the operator's dialog, and
-nothing else.
+reach another project only by a copy through the operator's dialog, never a
+hidden project they are not in, and nothing else.
 
 **The hub** operates every project: its leads (it may clone one, but only the
 operator removes one, and it never writes a lead's firewall) and its workers. Its own AppVMs and
@@ -430,7 +433,8 @@ anonymous, and dom0 keeps checking that it is:
   arrives wearing `qmcp-hubblind`, or the gate's stop, that it did not ask for
   is rolled back, never stripped; and the hub's clone of a qube whose
   template is hidden answers as a source that does not exist); the rulebook
-  refuses the hub every call into one; the services leave it out of the hub's
+  refuses the hub every call into one, and every qube of AI space outside the
+  project too, dialogs included, since the hub runs commands in those; the services leave it out of the hub's
   lists, reads, events and project rows, and answer the hub about one of its
   qubes exactly as about a name that does not exist, after the same single
   qubesd call; and a proposal that names it, or one of its qubes, fails at
@@ -491,7 +495,9 @@ anonymous, and dom0 keeps checking that it is:
   wake one, and every call from one, so one the operator starts by hand
   reaches no other qube and no dom0 service, though it keeps its network; and the services refuse to start, change or clone one, checking
   again right before a start, under the qube's lock); then each one is killed
-  unless it reads halted, and badged `qmcp-stopped` once it is known to be down (a
+  unless it reads halted, at once, and killed again if it runs once the
+  gate has its lock or has waited 5 s for the run (see "Authority is checked
+  when the work is done"), and badged `qmcp-stopped` once it is known to be down (a
   power state that cannot be read is no halt: the kill is tried, and a qube not
   known to be down is tried again on the next run); then their `autostart` is
   turned off where it is still on, on every run, so a write that failed is
@@ -577,21 +583,51 @@ once the qube resolves (a name the caller cannot see never waits on one, so
 contention tells it nothing), check the caller and the qube again, and hold it
 until their reply; `manage`, `guard`, `revoke`, `open`, `seal`, `project move`,
 setting a model qube, and the restore check's hold, accept and reject take it
-too, the create lock first where they hold both. A command that grants
-authority refuses when the lock stays held past its wait (60 s; `open`, which
-runs under the gate's lock, 5 s; a service's is 30 s). `guard`, `revoke` and
-`seal` go on without it, then wait for the lock again: by then the calls that
-were in flight have finished, and no new one gets past its check, since the
-qube no longer resolves for it. They then make their effect hold (a revoke or
-a seal kills again what such a call started; a guard reports a remove that
-won), and say they went on without the lock only when that second wait fails
-too. The restore check's hold goes on without it after 2 s, and reject after
-60 s; neither waits again.
-A lead's promotion or removal, a project's delete and the gate's stop take no
-qube lock. So a hub's start no longer lands
-after a revoke, nor a remove after a guard, and a remove lands after a hold
-only if it was still running 2 s into the hold. A lead's call already past its check finishes when the lead is removed
-(see the residual risks).
+too, the create lock first where they hold both; so do a lead's promotion,
+by `project lead` or `project create --lead-promote` (the promoted qube's
+lock, from before the plan to the end), and a lead's removal or change and a
+project's delete (the old lead's lock, for its demotion and kill). The gate
+kills at once, then takes the locks of the qubes it stops, waiting at most 5 s
+in all for one run, and kills again any that runs once it has them or the 5 s
+are up. A command that
+grants authority refuses when the lock stays held past its wait
+(60 s; `open`, which runs under the gate's lock, 5 s; a service's is 30 s).
+`guard`, `revoke`, `seal` and a lead's demotion go on without it, then wait
+for the lock again: by then the calls that were in flight have finished, and
+no new one gets past its check, since the qube no longer resolves for it (a
+demoted lead still does for the hub, and the hub's new calls on it are ordinary
+ones).
+They then make their effect hold (a revoke, a seal or a demotion kills again
+what such a call started; a guard reports a remove that won), and say they
+went on without the lock only when that second wait fails too. The restore
+check's hold goes on without it after 2 s, then waits up to 5 s more and
+reads the hold back (a remove that won is reported, not counted as held; one
+still waited on is reported, and `qmcp gate` exits 3); reject goes on after
+60 s and says so. A qube whose lock the gate did not have in time is killed
+again by the next run that still finds its project unsound, if a start lands
+after.
+**Qube locks, the create lock and the acting locks are taken through a
+turnstile** (`<name>.queue` beside a qube's lock, `/run/qmcp/create.queue`
+beside the create lock, `<caller>.acting.queue` beside an acting lock). A
+service passes straight through it; an operator's command, the restore check
+and the gate wait in it, so a call that arrives after one of them waits behind
+it, and only the calls already past the turnstile go first. A busy hub can
+therefore no longer hold a lock off the operator for longer than its own calls
+in flight take.
+**A caller's calls are drained before its authority goes.** Every call of a
+service that changes something (lifecycle, property, feature, spawn, clone,
+disposable) holds its caller's acting lock (`/run/qmcp/calls/<caller>.acting`),
+shared, from the moment its caller is checked again under a qube's lock or
+the create lock to its reply. A lead's removal, change or project delete takes
+the old lead's acting lock exclusively, in its turnstile, before a badge comes
+off, so every such call of the lead's already past that check has finished
+first, and one reaching it meanwhile waits and is then checked against what
+the command left, and refused. A create of the lead's waits for the create
+lock, which the command holds, and is then refused. The drain covers the dom0
+services only: commands the lead runs in its members through the rulebook
+(`qmcp.RunInAIManaged`, `qmcp.CopyToAIManaged`) and its firewall writes reach
+no dom0 code, and a command it started in a member runs on there after the
+lead is gone.
 
 ## Proposals
 
@@ -811,7 +847,7 @@ private cap, any create that asks for a `private` size.
 | Service | What it does |
 |---|---|
 | `qmcp.RunInAIManaged` | Runs a command as root and returns rc/stdout/stderr. The hub drives it in any managed qube; a lead in its own members. |
-| `qmcp.CopyToAIManaged` | Runs `qvm-copy-to-vm` from this qube. The copy itself is `qubes.Filecopy`: no dialog inside one slot or into its sink, refused into a guarded qube, the hub or a lead, the operator's dialog anywhere else. |
+| `qmcp.CopyToAIManaged` | Runs `qvm-copy-to-vm` from this qube. The copy itself is `qubes.Filecopy`: no dialog inside one slot or into its sink, refused into a guarded qube, the hub, a lead or a hidden project from outside its slot (a hidden lead's copy into its own sink included), the operator's dialog anywhere else. |
 
 ## The rulebook
 
@@ -898,10 +934,15 @@ space's denies.
 - **E. The hub:** the twelve dom0 services; exec, copy-out and firewall on
   AI space (firewall writes to a guarded qube or a lead were refused in A).
 - **F. Copies from AI space:** the operator's dialog, unless A refused them
-  (into a guarded qube, the hub or a lead) or B allowed them (inside one slot,
-  or into its sink). Every copy across projects gets the dialog. qrexec turns
-  a target that does not exist into `@default`, so the dialog reveals no
-  names.
+  (into a guarded qube, the hub or a lead), B allowed them (inside one slot,
+  or into its sink), or the line at the head of F refused them. That line refuses
+  AI space every service into a hidden project's qube, dialogs included (a
+  copy, a file or URL opened there, an app started there, a window's image
+  read), and sits below B,
+  so the project's own lines still decide inside it; a hidden lead's own copy
+  into its sink is refused with it, where its members copy without a dialog.
+  Every other copy across projects gets the dialog. qrexec turns a target that
+  does not exist into `@default`, so the dialog reveals no names.
 - **G. The hub's own operator UX:** its boot services, clock sync and dialogs.
 - **H. The hub's catch-alls:** everything else is refused.
 
@@ -916,7 +957,7 @@ and that the model lines sit between the denies that guard them.
 
 | Command | |
 |---|---|
-| `qmcp check [--json]` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway in AI space without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 51 checked claims; a gateway registry that does not read, or an enrolled gateway that no longer qualifies; a qube in AI space (not a gateway itself) on a network that is not enrolled; a lead with a network whose firewall differs from the rules the operator accepted; services, runtime directory (the per-qube lock directory included) or caps missing; no `qubes` group; a runtime directory, create lock, proposal lock or audit log the services cannot write, that is, not group-writable or not the `qubes` group's (an audit log missing, since they cannot create one), or `/run/qmcp` not setgid; the proposal store missing, or not the `qubes` group's, group-writable and setgid; a guarded qube wearing an open badge with no window record, an expired one or one that does not read, wearing `qmcp-open-fw` without `qmcp-open`, or wearing either where `qmcp open` would refuse it (a gateway above all, which the rulebook cannot tell from any other guarded qube); a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a qube the hub can reach (in AI space, not hidden) made from a hidden project's disposable template; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's; a lead whose project's model is a qube but which has a network; a model badge on a qube with a network, outside AI space, on a member, lead, template, disposable, gateway, drop box or the hub, in p00, on a qube whose template the hub manages, or that its slot's record does not name; a mode file that does not read, and in anonymous mode a project that is not anonymous or a gateway that is not anonymising; an anonymous project, or in anonymous mode the hub, that the gate finds unsound (it runs the gate, and acts on what it finds), and, while an anonymous project exists or the mode is on, the gate's timer not running or no run of it completed in the last 60 s; the gate's lock or heartbeat file missing or not the services group's to write; a qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID and that the gate has not yet held; dom0's copy of the in-qube services missing. Warns on a qube held for review; a template a project approves, a managed qube's template or a managed standalone whose `qmcp-services` label is missing or not the installed version (dom0's record, not the qube's disk); a guarded qube that is open, with the time it has left — the window is your own deliberate exception and it clears itself, so it is amber and not red; a stopped anonymous project that is sound again, a hidden project sharing an anonymising router with another project or the hub, `qmcp-anon`, `qmcp-blocked` or `qmcp-stopped` where neither an anonymous project nor anonymous mode puts them, a missing `projects.json`, stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix, any qube in a project's names that is not its lead or member, managed qubes pointing at a disposable template outside it, a birth-egress qube that is not enrolled, a lead with a network and no accepted firewall, a lead whose endpoint is an address and whose accepted rules still hold the DNS rule set before 0.9.22, a model qube that is not guarded, a recorded model qube that is gone or does not wear its badge, an audit log due for rotation, a project without a lead, an approved template that is not one, a worker network that is not enrolled, a member on a network off its project's list, a sink with a network, managed AppVMs and standalones in no slot, project quotas that add up to more than the pool cap, and a proposal that cannot be read or whose accept never finished. Reports an error for each read it could not make: a qube's tags, network, role, class, template or default disposable template, a qube's `qmcp-id` or `qmcp-services` label or its UUID, a gateway's `qubes-firewall` feature, a lead's firewall; and for a gate run that could not run, or found the gate's lock held past its wait. A qube whose tags cannot be read is skipped by the items that judge tags, the registry item included (the "qube tags" error names it). So is one qubesd says is gone when its tags are read, except an enrolled gateway: the registry item reports that one. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
+| `qmcp check [--json]` | Fails on: the hub missing, in AI space, or named differently in the policy; tier tags; a gateway in AI space without `qmcp-guarded`; a drop box in AI space; the policy modified, refused by qrexec's parser, or overridden by an earlier file for any of its 52 checked claims; a gateway registry that does not read, or an enrolled gateway that no longer qualifies; a qube in AI space (not a gateway itself) on a network that is not enrolled; a lead with a network whose firewall differs from the rules the operator accepted; services, runtime directory (the per-qube lock directory included) or caps missing; no `qubes` group; a runtime directory (the window records' included), create lock or its turnstile, proposal lock or audit log the services cannot write, that is, not group-writable or not the `qubes` group's (an audit log missing, since they cannot create one), or `/run/qmcp` not setgid; the proposal store missing, or not the `qubes` group's, group-writable and setgid; a guarded qube wearing an open badge with no window record, an expired one or one that does not read, wearing `qmcp-open-fw` without `qmcp-open`, or wearing either where `qmcp open` would refuse it (a gateway above all, which the rulebook cannot tell from any other guarded qube); a sealed qube whose kill was not read back (a pending kill); a broken audit chain; v0.9.16 leftovers; unreadable project records; a member or lead badge outside AI space, a sink inside it; a qube in two slots; a slot badge with no project; a template or gateway in a project; a qube the hub can reach (in AI space, not hidden) made from a hidden project's disposable template; a lead whose badges and record disagree, or any qube wearing lead badges that is not its slot's recorded lead; a sink that is not its record's; a lead whose project's model is a qube but which has a network; a model badge on a qube with a network, outside AI space, on a member, lead, template, disposable, gateway, drop box or the hub, in p00, on a qube whose template the hub manages, or that its slot's record does not name; a mode file that does not read, and in anonymous mode a project that is not anonymous or a gateway that is not anonymising; an anonymous project, or in anonymous mode the hub, that the gate finds unsound (it runs the gate, and acts on what it finds), and, while an anonymous project exists or the mode is on, the gate's timer not running or no run of it completed in the last 60 s; the gate's lock or heartbeat file missing or not the services group's to write; a qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID and that the gate has not yet held; dom0's copy of the in-qube services missing. Warns on a qube held for review; a template a project approves, a managed qube's template or a managed standalone whose `qmcp-services` label is missing or not the installed version (dom0's record, not the qube's disk); a guarded qube that is open, with the time it has left — the window is your own deliberate exception and it clears itself, so it is amber and not red; a stopped anonymous project that is sound again, a hidden project sharing an anonymising router with another project or the hub, `qmcp-anon`, `qmcp-blocked` or `qmcp-stopped` where neither an anonymous project nor anonymous mode puts them, a missing `projects.json`, stray badges, v0.9.16 tombstones, qubes outside AI space inside the name prefix, any qube in a project's names that is not its lead or member, managed qubes pointing at a disposable template outside it, a birth-egress qube that is not enrolled, a lead with a network and no accepted firewall, a lead whose endpoint is an address and whose accepted rules still hold the DNS rule set before 0.9.22, a model qube that is not guarded, a recorded model qube that is gone or does not wear its badge, an audit log due for rotation, a project without a lead, an approved template that is not one, a worker network that is not enrolled, a member on a network off its project's list, a sink with a network, managed AppVMs and standalones in no slot, project quotas that add up to more than the pool cap, and a proposal that cannot be read or whose accept never finished. Reports an error for each read it could not make: a qube's tags, network, role, class, template or default disposable template, a qube's `qmcp-id` or `qmcp-services` label or its UUID, a gateway's `qubes-firewall` feature, a lead's firewall; and for a gate run that could not run, or found the gate's lock held past its wait. A qube whose tags cannot be read is skipped by the items that judge tags, the registry item included (the "qube tags" error names it). So is one qubesd says is gone when its tags are read, except an enrolled gateway: the registry item reports that one. Exit 0 GREEN, 1 FAILED, 3 INCOMPLETE — INCOMPLETE is not green. |
 | `qmcp list [--all] [--json]` | AI space with state, class, template, network, power, slot and provenance. A state, class, template, network, slot or provenance that cannot be read is `<unreadable>`, and a power state `NA` or `unknown`; a qube whose tags cannot be read is still listed, and one qubesd says is gone is not. With `--json`, each row adds the lead flag, the slots it serves as a model qube, whether the qube provides network and whether it is a disposable template (each `<unreadable>` when it cannot be read), and its badges (`null` when its tags cannot be read). `--all` adds every other qube but dom0, with no state. |
 | `qmcp settings [--json]` | The operator files the services read (hub, name prefix, pool and private caps, birth egress), how many gateways are enrolled, the disk AI space uses, the mode (`anonymous`, `normal`, or `<unreadable>`), and the version. |
 | `qmcp settings set [--pool-cap SIZE] [--private-cap SIZE] [--birth-egress QUBE\|none]` | Change the caps (in a quota's format, `200G`) or birth egress, under the create lock and the records' lock. A pool cap below what AI space holds is refused; birth egress must be an enrolled gateway that is not held for review, `none` unsets it. It cannot change the hub, the mode or the name prefix (an import onto a fresh install brings the export's name prefix). Root. |
@@ -929,7 +970,7 @@ and that the model lines sit between the denies that guard them.
 | `qmcp manage QUBE` / `qmcp guard QUBE` | The role actions. Both refuse dom0, the hub (and any name while `/etc/qmcp/hub` cannot be read), a drop box, and a qube (other than a gateway) on a network that is not enrolled; `manage` also refuses a gateway; `guard` refuses a lead or a member. Guarding a model qube that was managed kills it if it runs (never a gateway or a template, whatever badge it wears); a kind that cannot be read stops only the kill, and the command says so and exits 1. In anonymous mode both put `qmcp-anon` on a qube joining AI space (not a gateway) before `ai-managed`. |
 | `qmcp revoke QUBE [--no-shutdown]` | Strips every qmcp badge, pins `default_dispvm` to none, kills the qube if it runs (never only a shutdown request, which a guest the hub ran as root can ignore and a paused one refuses), reads its power state back, and ends an open window (its record goes with the badges). A qube still running after the kill fails the command (exit 1), with its badges already off. `--no-shutdown` leaves it running. Refuses dom0, the hub (and every name while `/etc/qmcp/hub` cannot be read), a drop box, a lead and a qube held for review. |
 | `qmcp open QUBE --for DURATION [--firewall]` | Open a guarded qube to the hub for a bounded time: `qmcp-open` lets the hub run commands in it and copy a file in (Qubes asks you to confirm each file), and `--firewall` adds `qmcp-open-fw`, which lets it write that qube's firewall rules. It can never change the qube's network. Refuses dom0, and every name while `/etc/qmcp/hub` cannot be read. `DURATION` is `90s`, `30m` or `2h`, at most 24h; there is no indefinite window, which is `qmcp manage`. Refuses a gateway (its egress rules are AI space's), a managed qube (it needs no window), a lead or a member, a qube the anonymity gate stopped or a hidden project's, and anything outside AI space. Opening a qube that is open replaces its window, and drops the firewall half when this call did not ask for it. The window's end is recorded under `/run/qmcp/open/`, which a reboot clears. |
-| `qmcp seal QUBE` / `--expired` / `--all` | Close a window, even while `/etc/qmcp/hub` cannot be read: then the badges and the record still go, and only the kill is skipped and said. Named: the badges come off, the record goes, and the qube is KILLED if it runs, so nothing the hub started in it runs on — a package manager stopped part-way may leave the qube needing repair, and its files stay. A qube that was not open is left alone and says so. `--expired` seals every window that has run out, whose record does not read, or that sits on a qube `qmcp open` refuses (the gate's timer runs it every 15 s); `--all` seals every one whatever its record says (`qmcp-seal.service` runs it at every boot). `--expired` and `--all` exit 0, or 3 when something could not be judged, and 1 only when the command itself could not run; a named seal the command refuses (no such qube, dom0, the hub) exits 1. |
+| `qmcp seal QUBE` / `--expired` / `--all` | Close a window. It refuses only a name that is no qube, and dom0; a failed read stops it only when the qube cannot be looked up (its tags, its class or whether it provides network may fail to read), and it takes the badges off a drop box or the hub too, which `open` refuses but a hand-written tag can reach. Named: the record becomes a pending kill (naming the qube's UUID and when it started), the badges come off, and the qube is KILLED if it runs, so nothing the hub started in it runs on — a package manager stopped part-way may leave the qube needing repair, and its files stay. The record goes once the kill is read back. The hub is never killed, and a pending kill recorded on it while `/etc/qmcp/hub` did not read is dropped by the first pass that reads it; a qube is not killed while `/etc/qmcp/hub` or its class cannot be read: the badges still come off, the kill is skipped and said, and it stays pending. A kill that fails, or a seal cut short after the badges, leaves the pending kill, which every `--expired` or `--all` pass tries again, under the qube's lock when it is had within 2 s, and `qmcp check` fails on until it is made or dropped; a pass drops it, without a kill, once the qube is down, has been started again (when its start time reads, at the seal and now), or is another qube of that name. `qmcp open` refuses a qube with a pending kill. A qube that was not open is left alone and says so, unless it has a pending kill, which a named seal makes. `--expired` seals every window that has run out, whose record does not read, that sits on a qube `qmcp open` refuses, or on a qube whether it provides network cannot be read (one whose tags cannot be read is reported, not sealed); the gate's timer runs it every 15 s; `--all` seals every one whatever its record says (`qmcp-seal.service` runs it at every boot). Exit 0, or 3 when something could not be judged, a kill is pending (a named seal: its own; a sweep: any), or the gate's lock was held past its wait (nothing changed); 1 when the command could not run, a named seal refuses, its badges could not be taken off, or its second kill after a wait it lost failed. |
 | `qmcp project list` / `show NAME` | The slots in use; one project's record. |
 | `qmcp project create [LABEL] ...` | A new project in the lowest free slot; with `--anonymous` (and `--hub-sees` for a visible one, `--note TEXT` for a private note) an anonymous project, whose label dom0 picks (see "Anonymous projects"); in anonymous mode every project is one, without `--anonymous`, and a LABEL is refused: `--lead-template T` (with `--lead-class standalone` for a standalone lead), `--lead-clone QUBE` or `--lead-promote QUBE` (one of the hub's AppVMs or standalones); `--lead-netvm` (an enrolled gateway, or none); `--model HOST:PORT` (needed for a lead with a network: its firewall allows only that, and DNS for a host name) or `--model-qube QUBE` (a self-hosted model qube; the lead then has no network); `--template` (more approved templates; the lead's own goes first when it is in AI space); `--network QUBE` or `none` (enrolled gateways), the first the default; `--quota`; `--dump`. |
 | `qmcp project edit NAME ...` | Replace the approved templates or the worker networks, or change the quota. Workers keep their networks, so a network a member sits on cannot be taken off the list. |
@@ -937,7 +978,7 @@ and that the model lines sit between the denies that guard them.
 | `qmcp project firewall NAME [--json]` | The lead's model (an endpoint or a model qube), the firewall rules the operator accepted and its live ones. With `--model HOST:PORT`, `--model-qube QUBE\|none`, `--rule RULE` (repeatable) or `--accept-current`, set a new model endpoint (for a lead with a network; its firewall becomes that endpoint, and DNS for a host name; refused while the model is a qube), a model qube (see "Model qubes") or none, exactly these rules, or accept the live rules as they are, if they are in qmcp's rule format (no comment or expire, at most 32). A write that does not read back as set is undone. Each change needs root. |
 | `qmcp project dump NAME` | Create a dump sink for a project, or for p00 (`hub-dump`). |
 | `qmcp project unblock NAME` | Clear the anonymity gate's stop once a fresh run finds the project sound; `autostart` stays off. `p00` (or `hub`): the hub's stop, and every qube under the hub's check, once the gate finds the hub sound; in normal mode it takes off what anonymous mode left. Root. |
-| `qmcp gate [--json]` | First hold for review every qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID (the restore check; what it holds goes to standard error), then judge every anonymous project now, and in anonymous mode the hub (its verdict has `hub` and `offenders`), and stop what is not sound (the timer runs this). Prints only what is not sound and what it did, unless `--json`. Exit 0 all sound, 1 one is not, 3 one could not be judged, or the restore check could not run or a hold or a read in it failed. Runs as any member of `qubes`. |
+| `qmcp gate [--json]` | First hold for review every qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID (the restore check; what it holds goes to standard error), then judge every anonymous project now, and in anonymous mode the hub (its verdict has `hub` and `offenders`), and stop what is not sound (the timer runs this). Prints only what is not sound and what it did, unless `--json`. Exit 0 all sound, 1 one is not, 3 one could not be judged, or the restore check could not run, a hold or a read in it failed, or a hold was made while a call kept the qube's lock past both its waits (said on standard error, as is a qube that a call already running removed, before or after the hold's own write). Runs as any member of `qubes`. |
 | `qmcp project move QUBE TARGET` | Move a managed AppVM or StandaloneVM into p00, a project, or no slot. Its network does not change, so a project takes it only on one of its worker networks; out of one slot into another needs `--yes`, and so does a move into, out of or between anonymous projects, which says first what the qube carries with it. A move is refused if the anonymous project it goes into would be unsound or, in anonymous mode, if the hub's check would stop more qubes or the moved qube itself. A qube the gate stopped does not move. |
 | `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink and the model qube without the slot's badge, strip every badge of the slot, free it. Given a slot with no record, finish a delete that stopped half-way. Without `--yes` it prints what it would remove and changes nothing; that needs no root. |
 | `qmcp proposal list [--json]` / `show N [--json]` | The hub's proposals, newest first; one proposal with its stored options, the command it is the options of (an edit shows its project before and after instead; a lead-firewall proposal adds the lead's model and rules now and after), why it needs the second tick, the plan of a delete, and its decision and report once decided. Reads, as any member of `qubes`. |
@@ -1143,7 +1184,7 @@ disposable template with curl and network; Qubes' stock `default-dvm` has both):
 ```sh
 # in dom0
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.29.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.30.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -1153,7 +1194,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh   # --hub, --birth-egress, --pool-cap
 `install.sh` runs every preflight check before it changes anything: its options
 must be well-formed, the fleet must be in the two-state shape, existing project
 records and gateway registry must load, the rendered policy must parse on this box and decide
-each of the 51 claims itself, and the gate, as this release judges, must not leave an anonymous
+each of the 52 claims itself, and the gate, as this release judges, must not leave an anonymous
 project, or (with `--anonymous` or in anonymous mode) the hub, stopped only for want of an updates
 tick: the entry is named, with `--updates-via GATEWAY` to tick it in the same install. One unsound
 for another reason is noted, except the hub when `--anonymous` turns the mode on, which is
@@ -1361,7 +1402,7 @@ real dom0's policy set.
   copy-out and firewall writes are not on that log.
 - **A compromised lead controls its own project:** every worker, and through
   them what lands in its sink. It reaches another project or the hub's qubes
-  only by a copy through the operator's dialog, never the hub or any dom0
+  only by a copy through the operator's dialog, never a hidden project's, never the hub or any dom0
   service beyond its nine, and every create it makes stays inside its name
   space, templates, networks and quota. Give each project its own model
   key with a spend limit.
@@ -1381,15 +1422,14 @@ real dom0's policy set.
 - **A lead refused by the pool cap inside its own quota** learns that the rest
   of AI space is full. `qmcp check` warns when the projects' quotas add up to
   more than the cap.
-- **A lead's call that is already past its check finishes** when the operator
-  removes the lead at that moment: a lifecycle, property or feature change,
-  checked again under the qube's lock, a few milliseconds wide. A create is
-  checked again under the create lock.
-- **A hub that keeps calls going on one qube can delay the operator's commands
-  that grant authority on it** (`manage`, `open`, `project move`, setting a
-  model qube, `restored accept`): a qube's lock is not a queue, so each may find it taken past its
-  wait, and then refuses and says so. Commands that take authority away are
-  never delayed past their two waits.
+- **A lead's call still running 60 s after its removal starts waiting for it
+  can finish after the removal**: the removal waits that long for the lead's
+  calls already past their check, then goes on and says so. Such a call was checked while the lead had its
+  badges.
+- **A hub's calls already past a qube's turnstile go before the operator's
+  command on it**, so a grant command can still refuse if they outlast its
+  wait (60 s; `open`'s is 5 s); calls arriving after the command wait behind
+  it.
 - **A qrexec call admitted just before a revoke, a seal or the gate's stop can
   start the qube once more after the kill**, since qrexec starts a halted
   target after its decision. For a revoked qube, which nothing in qmcp watches
@@ -1466,11 +1506,15 @@ real dom0's policy set.
 - **The hub can tell that a hidden project exists**: a slot missing from its
   list, the pool figure, which counts its disk, and its own proposal's
   `accepted`. Never its contents. Its names are random, and the services
-  answer about them as about missing names; but the hub's dialog services
-  (Filecopy, OpenInVM, OpenURL, the clipboard) are refused at once for a hidden
-  name, where a missing one becomes `@default` and a dialog, so a hub that
-  already guessed a name could tell. It cannot guess one: a label is eight
-  random characters.
+  answer about them as about missing names; but the dialog services
+  (Filecopy, OpenInVM, OpenURL, StartApp and GetImageRGBA from the qubes it
+  runs commands in; Filecopy, OpenInVM, OpenURL and the clipboard from the hub
+  itself) are refused at once for a hidden name, where a
+  missing one becomes `@default` and a dialog, so a hub that holds a name can
+  tell it is a hidden qube's. It cannot guess one, since a label is eight
+  random characters, but it can learn one: a member moved out of a hidden
+  project keeps a folder in `~/QubesIncoming/` named after each qube that
+  copied a file into it, its old siblings included.
 - **A visible anonymous project is hidden from the network, not from the hub.**
   A prompt injection that climbs worker, lead, hub can steer the hub into a
   clearnet project's qube to touch the same target from the operator's own
@@ -1574,8 +1618,9 @@ and Fedora templates (they needed no change), and M5 (0.9.25) added sealed
 qubes. 1.0.0 comes in releases: 0.9.26 the operator's tools, the
 restore check and backups; 0.9.27 standalone workers and leads; 0.9.28 the
 last proposal types: managing and revoking a qube, and a template's packages; then an
-audit round from both seats, whose fixes ship by severity from 0.9.29 (this one, the
-high ones), and 1.0.0 once all of it is green on a reinstalled machine.
+audit round from both seats, whose fixes ship by severity from 0.9.29 (the high
+ones; 0.9.30, this one, and 0.9.31 the medium ones; 0.9.32 the low ones and the
+docs), and 1.0.0 once all of it is green on a reinstalled machine.
 
 ## Anti-goals (immutable)
 

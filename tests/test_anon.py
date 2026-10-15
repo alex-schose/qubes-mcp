@@ -10,10 +10,13 @@ was never green.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 
@@ -528,6 +531,56 @@ class Acting(AnonBase):
         v = self.gate()[self.p.slot]
         self.assertIn(f"{w1}: killed", v.acted)
         self.assertEqual(vm._power, "Halted")
+
+    def test_a_start_past_its_check_is_killed_by_the_same_run(self):
+        # The run kills at once, then waits for the qube's lock: a call that
+        # held it when the badge went on (a start) has landed by then, and
+        # what it started is killed again now, not on the next run.
+        anon.KILL_LOCK_WAIT_S = 3.0
+        w1 = f"ai-{self.p.label}-w1"
+        vm = self.app.domains[w1]
+        vm.__dict__["_power"] = "Halted"
+        held = core.acquire_qube_lock(w1, 1)
+
+        def the_call():
+            time.sleep(0.3)
+            vm.start()
+            os.close(held)
+        t = threading.Thread(target=the_call, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        v = self.gate()[self.p.slot]
+        self.assertIn(f"{w1}: killed again, after a call already running started it", v.acted)
+        self.assertEqual(vm._power, "Halted")
+
+    def test_the_kill_waits_for_no_lock_and_one_wait_serves_the_whole_run(self):
+        # Two projects stopped by one run, every qube's lock held by a call that
+        # never finishes: the kills come at once, and the run waits once, not
+        # once per project.
+        anon.KILL_LOCK_WAIT_S = 1.0
+        for name in self.qubes_of(self.p) + self.qubes_of(self.other):
+            self.app.domains[name].start()
+            self.addCleanup(os.close, core.acquire_qube_lock(name, 1))
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        t0 = time.monotonic()
+        verdicts = self.gate()
+        self.assertLess(time.monotonic() - t0, 1.8)
+        for p in (self.p, self.other):
+            self.assertEqual(verdicts[p.slot].status, anon.RED)
+            for name in self.qubes_of(p):
+                self.assertEqual(self.app.domains[name]._power, "Halted", name)
+
+    def test_a_lock_held_past_the_wait_does_not_hold_up_the_kill(self):
+        anon.KILL_LOCK_WAIT_S = 0.3
+        held = core.acquire_qube_lock(self.p.lead, 1)
+        self.addCleanup(os.close, held)
+        self.app.domains[self.p.lead].start()
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        t0 = time.monotonic()
+        v = self.gate()[self.p.slot]
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertIn(f"{self.p.lead}: killed", v.acted)
 
     def test_a_qube_whose_block_failed_and_was_woken_is_killed_on_the_next_run(self):
         w1 = f"ai-{self.p.label}-w1"

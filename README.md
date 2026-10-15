@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.29 — the audit round's high fixes.** Besides the hub, up to 15
+**Status: 0.9.30 — the audit round's medium fixes, first half.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -103,7 +103,7 @@ low findings, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.1
   the project's networks, and creates only inside its names (`ai-<label>-`)
   and disk quota. Workers call no qmcp service, cannot reach their lead or
   the hub, and reach another project only by a copy through the operator's
-  dialog. Copies inside a project, and into its dump sink, need no dialog.
+  dialog, never a hidden one. Copies inside a project, and into its dump sink, need no dialog.
   What a project's workers can reach is bounded by the gateways you list for
   it, which must be enrolled; inside that, the hub and the lead narrow each
   worker's reach with its firewall rules. The lead's own reach is its
@@ -153,8 +153,9 @@ low findings, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.1
   or a lead, cannot use Qubes' raw disposable shortcut, and cannot touch the
   Admin API, except a lead's firewall methods on its own workers. A copy needs
   the operator's dialog unless it stays inside one slot or goes into that
-  slot's dump sink, and a copy into a guarded qube, the hub or a lead is
-  refused.
+  slot's dump sink, and a copy into a guarded qube, the hub, a lead or a
+  hidden project from outside it is refused, as is every other dialog into a
+  hidden project.
 - **Every change made through a dom0 service** (creates, removes, lifecycle,
   properties, features, proposals), and every change the operator makes with
   the `qmcp` command or the window, is recorded on a hash-chained log in dom0
@@ -217,7 +218,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.29.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.30.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -227,7 +228,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 51 checked claims. It installs the anonymity gate's timer as
+overrides its 52 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user
@@ -248,7 +249,14 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.28? Install over it. `qmcp revoke`, an accepted revoke
+Coming from 0.9.29? Install over it. Nothing in AI space reaches a hidden
+project's qubes from outside it any more, not even through a dialog (a hidden
+lead's dialog copy into its own sink goes with it); `qmcp seal` takes an open
+badge off a drop box or the hub, and a seal whose kill fails is tried again
+and fails `qmcp check` until it is made or no longer needed. The CHANGELOG's 0.9.30 entry has the
+whole list. To roll back, run this release's `uninstall.sh` before 0.9.29's
+installer.
+Coming from 0.9.28? Install over it, then read the 0.9.29 note. `qmcp revoke`, an accepted revoke
 proposal and `qubes_run_disposable` kill the qube instead of asking it to shut
 down, and a revoke whose qube still runs exits 1; the anonymity gate kills a
 stopped project's qube it finds running, on every run, so you can no longer

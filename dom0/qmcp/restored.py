@@ -56,6 +56,9 @@ CALLER = "gate"
 LOCK_WAIT_S = 5
 #: How long the hold waits for one qube's lock before holding it without.
 HOLD_LOCK_WAIT_S = 2.0
+#: How long a hold made without the lock then waits for it again, so the call
+#: that held it has finished, and the hold is read back.
+HOLD_SETTLE_WAIT_S = 5.0
 NOTICE = ("qubes-mcp is holding {name} for your review: it came back from a backup, or was "
           "copied by hand. Open the qubes-mcp window.")
 
@@ -167,12 +170,15 @@ def require_label(vm) -> None:
 
 class Held:
     """What one pass did: qubes newly held, holds that failed, reads it could
-    not make. `judged` is False when the pass could not run at all."""
+    not make; `gone`, qubes removed by a call that was already running when
+    they were held; `unsettled`, qubes held while a call kept their lock past
+    both waits. `judged` is False when the pass could not run at all."""
 
-    __slots__ = ("held", "failed", "unread", "judged")
+    __slots__ = ("held", "failed", "unread", "judged", "gone", "unsettled")
 
     def __init__(self):
         self.held, self.failed, self.unread, self.judged = [], [], [], True
+        self.gone, self.unsettled = [], []
 
 
 def hold(app, lock_wait: float | None = None) -> Held:
@@ -182,7 +188,8 @@ def hold(app, lock_wait: float | None = None) -> Held:
     is reported and tried again next run."""
     out = Held()
     try:
-        fd = budget.acquire_create_lock(timeout=LOCK_WAIT_S if lock_wait is None else lock_wait)
+        fd = budget.acquire_create_lock(timeout=LOCK_WAIT_S if lock_wait is None else lock_wait,
+                                        queue=True)
     except Exception:
         out.judged = False
         return out
@@ -209,9 +216,9 @@ def hold(app, lock_wait: float | None = None) -> Held:
             # The qube's own lock, briefly: a service already past its check
             # (a remove, a start) lands before the hold, and none after it. A
             # hold only takes authority away, so it goes on without the lock
-            # when it cannot be had.
+            # when it cannot be had, and settles once the call has finished.
             try:
-                qfd = core.acquire_qube_lock(name, HOLD_LOCK_WAIT_S)
+                qfd = core.acquire_qube_lock(name, HOLD_LOCK_WAIT_S, queue=True)
             except core.Refusal:
                 qfd = None
             try:
@@ -219,12 +226,19 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 if HOLD not in core.tags_of(vm):
                     raise RuntimeError("the hold did not read back")
             except Exception as e:
-                out.failed.append((name, type(e).__name__))
-                _audit(name, False, f"not held: {type(e).__name__}")
+                if _is_gone(app, name):
+                    # A remove already running landed first: nothing is left to hold.
+                    out.gone.append(name)
+                    _audit(name, False, "removed by a call that was already running")
+                else:
+                    out.failed.append((name, type(e).__name__))
+                    _audit(name, False, f"not held: {type(e).__name__}")
                 continue
             finally:
                 if qfd is not None:
                     os.close(qfd)
+            if qfd is None and _settle(app, vm, name, out):
+                continue
             out.held.append(name)
             _audit(name, True)
     finally:
@@ -233,6 +247,50 @@ def hold(app, lock_wait: float | None = None) -> Held:
         except Exception:
             pass
     return out
+
+
+def _is_gone(app, name: str) -> bool:
+    """True only when qubesd says the qube no longer exists."""
+    try:
+        clear = getattr(app.domains, "clear_cache", None)
+        if clear is not None:
+            clear()
+        return name not in app.domains
+    except Exception:
+        return False
+
+
+def _settle(app, vm, name: str, out: Held) -> bool:
+    """After a hold made without the qube's lock: wait for the lock again, so
+    the call that held it has finished, then read the hold back. True when the
+    qube is gone (that call removed it), or its hold could not be read back or
+    put back, which `out` records; False otherwise: held, or not settled
+    because the lock was not had again (`out.unsettled`)."""
+    try:
+        late = core.acquire_qube_lock(name, HOLD_SETTLE_WAIT_S, queue=True)
+    except core.Refusal:
+        late = None
+    try:
+        if late is None:
+            out.unsettled.append(name)
+            return False
+        if _is_gone(app, name):
+            out.gone.append(name)
+            _audit(name, False, "removed by a call that was already running")
+            return True
+        try:
+            if HOLD not in core.tags_of(vm):
+                vm.tags.add(HOLD)
+                if HOLD not in core.tags_of(vm):
+                    raise RuntimeError("the hold did not read back")
+        except Exception as e:
+            out.failed.append((name, type(e).__name__))
+            _audit(name, False, f"not held: {type(e).__name__}")
+            return True
+        return False
+    finally:
+        if late is not None:
+            os.close(late)
 
 
 def _audit(name: str, ok: bool, error: str | None = None) -> None:
@@ -361,18 +419,19 @@ def _locked(name: str, must: bool, fn):
     which takes it away, goes on without it."""
     if not core.valid_qube_name(name):
         raise ReviewError(f"no qube '{name}'")
+    from qmcp import fleet
     try:
         lock = core.qube_lock(name, must=must)
-        lock.__enter__()
+        held = lock.__enter__()
     except core.QubeBusy as e:
         raise ReviewError(str(e)) from None
     except core.Refusal as r:
         if must:
             raise ReviewError(f"'{name}''s lock cannot be taken ({r.payload.get('error')}), so "
                               f"nothing was changed") from None
-        return fn()
+        return fn() + fleet.UNLOCKED
     try:
-        return fn()
+        return fn() + ("" if held else fleet.UNLOCKED)
     finally:
         lock.__exit__(None, None, None)
 

@@ -559,12 +559,22 @@ admin.vm.firewall.Reload   *  mcp-control  @tag:ai-managed  allow  target=@admin
 # F. COPIES FROM AI SPACE: the operator dialog
 # =========================================================================
 
+# A hidden project is not the hub's, and the hub runs commands in AI space, so
+# nothing in AI space reaches a hidden project's qube from outside its slot,
+# even through a dialog: no copy, no file or URL opened there, no app started
+# there. It sits below B, so the project's own lines still decide inside it
+# (its members' copies among themselves and into its sink), and above F and
+# Qubes' own asks. A made-up name still becomes @default and asks, so a
+# refusal here tells only what the hub's own refused call (A0) already does.
+*                          *  @tag:ai-managed  @tag:qmcp-hubblind       deny
+
 # Every qubes.Filecopy from AI space that A did not refuse (into a guarded
-# qube, the hub or a lead) and B did not allow (inside one slot, or into its
-# dump sink) gets the normal Qubes dialog, where the operator picks or
-# confirms the destination (since v0.9.15). That covers every copy across
-# projects. qrexec turns a target that does not exist into @default, so the
-# ask reveals no qube names.
+# qube, the hub or a lead), B did not allow (inside one slot, or into its
+# dump sink) and the line above did not refuse (into a hidden project) gets
+# the normal Qubes dialog, where the operator picks or confirms the
+# destination (since v0.9.15). That covers every other copy across projects.
+# qrexec turns a target that does not exist into @default, so the ask reveals
+# no qube names.
 qubes.Filecopy             *  @tag:ai-managed  @anyvm                   ask
 
 # =========================================================================

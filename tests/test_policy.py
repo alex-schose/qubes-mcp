@@ -146,6 +146,8 @@ FLEET["w-p05-hidden"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubbl
 FLEET["lead-p07-hidden"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p07", "qmcp-anon",
                                       "qmcp-hubblind"])
 FLEET["sink-p07-hidden"] = _dom(tags=["ai-dump", "qmcp-dump-p07", "qmcp-hubblind"])
+FLEET["w-p07-hidden"] = _dom(tags=[AI, "qmcp-proj-p07", "qmcp-anon", "qmcp-hubblind"])
+FLEET["w-p07-hidden-b"] = _dom(tags=[AI, "qmcp-proj-p07", "qmcp-anon", "qmcp-hubblind"])
 # M5's open windows: a guarded qube the operator opened, with and without the
 # firewall half, and a model qube in one (the common case). A badge on a qube
 # `qmcp open` refuses is not a legitimate state and is not modelled as one: the
@@ -398,6 +400,34 @@ def _cases() -> list[Case]:
         add("hub dialog into a hidden sink", svc, HUB, "sink-p07-hidden", "deny", "deny")
     add("hidden member copies to its sink", "qubes.Filecopy", "w-p05-hidden", "sink-p05",
         "allow", "allow")
+    # Nothing in AI space reaches a hidden project from outside its slot, not even
+    # through a dialog, because the hub runs commands in all of it: a qube of p00,
+    # of a visible project, a lead, a guarded qube the operator opened, an
+    # anonymous member, another hidden project. The four request shapes: the
+    # made-up name and @default stay the dialog, so a refusal tells a source
+    # the hub operates no more than the hub's own refused call does.
+    for src in ("w-p00-a", "w-p01-a", "lead-p01", "ai-tpl-open", "w-p06-a", "w-p05-hidden"):
+        for svc in ("qubes.Filecopy", "qubes.OpenInVM", "qubes.OpenURL", "qubes.StartApp"):
+            add("AI space into a hidden member", svc, src, "w-p07-hidden", "deny", "deny")
+            add("AI space into a hidden sink", svc, src, "sink-p07-hidden", "deny", "deny")
+        add("AI space copy to a made-up name", "qubes.Filecopy", src, "no-such-qube",
+            "ask", "ask")
+        add("AI space copy to @default", "qubes.Filecopy", src, "@default", "ask", "ask")
+        add("AI space copy to a visible member", "qubes.Filecopy", src, "w-p02-a",
+            "ask", "ask")
+    # ... while the hidden project's own lines still decide inside it.
+    add("hidden member copies to its sibling", "qubes.Filecopy", "w-p07-hidden",
+        "w-p07-hidden-b", "allow", "allow")
+    add("hidden member copies to its hidden sink", "qubes.Filecopy", "w-p07-hidden",
+        "sink-p07-hidden", "allow", "allow")
+    add("hidden lead copies to its member", "qubes.Filecopy", "lead-p07-hidden",
+        "w-p07-hidden", "allow", "allow")
+    # The accepted cost: a hidden lead's dialog copy into its own sink (its
+    # members copy there with no dialog), and StartApp's dialog inside the project.
+    add("hidden lead's dialog copy into its sink", "qubes.Filecopy", "lead-p07-hidden",
+        "sink-p07-hidden", "deny", "deny")
+    add("StartApp inside a hidden project", "qubes.StartApp", "w-p07-hidden",
+        "w-p07-hidden-b", "deny", "deny")
     # An anonymous qube opens nothing elsewhere, not even through a dialog.
     for svc in ("qubes.OpenURL", "qubes.OpenInVM"):
         for tgt in ("personal", "@default", "@dispvm:default-dvm", "w-p05-hidden"):

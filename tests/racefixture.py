@@ -260,7 +260,8 @@ def time_limit(seconds=RUN_LIMIT_S):
 SHORT_WAITS = [
     (core, "QUBE_WAIT_S", 0.0), (core, "OPERATOR_WAIT_S", 0.0),
     (fleet, "SWEEP_WAIT_S", 0.0), (fleet, "HALT_WAIT_S", 0.0),
-    (restored, "HOLD_LOCK_WAIT_S", 0.0), (restored, "LOCK_WAIT_S", 0.0),
+    (restored, "HOLD_LOCK_WAIT_S", 0.0), (restored, "HOLD_SETTLE_WAIT_S", 0.0),
+    (restored, "LOCK_WAIT_S", 0.0), (anon, "KILL_LOCK_WAIT_S", 0.0),
     (budget, "LOCK_TIMEOUT_S", 0.0),
     (anon, "LOCK_WAIT_S", 0.0), (anon, "RETRY_WAIT_S", 0.0),
     (proposals, "SUBMIT_WAIT_S", 0.0), (proposals, "DECIDE_WAIT_S", 0.0),
@@ -274,6 +275,7 @@ SHORT_WAITS = [
 REAL_WAITS = [
     (core, "QUBE_WAIT_S", 3.0), (core, "OPERATOR_WAIT_S", 3.0),
     (fleet, "SWEEP_WAIT_S", 3.0), (restored, "HOLD_LOCK_WAIT_S", 3.0), (restored, "LOCK_WAIT_S", 3.0),
+    (restored, "HOLD_SETTLE_WAIT_S", 3.0), (anon, "KILL_LOCK_WAIT_S", 3.0),
     (budget, "LOCK_TIMEOUT_S", 3.0), (anon, "LOCK_WAIT_S", 3.0),
     (proposals, "SUBMIT_WAIT_S", 3.0), (proposals, "DECIDE_WAIT_S", 3.0),
 ]

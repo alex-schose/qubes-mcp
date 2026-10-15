@@ -89,6 +89,11 @@ from qmcp import audit, core, gateways, projects
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_RUN_DIR = "/run/qubes/policy.d"
 LOCK_PATH = "/run/qmcp/gate.lock"
+#: How long a run that kills then waits, in all and across every project it
+#: stops, for the locks of the qubes it stops, so a start that was already past
+#: its check when the badge went on has landed, and is killed again. The first
+#: kill never waits for it.
+KILL_LOCK_WAIT_S = 5.0
 #: Written at the end of every completed run of the timer's; `qmcp check`
 #: requires it recent. Only the timer's runs write it (its unit sets HEARTBEAT_ENV),
 #: so a check or a window refresh, which run the gate too, cannot hide a timer
@@ -563,7 +568,62 @@ def _tag(vm, tag: str, add: bool) -> str:
         return type(e).__name__
 
 
-def block(app, v: Verdict, names, kill: bool) -> None:
+def _locks(vms: dict, deadline: float) -> list:
+    """The locks of `vms`' qubes that could be had by `deadline` (a
+    `time.monotonic()` value), queued (`core.acquire_qube_lock`); a qube whose
+    lock is held past that, or cannot be opened, is left out."""
+    fds = []
+    for name in vms:
+        try:
+            fd = core.acquire_qube_lock(name, max(0.0, deadline - time.monotonic()), queue=True)
+        except core.Refusal:
+            fd = None
+        if fd is not None:
+            fds.append(fd)
+    return fds
+
+
+def _kill_again(v: Verdict, vms: dict) -> None:
+    """After the calls in flight on the killed qubes have finished: kill again
+    whatever one of them started."""
+    for name, vm in vms.items():
+        if _power(vm) == "Halted":
+            continue
+        try:
+            vm.kill()
+            v.acted.append(f"{name}: killed again, after a call already running started it")
+        except Exception as e:
+            if _power(vm) != "Halted":
+                v.acted.append(f"{name}: NOT killed again ({type(e).__name__}); tried again on "
+                               f"the next run")
+
+
+def _kill_pass(v: Verdict, vms: dict, tags) -> None:
+    for name, vm in vms.items():
+        # A power state that cannot be read (qubesadmin's "NA") is no halt:
+        # the kill is tried, and a qube still not known to be down is left
+        # unmarked, so the next run tries again.
+        down = _power(vm) == "Halted"
+        killed = False
+        if not down:
+            try:
+                vm.kill()
+                v.acted.append(f"{name}: killed")
+                down = killed = True
+            except Exception as e:
+                down = _power(vm) == "Halted"
+                if not down:
+                    v.acted.append(f"{name}: NOT killed ({type(e).__name__}); tried again "
+                                   f"on the next run")
+        if down and projects.STOPPED not in tags(vm):
+            err = _tag(vm, projects.STOPPED, True)
+            if err:
+                v.acted.append(f"{name}: NOT marked stopped ({err})")
+            elif not killed:
+                v.acted.append(f"{name}: halted, marked stopped")
+
+
+def block(app, v: Verdict, names, kill: bool, deadline: float | None = None) -> None:
     """Stop the project's qubes, in passes, so no moment has one killed while
     another can still act: every one (the lead first) badged `qmcp-blocked`;
     then, for a violation, each one that does not read halted is killed, and
@@ -577,7 +637,15 @@ def block(app, v: Verdict, names, kill: bool) -> None:
     boot: whichever started it, it runs on the path this run found broken, so
     the next run stops it again. `qmcp-stopped` only records that a run knew
     it was down. A step that fails is reported and the next one still runs:
-    the kill is what stops the traffic."""
+    the kill is what stops the traffic.
+
+    The kill comes at once. Then the lock of each qube it stops is taken
+    (`core.acquire_qube_lock`, in its turnstile) by `deadline`, which the run
+    shares across every project it stops (`KILL_LOCK_WAIT_S` from its first),
+    so a call already past its check when the badge went on (a start) has
+    landed; any qube that runs then is killed again. A qube whose lock is not
+    had by then is killed again by the next run that still finds its project
+    unsound, if a start lands after."""
     vms = {}
     for name in names:
         try:
@@ -595,28 +663,13 @@ def block(app, v: Verdict, names, kill: bool) -> None:
             err = _tag(vm, projects.BLOCKED, True)
             v.acted.append(f"{name}: blocked" if not err else f"{name}: NOT blocked ({err})")
     if kill:
-        for name, vm in vms.items():
-            # A power state that cannot be read (qubesadmin's "NA") is no halt:
-            # the kill is tried, and a qube still not known to be down is left
-            # unmarked, so the next run tries again.
-            down = _power(vm) == "Halted"
-            killed = False
-            if not down:
-                try:
-                    vm.kill()
-                    v.acted.append(f"{name}: killed")
-                    down = killed = True
-                except Exception as e:
-                    down = _power(vm) == "Halted"
-                    if not down:
-                        v.acted.append(f"{name}: NOT killed ({type(e).__name__}); tried again "
-                                       f"on the next run")
-            if down and projects.STOPPED not in tags(vm):
-                err = _tag(vm, projects.STOPPED, True)
-                if err:
-                    v.acted.append(f"{name}: NOT marked stopped ({err})")
-                elif not killed:
-                    v.acted.append(f"{name}: halted, marked stopped")
+        _kill_pass(v, vms, tags)
+        fds = _locks(vms, time.monotonic() + KILL_LOCK_WAIT_S if deadline is None else deadline)
+        try:
+            _kill_again(v, vms)
+        finally:
+            for fd in fds:
+                os.close(fd)
     # On every run, not only the one that blocked: a write that failed, or a
     # run cut short before this pass, is tried again here.
     for name, vm in vms.items():
@@ -822,7 +875,7 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
     with _GateLock(lock_path) as got:
         if not got:
             return None
-        out = []
+        out, deadline = [], None
         for p in subjects:
             if p is HUB and mode is None:
                 v = Verdict(HUB)
@@ -835,7 +888,9 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
                 v = _verdict(app, p, records, policy_loader, retry_wait)
             stop = hub_stop_set(v, core.read_hub()) if p is HUB else v.names
             if act and v.status in (RED, UNREADABLE):
-                block(app, v, stop, kill=v.status == RED)
+                if deadline is None:
+                    deadline = time.monotonic() + KILL_LOCK_WAIT_S
+                block(app, v, stop, kill=v.status == RED, deadline=deadline)
                 # What the operator reads: blocked as the qubes are now.
                 try:
                     now = _snapshot(app)[1]

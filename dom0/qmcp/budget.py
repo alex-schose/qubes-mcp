@@ -26,11 +26,9 @@ refused, and a lock that cannot be opened at all refuses too.
 """
 from __future__ import annotations
 
-import fcntl
 import os
-import time
 
-from qmcp.core import UMBRELLA, Gone, Refusal, refuse, tags_of
+from qmcp.core import UMBRELLA, Gone, Refusal, refuse, tags_of, take_queued_lock
 
 CAP_PATH = "/etc/qmcp/pool-cap"
 PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
@@ -143,28 +141,23 @@ def check_quota(app, badge: str, quota: int, estimate: int) -> None:
         raise refuse(ERR_QUOTA_EXCEEDED)
 
 
-def acquire_create_lock(path: str | None = None, timeout: float | None = None) -> int:
+def acquire_create_lock(path: str | None = None, timeout: float | None = None,
+                        queue: bool = False) -> int:
     """The create lock, or a refusal. Released when the process exits.
+    `queue`: an operator's command or the restore check, which waits in the
+    lock's turnstile (`core.take_queued_lock`), so creates arriving after it
+    wait behind it rather than taking the lock first each time it is freed.
 
     The services (a non-root dom0 user in `qubes`) and the operator's project
     commands (root) share this file, so whoever creates it must leave it
     group-writable: created by root under sudo it came out 0600 (measured on
     Qubes 4.3.1) and locked every service out of it. tmpfiles also declares
-    it 0660."""
-    old = os.umask(0o007)
+    it, and its turnstile, 0660."""
     try:
-        fd = os.open(LOCK_PATH if path is None else path, os.O_RDWR | os.O_CREAT, 0o660)
+        fd = take_queued_lock(LOCK_PATH if path is None else path,
+                              LOCK_TIMEOUT_S if timeout is None else timeout, 0.2, queue)
     except OSError:
         raise refuse("qmcp runtime directory unavailable") from None
-    finally:
-        os.umask(old)
-    deadline = time.monotonic() + (LOCK_TIMEOUT_S if timeout is None else timeout)
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except OSError:
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                raise refuse("busy: another create is in progress") from None
-            time.sleep(0.2)
+    if fd is None:
+        raise refuse("busy: another create is in progress")
+    return fd

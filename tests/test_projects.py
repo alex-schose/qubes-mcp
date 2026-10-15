@@ -981,11 +981,21 @@ class HardwareFindings(ProjectBase):
         self.assertEqual(f["runtime dir"].status, "fail")
         self.assertIn("create.lock", f["runtime dir"].detail)
 
+    def test_check_fails_on_a_create_turnstile_the_services_cannot_write(self):
+        turn = pathlib.Path(core.queue_path(str(budget.LOCK_PATH)))
+        turn.touch()
+        os.chmod(turn, 0o640)
+        f = {x.check: x for x in fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})}
+        self.assertEqual(f["runtime dir"].status, "fail")
+        self.assertIn("create.queue", f["runtime dir"].detail)
+
     def test_tmpfiles_declares_the_create_lock(self):
         conf = (HERE.parent / "deploy" / "qmcp-tmpfiles.conf").read_text().splitlines()
         rules = {tuple(line.split()[:5]) for line in conf if line and not line.startswith("#")}
         for kind in ("f", "z"):
             self.assertIn((kind, "/run/qmcp/create.lock", "0660", "root", "qubes"), rules)
+            # and its turnstile, which every create passes through first
+            self.assertIn((kind, "/run/qmcp/create.queue", "0660", "root", "qubes"), rules)
         self.assertIn('LOCK_PATH = "/run/qmcp/create.lock"', (HERE.parent / "dom0" / "qmcp" / "budget.py").read_text())
 
 
@@ -1291,6 +1301,167 @@ class CopyRechecks(ProjectBase):
         self.app.domains["ai-hubq"]._props["only_on_source"] = 1
         self.assertTrue(self.clone("ai-hubq", "ai-hub-c1")["ok"])
 
+
+
+class LeadChangesWaitForCalls(ProjectBase):
+    """A lead's removal or change waits for the lead's calls that are past
+    their check (its acting lock), and runs under the lead's own lock, as a
+    revoke does; a promotion holds the promoted qube's lock throughout."""
+
+    def setUp(self):
+        super().setUp()
+        core.OPERATOR_WAIT_S = 5.0
+
+    def in_thread(self, fn):
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", fn()), daemon=True)
+        t.start()
+        self.addCleanup(t.join, 10)
+        return t, out
+
+    def test_a_project_command_gets_the_create_lock_from_a_busy_creator(self):
+        # The project commands queue in the create lock's turnstile.
+        budget.LOCK_TIMEOUT_S = 3.0
+        stop = threading.Event()
+
+        def creator():
+            while not stop.is_set():
+                try:
+                    fd = budget.acquire_create_lock(timeout=5)
+                except core.Refusal:
+                    continue
+                time.sleep(0.03)
+                os.close(fd)
+        t = threading.Thread(target=creator, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(stop.set)
+        time.sleep(0.1)
+        fleet.edit_project(self.app, "osint", quota=7 * GiB)
+        stop.set()
+        self.assertEqual(projects.find(self.records(), "osint").quota, 7 * GiB)
+
+    def test_a_lead_call_past_its_check_lands_before_the_lead_is_removed(self):
+        call = core.hold_acting(LEAD)                     # a call of the lead's, past its check
+        t, _ = self.in_thread(lambda: fleet.remove_lead(self.app, "osint"))
+        time.sleep(0.3)
+        self.assertIn("qmcp-lead-p01", self.tags(LEAD))    # the removal waits for the call
+        os.close(call)
+        t.join(10)
+        self.assertIsNone(projects.find(self.records(), "osint").lead)
+        self.assertNotIn(LEAD, self.app.domains)
+
+    def test_a_project_delete_waits_for_the_leads_call_too(self):
+        call = core.hold_acting(LEAD)
+        t, _ = self.in_thread(lambda: fleet.delete_project(self.app, "osint"))
+        time.sleep(0.3)
+        self.assertIn("ai-osint-w1", self.app.domains)       # nothing removed yet
+        self.assertIn("qmcp-lead-p01", self.tags(LEAD))
+        os.close(call)
+        t.join(10)
+        self.assertNotIn("ai-osint-w1", self.app.domains)
+        self.assertIsNone(projects.find(self.records(), "osint"))
+
+    def test_a_lead_cannot_starve_the_drain_by_overlapping_its_calls(self):
+        # Two of the lead's calls, staggered, keep the acting lock shared at
+        # every moment; the drain waits in its turnstile, so each new call
+        # waits behind it and it is had within about one call's length.
+        stop = threading.Event()
+
+        def calls(offset):
+            time.sleep(offset)
+            while not stop.is_set():
+                try:
+                    fd = core.hold_acting(LEAD, 5)
+                except core.Refusal:
+                    continue
+                time.sleep(0.2)
+                os.close(fd)
+        workers = [threading.Thread(target=calls, args=(i * 0.1,), daemon=True)
+                   for i in range(2)]
+        for w in workers:
+            w.start()
+            self.addCleanup(w.join, 5)
+        self.addCleanup(stop.set)
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        fd = core.drain_caller(LEAD, 3.0)
+        waited = time.monotonic() - t0
+        stop.set()
+        self.assertIsNotNone(fd, "the lead's overlapping calls starved the drain")
+        os.close(fd)
+        self.assertLess(waited, 1.0)
+
+    def test_a_lead_call_reaching_its_check_meanwhile_is_refused(self):
+        drain = core.drain_caller(LEAD, 1)                # the removal holds it
+        req = {"name": "ai-osint-w1", "property": "memory", "value": 600}
+        t, out = self.in_thread(lambda: self.lcall("qmcp.SetPropertyAIManaged", req))
+        time.sleep(0.3)
+        doc = json.loads(json.dumps(RECORDS))
+        doc["slots"]["p01"]["lead"] = None
+        self.write_records(doc)
+        self.app.domains[LEAD].tags.discard("qmcp-lead-p01")
+        os.close(drain)
+        t.join(10)
+        self.assertEqual(out["r"], core.NOT_AUTHORIZED)
+        self.assertNotEqual(self.app.domains["ai-osint-w1"].memory, 600)
+
+    def test_a_removal_that_waited_past_the_wait_says_so(self):
+        core.OPERATOR_WAIT_S = 0.3
+        call = core.hold_acting(LEAD)
+        self.addCleanup(os.close, call)
+        report = fleet.remove_lead(self.app, "osint")
+        self.assertTrue(any("was still running after" in line for line in report), report)
+        self.assertIsNone(projects.find(self.records(), "osint").lead)
+
+    def test_a_create_that_promotes_refuses_while_a_call_holds_that_qube(self):
+        core.OPERATOR_WAIT_S = 0.3
+        held = core.acquire_qube_lock("ai-work2", 1)
+        self.addCleanup(os.close, held)
+        with self.assertRaises(fleet.ProjectError) as cm:
+            fleet.create_project(self.app, "newp", "promote", "ai-work2",
+                                 templates=["ai-debian-13"])
+        self.assertIn("is being changed", str(cm.exception))
+        self.assertIsNone(projects.find(self.records(), "newp"))
+        self.assertNotIn("qmcp-lead", self.tags("ai-work2"))
+
+    def test_a_drain_that_cannot_open_its_lock_says_so(self):
+        real = core.drain_caller
+        core.drain_caller = lambda *a, **k: (_ for _ in ()).throw(PermissionError("x"))
+        self.addCleanup(setattr, core, "drain_caller", real)
+        report = fleet.remove_lead(self.app, "osint")
+        self.assertTrue(any("acting lock could not be opened" in l for l in report), report)
+        self.assertFalse(any("was still running" in l for l in report), report)
+
+    def test_a_promotion_refuses_while_a_call_holds_the_promoted_qube(self):
+        core.OPERATOR_WAIT_S = 0.3
+        held = core.acquire_qube_lock("ai-work2", 1)
+        self.addCleanup(os.close, held)
+        with self.assertRaises(fleet.ProjectError) as cm:
+            fleet.set_lead(self.app, "osint", "promote", "ai-work2", keep_old=True)
+        self.assertIn("is being changed", str(cm.exception))
+        self.assertEqual(projects.find(self.records(), "osint").lead, LEAD)
+        self.assertIn("qmcp-lead-p01", self.tags(LEAD))
+        self.assertNotIn("qmcp-lead", self.tags("ai-work2"))
+
+    def test_a_start_of_the_old_lead_that_landed_after_its_kill_is_killed_again(self):
+        real, asked = core.acquire_qube_lock, []
+
+        def acquire(name, timeout=None, **kw):
+            if name == LEAD:
+                asked.append(name)
+                if len(asked) == 1:
+                    return None                         # a call of the hub's holds it
+                if len(asked) == 2:
+                    self.app.domains[LEAD].start()      # ... and its start lands
+            return real(name, timeout, **kw)
+        core.acquire_qube_lock = acquire
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        report = fleet.set_lead(self.app, "osint", "promote", "ai-work2", keep_old=True)
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(self.app.domains[LEAD].get_power_state(), "Halted")
+        self.assertTrue(any("killed again" in line for line in report), report)
+        self.assertIn("qmcp-proj-p01", self.tags(LEAD))
 
 if __name__ == "__main__":
     unittest.main()
