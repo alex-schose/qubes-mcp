@@ -1044,8 +1044,9 @@ class RevokeForm(Form):
                          "Takes it out of AI space: removes ai-managed and every other qmcp "
                          "badge, so the hub and every lead lose it and this window stops "
                          "listing it (Add a qube to AI space brings it back). Its default "
-                         "disposable is set to none, and it is shut down unless you leave it "
-                         "running. The qube itself is not removed." + (f" {note}" if note else ""))
+                         "disposable is set to none, and it is killed if it runs, so nothing "
+                         "the hub started in it runs on, unless you leave it running. The "
+                         "qube itself is not removed." + (f" {note}" if note else ""))
         self.qube_name = name
         self.keep = _check(esc("leave it running"))
         self.keep.connect("toggled", self.update)

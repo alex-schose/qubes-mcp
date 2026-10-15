@@ -1285,7 +1285,7 @@ PAYLOAD_CASES = [
      [(A, "qmcp.CloneAIManagedQube", {"source": "ai-a", "name": "ai-a2"})]),
     ("qubes_spawn_disposable", {"template": "ai-dvm"},
      [(A, "qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"})]),
-    ("qubes_run_disposable", RUN_ARGS, [SPAWN, START, POLL, RUN, SHUTDOWN]),
+    ("qubes_run_disposable", RUN_ARGS, [SPAWN, START, POLL, RUN, KILL]),
     ("qubes_feature_set", {"name": "ai-a", "feature": "service.cups", "value": True},
      [(A, "qmcp.SetFeatureAIManaged", {"name": "ai-a", "feature": "service.cups", "value": True})]),
     ("qubes_feature_set", {"name": "ai-a", "feature": "vm-config.x", "value": 3},
@@ -1505,30 +1505,31 @@ class ToolCallTests(ServerCase):
                                                            "stderr": "e"}}})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
                          {"ok": True, "name": D, "rc": 3, "stdout": "o", "stderr": "e"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, SHUTDOWN])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
+        self.assertNotIn(SHUTDOWN, self.fake.calls())       # a request the guest may ignore
 
-    def test_run_disposable_failed_run_is_shut_down(self):
+    def test_run_disposable_failed_run_is_killed(self):
         self.fake.answer({"qmcp.RunInAIManaged": {"json": {"ok": False, "error": "no such file"}}})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
                          {"ok": False, "name": D, "stage": "run", "error": "no such file"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, SHUTDOWN])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
 
-    def test_run_disposable_failed_run_and_shutdown_is_killed(self):
+    def test_run_disposable_failed_run_and_kill_reports_the_run(self):
         self.fake.answer({
             "qmcp.RunInAIManaged": {"json": {"ok": False, "error": "no such file"}},
-            LIFE: [{"match": {"action": "shutdown"}, "json": {"ok": False, "error": "busy"}}],
+            LIFE: [{"match": {"action": "kill"}, "json": {"ok": False, "error": "busy"}}],
         })
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
                          {"ok": False, "name": D, "stage": "run", "error": "no such file"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, SHUTDOWN, KILL])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
 
-    def test_run_disposable_failed_shutdown_after_a_good_run_is_killed(self):
-        self.fake.answer({LIFE: [{"match": {"action": "shutdown"},
+    def test_run_disposable_failed_kill_after_a_good_run_says_so(self):
+        self.fake.answer({LIFE: [{"match": {"action": "kill"},
                                   "json": {"ok": False, "error": "busy"}}]})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
-                         {"ok": False, "name": D, "stage": "shutdown", "error": "busy",
+                         {"ok": False, "name": D, "stage": "kill", "error": "busy",
                           "rc": 0, "stdout": "out\n", "stderr": ""})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, SHUTDOWN, KILL])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
 
     def test_run_disposable_failed_start_is_killed(self):
         self.fake.answer({LIFE: [{"match": {"action": "start"},
@@ -1548,7 +1549,7 @@ class ToolCallTests(ServerCase):
         self.fake.answer({PROP: {"sequence": [{"json": {"ok": True, "value": "Halted"}},
                                               {"json": {"ok": True, "value": "Running"}}]}})
         self.assertTrue(self.call("qubes_run_disposable", RUN_ARGS)["ok"])
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, POLL, RUN, SHUTDOWN])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, POLL, RUN, KILL])
 
     def test_run_disposable_never_targets_a_bad_name_from_dom0(self):
         self.fake.answer({"qmcp.SpawnDisposableAIManaged": {"json": {"ok": True, "name": "dom0"}}})
@@ -1557,7 +1558,7 @@ class ToolCallTests(ServerCase):
                                   "error": "not found or refused"})
         calls = self.fake.calls()
         self.assertNotIn("dom0", [target for target, _, _ in calls])
-        self.assertEqual(calls[-1], (A, LIFE, {"name": "dom0", "action": "shutdown"}))
+        self.assertEqual(calls[-1], (A, LIFE, {"name": "dom0", "action": "kill"}))
 
     def test_firewall_set_reload_failure(self):
         self.fake.answer({"admin.vm.firewall.Reload": {"raw": "", "rc": 1}})

@@ -1401,9 +1401,9 @@ class ProposalModel(GuiBase):
         self.assertEqual(revoke["Equivalent command"], "qmcp revoke ai-work2 --no-shutdown")
         stops = self.show(self.submit_proposal("revoke", shutdown=True)["id"])
         self.assertEqual(dict(gm.proposal_details(stops))["Shut down"],
-                         "yes: the command shuts it down if it runs")
+                         "yes: the command kills it if it runs")
         self.assertEqual(stops["command"], "qmcp revoke ai-work2")
-        self.assertIn("; it is shut down", gm.second_tick_text(stops))
+        self.assertIn("; it is killed if it runs", gm.second_tick_text(stops))
         # An install: the template, the names as the command line has them, and
         # an accept form that says the window waits for it.
         install = self.show(self.submit_proposal("install")["id"])

@@ -1151,7 +1151,8 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
         out.append(f"REVOKES {q}: every qmcp badge comes off, so it leaves AI space and any slot "
                    f"it is in; after that the hub reaches it only through your dialogs, and "
                    f"what it left on its disk stays"
-                   + ("; it is shut down" if p["shutdown"] else "; it keeps running"))
+                   + ("; it is killed if it runs, so nothing the hub started in it runs on"
+                      if p["shutdown"] else "; it keeps running"))
     else:
         out.append(f"INSTALLS {len(p['packages'])} package(s) into the template {q} as root, "
                    f"with its own package manager, from the repositories it already trusts, "
@@ -1244,10 +1245,9 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
             out.append(f"whether {q} is a gateway or a disposable removed when it stops could "
                        f"not be read")
         if gateway and p["shutdown"]:
-            out.append(f"{q} provides network: Qubes refuses to shut it down while a qube on it "
-                       f"runs, and the report then says to kill it, which cuts their network")
+            out.append(f"{q} provides network: killing it cuts the network of every qube on it")
         if cleaned and p["shutdown"]:
-            out.append(f"{q} is a disposable that is removed when it stops: shutting it down "
+            out.append(f"{q} is a disposable that is removed when it stops: killing it "
                        f"removes it")
         if serves:
             out.append(f"{', '.join(serves)} lose their model qube: the record still names it, and "
@@ -1294,6 +1294,9 @@ def second_tick(app, p: dict, records: dict) -> list:
                            f"otherwise yours alone")
         reasons.append("the window closes by itself, at every boot, and on Seal, which kills "
                        "the qube if it is running")
+        warning = fleet.hidden_open_warning(app, p["qube"])
+        if warning:
+            reasons.append(f"WARNING: {warning}")
     if t in ("qube-manage", "qube-revoke", "template-install"):
         # Always: adopting or revoking a qube needs the second tick, and so
         # does a template's root, which every qube built on it runs.
@@ -1371,6 +1374,8 @@ def _execute(app, p: dict) -> list:
     t = p["type"]
     if "project" in p and _hidden(projects.load(), p["project"]):
         raise fleet.ProjectError(f"no project '{p['project']}'")
+    if t.startswith("project-"):
+        _refuse_hidden_names(app, p)
     if t == "project-create":
         return fleet.create_project(app, p["label"], p["lead"]["from"], p["lead"]["qube"],
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
@@ -1450,10 +1455,53 @@ def _refusal_seen(app, p: dict, vm, tags):
         if p["type"] == "qube-revoke" and not p["shutdown"] and (
                 core.GUARDED not in tags or tags & {core.OPEN, core.OPEN_FW}):
             return (f"the hub could run commands in {name}, so a hub's proposal to revoke it "
-                    f"shuts it down")
+                    f"kills it")
     except (core.Unreadable, fleet.RoleError):
         return None
     return None
+
+
+def _hidden_names(p: dict) -> list:
+    """(qube name, the command's own words for it when it does not exist) for
+    every qube a project proposal names that the command would look up: a
+    lead's clone source or promoted qube, an approved template, a model qube."""
+    out = []
+    lead = p.get("lead") or {}
+    if lead.get("from") in ("clone", "promote"):
+        q = lead["qube"]
+        out.append((q, f"no qube '{q}' in AI space"))
+    for t in list(p.get("templates") or ()) + list(p.get("add_templates") or ()):
+        out.append((t, f"'{t}' is not a template or disposable template in AI space"))
+    mq = p.get("model_qube")
+    if mq is not None and mq != NONE:
+        out.append((mq, f"'{mq}' cannot be a model qube: no such qube"))
+    return out
+
+
+def _refuse_hidden_names(app, p: dict) -> None:
+    """A project proposal that names a hidden project's qube (a disposable
+    template, a model qube, a lead's source) fails as one naming a qube that
+    does not exist, in the command's own words for that, before the command
+    reads anything else about it. A qube that cannot be looked up, or whose
+    tags cannot be read, refuses too, since it may be one."""
+    from qmcp import fleet
+    for name, missing in _hidden_names(p):
+        if not core.valid_qube_name(name):
+            continue                        # the command refuses it in its own words
+        try:
+            present = name in app.domains
+        except Exception:
+            raise fleet.ProjectError(f"'{name}' cannot be looked up; try again") from None
+        if not present:
+            continue
+        try:
+            tags = core.tags_of(app.domains[name])
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            raise fleet.ProjectError(f"'{name}''s badges cannot be read; try again") from None
+        if projects.HUBBLIND in tags:
+            raise fleet.ProjectError(missing)
 
 
 def _refuse_hidden_qube(app, p: dict) -> None:

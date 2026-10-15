@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 
 from qmcp import projects
 
@@ -304,6 +305,93 @@ def acquire_call_slot(caller_name: str, run_dir: str | None = None,
         except OSError:
             os.close(fd)
     raise refuse("too many concurrent calls")
+
+
+#: The per-qube lock: a service that operates a qube holds it from its check
+#: to its effect, and so do the commands `fleet._with_qube_lock` serves and the
+#: restore check's, so a call already past its check lands before such a
+#: command acts, unless the command went on without the lock.
+QUBE_LOCK_SUBDIR = "qubes"
+#: How long a service waits for a qube's lock before it refuses.
+QUBE_WAIT_S = 30.0
+#: How long an operator command waits. One that takes authority away goes on
+#: without the lock after this (and guard, revoke and seal wait again after).
+OPERATOR_WAIT_S = 60.0
+BUSY_REFUSAL = {"ok": False, "error": "busy: the qube is being changed; try again"}
+
+
+class QubeBusy(Exception):
+    """A qube's lock was held past the wait."""
+
+
+def qube_lock_path(name: str, run_dir: str | None = None) -> str:
+    return os.path.join(RUN_DIR if run_dir is None else run_dir, QUBE_LOCK_SUBDIR,
+                        f"{name}.lock")
+
+
+def acquire_qube_lock(name: str, timeout: float | None = None) -> int | None:
+    """The lock of the qube `name`: its descriptor, or None when it was held
+    past `timeout`. Released when the descriptor is closed, or the process
+    exits.
+
+    Taken only on a qube the caller may already see: a service resolves the
+    qube first and checks again under the lock, so a name outside its reach
+    never waits on a lock an operator command holds, and contention is no
+    oracle over names. The services (a non-root dom0 user in `qubes`) and the
+    operator's commands (root) share the files, so each is made group-writable
+    in the setgid directory tmpfiles declares; the directory is made here too
+    when it is missing. Raises `Refusal` when the lock cannot be opened at
+    all: a lock that cannot be opened never lets a service, or a command that
+    grants authority, go on."""
+    if not valid_qube_name(name):
+        raise Refusal(NOT_FOUND)
+    path = qube_lock_path(name)
+    old = os.umask(0o007)
+    try:
+        try:
+            os.mkdir(os.path.dirname(path), 0o2770)
+        except FileExistsError:
+            pass
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o660)
+    except OSError:
+        raise refuse("qmcp runtime directory unavailable") from None
+    finally:
+        os.umask(old)
+    deadline = time.monotonic() + (QUBE_WAIT_S if timeout is None else timeout)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+
+
+class qube_lock:
+    """`with core.qube_lock(name) as held:` for an operator command. `must`:
+    a command that grants authority refuses (`QubeBusy`) when the lock is held
+    past the wait; one that only takes authority away goes on without it
+    (`held` False) and says so."""
+
+    def __init__(self, name: str, must: bool = True, timeout: float | None = None) -> None:
+        self.name, self.must = name, must
+        self.timeout = OPERATOR_WAIT_S if timeout is None else timeout
+        self.fd = None
+
+    def __enter__(self) -> bool:
+        self.fd = acquire_qube_lock(self.name, self.timeout)
+        if self.fd is None and self.must:
+            raise QubeBusy(f"'{self.name}' is being changed by a call or another command "
+                           f"(its lock was held for {self.timeout:.0f}s); try again")
+        return self.fd is not None
+
+    def __exit__(self, *exc) -> bool:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        return False
 
 
 # ------------------------------------------------------------------ the states

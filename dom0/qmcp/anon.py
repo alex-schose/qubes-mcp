@@ -55,14 +55,17 @@ a heartbeat, which `qmcp check` requires to be recent.
 **On a confirmed violation** every lead and member is badged `qmcp-blocked`
 first, the lead before the rest (the rulebook refuses every call into a blocked
 qube, so qrexec cannot wake one, and the services refuse to start, change or
-clone one); then each one not yet stopped is killed if it may be running, and badged
+clone one); then each one that may be running is killed, and badged
 `qmcp-stopped` once it is known to be down; then their `autostart` is turned
-off. Nothing is removed. One audit line says what was done, and the operator
+off where it is still on. Nothing is removed. One audit line says what was done, and the operator
 is told: by a desktop notification from the timer's run, or by a line on the
 command's output when a `qmcp` command's own run acted (a root process cannot
 reach the desktop). A run that changes nothing and repeats no failed step
-says nothing; one that repeats a failed step (a kill, a badge) says so again. A qube already stopped (`qmcp-stopped`) is not killed again: only the
-operator can start one, by hand, to look at it. **A read the gate cannot
+says nothing; one that repeats a failed step (a kill, a badge) says so again. Every
+run that finds the project unsound kills whatever of it runs, `qmcp-stopped` or not:
+a start that qubesd accepted reads halted until its domain exists, and a block or
+an autostart write can fail, so a qube marked stopped can come up again; it runs on
+the broken path whoever started it. **A read the gate cannot
 complete** is tried once more; a second failure blocks the project without
 killing it, and a later confirmed violation still kills it. Only `qmcp project
 unblock`, after a fresh run finds the project sound, takes the badges off;
@@ -563,12 +566,18 @@ def _tag(vm, tag: str, add: bool) -> str:
 def block(app, v: Verdict, names, kill: bool) -> None:
     """Stop the project's qubes, in passes, so no moment has one killed while
     another can still act: every one (the lead first) badged `qmcp-blocked`;
-    then, for a violation, each one not yet stopped is killed unless it reads
-    halted, and badged `qmcp-stopped` once it is known to be down; then
-    autostart off on each it touched. A qube already
-    stopped is left as it is: only the operator can have started it, to look
-    at it. A step that fails is reported and the next one still runs: the kill
-    is what stops the traffic."""
+    then, for a violation, each one that does not read halted is killed, and
+    each known to be down is badged `qmcp-stopped`; then autostart off on
+    each one where it is still on.
+
+    Every run that finds the project unsound kills whatever of it runs,
+    `qmcp-stopped` or not. A start can land after the run read the qube as
+    halted (qubesd answers Halted until a start it accepted has made its
+    domain), a block or an autostart write can fail, and a qube can start at
+    boot: whichever started it, it runs on the path this run found broken, so
+    the next run stops it again. `qmcp-stopped` only records that a run knew
+    it was down. A step that fails is reported and the next one still runs:
+    the kill is what stops the traffic."""
     vms = {}
     for name in names:
         try:
@@ -581,20 +590,15 @@ def block(app, v: Verdict, names, kill: bool) -> None:
             return core.tags_of(vm)
         except core.Unreadable:
             return set()            # unknown: every step below runs on it
-    touched = []
     for name, vm in vms.items():
         if projects.BLOCKED not in tags(vm):
             err = _tag(vm, projects.BLOCKED, True)
             v.acted.append(f"{name}: blocked" if not err else f"{name}: NOT blocked ({err})")
-            touched.append(name)
     if kill:
         for name, vm in vms.items():
-            if projects.STOPPED in tags(vm):
-                continue
-            # `qmcp-stopped` only on a qube known to be down: killed now, or read
-            # as halted. A power state that cannot be read (qubesadmin's "NA")
-            # is no halt: the kill is tried, and a qube still not known to be
-            # down is left unmarked, so the next run tries again.
+            # A power state that cannot be read (qubesadmin's "NA") is no halt:
+            # the kill is tried, and a qube still not known to be down is left
+            # unmarked, so the next run tries again.
             down = _power(vm) == "Halted"
             killed = False
             if not down:
@@ -607,17 +611,23 @@ def block(app, v: Verdict, names, kill: bool) -> None:
                     if not down:
                         v.acted.append(f"{name}: NOT killed ({type(e).__name__}); tried again "
                                        f"on the next run")
-            if down:
+            if down and projects.STOPPED not in tags(vm):
                 err = _tag(vm, projects.STOPPED, True)
                 if err:
                     v.acted.append(f"{name}: NOT marked stopped ({err})")
                 elif not killed:
                     v.acted.append(f"{name}: halted, marked stopped")
-            if name not in touched:
-                touched.append(name)
-    for name in touched:
+    # On every run, not only the one that blocked: a write that failed, or a
+    # run cut short before this pass, is tried again here.
+    for name, vm in vms.items():
         try:
-            vms[name].autostart = False
+            on = vm.autostart
+        except Exception:
+            on = True               # unknown: turned off
+        if on is False:
+            continue
+        try:
+            vm.autostart = False
         except Exception as e:
             v.acted.append(f"{name}: autostart NOT turned off ({type(e).__name__})")
 

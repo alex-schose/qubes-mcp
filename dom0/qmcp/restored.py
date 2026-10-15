@@ -54,6 +54,8 @@ CALLER = "gate"
 #: runs right after it, and a pass that cannot have the lock judges nothing
 #: this time and says so.
 LOCK_WAIT_S = 5
+#: How long the hold waits for one qube's lock before holding it without.
+HOLD_LOCK_WAIT_S = 2.0
 NOTICE = ("qubes-mcp is holding {name} for your review: it came back from a backup, or was "
           "copied by hand. Open the qubes-mcp window.")
 
@@ -204,6 +206,14 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 out.unread.append(str(e))
                 continue
             name = core.name_of(vm)
+            # The qube's own lock, briefly: a service already past its check
+            # (a remove, a start) lands before the hold, and none after it. A
+            # hold only takes authority away, so it goes on without the lock
+            # when it cannot be had.
+            try:
+                qfd = core.acquire_qube_lock(name, HOLD_LOCK_WAIT_S)
+            except core.Refusal:
+                qfd = None
             try:
                 vm.tags.add(HOLD)
                 if HOLD not in core.tags_of(vm):
@@ -212,6 +222,9 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 out.failed.append((name, type(e).__name__))
                 _audit(name, False, f"not held: {type(e).__name__}")
                 continue
+            finally:
+                if qfd is not None:
+                    os.close(qfd)
             out.held.append(name)
             _audit(name, True)
     finally:
@@ -342,9 +355,35 @@ def _subject(app, name: str):
     return vm, tags
 
 
+def _locked(name: str, must: bool, fn):
+    """`fn()` under the qube's lock (`core.qube_lock`): an accept, which
+    gives authority back, refuses when it is held past the wait; a reject,
+    which takes it away, goes on without it."""
+    if not core.valid_qube_name(name):
+        raise ReviewError(f"no qube '{name}'")
+    try:
+        lock = core.qube_lock(name, must=must)
+        lock.__enter__()
+    except core.QubeBusy as e:
+        raise ReviewError(str(e)) from None
+    except core.Refusal as r:
+        if must:
+            raise ReviewError(f"'{name}''s lock cannot be taken ({r.payload.get('error')}), so "
+                              f"nothing was changed") from None
+        return fn()
+    try:
+        return fn()
+    finally:
+        lock.__exit__(None, None, None)
+
+
 def accept(app, name: str) -> str:
-    """Label the qube, then lift its hold. Its badges stay as they came back:
-    `qmcp check` judges them against the records from here on."""
+    """Label the qube, then lift its hold, under its lock. Its badges stay as
+    they came back: `qmcp check` judges them against the records from here on."""
+    return _locked(name, True, lambda: _accept(app, name))
+
+
+def _accept(app, name: str) -> str:
     vm, tags = _subject(app, name)
     label(vm)
     if HOLD in tags:
@@ -357,7 +396,11 @@ def accept(app, name: str) -> str:
 def reject(app, name: str) -> str:
     """Take every qmcp badge off, the umbrella and the drop-box badge included:
     the routed ones first, the hold last, so no moment leaves it routed and
-    unheld. The qube and its data stay."""
+    unheld. The qube and its data stay. Under its lock, as `accept`."""
+    return _locked(name, False, lambda: _reject(app, name))
+
+
+def _reject(app, name: str) -> str:
     from qmcp import fleet
     vm, tags = _subject(app, name)
     strip = {t for t in tags if t != HOLD and

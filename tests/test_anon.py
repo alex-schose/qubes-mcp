@@ -501,20 +501,62 @@ class Acting(AnonBase):
         # The rulebook now refuses the lead's calls; the services refuse it too.
         self.assertEqual(self.lcall("qmcp.ListAIManagedQubes", lead=self.p.lead), core.NOT_AUTHORIZED)
 
-    def test_a_blocked_qube_started_by_hand_is_not_killed_again(self):
+    def test_a_stopped_qube_found_running_is_killed_again(self):
+        # No stopped shortcut: whoever started it, it runs on the path this run
+        # found broken, so every run that finds the project unsound kills it.
         self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
         self.gate()
         self.notices.clear()
-        self.app.domains[self.p.lead].start()            # the operator looks at it
+        self.app.domains[self.p.lead].start()
         v = self.gate()[self.p.slot]
         self.assertTrue(v.blocked)
-        self.assertEqual(v.acted, [])
-        self.assertEqual(self.app.domains[self.p.lead]._power, "Running")
-        self.assertEqual(self.notices, [])
+        self.assertEqual(v.acted, [f"{self.p.lead}: killed"])
+        self.assertEqual(self.app.domains[self.p.lead]._power, "Halted")
+        self.assertEqual(len(self.notices), 1)
 
-    def test_a_partly_blocked_project_blocks_the_rest_and_spares_the_rest(self):
+    def test_a_start_that_lands_after_the_run_read_halted_is_killed_on_the_next(self):
+        # qubesd answers Halted until a start it accepted has made its domain,
+        # and refuses to kill it then: the run marks it stopped, the start
+        # lands, and the next run kills it.
+        w1 = f"ai-{self.p.label}-w1"
+        vm = self.app.domains[w1]
+        vm.__dict__["_power"] = "Halted"
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.gate()
+        self.assertIn("qmcp-stopped", self.tags(w1))
+        vm._went_up()                                   # the start lands
+        v = self.gate()[self.p.slot]
+        self.assertIn(f"{w1}: killed", v.acted)
+        self.assertEqual(vm._power, "Halted")
+
+    def test_a_qube_whose_block_failed_and_was_woken_is_killed_on_the_next_run(self):
+        w1 = f"ai-{self.p.label}-w1"
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.app.fail_reads("tag.add:qmcp-blocked", "ok fail")     # the lead's lands, w1's not
+        v = self.gate()[self.p.slot]
+        self.assertIn(f"{w1}: NOT blocked (Injected)", v.acted)
+        self.assertIn("qmcp-stopped", self.tags(w1))
+        self.app.domains[w1].start()                    # woken: nothing refused it
+        v = self.gate()[self.p.slot]
+        self.assertIn(f"{w1}: blocked", v.acted)
+        self.assertIn(f"{w1}: killed", v.acted)
+        self.assertEqual(self.app.domains[w1]._power, "Halted")
+
+    def test_an_autostart_left_on_is_turned_off_by_a_later_run(self):
+        w1 = f"ai-{self.p.label}-w1"
+        self.app.domains[w1].autostart = True
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.app.fail_reads("set.autostart", "fail")
+        v = self.gate()[self.p.slot]
+        self.assertTrue(any(a.startswith(f"{w1}: autostart NOT turned off") for a in v.acted),
+                        v.acted)
+        self.assertTrue(self.app.domains[w1]._props["autostart"])
+        self.gate()
+        self.assertFalse(self.app.domains[w1]._props["autostart"])
+
+    def test_a_partly_blocked_project_blocks_the_rest_and_kills_what_runs(self):
         # One badge write failed last time: the next run blocks that qube, and
-        # does not kill again the one the operator started by hand to look at.
+        # kills every qube of it that runs, the one started by hand included.
         self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
         self.gate()
         w2 = f"ai-{self.p.label}-w2"
@@ -526,8 +568,8 @@ class Acting(AnonBase):
         self.assertTrue(v.blocked)                   # as it is once this run has acted
         self.assertIn("qmcp-blocked", self.tags(w2))
         self.assertEqual(self.app.domains[w2]._power, "Halted")
-        self.assertEqual(self.app.domains[self.p.lead]._power, "Running")
-        self.assertEqual(v.acted, [f"{w2}: blocked", f"{w2}: killed"])
+        self.assertEqual(self.app.domains[self.p.lead]._power, "Halted")
+        self.assertEqual(v.acted, [f"{w2}: blocked", f"{self.p.lead}: killed", f"{w2}: killed"])
 
     def test_a_block_after_a_failed_read_still_kills_on_a_violation(self):
         # A stop for a read that failed twice is no kill; a later violation is.
@@ -599,6 +641,7 @@ class Acting(AnonBase):
         for w in ("w1", "w2"):
             self.app.domains[f"ai-{self.p.label}-{w}"].tags.add("qmcp-blocked")
             self.app.domains[f"ai-{self.p.label}-{w}"].tags.add("qmcp-stopped")
+            self.app.domains[f"ai-{self.p.label}-{w}"].__dict__["_power"] = "Halted"
         self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
         self.notices.clear()
         lines = len(self.audit_lines())
@@ -1084,3 +1127,85 @@ class Proposals(AnonBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================================================= hidden templates
+
+class HiddenTemplates(AnonBase):
+    """A hidden project's disposable templates, and the templates it runs
+    from, stay out of the hub's reach by every path."""
+
+    def child(self, name="ai-hub-snoop"):
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": name, "template": "ai-dvm-g",
+                                                  "klass": "DispVM"})
+        self.assertTrue(r["ok"], r)
+        return name
+
+    def test_hiding_a_disposable_template_the_hub_has_a_child_of_refuses(self):
+        child = self.child()
+        with self.assertRaises(fleet.ProjectError) as cm:
+            self.make(templates=["ai-dvm-g"])
+        self.assertIn(child, str(cm.exception))
+        self.assertNotIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+        self.assertFalse([p for p in self.records().values() if p.anonymous])
+        # Without the child, the same project is made and the template hidden.
+        self.app.domains[child].kill() if self.app.domains[child].is_running() else None
+        del self.app.domains[child]
+        p = self.make(templates=["ai-dvm-g"])
+        self.assertTrue(p.hidden)
+        self.assertIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+
+    def test_a_child_of_a_hidden_template_is_no_clone_source_and_fails_the_check(self):
+        child = self.child()
+        self.app.domains["ai-dvm-g"].tags.add("qmcp-hubblind")      # hidden by hand, say
+        r = self.call("qmcp.CloneAIManagedQube", {"source": child, "name": "ai-hub-snoop2"})
+        self.assertEqual(r, core.NOT_FOUND)
+        self.assertNotIn("ai-hub-snoop2", self.app.domains)
+        found = [f for f in fleet.check(self.app, policy_dir=str(self.tmp))
+                 if f.check == "hidden templates"]
+        self.assertTrue(found and found[0].status == "fail", found)
+        self.assertIn(child, found[0].detail)
+
+    def project_edit(self, template):
+        return self.submit({"type": "project-edit", "title": "t", "project": "osint",
+                            "add_templates": [template]})
+
+    def test_a_project_proposal_naming_a_hidden_template_fails_as_a_missing_name(self):
+        self.make(templates=["ai-dvm-g"])
+        before = projects.find(self.records(), "osint").templates
+        outcomes = []
+        for name in ("ai-dvm-g", "ai-no-such-dvm"):
+            r = self.project_edit(name)
+            self.assertTrue(r["ok"], r)
+            ok, report = self.accept(r["id"], yes=True)
+            self.assertFalse(ok, report)
+            outcomes.append((self.status({"id": r["id"]})["state"],
+                             [l.replace(name, "X") for l in report]))
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(projects.find(self.records(), "osint").templates, before)
+
+    def test_a_model_qube_proposal_naming_a_hidden_qube_fails_as_a_missing_name(self):
+        p = self.make()
+        hidden_q = self.app.vm("ai-hub-oldmodel", tags={"ai-managed", "qmcp-guarded",
+                                                         "qmcp-hubblind"})
+        r = self.submit({"type": "project-firewall", "title": "t", "project": "osint",
+                         "model_qube": hidden_q.name})
+        ok, report = self.accept(r["id"], yes=True)
+        self.assertFalse(ok)
+        self.assertTrue(report[-1].endswith(f"'{hidden_q.name}' cannot be a model qube: no such "
+                                            f"qube"), report)
+        self.assertNotIn("qmcp-model-p01", hidden_q.tags.raw())
+        del p
+
+    def test_opening_a_template_a_hidden_project_runs_from_warns(self):
+        p = self.make()
+        msg = fleet.open_window(self.app, "ai-tpl-g", 600)
+        self.assertIn("WARNING", msg)
+        self.assertIn(p.label, msg)
+        fleet.seal(self.app, "ai-tpl-g")
+        r = self.submit({"type": "qube-open", "title": "t", "qube": "ai-tpl-g", "for": "1h"})
+        reasons = proposals.show(self.app, r["id"])["second_tick"]
+        self.assertTrue(any("WARNING" in x and p.label in x for x in reasons), reasons)
+        # A template no hidden project runs from opens with no warning.
+        self.app.vm("ai-tpl-g2", klass="TemplateVM", tags={"ai-managed", "qmcp-guarded"})
+        self.assertNotIn("WARNING", fleet.open_window(self.app, "ai-tpl-g2", 600))

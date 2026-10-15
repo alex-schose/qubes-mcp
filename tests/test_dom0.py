@@ -15,6 +15,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -41,6 +42,9 @@ class Base(unittest.TestCase):
             (budget, "PRIVATE_CAP_PATH", self.tmp / "private-cap"),
             (budget, "LOCK_PATH", self.tmp / "run" / "create.lock"),
             (budget, "LOCK_TIMEOUT_S", 0.5),
+            (core, "QUBE_WAIT_S", 0.3),
+            (core, "OPERATOR_WAIT_S", 0.3),
+            (fleet, "OPEN_LOCK_WAIT_S", 0.3),
             (birth, "NAME_PREFIX_PATH", self.tmp / "name-prefix"),
             (birth, "BIRTH_EGRESS_PATH", self.tmp / "birth-egress"),
             (audit, "LOG_PATH", self.tmp / "audit.log"),
@@ -66,7 +70,8 @@ class Base(unittest.TestCase):
         self.addCleanup(self._restore)
         (self.tmp / "run" / "calls").mkdir(parents=True)
         (self.tmp / "run" / "open").mkdir()
-        for d in ("run", "run/calls", "run/open"):  # as tmpfiles makes them, whatever the umask
+        (self.tmp / "run" / "qubes").mkdir()
+        for d in ("run", "run/calls", "run/open", "run/qubes"):  # as tmpfiles makes them
             os.chmod(self.tmp / d, 0o2770)
         (self.tmp / "proposals").mkdir(mode=0o2770)
         os.chmod(self.tmp / "proposals", 0o2770)
@@ -976,7 +981,7 @@ class Fleet(Base):
         self.assertEqual(core.tags_of(vm), {"operator-note"})
         self.assertIsNone(vm.default_dispvm)
         self.assertEqual(vm.get_power_state(), "Halted")
-        self.assertIn("shutdown requested", msg)
+        self.assertIn("killed", msg)
 
 
 # ======================================================================= audit findings
@@ -1538,3 +1543,281 @@ class Windows(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================================================= taking authority away
+
+class TakingAuthorityAway(Base):
+    """A revoke kills and reads the qube back; a qube's lock serialises the
+    services that operate it with the commands that change its role."""
+
+    def test_revoke_kills_a_guest_that_ignores_the_shutdown_request(self):
+        vm = self.app.domains["ai-work"]
+        vm.__dict__["ignores_shutdown"] = True
+        vm.shutdown()
+        self.assertEqual(vm.get_power_state(), "Running")       # the fake's guest ignores it
+        msg = fleet.revoke(self.app, "ai-work")
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertIn("killed", msg)
+        self.assertNotIn(core.UMBRELLA, self.tags("ai-work"))
+
+    def test_revoke_kills_a_paused_qube(self):
+        vm = self.app.domains["ai-work"]
+        vm.pause()
+        with self.assertRaises(Exception):
+            vm.shutdown()                                       # a request a paused qube refuses
+        fleet.revoke(self.app, "ai-work")
+        self.assertEqual(vm.get_power_state(), "Halted")
+
+    def test_a_revoke_whose_kill_fails_fails(self):
+        self.app.fail.add("kill")
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-work")
+        self.assertIn("could NOT be killed", str(cm.exception))
+        self.assertNotIn(core.UMBRELLA, self.tags("ai-work"))  # out of AI space all the same
+        self.assertEqual(self.app.domains["ai-work"].get_power_state(), "Running")
+
+    def test_a_qube_that_reads_running_after_the_kill_is_not_down(self):
+        vm = self.app.domains["ai-work"]
+        vm.__dict__["kill"] = lambda: None                      # returned, but nothing stopped
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-work")
+        self.assertIn("still Running after the kill", str(cm.exception))
+
+    def test_a_state_that_cannot_be_read_after_the_kill_is_not_down(self):
+        # The kill returned, the qube still runs, and its state then reads NA:
+        # never "killed".
+        vm = self.app.domains["ai-work"]
+        vm.__dict__["kill"] = lambda: None
+        self.app.fail_reads("power:ai-work", "ok fail fail fail")
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-work")
+        self.assertIn("NA after the kill", str(cm.exception))
+        self.assertEqual(vm._power, "Running")
+
+    def test_an_open_whose_warning_cannot_be_read_still_reports_the_open(self):
+        real = fleet.hidden_projects_on
+        fleet.hidden_projects_on = lambda *a: (_ for _ in ()).throw(RuntimeError("list failed"))
+        self.addCleanup(setattr, fleet, "hidden_projects_on", real)
+        msg = fleet.open_window(self.app, "ai-tpl-g", 600)
+        self.assertIn("open until", msg)
+        self.assertIn(core.OPEN, self.tags("ai-tpl-g"))
+
+    def test_revoke_no_shutdown_leaves_it_running(self):
+        fleet.revoke(self.app, "ai-work", shutdown=False)
+        self.assertEqual(self.app.domains["ai-work"].get_power_state(), "Running")
+
+    def hold_lock(self, name):
+        fd = core.acquire_qube_lock(name, 1)
+        self.assertIsNotNone(fd)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_service_refuses_while_the_qubes_lock_is_held(self):
+        self.hold_lock("ai-work2")
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "start"})
+        self.assertEqual(r, core.BUSY_REFUSAL)
+        self.assertEqual(self.app.domains["ai-work2"].get_power_state(), "Halted")
+        for svc, req in (("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "vcpus",
+                                                        "value": 1}),
+                         ("qmcp.SetFeatureAIManaged", {"name": "ai-work2", "feature": "service.x",
+                                                       "value": "1"}),
+                         ("qmcp.CloneAIManagedQube", {"source": "ai-work2", "name": "ai-hub-c"})):
+            self.assertEqual(self.call(svc, req), core.BUSY_REFUSAL, svc)
+
+    def test_a_name_out_of_reach_never_waits_on_a_lock(self):
+        # The lock is taken only once the qube resolves: a hidden or missing
+        # name answers at once, so contention tells the hub nothing.
+        self.app.domains["personal"]                            # outside AI space
+        self.hold_lock("personal")
+        core.QUBE_WAIT_S = 5.0
+        t0 = time.monotonic()
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "personal", "action": "start"})
+        self.assertEqual(r, core.NOT_FOUND)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_a_service_checks_again_under_the_lock(self):
+        # A guard that lands while the call waits for the lock is honoured.
+        real = core.acquire_qube_lock
+
+        def guard_meanwhile(name, timeout=None):
+            self.app.domains[name].tags.add(core.GUARDED)
+            return real(name, timeout)
+        core.acquire_qube_lock = guard_meanwhile
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "remove"})
+        self.assertEqual(r, core.GUARDED_REFUSAL)
+        self.assertIn("ai-work2", self.app.domains)
+
+    def test_a_service_checks_its_caller_again_under_the_lock(self):
+        real = core.acquire_qube_lock
+
+        def hub_file_gone(name, timeout=None):
+            (self.tmp / "hub").write_text("someone-else\n")
+            return real(name, timeout)
+        core.acquire_qube_lock = hub_file_gone
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "start"})
+        self.assertEqual(r, core.NOT_AUTHORIZED)
+        self.assertEqual(self.app.domains["ai-work2"].get_power_state(), "Halted")
+
+    def test_a_command_that_takes_authority_away_goes_on_after_the_wait(self):
+        self.hold_lock("ai-work")
+        msg = fleet.revoke(self.app, "ai-work")
+        self.assertIn("went on without it", msg)
+        self.assertEqual(self.app.domains["ai-work"].get_power_state(), "Halted")
+        self.assertNotIn(core.UMBRELLA, self.tags("ai-work"))
+
+    def in_flight(self, landing):
+        """The qube's lock is held by a call when the command first asks for
+        it; the call's effect (`landing`) lands, and the call ends, before the
+        command asks again."""
+        real, asked = core.acquire_qube_lock, []
+
+        def acquire(name, timeout=None):
+            asked.append(name)
+            if len(asked) == 1:
+                return None                         # held past the wait
+            if len(asked) == 2:
+                landing()
+            return real(name, timeout)
+        core.acquire_qube_lock = acquire
+        self.addCleanup(setattr, core, "acquire_qube_lock", real)
+        return asked
+
+    def test_a_revoke_that_went_on_unlocked_kills_a_start_that_landed_after(self):
+        vm = self.app.domains["ai-work2"]
+        asked = self.in_flight(vm.start)
+        msg = fleet.revoke(self.app, "ai-work2")
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertIn("killed again", msg)
+        self.assertNotIn("went on without it", msg)
+
+    def test_a_guard_that_went_on_unlocked_says_a_remove_in_flight_won(self):
+        self.in_flight(lambda: self.app.domains._drop("ai-work2"))
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.guard(self.app, "ai-work2")
+        self.assertIn("removed it since", str(cm.exception))
+
+    def test_a_seal_that_went_on_unlocked_kills_a_start_that_landed_after(self):
+        fleet.open_window(self.app, "ai-tpl-g", 600)
+        vm = self.app.domains["ai-tpl-g"]
+        self.in_flight(vm.start)
+        msg = fleet.seal(self.app, "ai-tpl-g")
+        self.assertEqual(vm.get_power_state(), "Halted")
+        self.assertIn("killed again", msg)
+        self.assertFalse({core.OPEN, core.OPEN_FW} & self.tags("ai-tpl-g"))
+
+    def test_a_command_that_grants_authority_refuses_after_the_wait(self):
+        fleet.guard(self.app, "ai-work2")
+        self.hold_lock("ai-work2")
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.manage(self.app, "ai-work2")
+        self.assertIn("is being changed", str(cm.exception))
+        self.assertIn(core.GUARDED, self.tags("ai-work2"))
+        self.hold_lock("ai-tpl-g")
+        with self.assertRaises(fleet.RoleError):
+            fleet.open_window(self.app, "ai-tpl-g", 600)
+        self.assertNotIn(core.OPEN, self.tags("ai-tpl-g"))
+
+    def test_the_lock_files_are_the_services_groups(self):
+        old = os.umask(0o077)
+        try:
+            os.close(core.acquire_qube_lock("ai-work2", 1))
+        finally:
+            os.umask(old)
+        st = os.stat(core.qube_lock_path("ai-work2"))
+        self.assertEqual(st.st_mode & 0o777, 0o660)
+        self.assertEqual(os.stat(os.path.dirname(core.qube_lock_path("ai-work2"))).st_mode
+                         & 0o7777, 0o2770)
+
+
+class CreatesUnderTheLock(Base):
+    """A create judges its template again once it holds the create lock, sets
+    its network before it joins AI space, and counts what qubesd will give it."""
+
+    def during_the_wait(self, fn):
+        real = budget.acquire_create_lock
+
+        def wait(*a, **kw):
+            fd = real(*a, **kw)
+            fn()
+            return fd
+        budget.acquire_create_lock = wait
+        self.addCleanup(setattr, budget, "acquire_create_lock", real)
+
+    def test_a_template_stopped_while_a_spawn_waited_is_not_built_on(self):
+        self.during_the_wait(lambda: self.app.domains["ai-debian-13"].tags.add("qmcp-blocked"))
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-n", "template": "ai-debian-13",
+                                                  "netvm": None})
+        self.assertEqual(r, core.BLOCKED_REFUSAL)
+        self.assertNotIn("ai-hub-n", self.app.domains)
+
+    def test_a_template_revoked_while_a_spawn_waited_is_not_built_on(self):
+        self.during_the_wait(lambda: self.app.domains["ai-debian-13"].tags.discard("ai-managed"))
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-n", "template": "ai-debian-13",
+                                                  "netvm": None})
+        self.assertFalse(r["ok"])
+        self.assertNotIn("ai-hub-n", self.app.domains)
+
+    def test_a_disposable_template_hidden_while_a_call_waited_is_not_built_on(self):
+        self.during_the_wait(lambda: self.app.domains["ai-dvm-g"].tags.add("qmcp-hubblind"))
+        r = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm-g"})
+        self.assertFalse(r["ok"])
+        self.assertFalse([v for v in self.app.domains._hidden.values()
+                          if "ai-managed" in v.tags.raw()])
+
+    def test_a_child_that_arrives_hidden_is_rolled_back(self):
+        # Hidden after the last check: the platform copies the badge into the
+        # child, and the stamp refuses to take it off.
+        real = services._check_budget
+
+        def then_hide(*a, **kw):
+            real(*a, **kw)
+            self.app.domains["ai-dvm-g"].tags.add("qmcp-hubblind")
+        services._check_budget = then_hide
+        self.addCleanup(setattr, services, "_check_budget", real)
+        r = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm-g"})
+        self.assertFalse(r["ok"])
+        self.assertIn("rolled back", r["error"])
+
+    def test_a_new_qube_has_its_network_before_it_joins_ai_space(self):
+        seen = {}
+        real = fakequbes.FakeTags.add
+
+        def add(tags, tag):
+            if tag == core.UMBRELLA:
+                vm = tags._vm
+                seen[vm.name] = (vm._props.get("netvm"), vm.property_is_default("netvm"),
+                                 vm.property_is_default("default_dispvm"))
+            return real(tags, tag)
+        fakequbes.FakeTags.add = add
+        self.addCleanup(setattr, fakequbes.FakeTags, "add", real)
+        self.egress("ai-net-router")
+        self.assertTrue(self.call("qmcp.SpawnAIManagedQube", {
+            "name": "ai-hub-n", "template": "ai-debian-13"})["ok"])
+        self.assertTrue(self.call("qmcp.CloneAIManagedQube", {
+            "source": "ai-work", "name": "ai-hub-c"})["ok"])
+        router = self.app.domains["ai-net-router"]
+        for name in ("ai-hub-n", "ai-hub-c"):
+            net, net_default, dvm_default = seen[name]
+            self.assertIs(net, router, name)
+            self.assertFalse(net_default, f"{name} joined AI space following the default netvm")
+            self.assertFalse(dvm_default, f"{name} joined AI space following the default "
+                                          f"disposable template")
+
+    def test_a_named_disposable_is_counted_at_its_templates_private_size(self):
+        dvmt = self.app.domains["ai-dvm-g"]
+        dvmt.volumes["private"].size = 30 * GiB
+        used = budget.persistent_sum(self.app)
+        (self.tmp / "pool-cap").write_text(str(used + 3 * GiB) + "\n")
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-d", "template": "ai-dvm-g",
+                                                  "klass": "DispVM"})
+        self.assertEqual(r["error"], budget.ERR_CAP_EXCEEDED)
+        self.assertNotIn("ai-hub-d", self.app.domains)
+        (self.tmp / "pool-cap").write_text(str(used + 31 * GiB) + "\n")
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-d", "template": "ai-dvm-g",
+                                                  "klass": "DispVM"})
+        self.assertTrue(r["ok"], r)
+        self.assertLessEqual(budget.persistent_sum(self.app), used + 31 * GiB)

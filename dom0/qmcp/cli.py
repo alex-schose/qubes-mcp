@@ -744,11 +744,12 @@ def build_parser() -> argparse.ArgumentParser:
     for name, text in (("manage", "make a qube managed (the hub may operate it)"),
                        ("guard", "make a qube guarded (reference only); a model qube that was "
                                  "managed is killed if it runs (never a gateway or a template)"),
-                       ("revoke", "take a qube out of AI space and shut it down")):
+                       ("revoke", "take a qube out of AI space and kill it if it runs")):
         p = sub.add_parser(name, help=text)
         p.add_argument("qube")
         if name == "revoke":
-            p.add_argument("--no-shutdown", action="store_true")
+            p.add_argument("--no-shutdown", action="store_true",
+                           help="leave it running")
     p = sub.add_parser("open", help="open a guarded qube to the hub for a bounded time; the "
                                     "timer, qmcp seal and every boot close it")
     p.add_argument("qube")

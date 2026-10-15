@@ -1190,6 +1190,20 @@ class Install(PBase):
         self.in_another_group(run)
         self.assertEqual(self.finding("runtime dir").status, "fail")
 
+    def test_the_qube_lock_directory_must_be_the_services_to_write(self):
+        # Every call that operates a qube takes its lock there: a directory the
+        # services cannot write in refuses them all.
+        qubes = os.path.join(core.RUN_DIR, core.QUBE_LOCK_SUBDIR)
+        self.assertEqual(self.finding("runtime dir").status, "pass")
+        for mode in (0o0770, 0o2750):
+            os.chmod(qubes, mode)
+            self.assertEqual(self.finding("runtime dir").status, "fail", oct(mode))
+            self.assertIn(qubes, self.finding("runtime dir").detail)
+        os.chmod(qubes, 0o2770)
+        os.rmdir(qubes)
+        self.assertEqual(self.finding("runtime dir").status, "fail")
+        self.assertIn("missing", self.finding("runtime dir").detail)
+
     def test_each_shared_directory_alone_in_another_group_fails(self):
         calls = os.path.join(core.RUN_DIR, "calls")
         for path, name in ((calls, "runtime dir"), (proposals.PROPOSALS_DIR, "proposal store")):
@@ -1498,7 +1512,7 @@ class QubeProposals(PBase):
         pid = self.ask("qube-revoke", qube="ai-osint-w2")
         reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
         self.assertIn("it leaves p01", reasons)
-        self.assertIn("it is shut down", reasons)
+        self.assertIn("it is killed if it runs", reasons)
         ok, report = self.accept(pid, yes=True)
         self.assertTrue(ok, report)
         self.assertFalse({"ai-managed", "qmcp-proj-p01"} & set(w2.tags))
@@ -1510,7 +1524,7 @@ class QubeProposals(PBase):
         # no way in. The operator's own `qmcp revoke --no-shutdown` is theirs.
         w2 = self.app.domains["ai-osint-w2"]
         pid = self.ask("qube-revoke", qube="ai-osint-w2", shutdown=False)
-        self.assertIn("so a hub's proposal to revoke it shuts it down",
+        self.assertIn("so a hub's proposal to revoke it kills it",
                       proposals.show(self.app, pid)["plan"])
         ok, report = self.accept(pid, yes=True)
         self.assertFalse(ok)
@@ -1788,7 +1802,7 @@ class QubeProposals(PBase):
         self.app.vm("my-dvm", template_for_dispvms=True, netvm=None)
         self.assertIn("the rulebook refuses every qube a disposable from it",
                       tick("qube-manage", qube="my-dvm"))
-        self.assertIn("Qubes refuses to shut it down while a qube on it runs",
+        self.assertIn("killing it cuts the network of every qube on it",
                       tick("qube-revoke", qube="ai-net-router"))
         # A disposable Qubes made for one use is removed when it stops; a
         # named one is kept, and the tick says nothing of a removal.

@@ -75,8 +75,8 @@ ANON = "qmcp-anon"
 HUBBLIND = "qmcp-hubblind"
 #: A qube the anonymity gate stopped: the rulebook refuses every call into it.
 BLOCKED = "qmcp-blocked"
-#: A blocked qube the gate stopped for a violation and knows to be down: one
-#: running again was started by the operator, by hand, and the gate leaves it.
+#: A blocked qube the gate stopped for a violation and knew to be down. While
+#: its project is unsound the gate kills it again whenever it finds it running.
 STOPPED = "qmcp-stopped"
 #: The port a lead reaches its slot's model qube on (the rulebook's A6 lines).
 MODEL_PORT = 11434

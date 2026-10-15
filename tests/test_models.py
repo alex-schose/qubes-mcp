@@ -297,12 +297,20 @@ class MakeModelQube(ModelBase):
                             in line for line in report), report)
 
     def test_a_power_state_that_cannot_be_read_is_never_taken_for_halted(self):
-        # qubesadmin answers "NA" for a qube it cannot read: the kill is tried.
+        # qubesadmin answers "NA" for a qube it cannot read: the kill is tried,
+        # and a state that still cannot be read afterwards is not known to be
+        # down, so the command stops before the record and the badge.
         vm = self.app.domains[MODEL]
         vm.__dict__["get_power_state"] = lambda: "NA"
+        with self.assertRaises(fleet.ProjectError) as cm:
+            fleet.set_lead_firewall(self.app, "osint", model_qube=MODEL)
+        self.assertEqual(vm._power, "Halted")                    # the kill was tried
+        self.assertIn("NA after the kill", str(cm.exception))
+        self.assertNotIn("qmcp-model-p01", vm.tags.raw())
+        del vm.__dict__["get_power_state"]
         report = fleet.set_lead_firewall(self.app, "osint", model_qube=MODEL)
-        self.assertEqual(vm._power, "Halted")
-        self.assertTrue(any("killed" in line for line in report), report)
+        self.assertTrue(any("model qube" in line for line in report), report)
+        vm.__dict__["get_power_state"] = lambda: "NA"
         # A kill that fails while the state still cannot be read is a failure.
         fleet.set_lead_firewall(self.app, "osint", model_qube="none")
         fleet.manage(self.app, MODEL)
@@ -560,8 +568,13 @@ class NoOtherRole(ModelBase):
         vm = self.app.domains[MODEL]
         vm.__dict__["_power"] = "Running"
         vm.__dict__["get_power_state"] = lambda: "NA"
-        self.assertIn("killed", fleet.guard(self.app, MODEL))
+        # The kill is tried; a state that still cannot be read is not known to
+        # be down, so the guard (which has landed) says so and exits 1.
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.guard(self.app, MODEL)
+        self.assertIn("NA after the kill", str(cm.exception))
         self.assertEqual(vm._power, "Halted")
+        self.assertIn(core.GUARDED, vm.tags.raw())
         fleet.manage(self.app, MODEL)
         vm.__dict__["_power"] = "Running"
         self.app.fail.add("kill")

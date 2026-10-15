@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.28 — the last proposal types.** Besides the hub, up to 15
+**Status: 0.9.29 — the audit round's high fixes.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -59,8 +59,12 @@ templates alike, and dom0 keeps its own copy of them, so
 `qmcp template prepare` writes them into a template or a standalone at any
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
-`qmcp export` puts qmcp's settings where a Qubes backup carries them. Next:
-an audit round, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+`qmcp export` puts qmcp's settings where a Qubes backup carries them. The
+audit round of 0.9.28 is being fixed by severity: this release fixes the high
+findings (a revoke now kills, a lock per qube orders the hub's calls against
+the operator's commands, the gate kills a stopped qube it finds running, and
+creates set their network before they join AI space). Next: the medium and
+low findings, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -213,7 +217,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.28.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.29.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -244,7 +248,15 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.27? Install over it. Besides the new proposal types and
+Coming from 0.9.28? Install over it. `qmcp revoke`, an accepted revoke
+proposal and `qubes_run_disposable` kill the qube instead of asking it to shut
+down, and a revoke whose qube still runs exits 1; the anonymity gate kills a
+stopped project's qube it finds running, on every run, so you can no longer
+start one by hand while its project is unsound; approving a disposable
+template for a hidden project is refused while the hub can reach a qube made
+from it. The CHANGELOG's 0.9.29 entry has the whole list. To roll back, run
+this release's `uninstall.sh` before 0.9.28's installer.
+Coming from 0.9.27? Install over it, then read the 0.9.28 note. Besides the new proposal types and
 `sudo qmcp template install`: `qmcp manage`, `guard`, `revoke` and `open`
 refuse dom0, and every name while `/etc/qmcp/hub` cannot be read (a seal still
 takes a window off then, and only skips the kill); `template prepare` refuses

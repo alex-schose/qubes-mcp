@@ -753,13 +753,14 @@ def _teardown(name: str, stage: str) -> None:
     Spawns a disposable from `template` (a managed or guarded disposable
     template; for a lead, one of its project's, as for qubes_spawn_disposable),
     starts it, waits until it is running, runs the command as root,
-    and shuts it down; dom0 then removes it. If any step after the spawn fails,
-    the disposable is shut down or killed so it is still removed. cmd, shell,
-    timeout and stdin work as for qubes_run.
+    and kills it; dom0 then removes it. A shutdown would only ask the guest,
+    which may ignore it. If any step after the spawn fails, a kill is tried so
+    it is still removed; one that is refused is logged and can leave it
+    running. cmd, shell, timeout and stdin work as for qubes_run.
 
     Returns {"ok": true, "name": "disp1234", "rc": <int>, "stdout": "...",
     "stderr": "..."} on success, or {"ok": false, "stage":
-    "spawn|start|wait|run|shutdown", "error": "...", "name": "..."} on
+    "spawn|start|wait|run|kill", "error": "...", "name": "..."} on
     failure, with "name" once the spawn succeeded.
     """, {
         "template": _prop("string", "Disposable template to start from; managed or guarded."),
@@ -792,22 +793,21 @@ def _qubes_run_disposable(args: dict) -> dict:
 
     run = qrexec.call_service(name, "qmcp.RunInAIManaged", _run_payload(args),
                               timeout=args["timeout"] + EXEC_MARGIN)
-    shutdown = _lifecycle(name, "shutdown")
+    # Killed, never asked to stop: a guest can ignore a shutdown request, and
+    # dom0's "ok" for one means only that it was sent.
+    kill = _lifecycle(name, "kill")
 
     if not run.get("ok"):
-        # The run failed; a clean shutdown was still attempted above. If that
-        # failed too, kill, so dom0 removes the disposable instead of leaving
-        # it running.
-        if not shutdown.get("ok"):
-            _teardown(name, "run")
+        if not kill.get("ok"):
+            log.warning("qubes_run_disposable: kill of %s after a failed run was refused: %s",
+                        name, kill.get("error"))
         return {"ok": False, "name": name, "stage": "run", "error": run.get("error")}
 
-    if not shutdown.get("ok"):
-        # The command succeeded but the qube did not shut down: kill it, and
+    if not kill.get("ok"):
+        # The command succeeded but the qube was not killed: say so, and
         # still hand back what the command produced.
-        _teardown(name, "shutdown")
-        return {"ok": False, "name": name, "stage": "shutdown",
-                "error": shutdown.get("error"),
+        return {"ok": False, "name": name, "stage": "kill",
+                "error": kill.get("error"),
                 "rc": run.get("rc"), "stdout": run.get("stdout"), "stderr": run.get("stderr")}
 
     return {"ok": True, "name": name, "rc": run.get("rc"),
@@ -1362,9 +1362,9 @@ def _qubes_propose_manage(args: dict) -> dict:
     and its default disposable template is set to none. From then on dom0
     answers this hub and every lead about it as about a name that does not
     exist; bringing it back takes the operator, or an accepted
-    qubes_propose_manage. It is shut down
-    unless shutdown is false, though Qubes refuses to shut down a gateway
-    while a qube on it runs. Nothing is removed: the qube and its files
+    qubes_propose_manage. It is killed if it runs, unless shutdown is false,
+    so nothing this hub started in it runs on; killing a gateway cuts the
+    network of every qube on it. Nothing is removed: the qube and its files
     stay, outside AI space.
 
     The command refuses a lead (a lead is removed or replaced with
@@ -1375,10 +1375,10 @@ def _qubes_propose_manage(args: dict) -> dict:
 
     - qube: the qube to revoke.
     - shutdown: false to leave it running, which only a guarded qube that is
-      not open may be: one this hub could run commands in is always shut
-      down, so what this hub started in it does not run on outside AI space,
-      and false makes the accept fail. Omitted or null, it is shut down; the
-      stored proposal always holds which.
+      not open may be: one this hub could run commands in is always killed,
+      so what this hub started in it does not run on outside AI space, and
+      false makes the accept fail. Omitted or null, it is killed if it runs;
+      the stored proposal always holds which.
 
     A qube of a hidden project fails at accept exactly as a name that does
     not exist.
@@ -1386,7 +1386,7 @@ def _qubes_propose_manage(args: dict) -> dict:
         "title": _TITLE,
         "qube": _prop("string", "The qube to revoke."),
         "shutdown": _prop(["boolean", "null"], "false leaves the qube running. Omitted or null, "
-                                               "it is shut down (true)."),
+                                               "it is killed if it runs (true)."),
     }, required=("title", "qube"))
 def _qubes_propose_revoke(args: dict) -> dict:
     return _submit("qube-revoke", args)

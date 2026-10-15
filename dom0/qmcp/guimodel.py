@@ -1822,7 +1822,7 @@ def _option_text(key, value) -> Shown:
     if key == "packages" and isinstance(value, list):
         return esc(" ".join(str(p) for p in value))        # as the command line names them
     if key == "shutdown" and isinstance(value, bool):
-        return esc("yes: the command shuts it down if it runs" if value else
+        return esc("yes: the command kills it if it runs" if value else
                    "no: it keeps running (--no-shutdown)")
     return field_text(key, value)
 
@@ -2862,11 +2862,12 @@ ANON_MARKS = (
      "services leave it out of everything the hub reads"),
     (projects.BLOCKED, "BLOCKED by the gate",
      "wears qmcp-blocked: the anonymity gate stopped its project, and the rulebook refuses "
-     "every call into it, so qrexec cannot wake it. You may still start it from dom0 to look "
-     "at it. Unblock... takes the badge off once the gate finds the project sound"),
+     "every call into it, so qrexec cannot wake it. While the project is unsound, every run "
+     "of the gate kills it if it runs, whoever started it. Unblock... takes the badge off once "
+     "the gate finds the project sound"),
     (projects.STOPPED, "stopped by the gate",
      "wears qmcp-stopped: the gate stopped it for a violation (killed it, or found it halted). "
-     "Running again, it was started by hand, from dom0, and the gate leaves it running; "
+     "Running again while the project is unsound, the gate's next run kills it again; "
      "Unblock... takes this badge off too"),
 )
 #: A project's `blocked`, in words.

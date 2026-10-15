@@ -26,6 +26,94 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.29] — 2026-10-15
+
+**The audit round's high findings.** The audit of 0.9.28 found authority that
+was taken away only on paper: a revoke that asked the qube to stop, hub calls
+that landed after the operator's command, a gate that never killed a stopped
+qube again, creates that judged their template before a long wait, new qubes
+in AI space before their network was set, and paths by which the hub reached a
+hidden project's disposable template. This release closes them. The medium and
+low findings follow in the next releases.
+
+### Added
+
+- Two suites from the audit: `tests/test_interleave.py` runs 25 pairs of
+  operations at once, pausing one at every qubesd call while the other runs
+  with real lock waits, and requires a serial outcome; `tests/test_crashpoints.py`
+  interrupts 41 state-changing operations at every qubesd call, by a handled
+  failure and by a death, and requires that no authority is gained and every
+  leftover is named by `qmcp check`. Three known leftovers are marked as
+  expected failures until the release that fixes them.
+
+### Changed
+
+- **BREAKING:** `qmcp revoke`, and an accepted `qube-revoke`, kill the qube if
+  it runs instead of requesting a shutdown, and read its power state back. A
+  guest the hub ran as root can ignore a shutdown request and a paused one
+  refuses it; either ran on outside AI space while the command exited 0. A qube still running after the kill fails the command (exit 1),
+  with its badges already off. `--no-shutdown` is unchanged. The second tick,
+  the window's Revoke form and the tool's description say "killed".
+- **BREAKING:** the anonymity gate kills every running qube of a project it
+  finds unsound, on every run, whether or not it wears `qmcp-stopped`. Before,
+  a qube marked stopped was never killed again, on the premise that only the
+  operator could have started it. A start qubesd had accepted reads halted
+  until its domain exists, so a run could mark it stopped just before it came
+  up; a failed `qmcp-blocked` write, and an autostart left on, broke the
+  premise too, and in each case an anonymous project's qube ran on the broken
+  path for good. The operator can no longer start one by hand to look at it
+  while the project is unsound. The gate also turns `autostart` off on every
+  run where it is still on, so a write that failed is tried again.
+- **BREAKING:** `qubes_run_disposable` kills its disposable after the command
+  instead of requesting a shutdown; after a command that ran, a kill that is
+  refused reports stage `kill` (it was `shutdown`).
+- One lock per qube, under `/run/qmcp/qubes/` (declared in tmpfiles, checked
+  by `qmcp check`). The lifecycle, property and feature services, and a clone
+  for its source, take it once the qube resolves, check the caller and the
+  qube again under it, and hold it until their reply. `manage`, `guard`,
+  `revoke`, `open`, `seal`, `project move`, setting a model qube, and the
+  restore check's hold, accept and reject take it too. A command that grants
+  authority refuses when the lock stays held past its wait. `guard`, `revoke`
+  and `seal` go on without it, then wait for the lock again, when no new call
+  can get past its check, and make their effect hold: a revoke or a seal kills
+  again what a call in flight started, and a guard reports a remove that won.
+  The restore check's hold goes on without it after 2 s, and reject after
+  60 s; neither waits again. A hub start racing an
+  operator's revoke left the qube running outside AI space with `qmcp check`
+  GREEN (reproduced on Qubes 4.3.1); a remove in flight destroyed a qube the
+  operator had just guarded, or the restore check had just held.
+- `qmcp open` and an accepted `qube-open` warn, in the report and in red in
+  the second tick, when a hidden project runs from the template being opened:
+  the hub then runs commands as root in what that project's lead and workers
+  run.
+
+### Fixed
+
+- A spawn and a disposable judged their template only before waiting up to
+  120 s for the create lock. A template stopped by the gate, revoked, held, or
+  approved for a hidden project meanwhile was still built on. They judge it
+  again under the lock, as a clone already judged its source.
+- A new qube wore `ai-managed` (and an anonymous project's badges) while still
+  on Qubes' default network and default disposable template; a start in that
+  moment booted it there. Spawn, clone, a fresh lead and a dump sink now set
+  and read back the network and default disposable template before the qube
+  is labelled or badged; a disposable, which the platform creates already
+  wearing its template's tags, has both set before qmcp labels and stamps it.
+- A named DispVM was budgeted as a fresh 2 GiB private volume, while qubesd
+  gives it its disposable template's private size: AI space, or a project,
+  could end far over its cap. It is counted at least at the template's size.
+- Approving a disposable template for a hidden project left the hub's earlier
+  disposables and named DispVMs of it in the hub's reach, each start of which
+  hands over the template's home as it is then. Approving one is refused while
+  any such qube exists, `qmcp check` fails on one, the hub's clone of a qube
+  whose template is hidden answers as a source that does not exist, and a
+  create whose new qube arrives wearing `qmcp-hubblind`, `qmcp-blocked` or
+  `qmcp-stopped` unasked is rolled back instead of having the badge stripped.
+- A project proposal (create, edit, lead, firewall) naming a hidden project's
+  disposable template, model qube or a lead's source was accepted, and only
+  the project label was checked. It now fails as a proposal naming a qube that
+  does not exist, in the command's own words.
+
 ## [0.9.28] — 2026-10-12
 
 **The last proposal types.** The hub may now ask the operator to manage a qube

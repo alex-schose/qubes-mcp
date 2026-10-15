@@ -182,9 +182,9 @@ def _project_badges(who, project=None) -> set:
 
 
 def _recheck(app, call, template=None, netvm=None) -> None:
-    """Under the create lock, the caller must still be what it was: a project
-    command holds the same lock, so a create that waited for one must not run
-    on authority it took away. A lead's template and network are checked again
+    """Under the create lock or a qube's lock, the caller must still be what it
+    was: a project command holds the same lock, so a call that waited for one
+    must not run on authority it took away. A lead's template and network are checked again
     against its record as it is now."""
     who = core.principal(app, call.caller, core.read_hub())
     if who.kind != call.principal.kind or who.slot != call.principal.slot:
@@ -411,10 +411,28 @@ def _project_rows(app):
 
 # ------------------------------------------------------------------ writes
 
+def _operate(app, call, name):
+    """The qube a call operates, under its lock: resolved as `core.operand`
+    resolves it, then its lock is taken, then the caller and the qube are checked again, so a guard, revoke, move or
+    hold of the operator's, or the restore check's, that landed while this call
+    waited is honoured, and none lands between this check and the effect.
+    The lock is taken only once the qube resolves, so a name the caller cannot
+    see never waits on a lock and contention is no oracle; it is held until
+    the reply (`call.fds`)."""
+    core.operand(app, name, call.principal)
+    fd = core.acquire_qube_lock(name, core.QUBE_WAIT_S)
+    if fd is None:
+        raise core.Refusal(core.BUSY_REFUSAL)
+    call.fds.append(fd)
+    _recheck(app, call)
+    return core.operand(app, name, call.principal)
+
+
+
 def svc_set_property(app, call, req):
     name, prop = _string(req, "name"), _string(req, "property")
     call.summary.update({"name": _clip(name), "property": _clip(prop)})
-    vm = core.operand(app, name, call.principal)
+    vm = _operate(app, call, name)
     if prop not in SETTABLE_PROPS:
         raise refuse("property not settable")
     if "value" not in req:
@@ -449,7 +467,7 @@ def _feature_allowed(key: str) -> bool:
 def svc_set_feature(app, call, req):
     name, feature = _string(req, "name"), _string(req, "feature")
     call.summary.update({"name": _clip(name), "feature": _clip(feature)})
-    vm = core.operand(app, name, call.principal)
+    vm = _operate(app, call, name)
     if not _feature_allowed(feature):
         raise refuse("feature not settable")
     value = req.get("value")
@@ -478,7 +496,7 @@ def svc_lifecycle(app, call, req):
     call.summary.update({"name": _clip(name), "action": _clip(action)})
     if action not in LIFECYCLE_ACTIONS:
         raise refuse(f"action must be one of: {sorted(LIFECYCLE_ACTIONS)}")
-    vm = core.operand(app, name, call.principal)
+    vm = _operate(app, call, name)
     # A lead is a project's identity: removing one takes the operator's approval.
     if action == "remove" and projects.LEAD in core.tags_of(vm):
         raise refuse("removing a lead takes the operator's approval")
@@ -690,6 +708,19 @@ def _private_size(req):
     return size
 
 
+def _spawn_template(app, template, klass, who):
+    """The template a spawn builds on, judged: in reach, not stopped by the
+    gate, not held, of the class `klass` needs, and providing no network."""
+    tpl = core.reference(app, template, "template", who)
+    if klass in ("AppVM", "StandaloneVM", "DispVMTemplate"):
+        if core.klass_of(tpl) != "TemplateVM":
+            raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
+    elif not core.is_dvmt(tpl):
+        raise refuse(f"template '{template}' must be a disposable template for klass=DispVM")
+    _not_a_gateway(tpl, "template")
+    return tpl
+
+
 def svc_spawn(app, call, req):
     name = req.get("name")
     template = req.get("template")
@@ -710,24 +741,28 @@ def svc_spawn(app, call, req):
     if label not in LABELS:
         raise refuse(f"label must be one of: {sorted(LABELS)}")
     private_size = _private_size(req)
-    tpl = core.reference(app, template, "template", who)
-    if klass in ("AppVM", "StandaloneVM", "DispVMTemplate"):
-        if tpl.klass != "TemplateVM":
-            raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
-    elif not core.is_dvmt(tpl):
-        raise refuse(f"template '{template}' must be a disposable template for klass=DispVM")
-    _not_a_gateway(tpl, "template")
+    tpl = _spawn_template(app, template, klass, who)
     _claim_name(app, call, name)
     netvm = _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM"))
 
     budget.check_private_size(private_size)
     call.fds.append(budget.acquire_create_lock())
     _recheck(app, call, template=template, netvm=netvm)
+    who = call.principal
     _claim_name(app, call, name)
+    # The template is looked up and judged again under the lock, as a clone's
+    # source is: a stop, a revoke, a hold or a hidden project's approval that
+    # landed while this call waited must not be built on. Its tags below come
+    # from this read.
+    tpl = _spawn_template(app, template, klass, who)
     estimate = budget.estimate_new_private(private_size)
     if klass == "StandaloneVM":
         # A standalone's root is its own, counted at the template root's size.
         estimate += _estimate(budget._vol_size, tpl, "root")
+    elif klass == "DispVM":
+        # qubesd gives a named DispVM its disposable template's private size,
+        # whatever was asked, and the budget then counts it at that size.
+        estimate = max(estimate, _estimate(budget._vol_size, tpl, "private"))
     _check_budget(app, call, estimate)
     # Read after the lock, right before the create: a restriction the template
     # carries (`anon-vm`) must reach the child, including one added while this
@@ -747,34 +782,35 @@ def svc_spawn(app, call, req):
             vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
         raise _create_failed(app, call, name, "create", e)
-    step = "label"
+    step = "copy"
     try:
         if klass == "StandaloneVM":
             # Filled before it is in AI space: the stamp below is its first
             # badge of ours (`birth`, "A copy is built in dom0's own order").
-            step = "copy"
             birth.fill_copy(app, vm, tpl, standalone=True)
-            step = "label"
-            restored.label(vm)
-            step = "services label"
-            inqube.after_copy(vm, tpl, tpl_halted)
-        else:
-            restored.label(vm)
-        step = "birth stamp"
-        birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
-                    _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
+        # The network and the default disposable template are set and read
+        # back while the qube is still outside AI space, so no start of it,
+        # the caller's or anyone's, can boot it on Qubes' default network.
+        step = "netvm assignment"
+        _set_netvm(vm, netvm)
+        step = "default_dispvm pin"
+        _pin_default_dispvm(vm)
+        step = "network check"
+        if core.is_gateway(vm):
+            raise RuntimeError("the new qube provides network")
         if klass == "DispVMTemplate":
             step = "disposable template flag"
             vm.template_for_dispvms = True
             if not core.is_dvmt(vm):
                 raise RuntimeError("template_for_dispvms did not read back")
-        step = "network check"
-        if core.is_gateway(vm):
-            raise RuntimeError("the new qube provides network")
-        step = "netvm assignment"
-        _set_netvm(vm, netvm)
-        step = "default_dispvm pin"
-        _pin_default_dispvm(vm)
+        step = "label"
+        restored.label(vm)
+        if klass == "StandaloneVM":
+            step = "services label"
+            inqube.after_copy(vm, tpl, tpl_halted)
+        step = "birth stamp"
+        birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
+                    _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
     except Exception as e:
         raise _rollback(app, call, name, step, e)
     if private_size is not None:
@@ -808,7 +844,13 @@ def _clone_base(who, src) -> None:
     tpl = core.template_of(src)
     if tpl is None:
         return
-    if core.tags_of(tpl) & {projects.BLOCKED, projects.STOPPED}:
+    tags = core.tags_of(tpl)
+    # A hidden project's disposable template is not the hub's to build on,
+    # whatever an older child of it still wears: its clone would snapshot the
+    # template's home at every start. Answered as a source that does not exist.
+    if who.is_hub() and projects.HUBBLIND in tags:
+        raise core.Refusal(core.NOT_FOUND)
+    if tags & {projects.BLOCKED, projects.STOPPED}:
         raise core.Refusal(core.BLOCKED_REFUSAL)
     _reviewed(tpl)
     if not who.is_hub() and core.name_of(tpl) not in who.project.templates:
@@ -897,8 +939,11 @@ def svc_clone(app, call, req):
     _claim_name(app, call, name)
     # Under the lock everything about the source is read again: a move, a
     # stop, a hold or a project command while this call waited must not be
-    # copied past. The project's record is the one read now.
-    src = core.operand(app, source, who)
+    # copied past. The project's record is the one read now. The source's own
+    # lock is held from here to the reply, so a revoke or guard of it waits
+    # for the copy, and the copy for them.
+    src = _operate(app, call, source)
+    who = call.principal
     _reviewed(src)
     _clone_base(who, src)
     again, now = _clone_target(app, who, src)
@@ -924,6 +969,14 @@ def svc_clone(app, call, req):
     step = "copy"
     try:
         birth.fill_copy(app, vm, src, standalone=False)
+        # Network and default disposable template before it joins AI space.
+        step = "netvm assignment"
+        _set_netvm(vm, netvm)
+        step = "default_dispvm pin"
+        _pin_default_dispvm(vm)
+        step = "network check"
+        if core.is_gateway(vm):
+            raise RuntimeError("the new qube provides network")
         step = "label"
         restored.label(vm)
         step = "services label"
@@ -931,13 +984,6 @@ def svc_clone(app, call, req):
         step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), source_tags, call.caller,
                     None if slot is None else projects.member_badge(slot), extra)
-        step = "network check"
-        if core.is_gateway(vm):
-            raise RuntimeError("the new qube provides network")
-        step = "netvm assignment"
-        _set_netvm(vm, netvm)
-        step = "default_dispvm pin"
-        _pin_default_dispvm(vm)
     except Exception as e:
         raise _rollback(app, call, name, step, e)
     return {"ok": True, "name": name}
@@ -978,18 +1024,27 @@ def _dispose(app, name) -> bool:
     return not _exists_direct(app, name)
 
 
-def svc_spawn_disposable(app, call, req):
-    template = req.get("template")
-    call.summary.update({"template": _clip(template)})
-    who = call.principal
+def _disposable_template(app, template, who):
     dvmt = core.reference(app, template, "template", who)
     if not core.is_dvmt(dvmt):
         raise refuse(f"template '{template}' must be a disposable template")
     _not_a_gateway(dvmt, "disposable template")
+    return dvmt
+
+
+def svc_spawn_disposable(app, call, req):
+    template = req.get("template")
+    call.summary.update({"template": _clip(template)})
+    who = call.principal
+    dvmt = _disposable_template(app, template, who)
     netvm = _birth_netvm(app, call, {}, dvmt, authoritative=True)
 
     call.fds.append(budget.acquire_create_lock())
     _recheck(app, call, template=template, netvm=netvm)
+    who = call.principal
+    # Judged again under the lock, as a spawn's template is; the tags below
+    # come from this read.
+    dvmt = _disposable_template(app, template, who)
     _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
     _reviewed(dvmt)
 
@@ -1008,13 +1063,8 @@ def svc_spawn_disposable(app, call, req):
     # preloaded disposable arrives already running on its template's network,
     # which is the network it must have; it is left following that default,
     # since a disposable lives only until it halts.
-    step = "label"
+    step = "network check"
     try:
-        restored.label_direct(app, disp)
-        step = "birth stamp"
-        birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
-                    _slot_badge(who, "DispVM"), extra)
-        step = "network check"
         if _prop_direct(app, disp, "provides_network")[1] == "True":
             raise RuntimeError("the new qube provides network")
         step = "netvm assignment"
@@ -1027,6 +1077,11 @@ def svc_spawn_disposable(app, call, req):
         app.qubesd_call(disp, "admin.vm.property.Set", "default_dispvm", b"")
         if _prop_direct(app, disp, "default_dispvm") != (False, ""):
             raise RuntimeError("default_dispvm did not read back as None")
+        step = "label"
+        restored.label_direct(app, disp)
+        step = "birth stamp"
+        birth.stamp(birth.TagIO.for_qubesd(app, disp), source_tags, call.caller,
+                    _slot_badge(who, "DispVM"), extra)
     except Exception as e:
         call.error_class = type(e).__name__
         if _dispose(app, disp):

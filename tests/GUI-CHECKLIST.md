@@ -932,17 +932,19 @@ button is greyed out and the window waits for the report; that is not a hang.
 
     Refresh, select it. Expect *Qube to revoke* `ai-t12`, *Shut down* `no: it
     keeps running (--no-shutdown)`, and *Plan* `the hub could run commands in
-    ai-t12, so a hub's proposal to revoke it shuts it down, so accepting it
+    ai-t12, so a hub's proposal to revoke it kills it, so accepting it
     will fail and change nothing`: `ai-t12` is managed, and the hub's
     processes in it would run on outside AI space. *Reject...*, OK. Send it
     again without `"shutdown": false`. Expect *Shut down* `yes: the command
-    shuts it down if it runs`, *Equivalent command* `qmcp revoke ai-t12`, and
+    kills it if it runs`, *Equivalent command* `qmcp revoke ai-t12`, and
     in red `REVOKES ai-t12: every qmcp badge comes off, so it leaves AI space
     and any slot it is in; after that the hub reaches it only through your
-    dialogs, and what it left on its disk stays; it is shut down`. Tick the
-    box, *Accept...*, OK. Expect `ai-t12: revoked, shutdown requested`, then
-    `proposal N: accepted`; `ai-t12` gone from the tree, and `qvm-ls ai-t12`
-    listing it Halted soon after.
+    dialogs, and what it left on its disk stays; it is killed if it runs, so
+    nothing the hub started in it runs on`. Tick the box, *Accept...*, OK.
+    Expect `ai-t12: revoked, killed, so nothing the hub started in it runs on;
+    what it wrote to disk stays` (only `ai-t12: revoked` if it was halted),
+    then `proposal N: accepted`; `ai-t12` gone from the tree, and `qvm-ls
+    ai-t12` listing it Halted.
 71. **A qube that is not there.** In the hub, send step 70's request again
     with `ai-t12-gone` as the qube. Expect `"ok": true`: the hub's request is
     checked for its shape only. Refresh, select it. Expect *Plan* `there is no

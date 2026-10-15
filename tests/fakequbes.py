@@ -320,8 +320,14 @@ class FakeVM:
 
     # -- lifecycle
     def get_power_state(self):
-        # qubesadmin answers "NA", never an exception, for a qube it cannot read.
+        # qubesadmin answers "NA", never an exception, for a qube it cannot read;
+        # a read failed under "power" or "power:<qube>" answers it too.
         if self.app.domains._any(self.__dict__["name"]) is not self:
+            return "NA"
+        try:
+            self.app._maybe_fail("power")
+            self.app._maybe_fail(f"power:{self.__dict__['name']}")
+        except Injected:
             return "NA"
         return self._power
 
@@ -333,7 +339,14 @@ class FakeVM:
         self._went_up()
 
     def shutdown(self, force=False, wait=False):
+        """A request, as upstream's is: a paused qube refuses it, and a guest
+        whose `ignores_shutdown` is set (root in it can make the kernel ignore
+        a poweroff) keeps running."""
         self.app._maybe_fail("shutdown")
+        if self._power == "Paused" and not force:
+            raise Injected("QubesVMNotRunningError: paused")
+        if self.__dict__.get("ignores_shutdown"):
+            return
         self._went_down()
 
     def _went_up(self):

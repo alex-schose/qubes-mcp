@@ -773,7 +773,7 @@ QUBE_PROPERTIES = frozenset({
 #: (module, function) whose `try` reads a qube property and does not re-raise,
 #: with the reason its answer on failure is the restrictive one, or is reported.
 ALLOWED_TRY = {
-    ("restored.py", "reject"): "only a label already absent (KeyError) is passed over; any other "
+    ("restored.py", "_reject"): "only a label already absent (KeyError) is passed over; any other "
                                "failure raises and the reject reports it, with the badges off",
     ("restored.py", "hold"): "a hold that fails is reported in the pass's result and on the audit "
                              "chain, and tried again next run; the qube is never taken as reviewed",

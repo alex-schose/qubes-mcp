@@ -570,6 +570,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         return st is not None and bool(st.st_mode & stat.S_IWGRP) and st.st_gid == gid
 
     calls = os.path.join(core.RUN_DIR, "calls")
+    qubes_dir = os.path.join(core.RUN_DIR, core.QUBE_LOCK_SUBDIR)
     run = _safe(lambda: os.stat(core.RUN_DIR))
     st = _safe(lambda: os.stat(calls))
     lock = _safe(lambda: os.stat(budget.LOCK_PATH))
@@ -584,6 +585,13 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     elif not shared(st):
         add("fail", "runtime dir", f"{calls} is not writable by the services group "
                                    f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+    elif not ((qst := _safe(lambda: os.stat(qubes_dir))) is not None and shared(qst)
+              and qst.st_mode & stat.S_ISGID):
+        # The per-qube locks: a service that cannot open one refuses every
+        # call that operates a qube.
+        add("fail", "runtime dir", f"{qubes_dir} is missing, or not the services group's, "
+                                   f"group-writable and setgid: every call that operates a qube "
+                                   f"refuses (systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
     elif lock is not None and not shared(lock):
         add("fail", "runtime dir", f"{budget.LOCK_PATH} is not writable by the services group: "
                                    f"every create refuses (systemd-tmpfiles --create "
@@ -949,6 +957,26 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hu
     if stray:
         add("warn", "anonymous badges", f"qmcp-anon, qmcp-blocked or qmcp-stopped on qubes of no "
                                         f"anonymous project: {', '.join(sorted(stray))}")
+    # A qube the hub can reach built on a hidden disposable template: each
+    # start of it hands the hub the template's home as it is then.
+    hidden = {vm.name for vm in vms if projects.HUBBLIND in tags_by[vm.name]}
+    reachable = []
+    for vm in vms if hidden else ():
+        tags = tags_by[vm.name]
+        if core.UMBRELLA not in tags or projects.HUBBLIND in tags:
+            continue
+        try:
+            tpl = core.template_of(vm)
+        except core.Unreadable as e:
+            add("error", "hidden templates", f"{e}: whether the hub reaches a hidden project's "
+                                             f"disposable template through {vm.name} is not known")
+            continue
+        if tpl is not None and core.name_of(tpl) in hidden:
+            reachable.append(f"{vm.name} (from {core.name_of(tpl)})")
+    if reachable:
+        add("fail", "hidden templates", f"the hub can reach qubes made from a hidden project's "
+                                        f"disposable template: {', '.join(sorted(reachable))} "
+                                        f"(remove them, or qmcp revoke them)")
     if not anonymous and mode is False:
         return out
     # Only the timer's runs touch the heartbeat: this check's own run below does not.
@@ -1084,6 +1112,57 @@ def _template_chain(vm) -> list:
         chain.append(ref)
         ref = core.template_of(ref)
     return chain
+
+
+def hidden_projects_on(app, records: dict, name: str):
+    """The hidden projects whose qubes run from the template `name`: it is on
+    their approved list, or in the template chain of their lead, a member or
+    their model qube. None when a chain cannot be read, never an empty list."""
+    hidden = {p.slot: p for p in records.values() if p.hidden}
+    if not hidden:
+        return []
+    out = {p.slot for p in hidden.values() if name in p.templates}
+    for vm in app.domains:
+        if all(s in out for s in hidden):
+            break
+        try:
+            tags = core.tags_of(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            return None
+        slots = (projects.member_slots(tags) | projects.lead_slots(tags)
+                 | projects.model_slots(tags)) & set(hidden)
+        if not slots - out:
+            continue
+        try:
+            chain = [core.name_of(t) for t in _template_chain(vm)]
+        except core.Unreadable:
+            return None
+        if name in chain:
+            out |= slots
+    return sorted(f"{hidden[s].label or s} ({s})" for s in out)
+
+
+def hidden_open_warning(app, name: str):
+    """The warning `qmcp open` and an accepted `qube-open` give for a template
+    a hidden project runs from, or None. Said when it cannot be told too."""
+    try:
+        records = projects.load()
+    except projects.ProjectsUnreadable:
+        return (f"the project records cannot be read, so whether a hidden project runs from "
+                f"{name} is not known")
+    try:
+        on = hidden_projects_on(app, records, name)
+    except Exception:
+        on = None
+    if on is None:
+        return f"which hidden projects run from {name} could not be read"
+    if not on:
+        return None
+    return (f"the hidden project(s) {', '.join(on)} run from {name}: while it is open the hub "
+            f"runs commands as root in what their lead and workers run from their next start, "
+            f"and can learn what they hold")
 
 
 def gateway_refusal(by_name: dict, name: str, hub=None) -> str | None:
@@ -1881,7 +1960,63 @@ def pci_devices(vm) -> int:
                         f"try again") from None
 
 
+def _with_qube_lock(name, must: bool, fn, timeout=None, error=None, settle=None):
+    """Run `fn(held)` holding the qube's lock (`core.qube_lock`), which the
+    services hold from their check to their effect: a call already past its
+    check lands before this command acts, and none lands after. `must`: a
+    command that grants authority refuses when the lock is held past the
+    wait. One that only takes authority away goes on without it, then waits
+    for the lock again and runs `settle()`, whose words it adds: by then the
+    calls that were in flight have finished, and no new one gets past its
+    check, since the qube no longer resolves for it (out of AI space, guarded,
+    open no more). Only when that second wait fails too does it say it went
+    on without the lock. A name that is not a qube name takes no lock: the
+    command refuses it in its own words."""
+    if not core.valid_qube_name(name):
+        return fn(False)
+    lock = core.qube_lock(name, must=must, timeout=timeout)
+    try:
+        held = lock.__enter__()
+    except core.QubeBusy as e:
+        raise (error or RoleError)(str(e)) from None
+    except core.Refusal as r:
+        if not must:
+            # A lock that cannot even be opened never stops a command that
+            # only takes authority away: it goes on, unlocked, and says so.
+            return fn(False) + UNLOCKED
+        raise (error or RoleError)(f"'{name}''s lock cannot be taken ({r.payload.get('error')}), "
+                                   f"so nothing was changed") from None
+    if held:
+        try:
+            return fn(True)
+        finally:
+            lock.__exit__(None, None, None)
+    out = fn(False)
+    if settle is None:
+        return out + UNLOCKED
+    late = core.qube_lock(name, must=False, timeout=timeout)
+    try:
+        got = late.__enter__()
+    except core.Refusal:
+        got = False
+    try:
+        return out + (settle() if got else UNLOCKED)
+    finally:
+        late.__exit__(None, None, None)
+
+
+#: Said when a command that takes authority away went on without the lock.
+UNLOCKED = ("; its lock could not be had (a call held it past the wait, or the lock "
+            "could not be opened), so the command went on without it: check the qube "
+            "(qmcp list) once any call on it has finished")
+
+
 def manage(app, name, from_hub: bool = False) -> str:
+    """`qmcp manage`, under the qube's lock (`_manage`)."""
+    return _with_qube_lock(name, True, lambda held: _manage(app, name, from_hub))
+
+
+def _manage(app, name, from_hub: bool = False) -> str:
     """`qmcp manage`. `from_hub`: the command an accepted `qube-manage` runs,
     which also refuses a hidden project's qube (as a name that does not
     exist) and a qube that holds a PCI device (the hub would have root over
@@ -1942,6 +2077,31 @@ def _not_in_a_slot(vm, name, action: str) -> set:
 
 
 def guard(app, name) -> str:
+    """`qmcp guard`, under the qube's lock (`_guard`)."""
+    return _with_qube_lock(name, False, lambda held: _guard(app, name),
+                           settle=lambda: _settle_guard(app, name))
+
+
+def _settle_guard(app, name) -> str:
+    """After a guard that went on without the lock: a remove that was already
+    past its check when the guard landed has finished by now."""
+    if _gone_by_name(app, name):
+        raise RoleError(f"'{name}' was guarded, but a call that was already running then has "
+                        f"removed it since")
+    return ""
+
+
+def _gone_by_name(app, name) -> bool:
+    try:
+        clear = getattr(app.domains, "clear_cache", None)
+        if clear is not None:
+            clear()
+        return name not in app.domains
+    except Exception:
+        return False
+
+
+def _guard(app, name) -> str:
     vm = _target(app, name)
     _refuse_held(vm, name)
     before = _not_in_a_slot(vm, name, "guard")
@@ -2021,7 +2181,26 @@ def _kill_if_running(vm) -> str:
         vm.kill()
     except Exception as e:
         return "halted" if _safe(vm.get_power_state, "unknown") == "Halted" else type(e).__name__
-    return "killed"
+    # Read back: only a qube that reads halted, or one qubesd says is gone (a
+    # disposable Qubes removed when it stopped), is down. One that reads up (a
+    # start that landed right after the kill) or whose state cannot be read is
+    # not known to be down.
+    after = _safe(vm.get_power_state, "unknown")
+    if after == "Halted" or _gone(vm):
+        return "killed"
+    return f"{after} after the kill" if after in ("NA", "unknown") else f"still {after} after the kill"
+
+
+def _gone(vm) -> bool:
+    """True only when qubesd says the qube no longer exists."""
+    try:
+        domains = vm.app.domains
+        clear = getattr(domains, "clear_cache", None)
+        if clear is not None:
+            clear()
+        return core.name_of(vm) not in domains
+    except Exception:
+        return False
 
 
 def _model_qube_kind(vm):
@@ -2070,7 +2249,30 @@ def _kill_model_qube(report, slot, vm, name, managed: bool, guard_failed: str = 
 
 
 def revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
-    """Strip every AI-space badge, pin default_dispvm, and shut the qube down
+    """`qmcp revoke`, under the qube's lock (`_revoke`)."""
+    return _with_qube_lock(name, False, lambda held: _revoke(app, name, shutdown, from_hub),
+                           settle=lambda: _settle_kill(app, name) if shutdown else "")
+
+
+def _settle_kill(app, name) -> str:
+    """After a revoke or a seal that went on without the lock: a start that
+    was already past its check has landed by now, so the qube is killed again
+    and read back."""
+    if _gone_by_name(app, name):
+        return ""
+    done = _kill_if_running(app.domains[name])
+    if done == "halted":
+        return ""
+    if done == "killed":
+        return ("; a call that was already running started it again, so it was killed again "
+                "once that call had finished")
+    raise RoleError(f"'{name}': a call that was already running started it again, and it could "
+                    f"NOT be killed ({done}): kill it by hand (qvm-kill {name})")
+
+
+def _revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
+    """Strip every AI-space badge, pin default_dispvm, and kill the qube if it
+    runs, unless `shutdown` is false.
     Restrictions such as an egress lock go too: revoke is yours. `from_hub`:
     the command an accepted `qube-revoke` runs, which also refuses a hidden
     project's qube (as a name that does not exist), a qube outside AI space
@@ -2088,7 +2290,7 @@ def revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
         reachable = (core.GUARDED not in before) or bool(before & {core.OPEN, core.OPEN_FW})
         if reachable and not shutdown:
             raise RoleError(f"the hub could run commands in '{name}', so a hub's proposal to "
-                            f"revoke it shuts it down: propose it without shutdown false")
+                            f"revoke it kills it: propose it without shutdown false")
     _not_in_a_slot(vm, name, "revoke")
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
@@ -2107,15 +2309,17 @@ def revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
         raise RoleError(f"'{name}' is out of AI space, but {e}") from None
     msg = f"{name}: revoked"
     if shutdown:
-        power = _safe(vm.get_power_state, "unknown")
-        if power in ("NA", "unknown"):
-            msg += f", power state unreadable, so not shut down (qvm-shutdown {name})"
-        elif power != "Halted":
-            try:
-                vm.shutdown()
-                msg += ", shutdown requested"
-            except Exception as e:
-                msg += f", shutdown failed ({type(e).__name__}); kill it with qvm-kill {name}"
+        # Killed, never asked: a guest the hub ran as root can ignore a
+        # shutdown request, and a paused one refuses it, and either would run
+        # on outside AI space with nothing watching it. Read back: a qube that
+        # is not known to be down fails the command.
+        done = _kill_if_running(vm)
+        if done not in ("halted", "killed"):
+            raise RoleError(f"'{name}' is revoked, but it could NOT be killed ({done}): a process "
+                            f"the hub started in it may still run, outside AI space; kill it by "
+                            f"hand (qvm-kill {name})")
+        if done == "killed":
+            msg += ", killed, so nothing the hub started in it runs on; what it wrote to disk stays"
     return msg
 
 
@@ -2239,6 +2443,16 @@ def _open_refusal(vm, name, tags) -> str | None:
 
 
 def open_window(app, name, seconds: int, firewall: bool = False, dir_: str | None = None) -> str:
+    """`qmcp open`, under the qube's lock (`_open_window`). It runs under the
+    gate's lock, which the gate's timer and the expiry pass wait for only a
+    few seconds, so it waits briefly for the qube's and refuses after."""
+    return _with_qube_lock(name, True,
+                           lambda held: _open_window(app, name, seconds, firewall, dir_),
+                           timeout=OPEN_LOCK_WAIT_S)
+
+
+def _open_window(app, name, seconds: int, firewall: bool = False,
+                 dir_: str | None = None) -> str:
     """Open a guarded qube to the hub for a bounded time.
 
     Everything is checked before anything is written, and the record before
@@ -2255,6 +2469,9 @@ def open_window(app, name, seconds: int, firewall: bool = False, dir_: str | Non
     why = _open_refusal(vm, name, tags)
     if why:
         raise RoleError(why)
+    # Read before anything is written: it only reads, and a failed read must
+    # never turn an open that took effect into a reported failure.
+    warning = hidden_open_warning(app, name)
     if not os.path.isdir(WINDOW_DIR if dir_ is None else dir_):
         raise RoleError(f"{WINDOW_DIR if dir_ is None else dir_} is missing, so no window can be "
                         f"recorded and none is opened; the installer declares it in tmpfiles")
@@ -2283,7 +2500,8 @@ def open_window(app, name, seconds: int, firewall: bool = False, dir_: str | Non
     ends = time.strftime("%H:%M:%S", time.localtime(rec["expires"]))
     return (f"{name}: open until {ends} ({seconds // 60} min)"
             + (", firewall rules too" if firewall else "")
-            + f"; qmcp seal {name} closes it at once")
+            + f"; qmcp seal {name} closes it at once"
+            + (f"; WARNING: {warning}" if warning else ""))
 
 
 def open_window_report(app, name, seconds: int, firewall: bool = False) -> "Report":
@@ -2303,7 +2521,25 @@ def open_window_report(app, name, seconds: int, firewall: bool = False) -> "Repo
     return report
 
 
-def seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
+#: How long `qmcp open` waits for a qube's lock, under the gate's lock.
+OPEN_LOCK_WAIT_S = 5.0
+#: How long the expiry pass and the boot seal wait for a qube's lock before
+#: they seal without it: the pass runs every 15 seconds under the gate's 60 s
+#: unit timeout.
+SWEEP_WAIT_S = 2.0
+
+
+def seal(app, name, dir_: str | None = None, kill: bool = True, wait=None) -> str:
+    """`qmcp seal`, under the qube's lock (`_seal`); it takes authority away,
+    so it seals without the lock once `wait` has passed."""
+    return _with_qube_lock(name, False, lambda held: _seal(app, name, dir_, kill),
+                           timeout=wait,
+                           settle=lambda: (_settle_kill(app, name)
+                                           if kill and core.read_hub() not in (None, name)
+                                           else ""))
+
+
+def _seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
     """Close a window at once: the badges off, then the record, then the
     work the hub left running in the qube.
 
@@ -2384,7 +2620,7 @@ def expire_windows(app, dir_: str | None = None, now: float | None = None,
                     continue
                 reason = f"'{name}''s window ran out"
         try:
-            line = seal(app, name, dir_)
+            line = seal(app, name, dir_, wait=SWEEP_WAIT_S)
         except RoleError as e:
             out.append(f"{name}: NOT sealed: {e}")
             _swept(name, reason, False, str(e))
@@ -2812,10 +3048,39 @@ def _hide_disposable_templates(report, app, p) -> None:
     unhidden template would sit in the hub's view until its own stamp hid it,
     and a preloaded one indefinitely. The hub, which cannot operate a guarded
     template anyway, no longer sees these."""
+    todo = []
     for t in p.templates:
         vm = _vm(app, t)
         if vm is None or not core.is_dvmt(vm) or projects.HUBBLIND in _read_tags(vm):
             continue
+        todo.append((t, vm))
+    # Before any is hidden: a disposable or named DispVM the hub could reach,
+    # made from one of them earlier, would stay the hub's, and each start of
+    # it snapshots the template's home again. Refused, naming them.
+    reachable, hiding = [], {t for t, _ in todo}
+    for vm in app.domains if hiding else ():
+        try:
+            tags = core.tags_of(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            reachable.append(f"{vm.name} (its tags cannot be read)")
+            continue
+        if core.UMBRELLA not in tags or projects.HUBBLIND in tags:
+            continue                        # not the hub's to reach
+        try:
+            tpl = core.template_of(vm)
+        except core.Unreadable:
+            reachable.append(f"{vm.name} (its template cannot be read)")
+            continue
+        if tpl is not None and core.name_of(tpl) in hiding:
+            reachable.append(vm.name)
+    if reachable:
+        raise ProjectError(f"the hub can still reach qubes made from these disposable templates: "
+                           f"{', '.join(sorted(reachable))}; remove them, or take them out of AI "
+                           f"space (qmcp revoke), first: each start of one hands the hub its "
+                           f"template's home directory as it is then")
+    for t, vm in todo:
         _set_tags(vm, add={projects.HUBBLIND})
         report.append(f"{p.slot}: the disposable template {t} is hidden from the hub now")
 
@@ -3122,6 +3387,13 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
     try:
         if copied:
             birth.fill_copy(app, vm, src, standalone=standalone)
+        # Its network and default disposable template are set and read back
+        # while it is still outside AI space: no start of it in between boots
+        # it on Qubes' default network.
+        vm.netvm = netvm
+        vm.default_dispvm = None
+        if _netvm(vm) != netvm or core.default_dispvm_of(vm) is not None:
+            raise RuntimeError("the lead's network did not read back")
         # Its own label, never its source's.
         restored.label(vm)
         if copied:
@@ -3131,10 +3403,6 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
         _set_tags(vm, add={projects.LEAD})
         if rules:
             stored = firewall.write_rules(app, name, rules)
-        vm.netvm = netvm
-        vm.default_dispvm = None
-        if _netvm(vm) != netvm or core.default_dispvm_of(vm) is not None:
-            raise RuntimeError("the lead's network did not read back")
         _set_tags(vm, add=want)
     except Exception as e:
         err = _remove_qube(app, name)
@@ -3400,14 +3668,16 @@ def _make_sink(app, slot: str, name: str, hidden: bool = False):
         raise ProjectError("Qubes has no default template for the dump sink")
     vm = app.add_new_vm("AppVM", name, SINK_LABEL, template=tpl)
     try:
+        # No network before any badge: a sink is never on Qubes' default one.
+        vm.netvm = None
+        vm.default_dispvm = None
+        if _netvm(vm) is not None or core.default_dispvm_of(vm) is not None:
+            raise RuntimeError("the sink's network or default disposable template did not "
+                               "read back as none")
         restored.label(vm)
         if hidden:
             _set_tags(vm, add={projects.HUBBLIND})
         _set_tags(vm, add={projects.DROP_BOX, projects.dump_badge(slot)})
-        vm.netvm = None
-        vm.default_dispvm = None
-        if _netvm(vm) is not None:
-            raise RuntimeError("the sink's network did not read back as none")
     except Exception as e:
         err = _remove_qube(app, name)
         if err:
@@ -3828,6 +4098,14 @@ def _set_model_qube(report, app, records, p, name) -> None:
     conversations). Checked again here, against the fleet as it is
     now. A failure part-way leaves less authority than the command meant,
     never more, and the report says how far it got."""
+    if name is None:
+        return _set_model_qube_held(report, app, records, p, name)
+    _project_qube_lock(name, True,
+                       lambda held: _set_model_qube_held(report, app, records, p, name))
+
+
+def _set_model_qube_held(report, app, records, p, name) -> None:
+    """`_set_model_qube` with the model qube's lock held (none for None)."""
     _plan_model_qube(app, p.slot, name, records, p)
     badge = projects.model_badge(p.slot)
     for holder in _model_badge_holders(app, p.slot):
@@ -3964,7 +4242,19 @@ def move(app, name: str, target: str, confirm: bool = False) -> list:
     anonymous mode, as the move would leave them: the move is refused if the
     project would be unsound, or if the hub's check would stop more qubes or
     the moved qube itself."""
-    return _run(_move, app, name, target, confirm)
+    return _run(_move_locked, app, name, target, confirm)
+
+
+def _move_locked(report, app, name, target, confirm):
+    """`_move` under the qube's lock, taken inside the project locks (the
+    create lock first, then a qube's, as a clone takes them)."""
+    _project_qube_lock(name, True, lambda held: _move(report, app, name, target, confirm))
+
+
+def _project_qube_lock(name, must: bool, fn):
+    """`_with_qube_lock` for a project command, whose refusals are
+    ProjectErrors."""
+    return _with_qube_lock(name, must, fn, error=ProjectError)
 
 
 def _move(report, app, name, target, confirm):

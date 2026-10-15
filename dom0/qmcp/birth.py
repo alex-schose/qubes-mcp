@@ -276,6 +276,8 @@ def expected_tags(source_tags, principal: str, slot_badge: str | None = None,
 #: `qmcp-hubblind` before `ai-managed`, so no moment of a hidden project's new
 #: qube is open to the hub's AI-space lines.
 FIRST = ("qmcp-blocked", "qmcp-hubblind", "qmcp-anon")
+#: Badges that keep a caller out of a qube, which a stamp never removes.
+KEEPS_OUT = frozenset({"qmcp-blocked", "qmcp-stopped", "qmcp-hubblind"})
 
 
 def _add_order(tag: str) -> tuple:
@@ -298,6 +300,14 @@ def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None,
     # operator lifts a hold. Refused, so the caller rolls the child back.
     if HELD in have:
         raise RuntimeError("the new qube is held for the operator's review")
+    # Nor is a badge that keeps someone out (a hidden project's, or the gate's
+    # stop) ever taken off a child that arrived wearing it unasked: the
+    # platform copied it from a template that was hidden or stopped after the
+    # caller's checks, and stripping it would hand the caller a visible,
+    # unstopped child built on that template. Refused: the caller rolls back.
+    arrived = (have & KEEPS_OUT) - want
+    if arrived:
+        raise RuntimeError(f"the new qube arrived wearing {sorted(arrived)}")
     for tag in sorted(want - have, key=_add_order):
         io.add(tag)
     for tag in sorted(t for t in have - want if controlled(t) and not is_restriction(t)):
