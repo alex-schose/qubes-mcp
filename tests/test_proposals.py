@@ -1471,7 +1471,10 @@ class QubeProposals(PBase):
         self.write_records(records)
         pid = self.ask("qube-manage", qube="ai-tpl-g")
         reasons = " ".join(proposals.show(self.app, pid)["second_tick"])
-        self.assertIn("the anonymity gate stops other right after", reasons)
+        # This fixture has no rulebook for the gate to read: the judgement is
+        # said to be unmade, never dropped (test_anon judges it for real).
+        self.assertIn("whether the anonymity gate stops a project right after could not be told: "
+                      "other (cannot tell", reasons)
         records["slots"]["p02"]["anonymous"] = False
         del records["slots"]["p02"]["anonymous"]
         self.write_records(records)
@@ -1503,7 +1506,7 @@ class QubeProposals(PBase):
         pid = self.ask("qube-revoke", qube=LEAD)
         ok, report = self.accept(pid, yes=True)
         self.assertFalse(ok)
-        self.assertIn("is a lead", " ".join(report))
+        self.assertIn("is the lead of osint", " ".join(report))
         self.assertIn("qmcp-lead-p01", self.app.domains[LEAD].tags)
 
     def test_revoking_takes_a_member_out_of_its_slot_and_shuts_it_down(self):
@@ -1669,7 +1672,7 @@ class QubeProposals(PBase):
                 ("qube-manage", {"qube": "ai-sink"}, "ai-sink is a drop box"),
                 ("qube-manage", {"qube": "ai-net-router"}, "provides network"),
                 ("qube-manage", {"qube": "ai-held-x"}, "held for your review"),
-                ("qube-revoke", {"qube": LEAD}, f"{LEAD} is a lead"),
+                ("qube-revoke", {"qube": LEAD}, f"{LEAD} is the lead of osint"),
                 ("template-install", {"template": "ai-work", "packages": ["curl"]},
                  "is a AppVM")):
             with self.subTest(fields):
@@ -1681,6 +1684,17 @@ class QubeProposals(PBase):
                 self.assertFalse(ok)
         pid = self.ask("qube-manage", qube="ai-tpl-g")
         self.assertIsNone(proposals.show(self.app, pid)["plan"])
+
+    def test_a_revoke_of_a_stray_lead_badge_is_shown_and_runs(self):
+        # Only the lead a record names is refused; a stray lead badge is what
+        # revoke takes off.
+        stray = self.app.vm("ai-stray", netvm=None, tags={"ai-managed", "qmcp-lead",
+                                                           "qmcp-lead-p01"})
+        pid = self.ask("qube-revoke", qube="ai-stray")
+        self.assertNotIn("is the lead", proposals.show(self.app, pid)["plan"] or "")
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertFalse({"qmcp-lead", "qmcp-lead-p01"} & set(stray.tags))
 
     def test_a_failed_lookup_never_skips_the_hubs_refusals(self):
         # A lookup that fails is not "no such qube": wherever it fails, a
@@ -1758,6 +1772,82 @@ class QubeProposals(PBase):
         self.assertFalse(ok)
         self.assertIn("devices cannot be read", report[-1])
         self.assertIn("managed", fleet.manage(self.app, "sys-usb-x"))
+
+    def test_a_hub_cannot_manage_a_template_a_qube_outside_ai_space_runs_on(self):
+        # The hub would have root in what the operator's own qube runs: refused,
+        # naming it, whether it is built on it directly or through a disposable
+        # template. The operator's own command takes it.
+        tpl = self.app.domains["ai-tpl-g"]
+        vault = self.app.vm("vault-x", template=tpl, netvm=None)
+        for name in ("ai-tpl-g",):
+            pid = self.ask("qube-manage", qube=name)
+            plan = proposals.show(self.app, pid)["plan"] or ""
+            self.assertIn("template of qubes the hub does not operate (outside AI space or "
+                          "guarded) (vault-x)", plan)
+            ok, report = self.accept(pid, yes=True)
+            self.assertFalse(ok)
+            self.assertIn("vault-x", report[-1])
+            self.assertIn(core.GUARDED, tpl.tags)
+        # Through a chain: a disposable template outside AI space on it.
+        del self.app.domains["vault-x"]
+        self.app.vm("op-dvm-x", template=tpl, template_for_dispvms=True, netvm=None)
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("op-dvm-x", report[-1])
+        # A dependant whose badges do not read refuses too.
+        del self.app.domains["op-dvm-x"]
+        self.app.vm("plain-on-tpl", template=tpl, netvm=None)
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        self.app.fail.add("tag.List:plain-on-tpl")
+        try:
+            ok, report = self.accept(pid, yes=True)
+        finally:
+            self.app.fail.discard("tag.List:plain-on-tpl")
+        self.assertFalse(ok)
+        self.assertIn("cannot be read", report[-1])
+        self.assertIn(core.GUARDED, tpl.tags)
+        # Teeth: once only AI space runs on it, the hub's proposal manages it.
+        del self.app.domains["plain-on-tpl"]
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertNotIn(core.GUARDED, tpl.tags)
+
+    def test_manage_refuses_a_qube_wearing_a_projects_badges(self):
+        # The rulebook routes on badges: managed, a stray lead or member badge
+        # would hand the hub what it routes to. The operator's command and the
+        # hub's proposal both refuse; revoke takes the badges off.
+        for name, tags in (("stray-lead", {"qmcp-lead", "qmcp-lead-p01"}),
+                           ("stray-member", {"qmcp-proj-p01"}),
+                           ("guarded-member", {"ai-managed", core.GUARDED, "qmcp-proj-p01"})):
+            vm = self.app.vm(name, netvm=None, tags=tags)
+            with self.assertRaises(fleet.RoleError, msg=name) as cm:
+                fleet.manage(self.app, name)
+            self.assertIn(f"qmcp revoke {name}", str(cm.exception))
+            pid = self.ask("qube-manage", qube=name)
+            self.assertIn("badge", proposals.show(self.app, pid)["plan"] or "", name)
+            ok, report = self.accept(pid, yes=True)
+            self.assertFalse(ok, name)
+            self.assertEqual(set(vm.tags), tags, name)
+        # A managed member of a project, and a qube of p00, are no stray.
+        self.assertIn("managed", fleet.manage(self.app, "ai-osint-w1"))
+
+    def test_a_hub_cannot_manage_a_template_a_guarded_qube_runs_on(self):
+        # A model qube, a gateway or a guarded disposable template is no more the
+        # hub's to operate than a qube outside AI space.
+        tpl = self.app.domains["ai-tpl-g"]
+        self.app.vm("ai-mq-x", template=tpl, netvm=None,
+                    tags={"ai-managed", core.GUARDED, "qmcp-model-p01"})
+        pid = self.ask("qube-manage", qube="ai-tpl-g")
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("ai-mq-x", report[-1])
+        self.assertIn(core.GUARDED, tpl.tags)
+
+    def test_the_operators_own_manage_takes_a_template_outside_qubes_run_on(self):
+        self.app.vm("vault-x", template=self.app.domains["ai-tpl-g"], netvm=None)
+        self.assertIn("managed", fleet.manage(self.app, "ai-tpl-g"))
 
     def test_managing_an_open_qube_ends_its_window_with_no_kill(self):
         g = self.app.vm("ai-gq", tags={"ai-managed", core.GUARDED}, power="Running")

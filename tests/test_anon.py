@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -503,6 +504,89 @@ class Acting(AnonBase):
         self.assertIn("its networks", self.notices[0])
         # The rulebook now refuses the lead's calls; the services refuse it too.
         self.assertEqual(self.lcall("qmcp.ListAIManagedQubes", lead=self.p.lead), core.NOT_AUTHORIZED)
+
+    def test_records_that_do_not_read_twice_block_every_anonymous_qube_and_kill_none(self):
+        for name in self.qubes_of(self.p):
+            self.app.domains[name].__dict__["_power"] = "Running"
+        anonq = sorted(n for n in (v.name for v in self.app.domains) if "qmcp-anon" in self.tags(n))
+        self.assertTrue(set(self.qubes_of(self.p)) <= set(anonq))
+        good = pathlib.Path(projects.PROJECTS_PATH).read_text()
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        with self.assertRaises(projects.ProjectsUnreadable) as cm:
+            anon.run(self.app, retry_wait=0)
+        self.assertIn("blocked, none killed", str(cm.exception))
+        # Only members, leads and the hub: a template or a model qube wearing
+        # qmcp-anon is guarded, and no unblock would clear it.
+        blocked = {n for n in (v.name for v in self.app.domains) if "qmcp-blocked" in self.tags(n)}
+        for name in blocked:
+            t = self.tags(name)
+            self.assertTrue(projects.member_slots(t) or projects.lead_slots(t), name)
+        for name in anonq:
+            t = self.tags(name)
+            if projects.member_slots(t) or projects.lead_slots(t):
+                self.assertIn("qmcp-blocked", t, name)
+        for name in self.qubes_of(self.p):
+            self.assertEqual(self.app.domains[name]._power, "Running", name)
+        self.assertNotIn("qmcp-blocked", self.tags("ai-osint-w1"))
+        line = json.loads(pathlib.Path(audit.LOG_PATH).read_text().splitlines()[-1])
+        self.assertEqual((line["service"], line["args"]["conditions"]), (anon.SERVICE, "records"))
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("None was killed", self.notices[0])
+        # The next run blocks nothing more and says so once.
+        with self.assertRaises(projects.ProjectsUnreadable) as cm:
+            anon.run(self.app, retry_wait=0)
+        self.assertIn("blocked already", str(cm.exception))
+        self.assertEqual(len(self.notices), 1)
+        # Once the records read, each project is unblocked as after any stop,
+        # and no qube is left blocked.
+        pathlib.Path(projects.PROJECTS_PATH).write_text(good)
+        for p in (self.p, self.other):
+            anon.unblock(self.app, projects.load(), p.slot)
+        self.assertFalse([n for n in (v.name for v in self.app.domains)
+                          if "qmcp-blocked" in self.tags(n)])
+
+    def test_unread_records_name_the_qubes_whose_badges_do_not_read(self):
+        w2 = f"ai-{self.p.label}-w2"
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        self.app.fail.add(f"tag.List:{w2}")
+        try:
+            with self.assertRaises(projects.ProjectsUnreadable) as cm:
+                anon.run(self.app, retry_wait=0)
+        finally:
+            self.app.fail.discard(f"tag.List:{w2}")
+        self.assertIn(f"NOT judged, since their badges do not read: {w2}", str(cm.exception))
+        self.assertNotIn(w2 + ",", str(cm.exception).split("NOT judged")[0])
+
+    def test_unread_records_with_no_anonymous_qube_block_nothing_and_say_so(self):
+        for vm in list(self.app.domains):
+            vm.tags.discard("qmcp-anon")
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        with self.assertRaises(projects.ProjectsUnreadable) as cm:
+            anon.run(self.app, retry_wait=0)
+        self.assertIn("no project member, lead or hub wears qmcp-anon", str(cm.exception))
+        self.assertEqual(self.notices, [])
+
+    def test_records_that_read_on_the_retry_block_nothing(self):
+        real = projects.load
+        calls = []
+
+        def once(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise projects.ProjectsUnreadable("transient")
+            return real(*a, **kw)
+        with mock.patch.object(projects, "load", once):
+            self.gate(retry_wait=0)
+        self.assertEqual(len(calls), 2)
+        for name in self.qubes_of(self.p):
+            self.assertNotIn("qmcp-blocked", self.tags(name))
+
+    def test_a_judgement_only_run_blocks_nothing_on_unread_records(self):
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        with self.assertRaises(projects.ProjectsUnreadable):
+            anon.run(self.app, act=False, retry_wait=0)
+        for name in self.qubes_of(self.p):
+            self.assertNotIn("qmcp-blocked", self.tags(name))
 
     def test_a_stopped_qube_found_running_is_killed_again(self):
         # No stopped shortcut: whoever started it, it runs on the path this run
@@ -1123,6 +1207,24 @@ def anon_create(**kw):
 
 
 class Proposals(AnonBase):
+    def test_the_second_tick_names_a_project_the_gate_stops_through_its_leads_chain(self):
+        # The lead is built on a template outside AI space and off the approved
+        # list: managing that template stops the project, though no list names it.
+        fleet.create_project(self.app, None, "template", "debian-13", templates=["ai-tpl-g"],
+                             networks=["ai-net-tor"], quota="10G", lead_netvm="ai-net-tor",
+                             model="api.example.org:443", anonymous=True)
+        p = next(q for q in self.records().values() if q.anonymous)
+        self.green(p)
+        prop = proposals.normalise({"type": "qube-manage", "title": "x", "qube": "debian-13"},
+                                   "ai-")
+        reasons = " ".join(proposals.second_tick(self.app, prop, self.records()))
+        self.assertIn(f"the anonymity gate stops {p.label} (hidden) right after", reasons)
+        # Teeth: a template no anonymous project runs from stops nothing.
+        prop = proposals.normalise({"type": "qube-manage", "title": "x", "qube": "ai-debian-13"},
+                                   "ai-")
+        self.assertNotIn("anonymity gate stops",
+                         " ".join(proposals.second_tick(self.app, prop, self.records())))
+
     def test_the_shape(self):
         p = proposals.normalise(anon_create(), "ai-")
         self.assertEqual((p["anonymous"], p["label"]), (True, None))
@@ -1207,6 +1309,52 @@ class HiddenTemplates(AnonBase):
         p = self.make(templates=["ai-dvm-g"])
         self.assertTrue(p.hidden)
         self.assertIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+
+    def test_hiding_a_template_the_hub_saw_warns_that_the_hub_learns_it(self):
+        # Decided: warned and documented, not refused. Its contents stay hidden;
+        # its leaving the hub's list tells the hub a hidden project took it.
+        report = fleet.create_project(self.app, None, "template", "ai-tpl-g",
+                                      templates=["ai-dvm-g"], networks=["ai-net-tor"],
+                                      quota="10G", lead_netvm="ai-net-tor",
+                                      model="api.example.org:443", anonymous=True)
+        warned = [l for l in report if "WARNING" in l and "ai-dvm-g" in l]
+        self.assertEqual(len(warned), 1, report)
+        self.assertIn("learns from its leaving that a hidden project uses it", warned[0])
+        # Hidden already: the hub saw nothing leave, and nothing is said.
+        report = fleet.create_project(self.app, None, "template", "ai-tpl-g",
+                                      templates=["ai-dvm-g"], networks=["ai-net-tor"],
+                                      quota="10G", lead_netvm="ai-net-tor",
+                                      model="api.example.org:443", anonymous=True)
+        self.assertFalse([l for l in report if "WARNING" in l and "ai-dvm-g" in l], report)
+
+    def test_a_sink_template_waiting_for_review_refuses_before_anything_is_made(self):
+        tpl = self.app.vm("ai-tpl-d", klass="TemplateVM", tags={"ai-managed"},
+                          features={core.ID_FEATURE: "other"})
+        self.app.default_template = tpl
+        before = {v.name for v in self.app.domains}
+        with self.assertRaisesRegex(fleet.ProjectError, "waits for your review"):
+            fleet.create_project(self.app, None, "template", "ai-tpl-g", templates=["ai-dvm-g"],
+                                 networks=["ai-net-tor"], quota="10G", lead_netvm="ai-net-tor",
+                                 model="api.example.org:443", anonymous=True, dump=True)
+        self.assertEqual({v.name for v in self.app.domains}, before)
+        self.assertNotIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+
+    def test_a_sink_template_held_once_the_lead_is_made_is_refused_and_undone(self):
+        tpl = self.app.vm("ai-tpl-d", klass="TemplateVM", tags={"ai-managed"})
+        self.app.default_template = tpl
+        real = fleet._make_lead
+
+        def make(*a, **kw):
+            out = real(*a, **kw)
+            tpl.tags.add(core.QUARANTINE)
+            return out
+        before = {v.name for v in self.app.domains}
+        with mock.patch.object(fleet, "_make_lead", make):
+            with self.assertRaisesRegex(fleet.ProjectError, "held for your review"):
+                fleet.create_project(self.app, None, "template", "ai-tpl-g",
+                                     networks=["ai-net-tor"], quota="10G", lead_netvm="ai-net-tor",
+                                     model="api.example.org:443", anonymous=True, dump=True)
+        self.assertEqual({v.name for v in self.app.domains}, before)
 
     def test_a_child_of_a_hidden_template_is_no_clone_source_and_fails_the_check(self):
         child = self.child()

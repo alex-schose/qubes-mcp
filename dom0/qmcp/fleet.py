@@ -684,6 +684,20 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     # 13. the audit chain
     ok, n, err = audit.verify()
     add("pass" if ok else "fail", "audit chain", f"{n} entries intact" if ok else err)
+    lost = audit.dropped()
+    if lost is not None:
+        count, first = lost
+        add("fail", "audit lines lost",
+            (f"{count} line(s) could not be written to {audit.LOG_PATH} since {first}"
+             if count is not None else f"{audit.DROPPED_PATH} does not read")
+            + f": what they recorded is not on the chain. Free space under "
+              f"{os.path.dirname(audit.LOG_PATH)} if that is why, then remove the marker "
+              f"(sudo rm {audit.DROPPED_PATH})")
+    if not audit.room():
+        add("fail", "audit room", f"less than {audit.FLOOR_BYTES // (1024 * 1024)} MiB free under "
+                                  f"{os.path.dirname(audit.LOG_PATH)}, or that cannot be read: "
+                                  f"the services refuse every call that would change something, "
+                                  f"but a kill, until there is")
     size = _safe(lambda: os.path.getsize(audit.LOG_PATH), 0)
     if size > audit.ROTATE_AT_BYTES:
         add("warn", "audit size", f"{size // (1024 * 1024)} MiB; rotate with: qmcp audit rotate")
@@ -886,7 +900,8 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
         for name, (_, _, dumps) in slots_on.items():
             if p.slot in dumps and name not in names:
                 sink_bad.append(f"{p.slot}: {name} wears the dump badge but is not the record's sink")
-    lead_bad += [f"{name} wears lead badges but is not its slot's recorded lead" for name in stray_leads]
+    lead_bad += [f"{name} wears lead badges but is not its slot's recorded lead (qmcp revoke "
+                 f"{name} takes them off, with every other badge)" for name in stray_leads]
     add("fail" if lead_bad else "pass", "leads",
         f"record and badges disagree: {'; '.join(lead_bad)}" if lead_bad
         else "every lead wears exactly its slot's lead badges, and only leads do")
@@ -1344,9 +1359,10 @@ def _gateway_text(g) -> str:
             + f"; label '{g.label}'")
 
 
-def _would_stop(app, registry_after: dict) -> list:
-    """What the gate judges sound now and would not with `registry_after`:
-    the labels, the hub's as "the hub". A read that fails counts as a stop."""
+def _would_stop(app, registry_after: dict | None = None, overlay: dict | None = None) -> list:
+    """What the gate judges sound now and would not with `registry_after`, or
+    with the qubes in `overlay` (name -> tags) wearing those tags: the labels,
+    the hub's as "the hub". A read that fails counts as a stop."""
     try:
         records = _load_records()
         subjects = anon.subjects(records)
@@ -1358,7 +1374,8 @@ def _would_stop(app, registry_after: dict) -> list:
             before = anon.judge(app, p, records=records)
             if before.status != anon.GREEN:
                 continue
-            after = anon.judge(app, p, records=records, registry=registry_after)
+            after = anon.judge(app, p, records=records, registry=registry_after,
+                               overlay=overlay)
         except (core.Unreadable, anon.PolicyUnreadable) as e:
             out.append(f"{p.label} (cannot tell: {e})")
             continue
@@ -1972,6 +1989,44 @@ def _mode_badge(vm, name) -> None:
                             f"so it was not added to AI space") from None
 
 
+def tags_after_manage(tags) -> set:
+    """The tags `qmcp manage` leaves on a qube that wears `tags`: in AI space,
+    not guarded, its window ended, `qmcp-anon` in anonymous mode (RoleError
+    when the mode does not read)."""
+    return (set(tags) - LEGACY_TIER_TAGS - {core.GUARDED, core.OPEN, core.OPEN_FW}) \
+        | {core.UMBRELLA} | ({projects.ANON} if anonymous_mode() else set())
+
+
+def outside_dependants(app, name: str) -> list:
+    """The qubes the hub does not operate (outside AI space, or guarded: a model
+    qube, a gateway, a guarded disposable template) whose template chain holds
+    `name`, sorted: managed, `name` would hand the hub root in what they run.
+    Raises
+    `core.Unreadable` when the qube list, a chain or a qube's tags do not
+    read: one that cannot be read may be among them."""
+    out = []
+    try:
+        vms = list(app.domains)
+    except Exception:
+        raise core.Unreadable("cannot list the qubes") from None
+    for vm in vms:
+        n = core.name_of(vm)
+        try:
+            if n == name or core.klass_of(vm) == "AdminVM":
+                continue
+            if name in {t.name for t in _template_chain(vm)}:
+                tags = core.tags_of(vm)
+                if core.UMBRELLA not in tags or core.GUARDED in tags:
+                    out.append(n)
+        except core.Gone:
+            continue
+    return sorted(out)
+
+
+def _named_few(names, most: int = 8) -> str:
+    return ", ".join(names[:most]) + (f" and {len(names) - most} more" if len(names) > most else "")
+
+
 def pci_devices(vm) -> int:
     """How many PCI devices are assigned to the qube. Raises RoleError when
     that cannot be read: a failed read is never "none"."""
@@ -2039,18 +2094,37 @@ def manage(app, name, from_hub: bool = False) -> str:
 
 
 def _manage(app, name, from_hub: bool = False) -> str:
-    """`qmcp manage`. `from_hub`: the command an accepted `qube-manage` runs,
-    which also refuses a hidden project's qube (as a name that does not
-    exist) and a qube that holds a PCI device (the hub would have root over
-    a USB or network controller); the operator's own command takes both."""
+    """`qmcp manage`. Refuses a qube wearing lead badges, or a project's
+    member badge without being a managed qube of it (`slot_badge_refusal`).
+    `from_hub`: the command an accepted `qube-manage` runs, which also refuses
+    a hidden project's qube (as a name that does not exist), a qube that holds
+    a PCI device (the hub would have root over a USB or network controller),
+    and a template that a qube the hub does not operate is built on, or whose
+    dependants cannot be read (`outside_dependants`); the operator's own
+    command takes those three."""
     vm = _target(app, name, from_hub=from_hub)
     _refuse_held(vm, name)
+    why = slot_badge_refusal(_read_tags(vm), name)    # a read that fails refuses
+    if why:
+        raise RoleError(why)
     if from_hub:
         held = pci_devices(vm)
         if held:
             raise RoleError(f"'{name}' holds {held} PCI device(s): a hub's proposal cannot manage "
                             f"a qube that holds a device (qmcp manage {name} yourself if you "
                             f"mean it)")
+        try:
+            outside = outside_dependants(app, name)
+        except core.Unreadable as e:
+            raise RoleError(f"which qubes are built on '{name}' cannot be read ({e}), and one "
+                            f"the hub does not operate may be: a hub's proposal cannot manage it "
+                            f"(qmcp manage {name} yourself if you mean it)") from None
+        if outside:
+            raise RoleError(f"'{name}' is the template of qubes the hub does not operate "
+                            f"(outside AI space or guarded) "
+                            f"({_named_few(outside)}): a hub's proposal cannot manage it, since "
+                            f"the hub would have root in what they run (qmcp manage {name} "
+                            f"yourself if you mean it)")
     if _is_gateway(vm):
         raise RoleError(f"'{name}' provides network; gateways are always guarded (qmcp guard)")
     _network_enrolled(vm, name)
@@ -2088,11 +2162,49 @@ def _manage(app, name, from_hub: bool = False) -> str:
             f"are done" + (", which kills it if it runs)" if kind else ")"))
 
 
+def slot_badge_refusal(tags, name: str) -> str | None:
+    """Why `manage` refuses a qube for the slot badges it wears, or None. The
+    rulebook routes on badges, not records: a lead badge, or a project's member
+    badge on a qube that is not already managed in AI space, would hand the
+    hub, through the qube it then operates, what that badge routes to."""
+    tags = set(tags)
+    if projects.LEAD in tags or projects.lead_slots(tags):
+        return (f"'{name}' wears a lead's badges: managing it would hand the hub what they route "
+                f"to; a project's lead changes with qmcp project lead, and qmcp revoke {name} "
+                f"takes stray ones off")
+    members = projects.member_slots(tags) - {projects.HUB_SLOT}
+    if members and (core.UMBRELLA not in tags or core.GUARDED in tags):
+        return (f"'{name}' wears the member badge of {', '.join(sorted(members))} without being "
+                f"a managed qube of that slot: managing it would make it one; qmcp revoke {name} "
+                f"takes the badge off, and qmcp project move puts a managed qube in a slot")
+    return None
+
+
 def _not_in_a_slot(vm, name, action: str) -> set:
-    """The qube's tags, read once; refuses a lead, and a member unless revoking."""
+    """The qube's tags, read once. Refuses the lead a project's record names
+    (`qmcp project lead --remove` takes it away), and a member unless revoking.
+    A qube wearing a lead badge that no record names is no lead: revoke takes
+    the badges off, which is its fix, and guard and open refuse it until then.
+    While the records do not read, revoke goes on, since it only takes
+    authority away, and guard and open refuse."""
     tags = _read_tags(vm)
     if projects.LEAD in tags or projects.lead_slots(tags):
-        raise RoleError(f"'{name}' is a lead; use qmcp project lead <project> --remove first")
+        try:
+            p = projects.by_lead(projects.load(), name)
+        except projects.ProjectsUnreadable as e:
+            if action != "revoke":
+                raise RoleError(f"'{name}' wears a lead's badges and the project records do not "
+                                f"read ({e}), so whether it leads a project cannot be told; if it "
+                                f"does not, qmcp revoke {name} takes them off") from None
+        else:
+            if p is not None:
+                key = p.label or p.slot
+                raise RoleError(f"'{name}' is the lead of {key}; use qmcp project lead {key} "
+                                f"--remove first")
+            if action != "revoke":
+                raise RoleError(f"'{name}' wears a lead's badges, but no project's record names "
+                                f"it as its lead: qmcp revoke {name} takes them off, with every "
+                                f"other badge (it leaves AI space, and is killed if it runs)")
     if projects.member_slots(tags) and action != "revoke":
         raise RoleError(f"'{name}' is in a project slot; qmcp project move {name} none first")
     return tags
@@ -2862,18 +2974,27 @@ def expire_windows(app, dir_: str | None = None, now: float | None = None,
     """
     out, sealed = [], set()
     for vm in app.domains:
+        name = vm.name
         try:
             tags = _tags(vm)
         except core.Gone:
             continue
         except core.Unreadable as e:
-            # Never silently: a qube whose tags will not read may be open.
-            out.append(f"{vm.name}: {e}; its window could not be judged")
+            # Never silently: a qube whose tags will not read may be open. One
+            # whose window record has run out, or does not read, is sealed all
+            # the same, since `_seal` takes both badges off unread; one with no
+            # record is only named, since nothing says it is open and the seal
+            # would kill it.
+            tags, reason = None, _record_over(name, dir_, now)
+            if reason is None:
+                out.append(f"{name}: {e}; its window could not be judged")
+                continue
+            reason = f"{reason}, and its tags do not read ({e})"
+        if tags is None:
+            pass
+        elif not tags & {core.OPEN, core.OPEN_FW}:
             continue
-        if not tags & {core.OPEN, core.OPEN_FW}:
-            continue
-        name = vm.name
-        if every:
+        elif every:
             reason = "the boot seal: a window never survives a reboot"
         else:
             try:
@@ -2910,6 +3031,18 @@ def expire_windows(app, dir_: str | None = None, now: float | None = None,
             _swept(name, reason, True)
     out += retry_kills(app, dir_, skip=sealed)
     return out
+
+
+def _record_over(name: str, dir_, now) -> str | None:
+    """Why the window recorded for `name` is over, or None: no record, a
+    pending kill (`retry_kills` makes it), or time left."""
+    try:
+        if not os.path.exists(_window_path(name, dir_)) or kill_pending(name, dir_):
+            return None
+        left = window_left(name, dir_, now)
+    except WindowUnreadable as e:
+        return str(e)
+    return None if left > 0 else f"'{name}''s window ran out"
 
 
 def _swept(name: str, reason: str, ok: bool, error: str | None = None) -> None:
@@ -3330,12 +3463,17 @@ def _hide_disposable_templates(report, app, p) -> None:
     unhidden template would sit in the hub's view until its own stamp hid it,
     and a preloaded one indefinitely. The hub, which cannot operate a guarded
     template anyway, no longer sees these."""
-    todo = []
+    todo, seen = [], set()
     for t in p.templates:
         vm = _vm(app, t)
-        if vm is None or not core.is_dvmt(vm) or projects.HUBBLIND in _read_tags(vm):
+        if vm is None or not core.is_dvmt(vm):
+            continue
+        tags = _read_tags(vm)
+        if projects.HUBBLIND in tags:
             continue
         todo.append((t, vm))
+        if core.UMBRELLA in tags:
+            seen.add(t)
     # Before any is hidden: a disposable or named DispVM the hub could reach,
     # made from one of them earlier, would stay the hub's, and each start of
     # it snapshots the template's home again. Refused, naming them.
@@ -3365,6 +3503,12 @@ def _hide_disposable_templates(report, app, p) -> None:
     for t, vm in todo:
         _set_tags(vm, add={projects.HUBBLIND})
         report.append(f"{p.slot}: the disposable template {t} is hidden from the hub now")
+        if t in seen:
+            # Its contents stay hidden; that a hidden project took it does not.
+            report.append(f"{p.slot}: WARNING: the hub saw {t} in its list until now, so it "
+                          f"learns from its leaving that a hidden project uses it; one made for "
+                          f"this project alone tells it only that a hidden project took a new "
+                          f"template")
 
 
 def _qube_network(app, name):
@@ -3442,14 +3586,22 @@ def _lead_template(app, name):
     vm = _vm(app, name)
     if vm is None or core.klass_of(vm) != "TemplateVM":
         raise ProjectError(f"'{name}' is not a TemplateVM")
-    tags = _read_tags(vm)
-    # One in scope whose label is not its own is held on the gate's next pass:
-    # a standalone lead copied from it now would escape that review.
-    if _held(tags):
-        raise ProjectError(f"'{name}' {HELD_WHY}")
-    if restored.in_scope(tags) and not restored.known(vm):
-        raise ProjectError(f"'{name}' {WAITS_WHY}")
+    if why := _unreviewed(vm):
+        raise ProjectError(f"'{name}' {why}")
     return vm
+
+
+def _unreviewed(vm) -> str | None:
+    """`HELD_WHY` for a qube held for review, `WAITS_WHY` for one in scope
+    whose label is not its own (the gate's next pass holds it), else None.
+    Whatever is built on such a template now would escape that review: a fresh
+    or cloned lead, a standalone copy, a dump sink."""
+    tags = _read_tags(vm)
+    if _held(tags):
+        return HELD_WHY
+    if restored.in_scope(tags) and not restored.known(vm):
+        return WAITS_WHY
+    return None
 
 
 def _badges_of_slot(app, slot: str) -> tuple:
@@ -3566,11 +3718,14 @@ def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
     if source == "template":
         _lead_template(app, origin)
     elif source in ("clone", "promote"):
-        _hubs_own_qube(app, origin, "the lead")
-        # Its template joins the approved list, which never takes a held one.
+        src = _hubs_own_qube(app, origin, "the lead")
+        if source == "promote" and (why := _halted_refusal(src, origin, "into a lead's place")):
+            raise ProjectError(why)
+        # Its template joins the approved list, which never takes one held or
+        # waiting for review.
         tpl = _template_name(_vm(app, origin))
-        if tpl and (vm := _vm(app, tpl)) is not None and _held(_read_tags(vm)):
-            raise ProjectError(f"the template of {origin}, '{tpl}', {HELD_WHY}")
+        if tpl and (vm := _vm(app, tpl)) is not None and (why := _unreviewed(vm)):
+            raise ProjectError(f"the template of {origin}, '{tpl}', {why}")
     else:
         raise ProjectError(f"unknown lead source '{source}'")
     _lead_rules(app, source, origin, lead_netvm, model)
@@ -3612,6 +3767,11 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
     _, rules = _lead_rules(app, source, origin, lead_netvm, model)
     if source == "promote":
         vm = _hubs_own_qube(app, origin, "a promoted lead")
+        # Its template joins the approved list: read again under the locks, as
+        # a clone's is (the plan read it before an old lead went).
+        tpl = _template_name(vm)
+        if tpl and (tvm := _vm(app, tpl)) is not None and (why := _unreviewed(tvm)):
+            raise ProjectError(f"the template of {origin}, '{tpl}', {why}")
         netvm = _lead_network(app, source, origin, lead_netvm)
         before = {projects.member_badge(s) for s in projects.member_slots(_tags(vm))}
         old_rules = firewall.read_rules(app, origin) if rules else None
@@ -3638,6 +3798,14 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
             # Out of its slot, then the slot's lead badge: never both at once.
             _set_tags(vm, remove=before)
             _set_tags(vm, add=want)
+            # A start that landed since the read above (one the hub's command
+            # into it wakes, which takes no lock) is undone with the rest.
+            if _halted_refusal(vm, origin, "into a lead's place"):
+                raise ProjectError(f"'{origin}' started while it was made the lead, so it was "
+                                   f"given back its place; what this command did before, an "
+                                   f"old lead's removal or demotion included, stays done; shut it "
+                                   f"down (qvm-shutdown {origin}), then give the project its lead "
+                                   f"again")
         except Exception as e:
             err = _undo_lead(app, origin, False, slot, before, old_rules, old_net)
             if err:
@@ -3651,6 +3819,10 @@ def _make_lead(app, slot: str, source: str, origin: str, name: str, lead_netvm, 
         src = _lead_template(app, origin)
     else:
         src = _hubs_own_qube(app, origin, "a lead's clone source")
+        # Again under the locks: the plan read it before an old lead went.
+        tpl = _template_name(src)
+        if tpl and (tvm := _vm(app, tpl)) is not None and (why := _unreviewed(tvm)):
+            raise ProjectError(f"the template of {origin}, '{tpl}', {why}")
     copied = standalone or source == "clone"
     # Read before the create: a restriction its template or source wears
     # (`anon-vm`) must reach the lead. A template-based AppVM gets it from
@@ -3946,6 +4118,14 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
                  or _vm(app, sink) is not None):
         raise ProjectError(f"the dump sink '{sink}' would be inside '{prefix}', is no qube name, "
                            f"or exists")
+    if sink:
+        # Before anything is made: the lead and the hidden templates would
+        # otherwise come first, to be undone (`_make_sink` checks again).
+        try:
+            sink_tpl = app.default_template
+        except Exception:
+            raise ProjectError("cannot read Qubes' default template for the dump sink") from None
+        _sink_template_refusal(sink_tpl)
     name = _plan_lead(app, space, lead_source, lead_origin, lead_netvm, lead_name, model=model,
                       lead_class=lead_class)
     model, _ = _lead_rules(app, lead_source, lead_origin, lead_netvm, model)
@@ -3998,6 +4178,17 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
                           f"or the hub: {SHARED_ROUTER_WARNING}")
 
 
+def _sink_template_refusal(tpl) -> None:
+    """Refuse the template a dump sink is built on (Qubes' default) when there
+    is none, or it is held or waits for review: a sink built on it now would
+    escape that review. Called again when the sink is made."""
+    if tpl is None:
+        raise ProjectError("Qubes has no default template for the dump sink")
+    if why := _unreviewed(tpl):
+        raise ProjectError(f"Qubes' default template, '{tpl.name}', which the dump sink is built "
+                           f"on, {why}")
+
+
 def _make_sink(app, slot: str, name: str, hidden: bool = False):
     """A fresh drop box: ai-dump + the slot's dump badge, no network, outside AI
     space; a hidden project's also `qmcp-hubblind`, first."""
@@ -4007,8 +4198,7 @@ def _make_sink(app, slot: str, name: str, hidden: bool = False):
         tpl = app.default_template
     except Exception:
         raise ProjectError("cannot read Qubes' default template for the dump sink") from None
-    if tpl is None:
-        raise ProjectError("Qubes has no default template for the dump sink")
+    _sink_template_refusal(tpl)
     vm = app.add_new_vm("AppVM", name, SINK_LABEL, template=tpl)
     try:
         # No network before any badge: a sink is never on Qubes' default one.
@@ -4577,6 +4767,46 @@ def _add_dump(report, app, key, name):
     report.append(f"{p.slot}: dump sink {name} created (no network)")
 
 
+def _halted_refusal(vm, name: str, where: str) -> str | None:
+    """Why `name` may not go `where` while it runs, or None when it reads
+    Halted. Whatever runs in it would go on there, with that place's reach. It
+    is never killed for this, since a kill loses what is being written: the
+    operator shuts it down. A power state that does not read refuses too."""
+    state = _safe(vm.get_power_state, "unknown")
+    if state == "Halted":
+        return None
+    now = ("its power state cannot be read" if state in ("NA", "unknown", None)
+           else f"it is {state}")
+    how = (f"qvm-unpause {name}, then qvm-shutdown {name}" if state == "Paused"
+           else f"qvm-shutdown {name}")
+    return (f"'{name}' goes {where} only when shut down, and {now}: what runs in it would go "
+            f"on there; shut it down first ({how}), then run this again")
+
+
+#: How long a qube moving between slots must read Halted, under
+#: `qmcp-blocked`, before its badges change: Qubes' pre-start reads Halted,
+#: and a start admitted before the badge, which the rulebook then refuses
+#: anew, shows by then (the hub's teardown waits the same).
+MOVE_SETTLE_S = 10.0
+
+
+def _settled_halted(vm, seconds: float) -> str | None:
+    """None when the qube reads Halted throughout `seconds`, else what it read."""
+    deadline = time.monotonic() + seconds
+    while True:
+        state = _safe(vm.get_power_state, "unknown")
+        if state != "Halted":
+            return state
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+
+def _hub_only(slots) -> bool:
+    """True when every slot in `slots` is the hub's own: p00 or no slot."""
+    return all(s in (None, projects.HUB_SLOT) for s in slots)
+
+
 MOVE_PAST_WARNING = ("a qube has a past: what it holds and what it was used for come with it, "
                      "and it may link the projects it has been in")
 MOVE_HIDDEN_WARNING = "moving it out of a hidden project hands the hub its contents"
@@ -4661,6 +4891,13 @@ def _move(report, app, name, target, confirm):
             raise ProjectError(f"'{name}' is on {net}, which is not one of {p.label}'s worker networks")
     current = projects.member_slots(tags)
     moving = current != ({slot} if slot is not None else set())
+    # p00 and no slot are both the hub's, so a move between them carries
+    # nothing across; any other slot change does.
+    crossing = moving and not _hub_only(current | {slot})
+    where = "no slot" if slot is None else f"{p.label} ({slot})" if p is not None and p.label \
+        else slot
+    if crossing and (why := _halted_refusal(vm, name, f"into {where}")):
+        raise ProjectError(why)
     warnings = move_warnings(records, current, slot) if moving else []
     if moving and not confirm:
         if warnings:
@@ -4686,33 +4923,75 @@ def _move(report, app, name, target, confirm):
     add_first = want_anon - tags
     remove_last = (tags & anon_badges) - want_anon
     leaving = current - ({slot} if slot is not None else set())
+    if crossing:
+        # The rulebook refuses every call into a qube wearing `qmcp-blocked`,
+        # so no start is admitted from here on; one admitted before it shows
+        # while the qube must stay Halted. Only then do its slot badges change.
+        try:
+            _set_tags(vm, add={projects.BLOCKED})
+        except core.Unreadable as e:
+            raise ProjectError(f"'{name}' was given {projects.BLOCKED} for the move, but {e}, so "
+                               f"it was moved nowhere; it may wear {projects.BLOCKED} now, which "
+                               f"refuses every call into it: qvm-tags {name} del "
+                               f"{projects.BLOCKED} once qmcp check is clean") from None
+        state = _settled_halted(vm, MOVE_SETTLE_S)
+        if state is not None:
+            unblocked = _unblock_after_move(vm, name)
+            raise ProjectError(_halted_refusal(vm, name, f"into {where}")
+                               or f"'{name}' read {state} while it was to stay shut down; "
+                                  f"nothing was moved" + unblocked)
+        report.append(f"{name}: shut down throughout {MOVE_SETTLE_S:g} s, under "
+                      f"{projects.BLOCKED}")
+    # A step below that fails leaves the move's block on: nothing reaches a
+    # qube in a half-done move until the operator has looked.
+    held = (f"; it still wears {projects.BLOCKED}, so nothing reaches it until you take it off "
+            f"(qvm-tags {name} del {projects.BLOCKED})") if crossing else ""
     if add_first:
         try:
             _set_tags(vm, add=add_first)
         except core.Unreadable as e:
             report.fail(f"{name}: given {', '.join(sorted(add_first))}, but {e}; it was moved "
-                        f"nowhere (qmcp check shows what is left)")
+                        f"nowhere (qmcp check shows what is left)" + held)
             return
     if leaving:
         try:
             _set_tags(vm, remove={projects.member_badge(s) for s in leaving})
         except core.Unreadable as e:
             report.fail(f"{name}: taken out of {', '.join(sorted(leaving))}, but {e}; it was "
-                        f"moved into nothing (qmcp check shows what is left)")
+                        f"moved into nothing (qmcp check shows what is left)" + held)
             return
         report.append(f"{name}: out of {', '.join(sorted(leaving))}")
     if slot is not None and slot not in current:
         try:
             _set_tags(vm, add={projects.member_badge(slot)})
         except core.Unreadable as e:
-            report.fail(f"{name}: put in {slot}, but {e} (qmcp check shows what is left)")
+            report.fail(f"{name}: put in {slot}, but {e} (qmcp check shows what is left)" + held)
             return
     if remove_last:
         try:
             _set_tags(vm, remove=remove_last)
         except core.Unreadable as e:
             report.fail(f"{name}: put in {slot or 'no slot'}, and {', '.join(sorted(remove_last))} "
-                        f"taken off, but {e} (qmcp check shows what is left)")
+                        f"taken off, but {e} (qmcp check shows what is left)" + held)
+            return
+    if crossing and (state := _safe(vm.get_power_state, "unknown")) != "Halted":
+        # Started meanwhile, though no call could be admitted into it (dom0,
+        # say): the move is undone, to the badges it had, and said.
+        how = ("its power state cannot be read now" if state in ("NA", "unknown", None)
+               else f"it reads {state} now")
+        try:
+            _set_tags(vm, remove=after - tags, add=(tags - after) - {projects.BLOCKED})
+            undone = "the move was undone"
+        except Exception as e:
+            undone = f"the move could NOT be undone ({type(e).__name__}; qmcp check shows it)"
+        report.fail(f"{name}: {how}, so it may have started while it was moved: {undone}; "
+                    f"shut it down (qvm-shutdown {name}), then move it again"
+                    + _unblock_after_move(vm, name))
+        return
+    if crossing:
+        unblocked = _unblock_after_move(vm, name)
+        if unblocked:
+            report.fail(f"{name}: moved" + unblocked)
             return
     report.append(f"{name}: {'no slot' if slot is None else slot}")
     prefix = birth.read_name_prefix()
@@ -4720,6 +4999,16 @@ def _move(report, app, name, target, confirm):
         if q.label and q.slot != slot and name.startswith(q.space(prefix)):
             report.append(f"{name}: its name stays inside '{q.space(prefix)}', so {q.label}'s lead "
                           f"can still detect it by name")
+
+
+def _unblock_after_move(vm, name) -> str:
+    """Take the move's `qmcp-blocked` off: "" when it came off, else words."""
+    try:
+        _set_tags(vm, remove={projects.BLOCKED})
+        return ""
+    except Exception as e:
+        return (f"; it may still wear {projects.BLOCKED} ({type(e).__name__}), which refuses "
+                f"every call into it: qvm-tags {name} del {projects.BLOCKED}")
 
 
 def _gate_the_move(app, records: dict, name: str, after: set, p, mode: bool) -> None:

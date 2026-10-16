@@ -26,6 +26,119 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.31] — 2026-10-15
+
+**The audit round's medium findings, second half.** A qube moved or promoted
+while it runs; a disposable left running after the hub was told it was gone; a
+gate that judged nothing while the project records did not read; an audit log
+that a full disk silenced; a hub proposal that could reach the template the
+operator's own qubes run on. The window's findings follow in 0.9.32, the low
+ones and the docs in 0.9.33.
+
+### Changed
+
+- **BREAKING:** `qmcp project move` refuses a qube that is not shut down (it
+  runs, is paused, or its power state does not read) whenever it changes slot,
+  except between p00 and no slot, which are both the hub's; so do a lead's
+  promotion by `qmcp project lead` and `qmcp project create --lead-promote`,
+  before an old lead is touched. Nothing is killed: a kill loses what is being
+  written, so the command says to shut the qube down first. Before, whatever
+  ran in the qube went on in its new place with that place's reach. Such a
+  move first puts `qmcp-blocked` on the qube, which the rulebook refuses every
+  call into, and requires it to read Halted for 10 s (a start admitted just
+  before reads Halted while Qubes prepares it); only then do its slot badges
+  change, and the block comes off last. A start that shows meanwhile refuses
+  the move; one that lands after the badges changed undoes it. A promotion
+  puts on no block and reads the power state once, after the badges change: a
+  start that shows by then gives the qube back its place, and what the command did before
+  stays done (an old lead it removed or kept), which it says; a promotion also
+  reads its template again under the locks. The window's move form and lead
+  forms say so before OK.
+- **BREAKING:** an accepted `qube-manage` (the hub's proposal) refuses a
+  template or disposable template that any qube the hub does not operate is
+  built on (one outside AI space, or a guarded one: a model qube, a gateway, a
+  guarded disposable template), directly or through a disposable template, and
+  refuses when that cannot be read: the hub would have root in what they run.
+  `show` names up to eight of them. `qmcp manage` does not refuse such a
+  template.
+- **BREAKING:** the dom0 services refuse every call that would change
+  something, before it acts, while less than 64 MiB is free under `/var/log`
+  ("refused: dom0's audit log has no room"), so no service changes anything
+  without its audit line; a kill goes on (it only takes away), logged only when
+  dom0 accepted it, and the operator's commands and the timers are not
+  refused. A refusal made before the caller is known to be a principal (a
+  full call slot, a request too large, a caller that is no principal) is no
+  longer logged, nor is the floor's own refusal or a kill refused below the
+  floor: none changes anything, and
+  logging the first let anything that can make the call fill the log. An audit line that cannot be written is counted in
+  `/run/qmcp/audit-dropped`; `qmcp check` fails on that marker ("audit lines
+  lost") until the operator removes it (a reboot clears it too), and on the
+  free space ("audit room").
+- **BREAKING:** `qmcp restored reject` refuses the hub, and refuses any qube
+  while `/etc/qmcp/hub` does not read. The hub is the hub by that file, not by
+  a badge, so a reject took the gate's stop off it and left it a caller. Accept
+  a restored hub instead: the hold lifts and any stop stays. The window does
+  not offer Reject for the hub.
+- **BREAKING (MCP):** `qubes_run_disposable` answers `ok: true` only once its
+  disposable is read back halted or gone. It retries a kill dom0 refuses as
+  busy, waits for a start that has not made its domain yet, and gives up after
+  one deadline of about 120 s; every failure after the spawn carries
+  `"teardown": "killed"`, `"failed"` or `"out of reach"` (dom0 answered "not
+  found" before anything showed it was down, which is also its answer once a
+  qube left the caller's reach) with the disposable's name. A server that
+  leaves with `qubes_run_disposable` calls still running, 600 s after its input
+  ends or at once on SIGTERM or SIGINT, kills their disposables first (those
+  whose name it knows) and reads them back, within 120 s (30 s on a signal);
+  one it could not confirm is named on its standard error. A qmcp reply that
+  arrived whole is kept even if its client exits late (an Admin API reply then
+  has no exit status, and is refused). A create that ran its whole timeout
+  (`qubes_run_disposable`, `qubes_spawn_disposable`, `qubes_spawn`,
+  `qubes_clone`) says a qube may exist, never the opaque refusal.
+- **BREAKING (MCP):** the MCP server's client (the hub's and each lead's)
+  reads a reply up to 16 MiB and answers
+  `{"ok": false, "error": "reply too large"}` past it, killing the call; the
+  qrexec client's own stderr is not kept. A large reply could exhaust the
+  memory of the hub's or a lead's server.
+- When `projects.json` does not read on a second try, the anonymity gate
+  blocks every project member, lead and hub wearing `qmcp-anon` that is not
+  blocked yet (the qubes AI space acts through; templates and model qubes are
+  guarded, and a blocked hub reaches nothing), turns their autostart off, kills
+  none, names any qube whose badges do not read, audits it and
+  notifies; `qmcp project unblock` clears each project once the
+  records read. Before, it judged and blocked nothing, and the hub kept
+  operating. A run that cannot take the gate's lock or list the qubes blocks
+  nothing and says so; the next run tries again.
+- A hidden project that takes a disposable template the hub could see says so
+  in a warning: the template leaving the hub's list tells the hub that a
+  hidden project uses it. Listed under the residual risks.
+- **BREAKING:** `qmcp manage` (the operator's and the hub's proposal) refuses
+  any qube wearing lead badges, the recorded lead included, and one wearing a
+  project's member badge without being a managed qube of that slot: the
+  rulebook routes on badges, so managing it handed the hub what they route to.
+- `qmcp revoke` takes lead badges off a qube that no project's record names as
+  its lead, with every other badge, as for any qube; `guard` and `open` refuse
+  such a qube and point to revoke. Before,
+  every lead badge holder was refused with advice that removed the real lead.
+  The recorded lead is refused by its project's name; while the records do not
+  read, revoke goes on and guard and open refuse.
+
+### Fixed
+
+- The expiry pass seals an expired window on a qube whose tags do not read,
+  when its record has run out or does not read; one with time left or no
+  record is still only reported, and one whose record is a pending kill is left
+  to the kill's retry.
+- A lead cloned from a qube, a promoted lead and a dump sink refuse a template
+  that is held for review or waits for it (its label is not its own); a clone
+  and a promotion read the template again under the locks, and a new project's
+  sink is checked before its lead is made.
+- The second tick of a `qube-manage` names the anonymous projects the gate
+  would stop, judged by the gate on the fleet as the manage would leave it,
+  not only the projects that list the qube; a judgement it cannot make is
+  said.
+- A test pins that a fresh lead, a standalone lead, a cloned lead and a dump
+  sink have their network set before their first badge.
+
 ## [0.9.30] — 2026-10-15
 
 **The audit round's medium findings, first half.** Dialogs into a hidden

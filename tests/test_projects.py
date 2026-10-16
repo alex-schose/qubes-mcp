@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
@@ -538,6 +539,7 @@ class Operator(ProjectBase):
     def test_move(self):
         fleet.move(self.app, "ai-work", "p00")
         self.assertIn("qmcp-proj-p00", self.tags("ai-work"))
+        self.app.domains["ai-work"].shutdown()     # a qube changes project only when shut down
         fleet.move(self.app, "ai-work", "osint", confirm=True)
         self.assertEqual(projects.member_slots(self.tags("ai-work")), {"p01"})
         fleet.move(self.app, "ai-work", "none")
@@ -557,6 +559,223 @@ class Operator(ProjectBase):
         for action, name in ((fleet.guard, LEAD), (fleet.revoke, LEAD), (fleet.guard, "ai-osint-w1")):
             with self.assertRaises(fleet.RoleError, msg=name):
                 action(self.app, name)
+
+
+class NetworkBeforeBadges(ProjectBase):
+    """A fresh lead (from a template, a clone, a standalone copy) and a dump
+    sink have their network and default disposable template set before the
+    first badge lands, so no start between boots them on Qubes' defaults."""
+
+    def test_a_new_lead_or_sink_has_its_network_before_its_first_badge(self):
+        import fakequbes
+        seen = {}
+        real = fakequbes.FakeTags.add
+
+        def add(tags, tag):
+            vm = tags._vm
+            if vm.name not in seen and tag in (core.UMBRELLA, "qmcp-lead", "ai-dump"):
+                seen[vm.name] = (tag, vm._props.get("netvm"), vm.property_is_default("netvm"),
+                                 vm.property_is_default("default_dispvm"))
+            return real(tags, tag)
+        fakequbes.FakeTags.add = add
+        self.addCleanup(setattr, fakequbes.FakeTags, "add", real)
+        router = self.app.domains["ai-net-router"]
+        fleet.create_project(self.app, "fr", "template", "ai-debian-13", networks=["none"],
+                             quota="10G", lead_netvm="ai-net-router", dump=True,
+                             model="api.example.org:443")
+        fleet.create_project(self.app, "st", "template", "ai-debian-13", networks=["none"],
+                             quota="10G", lead_netvm="none", lead_class="standalone")
+        fleet.create_project(self.app, "cl", "clone", "ai-hubq", networks=["none"],
+                             quota="10G", lead_netvm="none")
+        want = {"ai-fr-lead": router, "fr-dump": None, "ai-st-lead": None, "ai-cl-lead": None}
+        for name, net in want.items():
+            tag, got, net_default, dvm_default = seen[name]
+            self.assertIs(got, net, (name, tag))
+            self.assertFalse(net_default, f"{name} wore {tag} on the default netvm")
+            self.assertFalse(dvm_default, f"{name} wore {tag} on the default disposable template")
+
+
+class RunningQubesStay(ProjectBase):
+    """A qube changes slot only when shut down: whatever runs in it would go on
+    with the reach of the place it joins. It is never killed for this, since a
+    kill loses what is being written; the command says to shut it down."""
+
+    def power(self, name):
+        return self.app.domains[name].get_power_state()
+
+    def starting_on(self, badge):
+        """`_set_tags`, which starts the qube once `badge` goes on: a start that
+        lands while the command runs (the hub's command into it wakes it, and
+        takes no lock)."""
+        real = fleet._set_tags
+
+        def set_tags(vm, add=(), remove=()):
+            real(vm, add=add, remove=remove)
+            if badge in set(add):
+                vm.__dict__["_power"] = "Running"
+        return mock.patch.object(fleet, "_set_tags", set_tags)
+
+    def test_a_running_qube_is_neither_moved_across_slots_nor_killed(self):
+        vm = self.app.domains["ai-osint-w2"]
+        for state in ("Running", "Paused"):
+            vm.__dict__["_power"] = state
+            for target in ("p00", "none", "other"):
+                with self.assertRaisesRegex(fleet.ProjectError, "only when shut down") as cm:
+                    fleet.move(self.app, "ai-osint-w2", target, confirm=True)
+                self.assertIn("qvm-shutdown ai-osint-w2", str(cm.exception))
+                if state == "Paused":
+                    self.assertIn("qvm-unpause ai-osint-w2, then", str(cm.exception))
+                if target == "other":
+                    self.assertIn("into other (p02)", str(cm.exception))
+                self.assertEqual(projects.member_slots(self.tags("ai-osint-w2")), {"p01"})
+                self.assertEqual(self.power("ai-osint-w2"), state)
+
+    def test_a_power_state_that_does_not_read_refuses(self):
+        self.app.domains["ai-osint-w2"].shutdown()
+        self.app.fail_reads("power:ai-osint-w2", "fail")
+        with self.assertRaisesRegex(fleet.ProjectError, "power state cannot be read"):
+            fleet.move(self.app, "ai-osint-w2", "p00", confirm=True)
+        self.assertEqual(projects.member_slots(self.tags("ai-osint-w2")), {"p01"})
+
+    def test_a_shut_down_qube_moves(self):
+        self.app.domains["ai-osint-w2"].shutdown()
+        report = fleet.move(self.app, "ai-osint-w2", "p00", confirm=True)
+        self.assertEqual(report.failed, [])
+        self.assertEqual(projects.member_slots(self.tags("ai-osint-w2")), {"p00"})
+
+    def test_between_p00_and_no_slot_a_running_qube_moves(self):
+        # Both are the hub's own, so nothing crosses.
+        self.app.domains["ai-hubq"].__dict__["_power"] = "Running"
+        fleet.move(self.app, "ai-hubq", "none")
+        self.assertEqual(projects.member_slots(self.tags("ai-hubq")), set())
+        fleet.move(self.app, "ai-hubq", "p00")
+        self.assertEqual(projects.member_slots(self.tags("ai-hubq")), {"p00"})
+        self.assertEqual(self.power("ai-hubq"), "Running")
+
+    def test_a_start_admitted_before_the_block_refuses_the_move(self):
+        # A start admitted just before the move's qmcp-blocked (Qubes' pre-start
+        # reads Halted) shows while the qube must stay Halted: nothing moves,
+        # nothing is killed, and the block comes off again.
+        self.app.domains["ai-osint-w2"].shutdown()
+        with self.starting_on("qmcp-blocked"):
+            with self.assertRaisesRegex(fleet.ProjectError, "only when shut down"):
+                fleet.move(self.app, "ai-osint-w2", "p00", confirm=True)
+        self.assertEqual(projects.member_slots(self.tags("ai-osint-w2")), {"p01"})
+        self.assertNotIn("qmcp-blocked", self.tags("ai-osint-w2"))
+        self.assertEqual(self.power("ai-osint-w2"), "Running")
+
+    def test_the_block_is_on_from_before_the_badges_change_to_after(self):
+        self.app.domains["ai-osint-w2"].shutdown()
+        seen = []
+        real = fleet._set_tags
+
+        def set_tags(vm, add=(), remove=()):
+            if vm.name == "ai-osint-w2" and {"qmcp-proj-p00", "qmcp-proj-p01"} & (set(add) | set(remove)):
+                seen.append("qmcp-blocked" in vm.tags.raw())
+            real(vm, add=add, remove=remove)
+        with mock.patch.object(fleet, "_set_tags", set_tags):
+            report = fleet.move(self.app, "ai-osint-w2", "p00", confirm=True)
+        self.assertEqual(report.failed, [])
+        self.assertTrue(seen and all(seen), seen)
+        self.assertNotIn("qmcp-blocked", self.tags("ai-osint-w2"))
+        # Between p00 and no slot nothing crosses, and no block is put on.
+        seen.clear()
+        self.app.domains["ai-hubq"].__dict__["_power"] = "Running"
+        fleet.move(self.app, "ai-hubq", "none")
+        self.assertNotIn("qmcp-blocked", self.tags("ai-hubq"))
+
+    def test_a_start_during_the_move_undoes_it_and_kills_nothing(self):
+        # Started after the badges changed, though no call could be admitted
+        # (dom0 can start it): the move is undone to the badges it had.
+        self.app.domains["ai-osint-w2"].shutdown()
+        with self.starting_on("qmcp-proj-p00"):
+            report = fleet.move(self.app, "ai-osint-w2", "p00", confirm=True)
+        self.assertEqual(len(report.failed), 1)
+        self.assertIn("the move was undone", report.failed[0])
+        self.assertIn("qvm-shutdown ai-osint-w2", report.failed[0])
+        self.assertEqual(projects.member_slots(self.tags("ai-osint-w2")), {"p01"})
+        self.assertNotIn("qmcp-blocked", self.tags("ai-osint-w2"))
+        self.assertEqual(self.power("ai-osint-w2"), "Running")
+
+    def test_a_running_qube_is_not_promoted_and_the_old_lead_stays(self):
+        self.app.domains["ai-hubq"].__dict__["_power"] = "Running"
+        for promote in (lambda: fleet.set_lead(self.app, "osint", "promote", "ai-hubq"),
+                        lambda: fleet.create_project(self.app, "prom", "promote", "ai-hubq",
+                                                     networks=["none"], quota=10 * GiB,
+                                                     model="api.example.org:8443")):
+            with self.assertRaisesRegex(fleet.ProjectError, "only when shut down"):
+                promote()
+            self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-proj-p00"})
+            self.assertEqual(self.records()["p01"].lead, LEAD)
+            self.assertEqual(self.tags(LEAD), {"ai-managed", "qmcp-lead", "qmcp-lead-p01"})
+            self.assertEqual(self.power("ai-hubq"), "Running")
+        self.assertNotIn("prom", {p.label for p in self.records().values()})
+
+    def test_a_start_during_a_lead_change_leaves_the_project_with_no_lead_and_says_so(self):
+        # The plan refused nothing (the qube was down); the start landed after
+        # the old lead went, so the project is left with no lead, never with a
+        # lead running what the hub started.
+        with self.starting_on("qmcp-lead-p01"):
+            with self.assertRaises(fleet.ProjectError) as cm:
+                fleet.set_lead(self.app, "osint", "promote", "ai-hubq", lead_netvm="none")
+        self.assertIn("stays done", str(cm.exception))
+        self.assertIn("give the project its lead again", str(cm.exception))
+        self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-proj-p00"})
+        self.assertIsNone(self.records()["p01"].lead)
+        self.assertNotIn(LEAD, self.app.domains)        # the old lead was removed, as asked
+
+    def test_a_start_during_a_promotion_gives_the_qube_back(self):
+        with self.starting_on("qmcp-lead-p03"):
+            with self.assertRaisesRegex(fleet.ProjectError, "started while it was made the lead"):
+                fleet.create_project(self.app, "prom", "promote", "ai-hubq", networks=["none"],
+                                     quota=10 * GiB, model="api.example.org:8443")
+        self.assertEqual(self.tags("ai-hubq"), {"ai-managed", "qmcp-proj-p00"})
+        self.assertEqual(self.power("ai-hubq"), "Running")
+        self.assertNotIn("prom", {p.label for p in self.records().values()})
+
+
+class StrayLeadBadges(ProjectBase):
+    """A qube wearing lead badges that no project's record names is no lead:
+    revoke takes the badges off, and the advice never points at the lead the
+    record does name."""
+
+    def stray(self):
+        self.app.domains["ai-hubq"].tags.add("qmcp-lead")
+        self.app.domains["ai-hubq"].tags.add("qmcp-lead-p01")
+        return "ai-hubq"
+
+    def test_revoke_takes_a_stray_lead_badge_off_and_the_real_lead_stays(self):
+        name = self.stray()
+        self.assertIn("qmcp revoke ai-hubq", " ".join(
+            f.detail for f in fleet.project_findings(list(self.app.domains),
+                                                     {v.name: v for v in self.app.domains},
+                                                     self.records(), "ai-")
+            if f.check == "leads"))
+        fleet.revoke(self.app, name)
+        self.assertFalse({"qmcp-lead", "qmcp-lead-p01"} & self.tags(name))
+        self.assertEqual(self.records()["p01"].lead, LEAD)
+        self.assertEqual(self.tags(LEAD), {"ai-managed", "qmcp-lead", "qmcp-lead-p01"})
+
+    def test_guard_and_open_refuse_a_stray_and_point_at_revoke(self):
+        name = self.stray()
+        for action in (fleet.guard, lambda app, n: fleet.open_window(app, n, 600)):
+            with self.assertRaises(fleet.RoleError) as cm:
+                action(self.app, name)
+            self.assertIn(f"qmcp revoke {name}", str(cm.exception))
+            self.assertNotIn("--remove", str(cm.exception))
+
+    def test_the_recorded_lead_is_refused_by_its_projects_name(self):
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, LEAD)
+        self.assertIn("qmcp project lead osint --remove", str(cm.exception))
+
+    def test_unread_records_let_revoke_go_on_and_refuse_guard(self):
+        name = self.stray()
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{bad")
+        with self.assertRaisesRegex(fleet.RoleError, "records do not read"):
+            fleet.guard(self.app, name)
+        fleet.revoke(self.app, name)
+        self.assertFalse({"qmcp-lead", "qmcp-lead-p01"} & self.tags(name))
 
 
 class CheckProjects(ProjectBase):

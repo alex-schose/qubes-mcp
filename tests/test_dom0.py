@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
@@ -38,6 +39,7 @@ class Base(unittest.TestCase):
         self._saved = []
         for mod, attr, value in [
             (core, "HUB_PATH", self.tmp / "hub"),
+            (audit, "DROPPED_PATH", str(self.tmp / "run" / "audit-dropped")),
             (core, "MODE_PATH", self.tmp / "mode"),
             (core, "RUN_DIR", self.tmp / "run"),
             (budget, "CAP_PATH", self.tmp / "pool-cap"),
@@ -47,6 +49,7 @@ class Base(unittest.TestCase):
             (core, "QUBE_WAIT_S", 0.3),
             (core, "OPERATOR_WAIT_S", 0.3),
             (fleet, "OPEN_LOCK_WAIT_S", 0.3),
+            (fleet, "MOVE_SETTLE_S", 0.0),
             (anon, "KILL_LOCK_WAIT_S", 0.3),
             (birth, "NAME_PREFIX_PATH", self.tmp / "name-prefix"),
             (birth, "BIRTH_EGRESS_PATH", self.tmp / "birth-egress"),
@@ -141,8 +144,9 @@ class Funnel(Base):
         big = json.dumps({"name": "ai-work", "pad": "x" * core.MAX_REQUEST_BYTES}).encode()
         r = self.call("qmcp.SetPropertyAIManaged", raw=big)
         self.assertEqual(r["error"], "request too large")
-        # Type-confused or oversized input on a state-changing service is audited.
-        self.assertEqual(self.audit_lines()[-1]["error"], "request too large")
+        # Refused before the caller is checked, so it changes nothing and is not
+        # audited: AI space must not be able to fill the log.
+        self.assertEqual(self.audit_lines(), [])
 
     def test_invalid_json_is_not_echoed(self):
         r = self.call("qmcp.GetPropertyAIManaged", raw=b'{"name": "SECRET-ish')
@@ -185,10 +189,80 @@ class Funnel(Base):
         self.call("qmcp.GetPropertyAIManaged", {"name": "ai-work", "property": "memory"})
         self.assertEqual(self.audit_lines(), [])
 
-    def test_audit_failure_changes_nothing(self):
-        audit.LOG_PATH = str(self.tmp / "no" / "such" / "dir" / "log")
-        r = self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 500})
+    def test_an_audit_write_that_fails_is_counted_and_check_fails(self):
+        # A write that fails with room on the disk (here: the log is a
+        # directory) does not undo the call, which already ran; it is counted
+        # where a full /var cannot reach, and qmcp check fails until removed.
+        (self.tmp / "logdir").mkdir()
+        audit.LOG_PATH = str(self.tmp / "logdir")
+        for value in (500, 600):
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "memory", "value": value})
+            self.assertEqual(r, {"ok": True})
+        count, first = audit.dropped()
+        self.assertEqual(count, 2)
+        self.assertTrue(first)
+        found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                 system_info={"domains": {}})}
+        self.assertEqual(found["audit lines lost"].status, "fail")
+        self.assertIn("2 line(s) could not be written", found["audit lines lost"].detail)
+        os.unlink(audit.DROPPED_PATH)
+        self.assertIsNone(audit.dropped())
+
+    def test_below_the_floor_a_change_is_refused_before_it_acts(self):
+        # Nothing changes without its line (decided for a full disk): with too little
+        # room for the log the services refuse what would change something,
+        # and change nothing; reads go on. The refusal itself is not audited.
+        vm = self.app.domains["ai-work"]
+        before = vm.memory
+        with mock.patch.object(audit, "FLOOR_BYTES", 1 << 62):
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "memory", "value": before + 100})
+            self.assertEqual(r, {"ok": False, "error": services.NO_AUDIT_ROOM})
+            self.assertEqual(vm.memory, before)
+            self.assertTrue(self.call("qmcp.ListAIManagedQubes")["ok"])
+            self.assertEqual(self.audit_lines(), [])
+            found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                     system_info={"domains": {}})}
+            self.assertEqual(found["audit room"].status, "fail")
+        r = self.call("qmcp.SetPropertyAIManaged",
+                      {"name": "ai-work", "property": "memory", "value": before + 100})
         self.assertEqual(r, {"ok": True})
+        self.assertEqual(len(self.audit_lines()), 1)
+
+    def test_below_the_floor_a_kill_still_goes_on_and_nothing_else(self):
+        vm = self.app.domains["ai-work"]
+        with mock.patch.object(audit, "FLOOR_BYTES", 1 << 62):
+            r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work", "action": "kill"})
+            self.assertEqual(r, {"ok": True})
+            self.assertEqual(vm.get_power_state(), "Halted")
+            for action in ("start", "shutdown"):
+                r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work", "action": action})
+                self.assertEqual(r, {"ok": False, "error": services.NO_AUDIT_ROOM}, action)
+            self.assertEqual(vm.get_power_state(), "Halted")
+
+    def test_below_the_floor_only_a_kill_that_was_done_is_logged(self):
+        # A refused kill changes nothing: logged, it would let a principal fill
+        # the disk past the floor, one refused call at a time.
+        with mock.patch.object(audit, "FLOOR_BYTES", 1 << 62):
+            for _ in range(3):
+                r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-no-such", "action": "kill"})
+                self.assertFalse(r["ok"])
+            self.assertEqual(self.audit_lines(), [])
+            r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work", "action": "kill"})
+            self.assertEqual(r, {"ok": True})
+            self.assertEqual(len(self.audit_lines()), 1)
+
+    def test_a_log_directory_that_does_not_stat_has_no_room(self):
+        self.assertTrue(audit.room())
+        self.assertFalse(audit.room(str(self.tmp / "no" / "such" / "dir" / "log")))
+
+    def test_a_refusal_before_the_principal_check_is_not_audited(self):
+        r = self.call("qmcp.SetPropertyAIManaged",
+                      {"name": "ai-work", "property": "memory", "value": 500}, caller="personal")
+        self.assertEqual(r, core.NOT_AUTHORIZED)
+        self.assertEqual(self.audit_lines(), [])
+        self.assertIsNone(audit.dropped())
 
     def test_internal_error_is_opaque(self):
         self.app.fail.add("property_list")
@@ -1467,6 +1541,26 @@ class Windows(Base):
         lines = fleet.expire_windows(self.app)
         self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
         self.assertTrue(any("cannot be told" in line for line in lines), lines)
+
+    def test_an_expired_window_whose_tags_do_not_read_is_sealed(self):
+        fleet.open_window(self.app, self.TPL, 60)
+        self.app.fail_reads(f"tag.List:{self.TPL}", "fail")      # the pass's own read only
+        lines = fleet.expire_windows(self.app, now=time.time() + 120)
+        self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
+        self.assertTrue(any("ran out, and its tags do not read" in line for line in lines), lines)
+        self.assertFalse(os.path.exists(fleet._window_path(self.TPL)))
+
+    def test_an_unread_window_with_time_left_or_no_record_stays_and_is_named(self):
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail_reads(f"tag.List:{self.TPL}", "fail")
+        lines = fleet.expire_windows(self.app)
+        self.assertIn(core.OPEN, self.tags(), lines)          # time left: nothing to seal
+        self.assertTrue(any("could not be judged" in line for line in lines), lines)
+        fleet.clear_window(self.TPL)                         # no record: nothing says it is open
+        self.app.fail_reads(f"tag.List:{self.TPL}", "fail")
+        lines = fleet.expire_windows(self.app, now=time.time() + 7200)
+        self.assertIn(core.OPEN, self.tags(), lines)
+        self.assertTrue(any("could not be judged" in line for line in lines), lines)
 
     def test_a_named_seal_needs_no_tag_read(self):
         fleet.open_window(self.app, self.TPL, 3600)

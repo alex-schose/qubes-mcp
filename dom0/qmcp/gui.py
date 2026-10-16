@@ -625,6 +625,12 @@ class LeadFields:
         space = self._space()
         _set(self.lead_space, esc(space))
         typed = self.lead_name.get_text() if source != "promote" and not self._fresh_only else ""
+        if source == "promote":
+            row = next((r for r in self._fleet if r.get("name") == self.origin.get_active_id()),
+                       None)
+            refusal = row and gm.shut_down_first(row, "into a lead's place")
+            if refusal:
+                raise gm.FormError(refusal)
         return (source, self.origin.get_active_id(), gm.lead_name_from(typed, space), netvm,
                 self.model.get_text())
 
@@ -1030,6 +1036,10 @@ class MoveForm(Form):
                                + ("; ".join(warnings) + ".")[1:] if warnings else ""))
         crossing = bool(self.current) and slot not in (None, self.current)
         needs = crossing or bool(warnings)
+        if moving and {self.current, slot} - {None, "p00"}:
+            refusal = gm.shut_down_first(self.row_data, f"into {slot or 'no slot'}")
+            if refusal:
+                raise gm.FormError(refusal)
         self.confirm.set_sensitive(needs)
         if needs and not self.confirm.get_active():
             raise gm.FormError("tick the box: it moves into or out of anonymous space"
@@ -2292,7 +2302,8 @@ class Window(Gtk.Window):
 
     def _sync(self):
         writable = self.complete and not self.busy
-        available = (gm.actions(self.node(), self.records, self.fw_pane, self.fleet)
+        available = (gm.actions(self.node(), self.records, self.fw_pane, self.fleet,
+                                self.settings.get("hub"))
                      if writable else set())
         for ident, button in self.buttons.items():
             button.set_sensitive(ident in available)

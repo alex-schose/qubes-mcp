@@ -19,7 +19,9 @@ import copy
 import inspect
 import json
 import logging
+import math
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -32,6 +34,12 @@ log = logging.getLogger(__name__)
 DOM0_TIMEOUT = 60.0
 # A create may first wait in dom0 for the create lock (up to 120 s), then build.
 CREATE_TIMEOUT = 300.0
+# What a create says when its reply never came: dom0 goes on with a call whose
+# client gave up, so the qube may exist. Only a timeout says this; a refusal,
+# a policy denial among them, stays the opaque one.
+SPAWN_LOST_QUBE = "no reply to the spawn in time: a qube may exist; check qubes_list"
+CLONE_LOST = "no reply to the clone in time: a qube may exist; check qubes_list"
+SPAWN_LOST = "no reply to the spawn in time: a disposable may exist; check qubes_list"
 LIFECYCLE_TIMEOUT = 120.0
 # qubes_run and qubes_copy wait for the agent's own timeout plus this margin.
 EXEC_MARGIN = 30
@@ -272,9 +280,9 @@ def _quota_in_bytes(args: dict) -> dict:
     return dict(args, quota=_size_bytes(args["quota"], "argument 'quota'"))
 
 
-def _get_property(name: str, prop: str) -> dict:
+def _get_property(name: str, prop: str, timeout: float = DOM0_TIMEOUT) -> dict:
     return qrexec.call_qmcp("qmcp.GetPropertyAIManaged",
-                            {"name": name, "property": prop}, timeout=DOM0_TIMEOUT)
+                            {"name": name, "property": prop}, timeout=timeout)
 
 
 def _read_properties(name: str, props) -> tuple[dict, dict, dict | None]:
@@ -304,9 +312,9 @@ def _read_properties(name: str, props) -> tuple[dict, dict, dict | None]:
     return values, errors, first_error
 
 
-def _lifecycle(name: str, action: str) -> dict:
-    return qrexec.call_qmcp("qmcp.LifecycleAIManaged",
-                            {"name": name, "action": action}, timeout=LIFECYCLE_TIMEOUT)
+def _lifecycle(name: str, action: str, timeout: float | None = None) -> dict:
+    return qrexec.call_qmcp("qmcp.LifecycleAIManaged", {"name": name, "action": action},
+                            timeout=LIFECYCLE_TIMEOUT if timeout is None else timeout)
 
 
 def _run_payload(args: dict) -> dict:
@@ -395,7 +403,8 @@ def _qubes_list(args: dict) -> dict:
     dom0 runs one create at a time, so this call may wait for others to finish.
 
     Returns {"ok": true, "name": "<name>"}, with a "warning" if a secondary step
-    failed, or {"ok": false, "error": "<reason>"}.
+    failed, or {"ok": false, "error": "<reason>"}. A spawn whose reply never
+    came says a qube may exist; check qubes_list.
     """, {
         "name": _prop("string", "Name of the new qube, inside the caller's own names "
                                 "(the hub's: ai-hub-...)."),
@@ -421,7 +430,8 @@ def _qubes_spawn(args: dict) -> dict:
         payload["netvm"] = args["netvm"]
     if args["private_size"] is not None:
         payload["private_size"] = args["private_size"]
-    return qrexec.call_qmcp("qmcp.SpawnAIManagedQube", payload, timeout=CREATE_TIMEOUT)
+    return qrexec.call_qmcp("qmcp.SpawnAIManagedQube", payload, timeout=CREATE_TIMEOUT,
+                            on_timeout={"ok": False, "error": SPAWN_LOST_QUBE})
 
 
 # A superset across classes on purpose: `template` exists on an AppVM and a
@@ -686,6 +696,7 @@ def _qubes_firewall_set(args: dict) -> dict:
     dom0 runs one create at a time, so this call may wait for others to finish.
 
     Returns {"ok": true, "name": "<new name>"} or {"ok": false, "error": "<reason>"}.
+    A clone whose reply never came says a qube may exist; check qubes_list.
     """, {
         "source": _prop("string", "Managed qube to clone."),
         "name": _prop("string", "Name of the clone, inside the caller's own names "
@@ -694,7 +705,8 @@ def _qubes_firewall_set(args: dict) -> dict:
 def _qubes_clone(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.CloneAIManagedQube",
                             {"source": args["source"], "name": args["name"]},
-                            timeout=CREATE_TIMEOUT)
+                            timeout=CREATE_TIMEOUT,
+                            on_timeout={"ok": False, "error": CLONE_LOST})
 
 
 @_register("qubes_spawn_disposable", """
@@ -714,13 +726,15 @@ def _qubes_clone(args: dict) -> dict:
     cycle in one call.
 
     Returns {"ok": true, "name": "<auto-assigned, e.g. disp1234>"} or
-    {"ok": false, "error": "<reason>"}.
+    {"ok": false, "error": "<reason>"}. A spawn whose reply never came says a
+    disposable may exist; check qubes_list.
     """, {
         "template": _prop("string", "Disposable template to start from; managed or guarded."),
     }, required=("template",))
 def _qubes_spawn_disposable(args: dict) -> dict:
     return qrexec.call_qmcp("qmcp.SpawnDisposableAIManaged",
-                            {"template": args["template"]}, timeout=CREATE_TIMEOUT)
+                            {"template": args["template"]}, timeout=CREATE_TIMEOUT,
+                            on_timeout={"ok": False, "error": SPAWN_LOST})
 
 
 _RUNNING_STATES = ("Running", "Transient")
@@ -737,14 +751,140 @@ def _wait_running(name: str) -> bool:
     return False
 
 
-def _teardown(name: str, stage: str) -> None:
-    """Kill the disposable so dom0 removes it. Best effort: the failure being
-    reported is the original one, but a refused kill is logged for the
-    operator, because it can leave a running disposable behind."""
-    reply = _lifecycle(name, "kill")
-    if not reply.get("ok"):
-        log.warning("qubes_run_disposable: kill of %s after a failed %s step was refused: %s",
-                    name, stage, reply.get("error"))
+# qubes_run_disposable's teardown. One deadline covers every kill and read-back
+# of it, so the call ends within this much after its command, kill or no kill.
+TEARDOWN_SECONDS = 120.0
+_KILL_RETRY_FIRST_SECONDS = 1.0
+_KILL_RETRY_MAX_SECONDS = 10.0
+# After a start whose reply was lost, how long a disposable must keep reading
+# Halted before it counts as down: Qubes' pre-start reads Halted too.
+_START_SETTLE_SECONDS = 10.0
+
+# dom0's answer for a qube that does not exist (Qubes removes a disposable once
+# it halts), and for a kill on a halted qube. Only these two are answers about
+# the qube; a busy refusal, full call slots or the transport's refusal are not.
+# "not found" is also dom0's answer for a qube that has left the caller's scope
+# (the operator revoked or moved it), so it means "gone" only after a sign
+# that the qube was down.
+_GONE = {"ok": False, "error": "not found"}
+_KILL_FAILED = "action failed"
+
+TEARDOWN_FAILED = "the disposable could not be confirmed killed; it may still be running"
+TEARDOWN_OUT_OF_REACH = ("the disposable left the caller's reach before its kill was "
+                         "confirmed; it may still be running")
+
+# The disposables of qubes_run_disposable calls still running, so a server that
+# leaves with calls in flight can end them first (end_abandoned). A name leaves
+# when its call returns, whatever happened: dom0 reuses disposable names.
+_live: set = set()
+_live_lock = threading.Lock()
+
+
+def _within(limit: float, deadline: float) -> float:
+    """A call's client timeout: `limit`, cut to the whole seconds left before
+    `deadline` (at least one), so no single call outlasts the deadline by more
+    than a second."""
+    return min(limit, max(1, math.ceil(deadline - time.monotonic())))
+
+
+def _end_disposable(name: str, deadline: float, start_unsettled: bool = False) -> str:
+    """Kill the disposable and confirm it is down, by `deadline` (a
+    time.monotonic() value): "killed", "out of reach" or "failed".
+
+    "killed" only once dom0 reads it Halted, or says it does not exist after a
+    sign it was down: a Halted read, or a kill dom0 accepted while no start can
+    be under way. A "not found" with no such sign may be a qube taken out of
+    the caller's scope while it runs: "out of reach", and no further kill can
+    reach it. "failed": the deadline passed first.
+
+    A kill dom0 refuses (busy, its call slots full, no answer) is tried again
+    with back-off, and the state is not read after it: a refusal as busy may be
+    the start still holding the qube's lock, and a qube in Qubes' pre-start
+    reads Halted. A kill dom0 ran ("ok", or "action failed" on a halted qube)
+    is read back, and made again while the qube reads anything but Halted: a
+    kill during pre-start returns success and the qube comes up anyway
+    (measured on hardware). `start_unsettled`: the start's reply was lost, so
+    it may still be under way where dom0's lock does not cover it, and Halted
+    counts only once it has held for _START_SETTLE_SECONDS."""
+    wait = _KILL_RETRY_FIRST_SECONDS
+    halted_since = None
+    was_down = False
+    while time.monotonic() < deadline:
+        ran = True
+        if halted_since is None:
+            kill = _lifecycle(name, "kill", timeout=_within(LIFECYCLE_TIMEOUT, deadline))
+            if kill == _GONE:
+                return "killed" if was_down else "out of reach"
+            ran = kill.get("ok") is True or kill.get("error") == _KILL_FAILED
+            if kill.get("ok") is True and not start_unsettled:
+                was_down = True
+            if not ran:
+                log.info("qubes_run_disposable: kill of %s refused (%s); trying again",
+                         name, kill.get("error"))
+        if ran and time.monotonic() < deadline:
+            state = _get_property(name, "power_state", timeout=_within(DOM0_TIMEOUT, deadline))
+            if state == _GONE:
+                if was_down:
+                    return "killed"
+                log.warning("qubes_run_disposable: %s is no longer in reach; its kill was not "
+                            "confirmed", name)
+                return "out of reach"
+            if state.get("ok") is True and state.get("value") == "Halted":
+                was_down = True
+                if not start_unsettled:
+                    return "killed"
+                now = time.monotonic()
+                halted_since = now if halted_since is None else halted_since
+                if now - halted_since >= _START_SETTLE_SECONDS:
+                    return "killed"
+                time.sleep(max(0.0, min(_START_POLL_INTERVAL_SECONDS, deadline - now)))
+                continue
+            halted_since = None
+            if state.get("ok") is True:
+                # It reads up: whatever was down before, it is not now.
+                was_down = False
+            log.info("qubes_run_disposable: %s reads %s after its kill; killing again", name,
+                     state.get("value") if state.get("ok") is True else "unreadable")
+        time.sleep(max(0.0, min(wait, deadline - time.monotonic())))
+        wait = min(wait * 2, _KILL_RETRY_MAX_SECONDS)
+    log.warning("qubes_run_disposable: the kill of %s could not be confirmed; it may still be "
+                "running", name)
+    return "failed"
+
+
+def end_abandoned(bound: float) -> list:
+    """End the disposables of qubes_run_disposable calls still in flight, all
+    within `bound` seconds; the server calls this before it leaves with calls
+    running. Returns the names it could not confirm killed. A start may be
+    under way in any of them, so Halted must hold (_START_SETTLE_SECONDS)."""
+    with _live_lock:
+        names = sorted(_live)
+    deadline = time.monotonic() + bound
+    ended: dict = {}
+
+    def end(name: str) -> None:
+        try:
+            ended[name] = _end_disposable(name, deadline, start_unsettled=True)
+        except Exception:
+            log.exception("ending the abandoned disposable %s failed", name)
+
+    threads = [threading.Thread(target=end, args=(name,), daemon=True,
+                                name="qubes-mcp-end-disposable") for name in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        # Each call is cut to the deadline (_within), plus at most a second.
+        thread.join(max(0.0, deadline + 2 - time.monotonic()))
+    left = [name for name in names if ended.get(name) != "killed"]
+    for name in left:
+        log.warning("disposable %s of an abandoned qubes_run_disposable may still be running",
+                    name)
+    return left
+
+
+def _teardown(name: str, start_unsettled: bool = False) -> str:
+    """The "teardown" field: "killed", "out of reach" or "failed"."""
+    return _end_disposable(name, time.monotonic() + TEARDOWN_SECONDS, start_unsettled)
 
 
 @_register("qubes_run_disposable", """
@@ -754,14 +894,21 @@ def _teardown(name: str, stage: str) -> None:
     template; for a lead, one of its project's, as for qubes_spawn_disposable),
     starts it, waits until it is running, runs the command as root,
     and kills it; dom0 then removes it. A shutdown would only ask the guest,
-    which may ignore it. If any step after the spawn fails, a kill is tried so
-    it is still removed; one that is refused is logged and can leave it
-    running. cmd, shell, timeout and stdin work as for qubes_run.
+    which may ignore it. The kill is read back and tried again, for up to
+    about two minutes, until the disposable reads halted or gone; if any step
+    after the spawn fails, the same teardown runs. cmd, shell, timeout and
+    stdin work as for qubes_run.
 
     Returns {"ok": true, "name": "disp1234", "rc": <int>, "stdout": "...",
-    "stderr": "..."} on success, or {"ok": false, "stage":
-    "spawn|start|wait|run|kill", "error": "...", "name": "..."} on
-    failure, with "name" once the spawn succeeded.
+    "stderr": "..."} only once the disposable is confirmed killed. Otherwise
+    {"ok": false, "stage": "spawn|start|wait|run|kill", "error": "...",
+    "name": "...", "teardown": "killed|failed|out of reach"}, with "name" and
+    "teardown" once the spawn succeeded. "failed" means it may still be
+    running; "out of reach" that dom0 no longer shows it to the caller (the
+    operator may have taken it out of scope) and it may still be running. Stage
+    "kill" (the command ran, its disposable could not be confirmed killed)
+    also carries rc, stdout and stderr. A spawn whose reply never came says a
+    disposable may exist; check qubes_list.
     """, {
         "template": _prop("string", "Disposable template to start from; managed or guarded."),
         "cmd": _CMD,
@@ -771,7 +918,8 @@ def _teardown(name: str, stage: str) -> None:
     }, required=("template", "cmd"))
 def _qubes_run_disposable(args: dict) -> dict:
     spawn = qrexec.call_qmcp("qmcp.SpawnDisposableAIManaged",
-                             {"template": args["template"]}, timeout=CREATE_TIMEOUT)
+                             {"template": args["template"]}, timeout=CREATE_TIMEOUT,
+                             on_timeout={"ok": False, "error": SPAWN_LOST})
     if not spawn.get("ok"):
         return {"ok": False, "stage": "spawn", "error": spawn.get("error")}
     name = spawn.get("name")
@@ -780,34 +928,44 @@ def _qubes_run_disposable(args: dict) -> dict:
         # down by name, so report it as a failed spawn.
         log.warning("qubes_run_disposable: spawn reported success without a name")
         return {"ok": False, "stage": "spawn", "error": qrexec.REFUSED}
+    with _live_lock:
+        _live.add(name)
+    try:
+        return _run_in_disposable(name, args)
+    finally:
+        with _live_lock:
+            _live.discard(name)
 
+
+def _run_in_disposable(name: str, args: dict) -> dict:
     start = _lifecycle(name, "start")
     if not start.get("ok"):
-        _teardown(name, "start")
-        return {"ok": False, "name": name, "stage": "start", "error": start.get("error")}
+        # The transport's refusal may be a reply lost to the timeout, while
+        # dom0 goes on starting it: its teardown waits out a pre-start.
+        return {"ok": False, "name": name, "stage": "start", "error": start.get("error"),
+                "teardown": _teardown(name, start_unsettled=start == qrexec.refused())}
 
     if not _wait_running(name):
-        _teardown(name, "wait")
         return {"ok": False, "name": name, "stage": "wait",
-                "error": "disposable did not reach Running state in time"}
+                "error": "disposable did not reach Running state in time",
+                "teardown": _teardown(name)}
 
     run = qrexec.call_service(name, "qmcp.RunInAIManaged", _run_payload(args),
                               timeout=args["timeout"] + EXEC_MARGIN)
     # Killed, never asked to stop: a guest can ignore a shutdown request, and
     # dom0's "ok" for one means only that it was sent.
-    kill = _lifecycle(name, "kill")
+    teardown = _teardown(name)
 
     if not run.get("ok"):
-        if not kill.get("ok"):
-            log.warning("qubes_run_disposable: kill of %s after a failed run was refused: %s",
-                        name, kill.get("error"))
-        return {"ok": False, "name": name, "stage": "run", "error": run.get("error")}
+        return {"ok": False, "name": name, "stage": "run", "error": run.get("error"),
+                "teardown": teardown}
 
-    if not kill.get("ok"):
-        # The command succeeded but the qube was not killed: say so, and
-        # still hand back what the command produced.
+    if teardown != "killed":
+        # The command succeeded but the qube was not confirmed killed: say so,
+        # and still hand back what the command produced.
         return {"ok": False, "name": name, "stage": "kill",
-                "error": kill.get("error"),
+                "error": TEARDOWN_FAILED if teardown == "failed" else TEARDOWN_OUT_OF_REACH,
+                "teardown": teardown,
                 "rc": run.get("rc"), "stdout": run.get("stdout"), "stderr": run.get("stderr")}
 
     return {"ok": True, "name": name, "rc": run.get("rc"),
@@ -1337,9 +1495,12 @@ def _qubes_propose_open(args: dict) -> dict:
     - qube: the qube to manage. The command refuses dom0, the hub, a drop
       box, a gateway (gateways are always guarded), a qube held for review, a
       qube wearing qmcp badges whose dom0 label is not its own, one on a
-      network that is not an enrolled gateway, and, from this hub, a qube that
-      holds a PCI device (a USB or network controller) or whose devices cannot
-      be read. Managing a template lets this
+      network that is not an enrolled gateway, a qube wearing lead badges or a
+      project's member badge without being a managed qube of it, and, from
+      this hub, a qube that holds a PCI device (a USB or network controller)
+      or whose devices cannot be read, and a template that a qube this hub
+      does not operate (outside AI space, or guarded) is built on, or whose
+      dependants cannot be read. Managing a template lets this
       hub change what every qube built on it runs, from their first start
       after the template has shut down.
 
@@ -1367,7 +1528,7 @@ def _qubes_propose_manage(args: dict) -> dict:
     network of every qube on it. Nothing is removed: the qube and its files
     stay, outside AI space.
 
-    The command refuses a lead (a lead is removed or replaced with
+    The command refuses a project's lead (removed or replaced with
     qubes_propose_lead) and a qube held for review, and accepting fails for a
     qube outside AI space: this hub revokes only what it can see. Say in the title which
     qube it is and why it goes back: this always needs the operator's second

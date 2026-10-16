@@ -11,12 +11,15 @@ Run from the public/ directory:
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import logging
 import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -812,16 +815,20 @@ class ClientTimeoutTests(unittest.TestCase):
 
         def fake_run(target, service, stdin, timeout):
             seen.append((target, service, timeout))
+            killed = any(s == LIFE and b'"kill"' in i for _, s, i in requests)
+            requests.append((target, service, stdin))
             if service.startswith("admin."):
                 out = b"0\x00"
             elif service == "qmcp.SpawnDisposableAIManaged":
                 out = b'{"ok": true, "name": "disp7"}'
             elif service == PROP:
-                out = b'{"ok": true, "value": "Running"}'
+                # A killed qube reads Halted, as dom0 reads it back.
+                out = b'{"ok": true, "value": "%s"}' % (b"Halted" if killed else b"Running")
             else:
                 out = b'{"ok": true}'
             return subprocess.CompletedProcess([target, service], 0, out, b"")
 
+        requests: list = []
         with mock.patch.object(qrexec, "_run", fake_run):
             tools.call_tool(name, arguments)
         return seen
@@ -860,7 +867,7 @@ class ClientTimeoutTests(unittest.TestCase):
              [("ai-a", "admin.vm.firewall.Set", 60), ("ai-a", "admin.vm.firewall.Reload", 60)]),
             ("qubes_run_disposable", {"template": "ai-dvm", "cmd": ["id"], "timeout": 5},
              [(A, "qmcp.SpawnDisposableAIManaged", 300), (A, LIFE, 120), (A, PROP, 60),
-              ("disp7", "qmcp.RunInAIManaged", 35), (A, LIFE, 120)]),
+              ("disp7", "qmcp.RunInAIManaged", 35), (A, LIFE, 120), (A, PROP, 60)]),
             ("qubes_proposals", {}, [(A, STATUS, 60)]),
             ("qubes_proposals", {"id": 4}, [(A, STATUS, 60)]),
         ] + [(name, arguments, [(A, SUBMIT, 60)])
@@ -879,19 +886,481 @@ class RunDisposableWaitTests(InProcessFakeCase):
                 mock.patch.object(tools, "_START_POLL_INTERVAL_SECONDS", 0.01):
             result = tools.call_tool("qubes_run_disposable", {"template": "ai-dvm", "cmd": ["id"]})
         self.assertEqual(result, {"ok": False, "name": "disp1234", "stage": "wait",
-                                  "error": "disposable did not reach Running state in time"})
+                                  "error": "disposable did not reach Running state in time",
+                                  "teardown": "killed"})
         poll = (A, PROP, {"name": "disp1234", "property": "power_state"})
         self.assertEqual(self.fake.calls(), [
             (A, "qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"}),
             (A, LIFE, {"name": "disp1234", "action": "start"}),
             poll, poll, poll,
             (A, LIFE, {"name": "disp1234", "action": "kill"}),
+            poll,
         ])
 
 
 # --------------------------------------------------------------------------
 # The server in process: failure paths that need a custom registry
 # --------------------------------------------------------------------------
+
+# What the agent reads when the teardown could not be confirmed, and when the
+# spawn's reply never came: fixed text, never dom0's.
+TEARDOWN_FAILED = "the disposable could not be confirmed killed; it may still be running"
+SPAWN_LOST = "no reply to the spawn in time: a disposable may exist; check qubes_list"
+OUT_OF_REACH = ("the disposable left the caller's reach before its kill was confirmed; "
+                "it may still be running")
+GONE = {"ok": False, "error": "not found"}
+BUSY = {"ok": False, "error": "busy: the qube is being changed; try again"}
+SLOTS = {"ok": False, "error": "too many concurrent calls"}
+# The teardown's waits, shortened so a test takes seconds, not minutes.
+FAST = {"TEARDOWN_SECONDS": 3.0, "_KILL_RETRY_FIRST_SECONDS": 0.05,
+        "_KILL_RETRY_MAX_SECONDS": 0.2, "_START_SETTLE_SECONDS": 0.6,
+        "_START_POLL_INTERVAL_SECONDS": 0.05}
+
+
+@contextlib.contextmanager
+def _quiet():
+    """Keep qubes_mcp's log lines off the test run's stderr, whether or not any come."""
+    logger = logging.getLogger("qubes_mcp")
+    handler = logging.NullHandler()
+    logger.addHandler(handler)
+    saved, logger.propagate = logger.propagate, False
+    try:
+        yield
+    finally:
+        logger.propagate = saved
+        logger.removeHandler(handler)
+
+
+class DisposableTeardownTests(InProcessFakeCase):
+    """qubes_run_disposable ends its disposable, or says it could not.
+
+    The fake models what the teardown has to get past: dom0's qube lock (a
+    kill while dom0 still runs the start is refused as busy), Qubes' pre-start
+    (a kill then returns success and changes nothing, and the qube reads
+    Halted), and a kill on a halted qube failing "action failed"."""
+
+    def run_disposable(self, args=None, **patch):
+        patches = dict(FAST, **patch)
+        with mock.patch.multiple(tools, **{k: v for k, v in patches.items()
+                                           if hasattr(tools, k)}), \
+                self._missing(patches):
+            return tools.call_tool("qubes_run_disposable",
+                                   args or {"template": "ai-dvm", "cmd": ["id"]})
+
+    @staticmethod
+    def _missing(patches):
+        # Constants the code under test may not have yet: created for the
+        # test, so a missing fix fails an assertion rather than erroring.
+        stack = contextlib.ExitStack()
+        for key, value in patches.items():
+            if not hasattr(tools, key):
+                stack.enter_context(mock.patch.object(tools, key, value, create=True))
+        return stack
+
+    def power(self) -> str:
+        """The disposable's power state as the fake's dom0 reads it now (not logged)."""
+        log = self.fake.log_path.read_text()
+        try:
+            return qrexec.call_qmcp(PROP, {"name": D, "property": "power_state"})["value"]
+        finally:
+            self.fake.log_path.write_text(log)
+
+    def test_a_kill_refused_as_busy_is_tried_again_until_it_is_confirmed(self):
+        self.fake.answer({LIFE: [{"match": {"action": "kill"},
+                                  "sequence": [{"json": BUSY}, {"json": SLOTS},
+                                               {"json": {"ok": True}}]}]})
+        self.assertEqual(self.run_disposable(),
+                         {"ok": True, "name": D, "rc": 0, "stdout": "out\n", "stderr": ""})
+        poll = POLL
+        run = (D, "qmcp.RunInAIManaged", {"cmd": ["id"], "shell": False, "timeout": 60,
+                                          "stdin": ""})
+        self.assertEqual(self.fake.calls(), [SPAWN, START, poll, run, KILL, KILL, KILL, poll])
+        self.assertEqual(self.power(), "Halted")
+
+    def test_a_kill_never_confirmed_says_so_within_one_deadline(self):
+        self.fake.answer({LIFE: [{"match": {"action": "kill"}, "json": BUSY}]})
+        began = time.monotonic()
+        with self.assertLogs("qubes_mcp.tools", level="WARNING"):
+            result = self.run_disposable(TEARDOWN_SECONDS=1.0)
+        self.assertLess(time.monotonic() - began, 4)
+        self.assertEqual(result, {"ok": False, "name": D, "stage": "kill",
+                                  "error": TEARDOWN_FAILED, "teardown": "failed",
+                                  "rc": 0, "stdout": "out\n", "stderr": ""})
+        kills = [c for c in self.fake.calls() if c == KILL]
+        self.assertGreater(len(kills), 2)
+        self.assertNotIn(POLL, self.fake.calls()[4:])   # a busy kill is never read back
+
+    def test_a_hung_kill_is_cut_to_the_deadline(self):
+        # One kill that never answers must not outlast the teardown's deadline.
+        self.fake.answer({LIFE: [{"match": {"action": "kill"}, "sleep": 10,
+                                  "json": {"ok": True}}]})
+        began = time.monotonic()
+        with _quiet():
+            result = self.run_disposable(TEARDOWN_SECONDS=1.0)
+        self.assertLess(time.monotonic() - began, 4)
+        self.assertEqual(result["teardown"], "failed", result)
+
+    def test_a_failed_run_says_whether_its_disposable_was_killed(self):
+        failed = {"json": {"ok": False, "error": "no such file"}}
+        self.fake.answer({"qmcp.RunInAIManaged": failed})
+        self.assertEqual(self.run_disposable(),
+                         {"ok": False, "name": D, "stage": "run", "error": "no such file",
+                          "teardown": "killed"})
+        self.fake.reset()
+        self.fake.answer({"qmcp.RunInAIManaged": failed,
+                          LIFE: [{"match": {"action": "kill"}, "json": BUSY}]})
+        with self.assertLogs("qubes_mcp.tools", level="WARNING"):
+            self.assertEqual(self.run_disposable(TEARDOWN_SECONDS=0.5),
+                             {"ok": False, "name": D, "stage": "run",
+                              "error": "no such file", "teardown": "failed"})
+
+    def test_a_start_whose_reply_was_lost_is_killed_once_dom0_has_started_it(self):
+        # The client gives up on a start dom0 goes on with. dom0's qube
+        # lock refuses the kill as busy until the start is done; then it runs.
+        self.fake.answer({LIFE: [{"match": {"action": "start"}, "sleep": 1.5,
+                                  "json": {"ok": True}}]})
+        with self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+            result = self.run_disposable(LIFECYCLE_TIMEOUT=0.5, TEARDOWN_SECONDS=6.0)
+        self.assertEqual(result, {"ok": False, "name": D, "stage": "start",
+                                  "error": "not found or refused", "teardown": "killed"})
+        time.sleep(0.2)
+        self.assertEqual(self.power(), "Halted")
+
+    def test_a_kill_during_pre_start_is_read_back_and_made_again(self):
+        # Measured on hardware: a kill while Qubes is still starting the qube
+        # returns success, the qube reads Halted, and it comes up afterwards.
+        # A start outside dom0's qube lock (qrexec's own) meets it that way.
+        self.fake.answer({LIFE: [{"match": {"action": "start"}, "sleep": 1.0,
+                                  "unlocked": True, "json": {"ok": True}}]})
+        with self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+            result = self.run_disposable(LIFECYCLE_TIMEOUT=0.3, TEARDOWN_SECONDS=8.0,
+                                         _START_SETTLE_SECONDS=1.5)
+        self.assertEqual(result["teardown"], "killed", result)
+        time.sleep(0.2)
+        self.assertEqual(self.power(), "Halted")
+        kills = [c for c in self.fake.calls() if c == KILL]
+        self.assertGreaterEqual(len(kills), 2)
+
+    def test_an_accepted_kill_during_a_pre_start_is_no_sign_it_was_down(self):
+        # The start's reply was lost and the kill came back ok, which in a
+        # pre-start changes nothing; a "not found" then may be the operator
+        # taking a qube that is coming up out of reach.
+        self.fake.answer({LIFE: [{"match": {"action": "start"}, "sleep": 1.0,
+                                  "unlocked": True, "json": {"ok": True}}],
+                          PROP: {"json": GONE}})
+        with _quiet():
+            result = self.run_disposable(LIFECYCLE_TIMEOUT=0.3)
+        self.assertEqual(result, {"ok": False, "name": D, "stage": "start",
+                                  "error": "not found or refused", "teardown": "out of reach"})
+
+    def test_gone_is_confirmed_but_an_opaque_read_is_not(self):
+        gone = GONE
+        cases = [
+            # dom0 says "not found" for a qube that left the caller's scope too
+            # (revoked, moved): with no sign it was ever down, it is not "killed".
+            ("the kill finds it gone", {LIFE: [{"match": {"action": "kill"}, "json": gone}]},
+             "out of reach"),
+            # "action failed" may be a kill that failed on a running qube: no sign it was down.
+            ("gone after a failed kill", {
+                LIFE: [{"match": {"action": "kill"},
+                        "json": {"ok": False, "error": "action failed"}}],
+                PROP: {"sequence": [{"json": {"ok": True, "value": "Running"}}, {"json": gone}]}},
+             "out of reach"),
+            # An accepted kill, then a read that it is up again, then gone: not "killed".
+            ("up after an accepted kill, then gone", {
+                LIFE: [{"match": {"action": "kill"},
+                        "sequence": [{"json": {"ok": True}}, {"json": gone}]}],
+                PROP: {"json": {"ok": True, "value": "Running"}}},
+             "out of reach"),
+            ("gone after a kill that was refused", {LIFE: [{"match": {"action": "kill"},
+                                                            "sequence": [{"json": BUSY},
+                                                                         {"json": gone}]}]},
+             "out of reach"),
+            ("the read-back finds it gone", {PROP: {"sequence": [
+                {"json": {"ok": True, "value": "Running"}}, {"json": gone}]}}, "killed"),
+            # The transport's refusal is no answer about the qube: never "gone".
+            ("the read-back is refused", {PROP: {"sequence": [
+                {"json": {"ok": True, "value": "Running"}}, {"raw": ""}]}}, "failed"),
+        ]
+        for label, answers, teardown in cases:
+            with self.subTest(label):
+                self.fake.reset()
+                self.fake.answer(answers)
+                with _quiet():
+                    result = self.run_disposable(TEARDOWN_SECONDS=0.6)
+                self.assertEqual(result.get("teardown", "killed"), teardown, result)
+                self.assertEqual(result["ok"], teardown == "killed", result)
+                if teardown == "out of reach":
+                    self.assertEqual(result["error"], OUT_OF_REACH)
+
+    def test_a_failed_run_whose_disposable_left_reach_says_so(self):
+        self.fake.answer({"qmcp.RunInAIManaged": {"json": {"ok": False, "error": "no such file"}},
+                          LIFE: [{"match": {"action": "kill"}, "json": GONE}]})
+        self.assertEqual(self.run_disposable(),
+                         {"ok": False, "name": D, "stage": "run", "error": "no such file",
+                          "teardown": "out of reach"})
+
+    def test_a_lost_spawn_reply_says_a_disposable_may_exist(self):
+        self.fake.answer({"qmcp.SpawnDisposableAIManaged": {
+            "sleep": 1.5, "json": {"ok": True, "name": D}}})
+        with self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+            self.assertEqual(self.run_disposable(CREATE_TIMEOUT=0.5),
+                             {"ok": False, "stage": "spawn", "error": SPAWN_LOST})
+        # A refusal, a policy denial among them, stays the opaque one.
+        self.fake.reset()
+        self.fake.answer({"qmcp.SpawnDisposableAIManaged": {"raw": "", "rc": 126}})
+        self.assertEqual(self.run_disposable(),
+                         {"ok": False, "stage": "spawn", "error": "not found or refused"})
+
+    def test_a_disposable_is_registered_only_while_its_call_runs(self):
+        seen = []
+        real = tools._lifecycle
+
+        def spy(name, action, *args, **kwargs):
+            seen.append(sorted(getattr(tools, "_live", ())))
+            return real(name, action, *args, **kwargs)
+
+        with mock.patch.object(tools, "_lifecycle", spy):
+            self.run_disposable()
+        self.assertEqual(seen[0], [D])
+        self.assertEqual(sorted(getattr(tools, "_live", ())), [])
+
+
+class LostCreateTests(InProcessFakeCase):
+    """A create whose reply never came may still have made its qube: dom0 goes
+    on after the client gives up. The tool says so; a refusal stays opaque."""
+
+    CASES = [
+        ("qubes_spawn", {"name": "ai-hub-x", "template": "ai-tpl"}, "qmcp.SpawnAIManagedQube",
+         "no reply to the spawn in time: a qube may exist; check qubes_list"),
+        ("qubes_clone", {"source": "ai-a", "name": "ai-hub-x"}, "qmcp.CloneAIManagedQube",
+         "no reply to the clone in time: a qube may exist; check qubes_list"),
+        ("qubes_spawn_disposable", {"template": "ai-dvm"}, "qmcp.SpawnDisposableAIManaged",
+         SPAWN_LOST),
+    ]
+
+    def test_a_create_that_ran_its_full_timeout_says_a_qube_may_exist(self):
+        for tool, arguments, service, text in self.CASES:
+            with self.subTest(tool):
+                self.fake.answer({service: {"sleep": 1.5, "json": {"ok": True, "name": "x"}}})
+                with mock.patch.object(tools, "CREATE_TIMEOUT", 0.5), \
+                        self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+                    self.assertEqual(tools.call_tool(tool, arguments),
+                                     {"ok": False, "error": text})
+
+    def test_an_ordinary_refusal_stays_opaque(self):
+        for tool, arguments, service, _ in self.CASES:
+            for label, response in {"policy denial": {"raw": "", "rc": 126},
+                                    "garbage": {"raw": "<html>"}}.items():
+                with self.subTest(tool=tool, case=label):
+                    self.fake.answer({service: response})
+                    with _quiet():
+                        self.assertEqual(tools.call_tool(tool, arguments), REFUSED)
+            with self.subTest(tool=tool, case="client cannot start"), \
+                    mock.patch.dict(os.environ, {qrexec.CLIENT_ENV: str(self.fake.root / "absent")}), \
+                    _quiet():
+                self.assertEqual(tools.call_tool(tool, arguments), REFUSED)
+            with self.subTest(tool=tool, case="dom0's own refusal"):
+                refusal = {"ok": False, "error": "pool cap exceeded"}
+                self.fake.answer({service: {"json": refusal}})
+                self.assertEqual(tools.call_tool(tool, arguments), refusal)
+
+
+class ServerExitTests(FakeCase):
+    """The server ends the disposables of calls it abandons at exit."""
+
+    CHILD = ("import sys\n"
+             "from qubes_mcp import server, tools\n"
+             "server.EOF_GRACE_SECONDS = 1.0\n"
+             "tools._START_SETTLE_SECONDS = 0.5\n"
+             "sys.exit(server.main())\n")
+
+    def test_an_abandoned_run_disposable_is_killed_before_the_server_exits(self):
+        self.fake.answer({"qmcp.RunInAIManaged": {"sleep": 8, "json": {"ok": True, "rc": 0}}})
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "qubes_run_disposable",
+                           "arguments": {"template": "ai-dvm", "cmd": ["make"], "timeout": 900}}}
+        out_path, err_path = self.fake.root / "out", self.fake.root / "err"
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            proc = subprocess.Popen([sys.executable, "-W", "error::DeprecationWarning", "-c",
+                                     self.CHILD], cwd=str(PUBLIC_DIR), env=self.fake.env(),
+                                    stdin=subprocess.PIPE, stdout=out, stderr=err)
+        proc.stdin.write(json.dumps(call).encode() + b"\n")
+        proc.stdin.flush()
+        deadline = time.monotonic() + 10
+        while (D, "qmcp.RunInAIManaged") not in [c[:2] for c in self.fake.calls()]:
+            self.assertLess(time.monotonic(), deadline, "the run never started")
+            time.sleep(0.05)
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            self.fail("the server did not exit after its grace")
+        out, err = out_path.read_bytes(), err_path.read_bytes()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(out, b"")          # the abandoned call's reply never left
+        calls = self.fake.calls()
+        ran = [c[:2] for c in calls].index((D, "qmcp.RunInAIManaged"))
+        self.assertIn(KILL, calls[ran:])
+        self.assertIn(b"still running", err)
+        with mock.patch.dict(os.environ, self.fake.overrides()):
+            power = qrexec.call_qmcp(PROP, {"name": D, "property": "power_state"})
+        self.assertEqual(power, {"ok": True, "value": "Halted"})
+
+
+class ServerSignalTests(FakeCase):
+    """A client that ends the server with SIGTERM or SIGINT: the disposable of
+    a qubes_run_disposable in flight is killed before the process leaves."""
+
+    CHILD = ("import sys\n"
+             "from qubes_mcp import tools, server\n"
+             "tools._START_SETTLE_SECONDS = 0.5\n"
+             "sys.exit(server.main())\n")
+
+    def test_a_signal_ends_the_disposables_in_flight(self):
+        for signum, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
+            with self.subTest(signal=signum.name):
+                self.fake.reset()
+                # Still running when the signal comes; the orphaned client ends by itself.
+                self.fake.answer({"qmcp.RunInAIManaged": {"sleep": 10,
+                                                          "json": {"ok": True, "rc": 0}}})
+                err_path = self.fake.root / "err"
+                with open(err_path, "wb") as err:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-W", "error::DeprecationWarning", "-c", self.CHILD],
+                        cwd=str(PUBLIC_DIR), env=self.fake.env(), stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=err)
+                self.addCleanup(proc.kill)
+                call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "qubes_run_disposable",
+                                   "arguments": {"template": "ai-dvm", "cmd": ["make"]}}}
+                proc.stdin.write(json.dumps(call).encode() + b"\n")
+                proc.stdin.flush()
+                deadline = time.monotonic() + 10
+                while (D, "qmcp.RunInAIManaged") not in [c[:2] for c in self.fake.calls()]:
+                    self.assertLess(time.monotonic(), deadline, "the run never started")
+                    time.sleep(0.05)
+                proc.send_signal(signum)
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail("the server did not leave after the signal")
+                proc.stdin.close()
+                self.assertEqual(proc.returncode, code, err_path.read_bytes())
+                calls = self.fake.calls()
+                ran = [c[:2] for c in calls].index((D, "qmcp.RunInAIManaged"))
+                self.assertIn(KILL, calls[ran:])
+                with mock.patch.dict(os.environ, self.fake.overrides()):
+                    power = qrexec.call_qmcp(PROP, {"name": D, "property": "power_state"})
+                self.assertEqual(power, {"ok": True, "value": "Halted"})
+
+
+class ReplyCapTests(InProcessFakeCase):
+    """A reply is read up to MAX_REPLY bytes, and no further."""
+
+    HEAD = '{"ok": true, "rc": 0, "stdout": "'
+    TAIL = '", "stderr": ""}\n'
+
+    def big(self, fill: str, size: int) -> dict:
+        return {"big": {"head": self.HEAD, "fill": fill, "size": size, "tail": self.TAIL}}
+
+    def test_the_cap_is_16_mib(self):
+        self.assertEqual(getattr(qrexec, "MAX_REPLY", None), 16 * 1024 * 1024)
+
+    def test_a_reply_past_the_cap_is_refused_and_its_client_killed(self):
+        too_large = {"ok": False, "error": "reply too large"}
+        # 64 MiB: a client left running would block on its full pipe until the timeout.
+        self.fake.answer({"qmcp.RunInAIManaged": self.big("é", 64 * 1024 * 1024),
+                          "qmcp.GetPoolStats": self.big("A", 17 * 1024 * 1024),
+                          "admin.vm.firewall.Get": {"big": {"head": "0\x00", "fill": "A",
+                                                            "size": 17 * 1024 * 1024}}})
+        began = time.monotonic()
+        with self.assertLogs("qubes_mcp.qrexec", level="WARNING") as logs:
+            self.assertEqual(qrexec.call_service("ai-a", "qmcp.RunInAIManaged", {},
+                                                 timeout=30), too_large)
+            self.assertEqual(qrexec.call_qmcp("qmcp.GetPoolStats", timeout=30), too_large)
+            self.assertEqual(qrexec.call_admin("admin.vm.firewall.Get", "ai-a", timeout=30),
+                             too_large)
+        self.assertLess(time.monotonic() - began, 8)
+        self.assertIn("too large", "\n".join(logs.output))
+
+    def test_a_reply_up_to_the_cap_arrives_whole(self):
+        size = 16 * 1024 * 1024 - len(self.HEAD) - len(self.TAIL)
+        self.fake.answer({"qmcp.RunInAIManaged": self.big("A", size)})
+        reply = qrexec.call_service("ai-a", "qmcp.RunInAIManaged", {}, timeout=30)
+        self.assertEqual(len(reply["stdout"]), size)
+
+    def test_a_large_request_and_a_large_early_reply_do_not_deadlock(self):
+        # The client answers before it reads its request; both outgrow a pipe.
+        rule = self.big("A", 4 * 1024 * 1024)
+        rule["reply_first"] = True
+        self.fake.answer({"qmcp.RunInAIManaged": rule})
+        reply = qrexec.call_service("ai-a", "qmcp.RunInAIManaged",
+                                    {"stdin": "x" * (4 * 1024 * 1024)}, timeout=10)
+        self.assertEqual(len(reply.get("stdout", "")), 4 * 1024 * 1024, reply)
+        [entry] = self.fake.log_path.read_text().splitlines()
+        self.assertEqual(len(json.loads(json.loads(entry)["stdin"])["stdin"]), 4 * 1024 * 1024)
+
+    def test_a_whole_reply_counts_when_the_client_exits_late(self):
+        self.fake.answer({"qmcp.GetPoolStats": {"json": {"ok": True, "n": 1}, "linger": 5}})
+        began = time.monotonic()
+        with _quiet():
+            self.assertEqual(qrexec.call_qmcp("qmcp.GetPoolStats", timeout=1), {"ok": True, "n": 1})
+        self.assertLess(time.monotonic() - began, 3)
+        # No exit status is known then: an admin call, which needs one, still refuses.
+        self.fake.answer({"admin.vm.firewall.Get": {"raw": "0\x00action=drop\n", "linger": 5}})
+        with _quiet():
+            self.assertEqual(qrexec.call_admin("admin.vm.firewall.Get", "ai-a", timeout=1), REFUSED)
+
+    def test_stderr_is_not_kept_and_cannot_block_the_client(self):
+        # 8 MiB on stderr before any reply: a pipe nobody reads fills and stalls the client.
+        self.fake.answer({"qmcp.GetPoolStats": {"stderr_size": 8 * 1024 * 1024,
+                                                "json": {"ok": True}}})
+        with mock.patch.object(qrexec.subprocess, "Popen", wraps=subprocess.Popen) as popen:
+            self.assertEqual(qrexec.call_qmcp("qmcp.GetPoolStats", timeout=10), {"ok": True})
+        self.assertIs(popen.call_args.kwargs.get("stderr"), subprocess.DEVNULL)
+
+
+class ServerMemoryTests(FakeCase):
+    """A flood from a qube stays a bounded cost to the server that reads it."""
+
+    def peak_mib(self, answers: dict) -> tuple[int, int]:
+        self.fake.answer(answers)
+        proc = ServerProcess(self.fake.env())
+        self.addCleanup(proc.stop)
+
+        def hwm() -> int:
+            for line in Path(f"/proc/{proc.proc.pid}/status").read_text().splitlines():
+                if line.startswith("VmHWM"):
+                    return int(line.split()[1]) // 1024
+            raise AssertionError("no VmHWM")
+
+        proc.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+        base = hwm()
+        proc.call("qubes_run", {"name": "ai-a", "cmd": ["id"]})
+        return base, hwm()
+
+    def test_a_reply_up_to_the_cap_is_not_copied_needlessly(self):
+        # 16 MiB of a two-byte character: escaped six bytes a character, twice
+        # (text and structuredContent), a 96 MiB line. Measured growth: 312 MiB
+        # as 0.9.30 read and wrote it; 215 with the reply read without copies
+        # but the line encoded whole; about 170 written in pieces.
+        head = '{"ok": true, "rc": 0, "stdout": "'
+        tail = '", "stderr": ""}\n'
+        base, peak = self.peak_mib({"qmcp.RunInAIManaged": {
+            "big": {"head": head, "fill": "é", "size": 16 * 1024 * 1024 - 64, "tail": tail}}})
+        self.assertLess(peak - base, 200, f"{base} MiB before, {peak} MiB after")
+
+    def test_a_reply_flood_and_a_stderr_flood_cost_a_bounded_amount(self):
+        head = '{"ok": true, "rc": 0, "stdout": "'
+        base, peak = self.peak_mib({"qmcp.RunInAIManaged": {
+            "stderr_size": 24 * 1024 * 1024,
+            "big": {"head": head, "fill": "A", "size": 24 * 1024 * 1024,
+                    "tail": '", "stderr": ""}\n'}}})
+        self.assertLess(peak - base, 48, f"{base} MiB before, {peak} MiB after")
+
 
 def _tool(name: str, handler) -> tools.Tool:
     return tools.Tool(name, "A test tool.", {"type": "object", "properties": {},
@@ -1285,7 +1754,7 @@ PAYLOAD_CASES = [
      [(A, "qmcp.CloneAIManagedQube", {"source": "ai-a", "name": "ai-a2"})]),
     ("qubes_spawn_disposable", {"template": "ai-dvm"},
      [(A, "qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"})]),
-    ("qubes_run_disposable", RUN_ARGS, [SPAWN, START, POLL, RUN, KILL]),
+    ("qubes_run_disposable", RUN_ARGS, [SPAWN, START, POLL, RUN, KILL, POLL]),
     ("qubes_feature_set", {"name": "ai-a", "feature": "service.cups", "value": True},
      [(A, "qmcp.SetFeatureAIManaged", {"name": "ai-a", "feature": "service.cups", "value": True})]),
     ("qubes_feature_set", {"name": "ai-a", "feature": "vm-config.x", "value": 3},
@@ -1505,38 +1974,27 @@ class ToolCallTests(ServerCase):
                                                            "stderr": "e"}}})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
                          {"ok": True, "name": D, "rc": 3, "stdout": "o", "stderr": "e"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
+        # The kill is read back: ok:true only once the disposable reads Halted.
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL, POLL])
         self.assertNotIn(SHUTDOWN, self.fake.calls())       # a request the guest may ignore
 
     def test_run_disposable_failed_run_is_killed(self):
         self.fake.answer({"qmcp.RunInAIManaged": {"json": {"ok": False, "error": "no such file"}}})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
-                         {"ok": False, "name": D, "stage": "run", "error": "no such file"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
+                         {"ok": False, "name": D, "stage": "run", "error": "no such file",
+                          "teardown": "killed"})
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL, POLL])
 
-    def test_run_disposable_failed_run_and_kill_reports_the_run(self):
-        self.fake.answer({
-            "qmcp.RunInAIManaged": {"json": {"ok": False, "error": "no such file"}},
-            LIFE: [{"match": {"action": "kill"}, "json": {"ok": False, "error": "busy"}}],
-        })
-        self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
-                         {"ok": False, "name": D, "stage": "run", "error": "no such file"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
-
-    def test_run_disposable_failed_kill_after_a_good_run_says_so(self):
-        self.fake.answer({LIFE: [{"match": {"action": "kill"},
-                                  "json": {"ok": False, "error": "busy"}}]})
-        self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
-                         {"ok": False, "name": D, "stage": "kill", "error": "busy",
-                          "rc": 0, "stdout": "out\n", "stderr": ""})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, RUN, KILL])
+    # A kill that dom0 keeps refusing is tried again for up to TEARDOWN_SECONDS;
+    # those cases run in process with the waits shortened (DisposableTeardownTests).
 
     def test_run_disposable_failed_start_is_killed(self):
         self.fake.answer({LIFE: [{"match": {"action": "start"},
                                   "json": {"ok": False, "error": "out of memory"}}]})
         self.assertEqual(self.call("qubes_run_disposable", RUN_ARGS),
-                         {"ok": False, "name": D, "stage": "start", "error": "out of memory"})
-        self.assertEqual(self.fake.calls(), [SPAWN, START, KILL])
+                         {"ok": False, "name": D, "stage": "start", "error": "out of memory",
+                          "teardown": "killed"})
+        self.assertEqual(self.fake.calls(), [SPAWN, START, KILL, POLL])
 
     def test_run_disposable_failed_spawn_stops_there(self):
         self.fake.answer({"qmcp.SpawnDisposableAIManaged": {"json": {"ok": False,
@@ -1547,15 +2005,19 @@ class ToolCallTests(ServerCase):
 
     def test_run_disposable_waits_until_running(self):
         self.fake.answer({PROP: {"sequence": [{"json": {"ok": True, "value": "Halted"}},
-                                              {"json": {"ok": True, "value": "Running"}}]}})
+                                              {"json": {"ok": True, "value": "Running"}},
+                                              {"json": {"ok": True, "value": "Halted"}}]}})
         self.assertTrue(self.call("qubes_run_disposable", RUN_ARGS)["ok"])
-        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, POLL, RUN, KILL])
+        self.assertEqual(self.fake.calls(), [SPAWN, START, POLL, POLL, RUN, KILL, POLL])
 
     def test_run_disposable_never_targets_a_bad_name_from_dom0(self):
-        self.fake.answer({"qmcp.SpawnDisposableAIManaged": {"json": {"ok": True, "name": "dom0"}}})
+        # dom0 answers every call about "dom0", a name outside AI space, "not found".
+        self.fake.answer({"qmcp.SpawnDisposableAIManaged": {"json": {"ok": True, "name": "dom0"}},
+                          LIFE: [{"match": {"name": "dom0"}, "json": GONE}],
+                          PROP: [{"match": {"name": "dom0"}, "json": GONE}]})
         result = self.call("qubes_run_disposable", RUN_ARGS)
-        self.assertEqual(result, {"ok": False, "name": "dom0", "stage": "run",
-                                  "error": "not found or refused"})
+        self.assertEqual(result, {"ok": False, "name": "dom0", "stage": "start",
+                                  "error": "not found", "teardown": "out of reach"})
         calls = self.fake.calls()
         self.assertNotIn("dom0", [target for target, _, _ in calls])
         self.assertEqual(calls[-1], (A, LIFE, {"name": "dom0", "action": "kill"}))

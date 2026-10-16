@@ -188,9 +188,77 @@ def rotate(path: str | None = None) -> str:
         f.close()
 
 
+#: Lines that could not be written are counted here, on tmpfs, which a full
+#: /var does not fill: `qmcp check` fails while it exists. Created by the
+#: first failure (root or the services' user: /run/qmcp is setgid qubes) and
+#: removed by the operator, never by qmcp; a reboot or `uninstall.sh` clears
+#: it with the rest of /run/qmcp, so a gap is told until then.
+DROPPED_PATH = "/run/qmcp/audit-dropped"
+#: Below this much free space under the log's directory the services refuse
+#: every state-changing call before it acts, but a kill (which only takes
+#: away, and is logged only when dom0 accepted it): no other change is made
+#: without its line.
+FLOOR_BYTES = 64 * 1024 * 1024
+
+
+def room(path: str | None = None) -> bool:
+    """True when the log's directory has `FLOOR_BYTES` free. False when it has
+    not, or when that cannot be read: a gate, so it fails toward refusing."""
+    path = LOG_PATH if path is None else path
+    try:
+        st = os.statvfs(os.path.dirname(path) or ".")
+    except OSError:
+        return False
+    return st.f_bavail * st.f_frsize >= FLOOR_BYTES
+
+
+def dropped(path: str | None = None):
+    """(lines not written, first time) from the marker, or None without one;
+    (None, None) for a marker that does not read."""
+    try:
+        with open(DROPPED_PATH if path is None else path, encoding="utf-8") as fh:
+            rec = json.loads(fh.read(4096))
+        return int(rec["count"]), str(rec["first"])
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None, None
+
+
+def _note_dropped() -> None:
+    """Count a line that was not written. Best-effort: it never raises."""
+    try:
+        old = os.umask(0o007)
+        try:
+            fd = os.open(DROPPED_PATH, os.O_RDWR | os.O_CREAT, 0o660)
+        finally:
+            os.umask(old)
+        with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                rec = json.loads(fh.read(4096) or "{}")
+                count, first = int(rec.get("count", 0)), str(rec.get("first") or _utc_now_iso())
+            except Exception:
+                count, first = 0, _utc_now_iso()
+            fh.seek(0)
+            fh.truncate()
+            fh.write(json.dumps({"count": count + 1, "first": first}) + "\n")
+    except Exception:
+        pass
+
+
 def audit(service, caller, summary, ok, error=None, error_class=None,
           path: str | None = None) -> bool:
-    """Record one state-changing call. Returns True if a line was written."""
+    """Record one state-changing call. Returns True if a line was written; a
+    line that was not is counted (`DROPPED_PATH`)."""
+    written = _audit(service, caller, summary, ok, error, error_class, path)
+    if not written:
+        _note_dropped()
+    return written
+
+
+def _audit(service, caller, summary, ok, error=None, error_class=None,
+           path: str | None = None) -> bool:
     try:
         record = {
             "v": SCHEMA,

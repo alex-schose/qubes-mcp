@@ -1222,12 +1222,25 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
         if serves:
             out.append(f"{q} is the model qube of {', '.join(serves)}: while it is managed the hub "
                        f"may operate it, and qmcp check warns until it is guarded again")
-        stopped = sorted(f"{r.label or r.slot}" + (" (hidden)" if r.hidden else "")
-                         for r in records.values()
-                         if r.anonymous and (q in r.templates or r.model_qube == q))
+        from qmcp import fleet
+        # Judged as the gate would judge the fleet after it, never from the
+        # list alone: a template in the chain of a lead or a member, off the
+        # approved list, stops a project too. A judgement that cannot be made
+        # is said, never dropped.
+        try:
+            labels = fleet._would_stop(app, overlay={q: fleet.tags_after_manage(tags)})
+        except fleet.RoleError as e:
+            labels = [f"(cannot tell: {e})"]
+        hidden_labels = {r.label for r in records.values() if r.hidden}
+        unsure = sorted(x for x in labels if "(cannot tell" in x)
+        stopped = sorted(f"{x} (hidden)" if x in hidden_labels else x
+                         for x in labels if x not in unsure)
         if stopped:
             out.append(f"the anonymity gate stops {', '.join(stopped)} right after: an anonymous "
                        f"project's templates and model qube must be guarded")
+        if unsure:
+            out.append(f"whether the anonymity gate stops a project right after could not be "
+                       f"told: {'; '.join(unsure)}")
     elif t == "qube-revoke":
         slots = sorted(projects.member_slots(tags))
         if slots:
@@ -1421,6 +1434,17 @@ def _execute(app, p: dict) -> list:
     raise Refused(f"unknown type {t}")
 
 
+def _recorded_lead_of(name: str):
+    """The label (or slot) of the project whose record names `name` its lead,
+    or None, also when the records do not read (show only informs)."""
+    try:
+        records = projects.load()
+    except projects.ProjectsUnreadable:
+        return None
+    p = projects.by_lead(records, name)
+    return None if p is None else (p.label or p.slot)
+
+
 def _refusal_seen(app, p: dict, vm, tags):
     """A refusal the command would make that `show` can see without writing
     anything, in words, or None. Informational: the command checks again at
@@ -1444,12 +1468,24 @@ def _refusal_seen(app, p: dict, vm, tags):
         if core.QUARANTINE in tags:
             return f"{name} is held for your review"
         if p["type"] == "qube-revoke" and (projects.LEAD in tags or projects.lead_slots(tags)):
-            return f"{name} is a lead"
-        # In the command's own order (`fleet.manage`): the devices first.
+            # Only the lead a record names; a stray lead badge is revoke's to take off.
+            led = _recorded_lead_of(name)
+            if led is not None:
+                return f"{name} is the lead of {led}"
+        # In the command's own order (`fleet._manage`): the slot badges, the
+        # devices, then the qubes built on it.
+        if p["type"] == "qube-manage" and (why := fleet.slot_badge_refusal(tags, name)):
+            return why.replace(f"'{name}'", name, 1)
         if p["type"] == "qube-manage":
             held = fleet.pci_devices(vm)
             if held:
                 return f"{name} holds {held} PCI device(s), which a hub's proposal cannot manage"
+        if p["type"] == "qube-manage":
+            outside = fleet.outside_dependants(app, name)
+            if outside:
+                return (f"{name} is the template of qubes the hub does not operate "
+                        f"(outside AI space or guarded) "
+                        f"({fleet._named_few(outside)}), which a hub's proposal cannot manage")
         if p["type"] == "qube-manage" and core.is_gateway(vm):
             return f"{name} provides network, and gateways are always guarded"
         if p["type"] == "qube-revoke" and not p["shutdown"] and (

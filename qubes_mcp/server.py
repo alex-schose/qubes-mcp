@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -39,7 +40,13 @@ WORKERS = 8
 # How long in-flight calls may run on after stdin closes. Long enough for a
 # create, or a disposable's teardown, to finish rather than be abandoned half
 # way; bounded so a dead session cannot keep the process alive indefinitely.
+# A qubes_run_disposable still running then has its disposable killed by
+# main() before the process leaves (tools.end_abandoned).
 EOF_GRACE_SECONDS = 600.0
+# On SIGTERM or SIGINT, how long the disposables of calls in flight get to be
+# killed and confirmed before the process leaves. Each kill is sent at once;
+# the rest is the read-back. A second signal leaves at once.
+SIGNAL_TEARDOWN_SECONDS = 30.0
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -52,6 +59,8 @@ Sink = Callable[[Optional[Message]], None]
 
 # Returned by _route when a worker thread will answer later.
 _DEFERRED = object()
+
+_ENCODER = json.JSONEncoder(separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
 def _result(msg_id, result: dict) -> dict:
@@ -308,19 +317,25 @@ class Server:
             # character, so a newline inside a string can never split a
             # message; ensure_ascii also escapes U+2028, U+2029 and U+0085,
             # which some line readers (str.splitlines among them) treat as
-            # line breaks.
-            data = json.dumps(message, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-        except (TypeError, ValueError):
+            # line breaks. Encoded as a list of pieces, written one by one: a
+            # reply can be large (a command's output, up to qrexec.MAX_REPLY,
+            # twice over with structuredContent), and one string of the whole
+            # line plus its bytes would hold it twice more. The list is built
+            # before anything is written, so a reply that cannot be encoded
+            # never leaves half a line.
+            pieces = list(_ENCODER.iterencode(message))
+        except (TypeError, ValueError, RecursionError):
             log.exception("a reply could not be encoded")
             if not (isinstance(message, dict) and "id" in message):
                 return
-            data = json.dumps(_error(message["id"], INTERNAL_ERROR, "internal error"))
-        line = data.encode("ascii") + b"\n"
+            pieces = [json.dumps(_error(message["id"], INTERNAL_ERROR, "internal error"))]
+        pieces.append("\n")
         with self._write_lock:
             if self._out_closed:
                 return
             try:
-                self._out.write(line)
+                for piece in pieces:
+                    self._out.write(piece.encode("ascii"))
                 self._out.flush()
             except (OSError, ValueError) as exc:
                 self._out_closed = True
@@ -337,16 +352,49 @@ def _claim_stdout() -> BinaryIO:
     return protocol_out
 
 
+_leaving = False
+
+
+def _on_signal(signum, frame) -> None:
+    """SIGTERM or SIGINT: kill the disposables of calls in flight, bounded,
+    then leave with the shell's status for the signal. A client closing a
+    session often sends SIGTERM shortly after closing stdin, well inside the
+    end-of-input grace, so this is the path that usually runs."""
+    global _leaving
+    if _leaving:
+        os._exit(128 + signum)
+    _leaving = True
+    log.warning("signal %d: ending the disposables of calls in flight, then leaving", signum)
+    try:
+        tools.end_abandoned(SIGNAL_TEARDOWN_SECONDS)
+    except Exception:
+        log.exception("ending the disposables of abandoned calls failed")
+    sys.stderr.flush()
+    os._exit(128 + signum)
+
+
 def main() -> int:
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
                         format="qubes-mcp: %(levelname)s: %(message)s")
     out = _claim_stdout()
     server = Server(out)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, _on_signal)
     try:
-        drained = server.serve(sys.stdin.buffer)
+        # The grace is read here, not bound as serve()'s default, so a test
+        # can shorten it.
+        drained = server.serve(sys.stdin.buffer, grace=EOF_GRACE_SECONDS)
     except KeyboardInterrupt:
         sys.stderr.flush()
         os._exit(130)
+    if not drained:
+        # A qubes_run_disposable still in flight would leave its disposable
+        # running: end those first, bounded like the call's own teardown. A
+        # failure here must not keep the process from leaving.
+        try:
+            tools.end_abandoned(tools.TEARDOWN_SECONDS)
+        except Exception:
+            log.exception("ending the disposables of abandoned calls failed")
     sys.stderr.flush()
     if not drained:
         # Worker threads are still blocked in qrexec calls, and the

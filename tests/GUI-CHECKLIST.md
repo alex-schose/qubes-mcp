@@ -61,7 +61,9 @@ what runs. While OK is off, that line says why instead, in orange, under
 8. **Across slots.** Select `ai-t1h`, *Move...*, into `t1`. Expect the form's
    *Network* line to say `ai-t1h` is on none, and that `t1` takes qubes on
    none and `<gateway>`; OK greyed out until you tick the box saying it leaves
-   p00. Tick it, OK. Expect: `ai-t1h` is a worker of `t1`.
+   p00. Tick it, OK. Expect: `ai-t1h` is a worker of `t1`. (It has never run;
+   a running qube is refused here, with OK greyed out and a line saying to
+   shut it down first, and nothing is killed.)
 9. **Change the lead.** Select the project, *Change lead...*. Choose *a fresh
    qube from a template*, *Made from* `<template>`. Expect OK greyed out until
    you choose what happens to the old lead: *The old lead* has no default.

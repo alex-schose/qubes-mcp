@@ -120,6 +120,8 @@ CONDITION_WORDS = {"networks": "its networks", "model": "its model", "templates"
                    "badges": "its badges", "read": "a read that failed twice"}
 NOTICE = "qubes-mcp stopped the anonymous project {label} ({slot}): {why}."
 NOTICE_HUB = "qubes-mcp stopped {who} (anonymous mode): {why}."
+NOTICE_RECORDS = ("qubes-mcp blocked {n} anonymous qube(s): the project records do not read, so "
+                  "no project is known to be sound. None was killed.")
 
 TIMER = "qmcp-gate.timer"
 #: Tests replace this: whether the timer runs (None when that cannot be told).
@@ -159,6 +161,15 @@ class HubSubject:
 
 
 HUB = HubSubject()
+
+
+class RecordsSubject:
+    """What the gate stops when the project records do not read: no project is
+    known, so the verdict names none."""
+    slot, label, hidden, anonymous = "-", "the project records", False, True
+
+
+RECORDS = RecordsSubject()
 
 
 class Verdict:
@@ -862,8 +873,21 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
     the gate past its wait (nothing was judged). `beat`: the timer's run, which
     leaves the heartbeat. Raises `projects.ProjectsUnreadable` when the project
     records cannot be read: then no project is known to be anonymous, and the
-    services already refuse every lead (`qmcp check` fails on the records)."""
-    records = projects.load() if records is None else records
+    services already refuse every lead (`qmcp check` fails on the records).
+    Read twice first; when acting, a second failure blocks every qube wearing
+    `qmcp-anon` before it raises (`_stop_unread_records`)."""
+    if records is None:
+        try:
+            records = projects.load()
+        except projects.ProjectsUnreadable:
+            time.sleep(RETRY_WAIT_S if retry_wait is None else retry_wait)
+            try:
+                records = projects.load()
+            except projects.ProjectsUnreadable as e:
+                if not act:
+                    raise
+                raise projects.ProjectsUnreadable(
+                    f"{e}; {_stop_unread_records(app, e, lock_path)}") from None
     anon = [p for p in sorted(records.values(), key=lambda p: p.slot)
             if p.anonymous and p.slot != projects.HUB_SLOT]
     mode, mode_error = mode_state()
@@ -921,6 +945,66 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
         if beat:
             _beat()
         return out
+
+
+def _stop_unread_records(app, err, lock_path) -> str:
+    """The project records did not read twice, so no anonymous project is
+    known to be sound, and the hub keeps operating while nothing is judged.
+    Every qube wearing `qmcp-anon` that is not blocked yet is blocked, never
+    killed: nothing was found unsound, and a kill loses what is being written.
+    The badge stops the hub's and the leads' calls into them and theirs out;
+    `qmcp project unblock` clears each project once the records read and a run
+    finds it sound. What was done, in words."""
+    with _GateLock(lock_path) as got:
+        if not got:
+            return "another run held the gate, so nothing was blocked; the next run tries again"
+        try:
+            by_name, tags_by = _snapshot(app)
+        except core.Unreadable as e:
+            return f"{e}, so nothing was blocked; the next run tries again"
+        # Within what the unblocks clear, and what AI space acts through: a
+        # project's members and leads and the hub. Its templates and model
+        # qubes are guarded, so nothing operates them, and a block there would
+        # outlast every unblock (a template could not even update).
+        hub = core.read_hub()
+        worn = [n for n, t in tags_by.items() if projects.ANON in t
+                and (projects.member_slots(t) or projects.lead_slots(t) or n == hub)]
+        names = sorted(n for n in worn if projects.BLOCKED not in tags_by[n])
+        unread = sorted(set(by_name) - set(tags_by))
+        not_judged = (f"; NOT judged, since their badges do not read: {', '.join(unread)}"
+                      if unread else "")
+        if not worn:
+            return ("no project member, lead or hub wears qmcp-anon, so nothing was blocked"
+                    + not_judged)
+        if not names:
+            return "every project member, lead and hub wearing qmcp-anon is blocked already" \
+                + not_judged
+        v = Verdict(RECORDS)
+        v.status = UNREADABLE
+        v.problems.append(("read", str(err)))
+        block(app, v, names, kill=False)
+        # Read back, never parsed from the lines: a name may hold any word.
+        try:
+            after = _snapshot(app)[1]
+            failed = [n for n in names if projects.BLOCKED not in after.get(n, ())]
+            told = len(names) - len(failed)
+        except core.Unreadable:
+            failed = ["whether they were blocked could not be read back"]
+            told = len(names)           # tried on each; the notice counts them all
+        try:
+            audit.audit(SERVICE, CALLER, {"project": RECORDS.slot, "status": UNREADABLE,
+                                          "conditions": "records", "acted": len(v.acted),
+                                          "qubes": len(names)}, False,
+                        f"{UNREADABLE}: the project records do not read")
+        except Exception:
+            pass
+        if told:
+            notify(NOTICE_RECORDS.format(n=told))
+        return (f"so every project member, lead and hub wearing qmcp-anon was blocked, none "
+                f"killed: {', '.join(names)}"
+                + (f" (NOT blocked: {', '.join(failed)})" if failed else "") + not_judged
+                + "; qmcp project unblock clears each project, and p00 the hub, once the "
+                  "records read")
 
 
 def unblock(app, records: dict, key: str, policy_loader=None, lock_path: str | None = None) -> list:

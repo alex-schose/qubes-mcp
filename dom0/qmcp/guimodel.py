@@ -1406,9 +1406,12 @@ def details(node: Node, project_rows=None, fleet_rows=None, gate=None, hub=None,
     return []
 
 
-def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=None) -> set:
+def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=None,
+            hub=None) -> set:
     """The buttons that make sense for a selection. The command decides; a
-    button left on is refused with the command's own reason. The lead's
+    button left on is refused with the command's own reason. Reject restored
+    is never offered for `hub`, the hub's name, which the command refuses
+    (nor while the hub is not known, as it refuses then too). The lead's
     firewall buttons come from `firewall_pane`, the selected project's last
     firewall read, and only while it is that project's and read; Set lead
     model unless `model_refusal` finds why the command refuses it."""
@@ -1438,7 +1441,9 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         # The command takes one not held yet too: it labels it, and the
         # hold, had it come, has nothing left to do.
         if attention in ("held", "unheld"):
-            out |= {"accept_restored", "reject_restored"}
+            out.add("accept_restored")
+            if hub is not None and node.data.get("name") != hub:
+                out.add("reject_restored")
         # Seal shows whenever a badge is on, on any row: a drop box or a qube
         # under Needs attention included. It only takes authority away, and
         # it is how the operator takes a badge off without waiting for the pass.
@@ -3391,6 +3396,23 @@ def stopped_qube(row) -> bool:
     gate's stop is cleared."""
     tags = row.get("badges") if isinstance(row, dict) else None
     return isinstance(tags, list) and bool({projects.BLOCKED, projects.STOPPED} & set(tags))
+
+
+def shut_down_first(row, where: str) -> str | None:
+    """The command's refusal of a qube that is not shut down, before OK: one
+    that changes slot (other than between p00 and no slot) or is promoted to
+    a lead goes there only halted, and is never killed for it
+    (`fleet._halted_refusal`). A power state the list could not read refuses
+    too, as the command does."""
+    name, power = row.get("name"), row.get("power")
+    if power == "Halted":
+        return None
+    now = ("its power state could not be read" if power in POWER_UNREAD or not power
+           else f"it is {power}")
+    how = (f"qvm-unpause {name}, then qvm-shutdown {name}" if power == "Paused"
+           else f"qvm-shutdown {name}")
+    return (f"{name} goes {where} only when shut down, and {now}: shut it down first "
+            f"({how}), then try again")
 
 
 def move_warnings(records: dict, current, target_slot) -> list:

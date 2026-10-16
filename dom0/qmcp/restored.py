@@ -461,6 +461,19 @@ def reject(app, name: str) -> str:
 
 def _reject(app, name: str) -> str:
     from qmcp import fleet
+    # The hub is the hub by its file, not by a badge: a reject would take the
+    # gate's stop off it and leave it a caller. Refused, as every role command
+    # refuses it, and while the file does not read, since it may be the hub.
+    hub = core.read_hub()
+    if hub is None:
+        raise ReviewError(f"{core.HUB_PATH} cannot be read, so '{name}' may be the hub, which a "
+                          f"reject would free from the gate's stop; nothing was changed")
+    if name == hub:
+        raise ReviewError(f"'{name}' is the hub, which is the hub by its file and not by a badge: "
+                          f"a reject would take the gate's stop off it and leave it a caller. "
+                          f"Accept it (qmcp restored accept {name}: the hold lifts, any stop "
+                          f"stays); the hub changes only through uninstall.sh --purge and a "
+                          f"fresh install")
     vm, tags = _subject(app, name)
     strip = {t for t in tags if t != HOLD and
              (t in (core.UMBRELLA, core.GUARDED, projects.DROP_BOX) or t.startswith("qmcp-"))}

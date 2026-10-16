@@ -29,6 +29,7 @@ import re
 import sys
 import time
 
+from qmcp import audit as audit_mod
 from qmcp import birth, budget, core, gateways, inqube, projects, proposals, restored, scope
 from qmcp.core import refuse
 
@@ -1297,12 +1298,24 @@ SERVICES = {
 }
 
 
+#: Fixed vocabulary: says only that dom0's audit log is out of room.
+NO_AUDIT_ROOM = "refused: dom0's audit log has no room"
+
+
 def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> int:
     call = core.Call(service)
     entry = SERVICES.get(service)
     if entry is None:
         return core.emit(call, {"ok": False, "error": "unknown service"}, audit=False, out=out)
     handler, state_changing = entry
+    # Audited only once the caller is a principal and the log has room: a
+    # refusal before that (no call slot, no principal, no room) changes
+    # nothing, and auditing it would let anything that can make the call fill
+    # the log. A principal's refused calls are still audited, so a principal
+    # can still fill it down to the floor, and below it only with kills dom0
+    # accepted: slowly, since each needs a running qube, and a command the
+    # rulebook lets it run in a halted one starts it again.
+    audited, only_done = False, False
     try:
         call.caller = core.caller(environ)
         # Concurrency first, before any qubesd work: the hub has its own slots,
@@ -1319,6 +1332,21 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         req = core.read_request(sys.stdin if stdin is None else stdin)
         app = (app_factory or _local_app)()
         call.principal = core.principal(app, call.caller, hub)
+        if state_changing:
+            # Nothing changes without its line: below the floor, refused first.
+            # A kill only takes away, so it goes on. Not a shut-down request:
+            # dom0 accepts one again while the qube is still stopping, so it
+            # could be repeated without end; a kill of a halted qube is refused.
+            lowers = (service == "qmcp.LifecycleAIManaged" and isinstance(req, dict)
+                      and req.get("action") == "kill")
+            if not audit_mod.room():
+                if not lowers:
+                    raise core.Refusal({"ok": False, "error": NO_AUDIT_ROOM})
+                # Below the floor only a kill dom0 accepted is logged: a
+                # refused one changes nothing, and logging it would let a
+                # principal fill the disk past the floor.
+                only_done = True
+            audited = True
         payload = handler(app, call, req)
     except core.Refusal as r:
         payload = r.payload
@@ -1333,7 +1361,8 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         call.error_class = type(e).__name__
         print(f"{service}: unhandled {type(e).__name__}", file=sys.stderr)
         payload = {"ok": False, "error": "internal error"}
-    rc = core.emit(call, payload, audit=state_changing, out=out)
+    rc = core.emit(call, payload, audit=audited and (bool(payload.get("ok")) or not only_done),
+                   out=out)
     for fd in call.fds:
         try:
             os.close(fd)

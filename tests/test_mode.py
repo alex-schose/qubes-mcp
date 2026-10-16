@@ -471,6 +471,27 @@ class AuditFindings(ModeBase):
         self.assertIn("ai-hub-mq", v.names)                  # under the hub's check now
         self.assertEqual((v.status, v.problems), (anon.GREEN, []))
 
+    def test_unread_records_leave_nothing_blocked_once_both_unblocks_ran(self):
+        # Anonymous mode with a model qube: the records block stops the hub and
+        # the project's lead and members, never the guarded model qube, so the
+        # two unblocks leave nothing blocked.
+        a = self.app
+        p = self.anonymous_project()
+        a.vm("ai-hub-mq", template=a.domains["ai-tpl-g"], netvm=None, tags={"ai-managed"})
+        fleet.set_lead_firewall(a, p.slot, model_qube="ai-hub-mq")
+        good = pathlib.Path(projects.PROJECTS_PATH).read_text()
+        pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
+        with self.assertRaises(projects.ProjectsUnreadable):
+            anon.run(a, retry_wait=0)
+        self.assertIn(BLOCKED, self.tags(HUB))
+        self.assertIn(BLOCKED, self.tags(p.lead))
+        self.assertNotIn(BLOCKED, self.tags("ai-hub-mq"))
+        pathlib.Path(projects.PROJECTS_PATH).write_text(good)
+        records = projects.load()
+        anon.unblock(a, records, p.slot)
+        anon.unblock(a, records, "p00")
+        self.assertFalse([v.name for v in a.domains if BLOCKED in self.tags(v.name)])
+
     def test_the_services_refuse_a_stopped_hub(self):
         self.app.domains[HUB].tags.add(BLOCKED)
         self.assertEqual(self.call("qmcp.ListAIManagedQubes", {}), core.NOT_AUTHORIZED)
@@ -572,9 +593,11 @@ class Moves(AnonBase):
         self.assertEqual(self.tags(w) & {ANON, HUBBLIND, projects.member_badge(self.p.slot)},
                          set())
         self.assertIn(projects.member_badge("p00"), self.tags(w))
-        # The hidden badge comes off last: no moment is the qube both in p00 and
+        # The move's block goes on first and comes off last, and inside it the
+        # hidden badge comes off last: no moment is the qube both in p00 and
         # open to the hub while still its old project's member.
-        self.assertEqual(order[-1], ("-", HUBBLIND))
+        self.assertEqual((order[0], order[-1]), (("+", projects.BLOCKED), ("-", projects.BLOCKED)))
+        self.assertEqual(order[-2], ("-", HUBBLIND))
         self.assertLess(order.index(("-", projects.member_badge(self.p.slot))),
                         order.index(("+", projects.member_badge("p00"))))
 

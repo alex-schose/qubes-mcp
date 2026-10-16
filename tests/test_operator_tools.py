@@ -653,6 +653,72 @@ class Hold(ToolsBase):
         fleet.set_lead(self.app, "osint", "promote", "ai-hubr", lead_netvm="none", keep_old=True)
         self.assertIn("ai-tpl-back", projects.find(projects.load(), "osint").templates)
 
+    def test_a_lead_from_a_clone_or_promotion_refuses_a_template_waiting_for_review(self):
+        # Not held yet (the gate's next pass would hold it): built on now, the
+        # lead would escape that review.
+        tpl = self.app.vm("ai-tpl-back", klass="TemplateVM", tags={"ai-managed"},
+                          features={core.ID_FEATURE: "other"})
+        self.app.vm("ai-hubr", template=tpl, netvm=None, tags={"ai-managed", "qmcp-proj-p00"})
+        before = pathlib.Path(projects.PROJECTS_PATH).read_text()
+        for source, name in (("clone", "ai-osint-lead2"), ("promote", None)):
+            with self.assertRaises(fleet.ProjectError, msg=source) as cm:
+                fleet.set_lead(self.app, "osint", source, "ai-hubr", lead_netvm="none",
+                               keep_old=True, lead_name=name)
+            self.assertIn(fleet.WAITS_WHY, str(cm.exception))
+        self.assertEqual(pathlib.Path(projects.PROJECTS_PATH).read_text(), before)
+        self.assertNotIn("ai-osint-lead2", self.app.domains)
+
+    def test_a_clone_reads_its_template_again_under_the_locks(self):
+        # Held after the plan read it (here: while the old lead was demoted):
+        # the clone is refused before it is made.
+        tpl = self.app.vm("ai-tpl-c", klass="TemplateVM", tags={"ai-managed"})
+        self.app.vm("ai-hubr", template=tpl, netvm=None, tags={"ai-managed", "qmcp-proj-p00"})
+        real = fleet._demote_lead
+
+        def demote(*a, **kw):
+            out = real(*a, **kw)
+            tpl.tags.add(core.QUARANTINE)
+            return out
+        with mock.patch.object(fleet, "_demote_lead", demote):
+            with self.assertRaises(fleet.ProjectError) as cm:
+                fleet.set_lead(self.app, "osint", "clone", "ai-hubr", lead_netvm="none",
+                               keep_old=True, lead_name="ai-osint-lead2")
+        self.assertIn(fleet.HELD_WHY, str(cm.exception))
+        self.assertNotIn("ai-osint-lead2", self.app.domains)
+
+    def test_a_promotion_reads_its_template_again_under_the_locks(self):
+        tpl = self.app.vm("ai-tpl-c", klass="TemplateVM", tags={"ai-managed"})
+        self.app.vm("ai-hubr", template=tpl, netvm=None, tags={"ai-managed", "qmcp-proj-p00"})
+        real = fleet._demote_lead
+
+        def demote(*a, **kw):
+            out = real(*a, **kw)
+            tpl.tags.add(core.QUARANTINE)
+            return out
+        with mock.patch.object(fleet, "_demote_lead", demote):
+            with self.assertRaises(fleet.ProjectError) as cm:
+                fleet.set_lead(self.app, "osint", "promote", "ai-hubr", lead_netvm="none",
+                               keep_old=True)
+        self.assertIn(fleet.HELD_WHY, str(cm.exception))
+        self.assertEqual(self.app.domains["ai-hubr"].tags.raw() & {"qmcp-lead"}, set())
+
+    def test_a_dump_sink_refuses_a_default_template_waiting_for_review(self):
+        tpl = self.app.vm("ai-tpl-d", klass="TemplateVM", tags={"ai-managed"},
+                          features={core.ID_FEATURE: "other"})
+        self.app.default_template = tpl
+        with self.assertRaises(fleet.ProjectError) as cm:
+            fleet.add_dump(self.app, "p00")
+        self.assertIn(fleet.WAITS_WHY, str(cm.exception))
+        self.assertNotIn("hub-dump", self.app.domains)
+        restored.hold(self.app)
+        with self.assertRaises(fleet.ProjectError) as cm:
+            fleet.add_dump(self.app, "p00")
+        self.assertIn(fleet.HELD_WHY, str(cm.exception))
+        # Teeth: an accepted template takes the sink.
+        restored.accept(self.app, "ai-tpl-d")
+        fleet.add_dump(self.app, "p00")
+        self.assertIn("hub-dump", self.app.domains)
+
     def test_no_badge_goes_on_a_badged_qube_with_no_label_before_the_gate_holds_it(self):
         vm = self.app.vm("ai-nolabel", netvm=None, tags={"ai-managed", "qmcp-proj-p00"},
                          labelled=False)
@@ -769,6 +835,30 @@ class Review(ToolsBase):
         self.assertEqual(check(), [("pass", "restored qubes", "none waiting for review")])
         self.app.fail.add("feature.get:ai-osint-w1")
         self.assertEqual([f[0] for f in check()], ["error"])
+
+    def test_reject_refuses_the_hub_and_its_stop_stays(self):
+        # The hub is the hub by its file: a reject would strip the gate's stop
+        # and leave it a caller. Accept keeps the stop.
+        hub = self.app.domains[HUB]
+        for t in ("qmcp-anon", "qmcp-blocked", "qmcp-stopped", core.QUARANTINE):
+            hub.tags.add(t)
+        hub.features[core.ID_FEATURE] = "old"
+        before = set(hub.tags.raw())
+        with self.assertRaisesRegex(restored.ReviewError, "is the hub"):
+            restored.reject(self.app, HUB)
+        self.assertEqual(set(hub.tags.raw()), before)
+        self.assertEqual(self.call("qmcp.ListAIManagedQubes", {}), core.NOT_AUTHORIZED)
+        rc, _, err = self.cli("restored", "reject", HUB)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("qmcp restored accept", err)
+
+    def test_reject_refuses_while_the_hub_file_does_not_read(self):
+        self.back("ai-a", {"qmcp-proj-p00"})
+        restored.hold(self.app)
+        os.unlink(core.HUB_PATH)
+        with self.assertRaisesRegex(restored.ReviewError, "may be the hub"):
+            restored.reject(self.app, "ai-a")
+        self.assertIn(core.QUARANTINE, self.app.domains["ai-a"].tags.raw())
 
     def test_accept_and_reject_refuse_a_qube_not_waiting(self):
         for name in ("ai-osint-w1", "personal"):

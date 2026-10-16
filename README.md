@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.30 — the audit round's medium fixes, first half.** Besides the hub, up to 15
+**Status: 0.9.31 — the audit round's medium fixes, second half.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -218,7 +218,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.30.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.31.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -249,7 +249,18 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.29? Install over it. Nothing in AI space reaches a hidden
+Coming from 0.9.30? Install over it. A qube that changes slot (but between
+p00 and no slot), or becomes a lead, does so only once it is shut down (nothing
+is killed), and such a move waits 10 s under `qmcp-blocked` to be sure it
+stays so; a hub proposal
+cannot manage a template your own qubes, or guarded ones, run on; dom0's
+services refuse every change but a kill while less than 64 MiB is free
+under `/var/log`, and `qmcp check` fails
+on audit lines that could not be written; `qmcp restored reject` refuses the
+hub; `qubes_run_disposable` says ok only once its disposable reads back
+halted or gone. The CHANGELOG's 0.9.31 entry has the whole list. To roll back, run this
+release's `uninstall.sh` before 0.9.30's installer.
+Coming from 0.9.29? Install over it, then read the 0.9.30 note. Nothing in AI space reaches a hidden
 project's qubes from outside it any more, not even through a dialog (a hidden
 lead's dialog copy into its own sink goes with it); `qmcp seal` takes an open
 badge off a drop box or the hub, and a seal whose kill fails is tried again

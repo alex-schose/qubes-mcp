@@ -3068,7 +3068,8 @@ class RestoredModel(GuiBase):
         # Never shown as the worker of p01 its badge names: the rulebook acts on it nowhere.
         osint = next(n for n in gm.walk(tree) if n.key == "project:p01")
         self.assertNotIn("qube:ai-back", {c.key for c in osint.children})
-        self.assertEqual(gm.actions(node, {}) - ALWAYS, {"accept_restored", "reject_restored"})
+        self.assertEqual(gm.actions(node, {}, hub=HUB) - ALWAYS,
+                         {"accept_restored", "reject_restored"})
         shown = dict(gm.details(node, restored=self.restored()))
         self.assertTrue(shown["Why"].startswith("held for your review"))
         self.assertTrue(shown["Held for review"].startswith("yes: the rulebook refuses"))
@@ -3086,6 +3087,15 @@ class RestoredModel(GuiBase):
                 self.assertFalse(shown & ({"Restore review", gm.RESTORED_UNREAD[1]}
                                           | {h for _, h in gm.RESTORED_FIELDS}), key)
 
+    def test_reject_restored_is_never_offered_for_the_hub(self):
+        # The command refuses it (the hub is the hub by its file, and a reject
+        # would take the gate's stop off it), and refuses while the hub is not known.
+        node = gm.Node("qube:ai-back", "qube", [], {"name": "ai-back", "attention": "held"})
+        self.assertEqual(gm.actions(node, {}, hub="ai-back") - ALWAYS, {"accept_restored"})
+        self.assertEqual(gm.actions(node, {}) - ALWAYS, {"accept_restored"})
+        self.assertEqual(gm.actions(node, {}, hub=HUB) - ALWAYS,
+                         {"accept_restored", "reject_restored"})
+
     def test_a_qube_not_held_yet_is_under_needs_attention_as_the_check_fails(self):
         before = self.failing()
         self.came_back("ai-copy", tags=("ai-managed", "qmcp-guarded"), hold=False,
@@ -3094,7 +3104,8 @@ class RestoredModel(GuiBase):
         self.assertIn("ai-copy", new, "check must fail on it first")
         [node] = self.placed("ai-copy")
         self.assertEqual(node.data["attention"], "unheld")
-        self.assertEqual(gm.actions(node, {}) - ALWAYS, {"accept_restored", "reject_restored"})
+        self.assertEqual(gm.actions(node, {}, hub=HUB) - ALWAYS,
+                         {"accept_restored", "reject_restored"})
         shown = dict(gm.details(node, restored=self.restored()))
         self.assertTrue(shown["Held for review"].startswith("NOT YET"))
         self.assertTrue(shown["Its qmcp-id label"].startswith("another qube's UUID"))
@@ -4070,6 +4081,8 @@ class Widgets(GuiBase):
         self.assertEqual(self.reports[-1][0], "t")
 
     def test_a_refused_change_is_reported_with_the_commands_reason(self):
+        self.app.domains["ai-work"].shutdown()                  # else the form refuses first
+        self.win.refresh()
         self.select("qube:ai-work")                              # on ai-net-router
         form = self.win.act("move")
         form.target.set_active_id("other")                      # other's only network is none
@@ -4502,6 +4515,38 @@ class Widgets(GuiBase):
         self.assertNotIn("refuse", form.netinfo.get_text())
         form.target.set_active_id("p00")
         self.assertIn("take any network", form.netinfo.get_text())
+
+    def test_the_move_form_refuses_a_running_qube_before_ok(self):
+        # The command moves a qube across slots only shut down and never kills
+        # it; the form says so before OK. Between p00 and no slot it moves.
+        self.select("qube:ai-work")                              # running, in no slot
+        form = self.win.act("move")
+        form.target.set_active_id("osint")
+        form.update()
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("only when shut down, and it is Running", form.error.get_text())
+        self.assertIn("qvm-shutdown ai-work", form.error.get_text())
+        form.target.set_active_id("p00")
+        form.update()
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        form.destroy()
+        self.app.domains["ai-work"].shutdown()
+        self.win.refresh()
+        self.select("qube:ai-work")
+        form = self.win.act("move")
+        form.target.set_active_id("osint")
+        form.update()
+        self.assertNotIn("shut down", form.error.get_text())
+
+    def test_a_lead_form_refuses_to_promote_a_running_qube_before_ok(self):
+        self.select("project:p01")
+        form = self.win.act("change_lead")
+        form.old_lead.set_active_id("remove")
+        form.source["promote"].set_active(True)
+        form.origin.set_active_id("ai-work")                    # running
+        form.update()
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("into a lead's place only when shut down", form.error.get_text())
 
     def test_revoke_says_it_leaves_ai_space(self):
         self.select("qube:ai-work")
