@@ -26,6 +26,77 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.32] — 2026-10-17
+
+**The audit round's window findings, and limits on what one principal can put on the audit log.** A window
+that came back on from the view taken before a change; a failed read that
+turned off the commands that only take authority away; a delete that removed
+qubes its plan never named; Manage described as a maintenance window where it
+stops an anonymous project; a window closed mid-change that left a completed
+change recorded as failed; the window killing its own gate run part-way;
+and one compromised principal filling dom0's audit log until every lead's
+changes were refused. The
+low findings and the docs follow in 0.9.33.
+
+### Changed
+
+- **BREAKING:** `qmcp project delete` keeps a qube wearing the slot's member
+  badge that is also a member of another slot, or is a template, a disposable
+  template, a gateway, a model qube, a guarded qube, a dump sink or the hub:
+  it loses only the slot's badges, with a record or without. One whose tags or class do not read is left as it is, and the slot
+  stays in use until a run reads it. Without `--yes` the plan names the qubes
+  the delete removes, keeps and strips, with or without a record; before, a
+  slot with no record printed a fixed sentence, and every delete removed every
+  qube in AI space wearing the member badge but a lead. A hub's
+  `project-delete` proposal shows that plan in its second tick (not for a
+  hidden project, whose delete the hub cannot name).
+- The dom0 services log a principal's calls that changed nothing (refused,
+  failed, or a feature, or a property set explicitly, set to the value it
+  already has, which still answers ok) up to 60 in each clock hour (UTC) for each caller, and count the rest in
+  `/run/qmcp/calls/<caller>.refused`; `qmcp check` warns ("calls not
+  logged") until the operator removes the counter or a reboot clears it. A
+  failed create that made a qube, or may have, is always logged.
+  Before, a compromised hub could fill `/var/log` to the free-space floor
+  with refused calls and stop every lead's changes.
+- **BREAKING:** each principal may put about 20,000 lines a day (UTC) on
+  the audit log for calls that changed something; past that its
+  state-changing calls, but a kill, are refused before they act ("refused:
+  this caller's audit budget for today is spent"), counted in the same file,
+  and `qmcp check` warns ("audit budget spent"). A counter the services
+  cannot keep refuses that principal's changes too ("refused: this caller's
+  audit counter cannot be kept") and fails `qmcp check`. One compromised
+  principal spends only its own share; before, real changes at full rate (a
+  label set back and forth) could fill the disk to the floor and stop every
+  lead. Past the budget a kill still acts, since it only takes authority
+  away, but its line falls under the hourly cap: past both limits a kill is
+  counted rather than logged, the one change that can happen without its own
+  line. A
+  malformed `klass` or `label` is refused as such rather than as an internal
+  error.
+- The window keeps Seal, Revoke and Reject restored on after a read fails:
+  they only take authority away, and their commands decide for themselves
+  (Revoke on a qube that left AI space since the view was read still sets its
+  default disposable template to none and, unless told not to, kills it if it
+  runs).
+  Every other change is off from the moment a refresh starts until it reads
+  everything, after a change as well, and a form opened on an older view
+  refuses at OK unless it re-checks what it shows (the three above run on
+  any view). Before, the
+  buttons came back on from the view taken before the change, so a second
+  edit could approve again a template the first had just taken away. The
+  status bar says first what stays on: the failure's own text came first
+  before, and the bar cut the line before it said changes were off.
+- Manage on the model qube of an anonymous project says in red that it stops
+  the project (the gate needs that model qube guarded), and the details pane
+  says so; before, the form called it a maintenance window.
+- The window asks before it closes while a change runs. `qmcp` no longer fails
+  on a report nobody reads any more: a command whose window closed records
+  how it really ended on the audit log, and exits with its own status, where before a long report raised on
+  the closed pipe and the line said the completed change had failed.
+- The window stops waiting for `qmcp gate` and `qmcp check` at 120 s but no
+  longer kills them, since both act; before, a slow run was killed part-way
+  through stopping a project.
+
 ## [0.9.31] — 2026-10-15
 
 **The audit round's medium findings, second half.** A qube moved or promoted

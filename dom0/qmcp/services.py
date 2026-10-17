@@ -446,7 +446,7 @@ def svc_set_property(app, call, req):
         raise refuse("value is required")
     value = req["value"]
     if prop == "label":
-        if value not in LABELS:
+        if not isinstance(value, str) or value not in LABELS:
             raise refuse(f"label must be one of: {sorted(LABELS)}")
     elif prop == "netvm":
         if value is not None:
@@ -454,6 +454,17 @@ def svc_set_property(app, call, req):
     elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         # bool is an int subclass, so `True` must be refused explicitly.
         raise refuse(f"{prop} must be a positive integer")
+    try:
+        # A value still following its default is not the same: the set pins it.
+        same = (not vm.property_is_default(prop)
+                and _name_of(getattr(vm, prop)) == _name_of(value))
+    except Exception:
+        same = False                # not read: the set goes on, as a change
+    if same:
+        # Nothing to change: answered as a set, logged as a call that changed
+        # nothing (capped), so repeating it cannot fill the audit log.
+        call.noop = True
+        return {"ok": True}
     try:
         setattr(vm, prop, value)
     except Exception as e:
@@ -486,6 +497,13 @@ def svc_set_feature(app, call, req):
         text = value
     else:
         raise refuse("value must be a string, integer or boolean (removal is operator-only)")
+    try:
+        same = vm.features.get(feature, None) == text
+    except Exception:
+        same = False                # not read: the set goes on, as a change
+    if same:
+        call.noop = True            # as for a property: capped, answered as a set
+        return {"ok": True, "feature": feature, "value": text}
     try:
         vm.features[feature] = text
     except Exception as e:
@@ -570,7 +588,10 @@ def _create_failed(app, call, name, what, exc) -> core.Refusal:
     CreateInPool itself, which is a copy's create too. Deleting by name here could
     take a qube someone else created under that name in the meantime."""
     call.error_class = type(exc).__name__
-    if _exists(app, name):
+    exists = _exists(app, name)
+    if exists is not False:
+        call.landed = True          # it may be this call's: its line is never withheld
+    if exists:
         return refuse(f"{what} failed; a qube named '{name}' exists and was left alone")
     return refuse(f"{what} failed")
 
@@ -743,9 +764,10 @@ def svc_spawn(app, call, req):
     if err:
         raise refuse(err)
     klasses = SPAWN_KLASSES if who.is_hub() else LEAD_SPAWN_KLASSES
-    if klass not in klasses:
+    # Shape first: a list is unhashable, and `in` on a frozenset would raise.
+    if not isinstance(klass, str) or klass not in klasses:
         raise refuse(f"klass must be one of: {sorted(klasses)}")
-    if label not in LABELS:
+    if not isinstance(label, str) or label not in LABELS:
         raise refuse(f"label must be one of: {sorted(LABELS)}")
     private_size = _private_size(req)
     tpl = _spawn_template(app, template, klass, who)
@@ -789,6 +811,7 @@ def svc_spawn(app, call, req):
             vm = app.add_new_vm(create_klass, name, label, template=template)
     except Exception as e:
         raise _create_failed(app, call, name, "create", e)
+    call.landed = True
     step = "copy"
     try:
         if klass == "StandaloneVM":
@@ -972,6 +995,7 @@ def svc_clone(app, call, req):
         vm = birth.create_copy(app, src, name, core.klass_of(src), _name_of(src.label))
     except Exception as e:
         raise _create_failed(app, call, name, "clone", e)
+    call.landed = True
     # Filled before it is in AI space: the stamp is its first badge of ours.
     step = "copy"
     try:
@@ -1061,7 +1085,11 @@ def svc_spawn_disposable(app, call, req):
         disp = app.qubesd_call(dvmt.name, "admin.vm.CreateDisposable").decode(errors="replace").strip()
     except Exception as e:
         call.error_class = type(e).__name__
+        # Whether qubesd made one before it raised cannot be read without its
+        # name: its line is never withheld.
+        call.landed = True
         raise refuse("disposable creation failed") from None
+    call.landed = True
     if not core.valid_qube_name(disp):
         raise refuse("disposable creation failed")
     call.summary["name"] = disp
@@ -1300,6 +1328,10 @@ SERVICES = {
 
 #: Fixed vocabulary: says only that dom0's audit log is out of room.
 NO_AUDIT_ROOM = "refused: dom0's audit log has no room"
+#: Fixed vocabulary: this caller has put its day's share of lines on the log.
+NO_AUDIT_BUDGET = "refused: this caller's audit budget for today is spent"
+#: Fixed vocabulary: the caller's audit counter cannot be kept (qmcp check fails).
+NO_AUDIT_COUNTER = "refused: this caller's audit counter cannot be kept"
 
 
 def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> int:
@@ -1311,11 +1343,17 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
     # Audited only once the caller is a principal and the log has room: a
     # refusal before that (no call slot, no principal, no room) changes
     # nothing, and auditing it would let anything that can make the call fill
-    # the log. A principal's refused calls are still audited, so a principal
-    # can still fill it down to the floor, and below it only with kills dom0
-    # accepted: slowly, since each needs a running qube, and a command the
-    # rulebook lets it run in a halted one starts it again.
-    audited, only_done = False, False
+    # the log. A principal's calls that changed nothing (refused, failed, or a
+    # feature, or a property set explicitly, set to the value already there)
+    # are logged up to
+    # `audit.REFUSALS_PER_HOUR` in each clock hour and counted past it. A
+    # failed create that made a qube, or may have (`call.landed`), is always
+    # logged. A call that changed something spends the caller's day's share
+    # (`audit.AUDIT_LINES_PER_DAY`), refused before it acts once spent; a kill
+    # acts past it, its line then under the hourly cap. So a principal adds
+    # at most its budget and its hourly cap a day, kills included.
+    audited, only_done, over, kill_capped = False, False, False, False
+    counter = None
     try:
         call.caller = core.caller(environ)
         # Concurrency first, before any qubesd work: the hub has its own slots,
@@ -1339,6 +1377,20 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
             # could be repeated without end; a kill of a halted qube is refused.
             lowers = (service == "qmcp.LifecycleAIManaged" and isinstance(req, dict)
                       and req.get("action") == "kill")
+            counter = os.path.join(core.RUN_DIR, "calls",
+                                   f"{call.caller}{audit_mod.REFUSED_SUFFIX}")
+            # A day's share of the log per caller: past it, refused before it
+            # acts, and counted rather than logged, so one principal cannot
+            # spend the others' room. A kill goes on.
+            # A kill acts past the budget too, since it only takes away; but
+            # its line then falls under the hourly cap, so start-and-kill
+            # cycles cannot bring the shared floor nearer for everyone.
+            kill_capped = lowers and audit_mod.budget_spent(counter)
+            left = True if lowers else audit_mod.budget_left(counter)
+            if not left:
+                over = True
+                raise core.Refusal({"ok": False, "error": NO_AUDIT_BUDGET if left is False
+                                    else NO_AUDIT_COUNTER})
             if not audit_mod.room():
                 if not lowers:
                     raise core.Refusal({"ok": False, "error": NO_AUDIT_ROOM})
@@ -1361,8 +1413,19 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         call.error_class = type(e).__name__
         print(f"{service}: unhandled {type(e).__name__}", file=sys.stderr)
         payload = {"ok": False, "error": "internal error"}
-    rc = core.emit(call, payload, audit=audited and (bool(payload.get("ok")) or not only_done),
-                   out=out)
+    ok = bool(payload.get("ok"))
+    log = audited and (ok or not only_done) and not over
+    changed = ok and not call.noop or call.landed
+    if log and (not changed or kill_capped) and call.caller is not None:
+        # A call that changed nothing (failed without creating a qube, or a
+        # set to the value already there): capped per caller. A shut-down
+        # request dom0 accepted is logged every time, repeated or not. A qubesd
+        # call that raised after its change landed is, past the cap, only
+        # counted (per caller, on tmpfs): qmcp check names the caller.
+        log = audit_mod.take_refusal(counter)
+    elif log and counter is not None:
+        audit_mod.spend(counter)        # a line of a change: against the day's budget
+    rc = core.emit(call, payload, audit=log, out=out)
     for fd in call.fds:
         try:
             os.close(fd)

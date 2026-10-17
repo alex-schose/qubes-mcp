@@ -167,6 +167,10 @@ READS = {
 }
 #: The reads a refresh runs before the others start.
 FIRST_READS = ("gate",)
+#: The reads that act as well (the gate's badges and kills; `check` runs the
+#: gate): the window stops waiting for one at its timeout but never kills it,
+#: so a stop is never cut off half-way and the run ends as the timer's would.
+ACTING_READS = frozenset({"gate", "check"})
 AUDIT_VERIFY = read_cmd("audit", "verify")
 
 
@@ -1361,7 +1365,14 @@ def model_notes(row, project_rows=None) -> list:
                           f"{projects.MODEL_PORT}"))]
     if len(slots) > 1:
         out.append(("Shared", esc(fleet.SHARED_MODEL_WARNING)))
+    anon = sorted(s for s in slots if any(isinstance(p, dict) and p.get("slot") == s
+                                          and p.get("anonymous") for p in project_rows or ()))
     out.append(("Maintenance", esc(
+        (f"guarded, as the anonymity gate requires for {_and(anon)}: Manage... stops "
+         f"{'that project' if len(anon) == 1 else 'those projects'} (the gate blocks and kills "
+         f"the lead and members) until you guard it again and unblock "
+         f"{'it' if len(anon) == 1 else 'each'}")
+        if b["guarded"] and anon else
         "guarded: the hub cannot operate it. Manage... opens it to the hub while it needs changes, "
         "and qmcp check warns until Guard... closes it again" if b["guarded"] else
         "not guarded: the hub may operate it (run commands in it as root, change it) until you "
@@ -1404,6 +1415,15 @@ def details(node: Node, project_rows=None, fleet_rows=None, gate=None, hub=None,
     if node.kind == "hub":
         return [("Hub", esc(node.data.get("name")))]
     return []
+
+
+#: The selection's changes that only take authority away, and whose command
+#: decides everything itself: on while a refresh runs or after one failed.
+#: (Revoke on a qube that left AI space since the view was read still sets
+#: its default disposable template to none and kills it if it runs.)
+#: Not Guard: on a qube outside AI space (one revoked since the view was
+#: read) `qmcp guard` adds it to AI space, guarded, where the hub lists it.
+LOWERING = frozenset({"seal", "revoke", "reject_restored"})
 
 
 def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=None,
@@ -1526,10 +1546,18 @@ def seal_intro(row) -> str:
             f"start.")
 
 
-def role_intro(action, row) -> str:
+def _anonymous_served(row, records) -> list:
+    """The anonymous projects a model qube serves, as `records` has them."""
+    return sorted(s for s in badges(row)["model"]
+                  if isinstance((records or {}).get(s), dict) and records[s].get("anonymous"))
+
+
+def role_intro(action, row, records=None) -> str:
     """What Manage or Guard does to a qube, for the form that confirms it. A
     model qube's says what it means for the leads it serves: managed is the
-    operator's maintenance window, during which the hub may operate it."""
+    operator's maintenance window, during which the hub may operate it. For an
+    anonymous project there is none: its gate requires the model qube guarded,
+    so managing it stops the project (`manage_red`)."""
     name = row.get("name")
     becomes, what = (("managed", "the hub may run commands in it as root and change it")
                      if action == "manage" else
@@ -1540,7 +1568,23 @@ def role_intro(action, row) -> str:
     kind = row.get("klass") in ("AppVM", "StandaloneVM") and row.get("dvmt") is False \
         and row.get("gateway") is False
     serves = sorted(badges(row)["model"]) if kind else []
-    if serves and action == "manage":
+    anon = _anonymous_served(row, records) if kind else []
+    if anon and action == "manage":
+        plain = [s for s in serves if s not in anon]
+        text += (f" It stays the model qube of {_and(serves)}, but {_and(anon)} "
+                 f"{'is' if len(anon) == 1 else 'are'} anonymous, and the anonymity gate needs "
+                 f"the model qube of an anonymous project guarded: when this command ends, or "
+                 f"at the gate's next pass within about 15 s, the gate stops "
+                 f"{'it' if len(anon) == 1 else 'them'} (see in red), and qmcp check fails "
+                 f"until you guard it again, then unblock {'it' if len(anon) == 1 else 'each'} "
+                 f"and start its qubes."
+                 + (f" The leads of {_and(plain)} still reach it on port {projects.MODEL_PORT}."
+                    if plain else ""))
+        if projects.HUBBLIND in set(row.get("badges") or ()):
+            text += " It is hidden from the hub, so the hub cannot operate it, managed or not."
+        else:
+            text += " Until you guard it again the hub may operate it, as any managed qube."
+    elif serves and action == "manage":
         text += (f" It stays the model qube of {_and(serves)}, and their leads still reach it on "
                  f"port {projects.MODEL_PORT}: this opens its maintenance window, and qmcp check "
                  f"warns until you guard it again.")
@@ -1551,6 +1595,20 @@ def role_intro(action, row) -> str:
                  f"StandaloneVM), and whatever is set to start from there runs at its next "
                  f"start.")
     return text
+
+
+def manage_red(row, records) -> str | None:
+    """What Manage on a model qube of an anonymous project does to that project,
+    in red: the gate stops it. None for any other qube."""
+    if not (row.get("klass") in ("AppVM", "StandaloneVM") and row.get("dvmt") is False
+            and row.get("gateway") is False):
+        return None
+    anon = _anonymous_served(row, records)
+    if not anon:
+        return None
+    return (f"This stops {_and(anon)}: the anonymity gate blocks and kills {'its' if len(anon) == 1 else 'their'} lead "
+            f"and members and turns their autostart off, and the leads lose the model qube. Work "
+            f"they have part-finished is interrupted.")
 
 
 def revoke_note(row) -> str:

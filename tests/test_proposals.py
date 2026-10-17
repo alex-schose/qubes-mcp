@@ -570,8 +570,9 @@ class SecondTick(PBase):
         self.assertIn("cannot be read", self.reasons(create())[0])
 
     def test_removals(self):
-        self.assertIn("deletes the project osint",
-                      self.reasons({"type": "project-delete", "title": "t", "project": "osint"})[0])
+        why = self.reasons({"type": "project-delete", "title": "t", "project": "osint"})[0]
+        self.assertIn("deletes the project osint", why)
+        self.assertIn("(ai-osint-w1, ai-osint-w2)", why)          # the command's plan, by name
         remove = {"type": "project-lead", "title": "t", "project": "osint", "remove": True}
         self.assertEqual(self.reasons(remove), [f"removes the lead {LEAD} with everything in it"])
         change = {"type": "project-lead", "title": "t", "project": "osint", "keep_old": False,

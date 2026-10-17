@@ -50,6 +50,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import time
@@ -176,12 +177,14 @@ class CliRunner:
         self.app, self.hold = app, hold
         self.calls: list = []
         self.timeouts: list = []
+        self.kills: list = []
         self.held: list = []
         self.fail: set = set()          # argv tuples to answer as a failed read
 
-    def run(self, argv, done, timeout=None):
+    def run(self, argv, done, timeout=None, kill=True):
         self.calls.append(list(argv))
         self.timeouts.append(timeout)
+        self.kills.append(kill)
         if tuple(argv) in self.fail:
             done(gm.Result(argv, 1, "", "QubesDaemonCommunicationError"))
             return
@@ -2272,6 +2275,39 @@ class ModelQubes(GuiBase):
         self.assertEqual(gm.revoke_note(self.node("qube:ai-work").data), "")
         self.assertIn("their leads no longer reach it", gm.revoke_note(node.data))
 
+    def test_manage_on_an_anonymous_projects_model_qube_says_it_stops_the_project(self):
+        # The gate needs an anonymous project's model qube guarded: Manage is no
+        # maintenance window there, it stops the project, and the form says so
+        # in red, as every destructive action does.
+        p = self.anonymous()
+        model_qube(self.app, MODEL)
+        self.run_ok(gm.set_lead_model_qube(p.label, MODEL))
+        self.run_ok(gm.role("guard", MODEL))
+        self.app.domains[p.lead].start()
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        node = self.node(f"qube:{MODEL}")
+        intro = gm.role_intro("manage", node.data, records)
+        self.assertNotIn("maintenance window", intro)
+        self.assertIn("the gate stops it", intro)
+        red = gm.manage_red(node.data, records)
+        self.assertIn(f"This stops {p.slot}", red)
+        self.assertIn("guarded, as the anonymity gate requires", dict(gm.details(
+            node, self.read_json("project", "list", "--json")))["Maintenance"])
+        # What the red line says is what the command does.
+        self.run_ok(gm.role("manage", MODEL))
+        lead = self.app.domains[p.lead]
+        self.assertIn(projects.BLOCKED, lead.tags)
+        self.assertEqual(lead.get_power_state(), "Halted")
+        # The fixture's project is hidden: the hub cannot operate the qube at all.
+        self.assertIn("qmcp-hubblind", node.data.get("badges"))
+        self.assertIn("the hub cannot operate it, managed or not", intro)
+        self.assertNotIn("the hub may operate it", intro)
+        visible = dict(node.data, badges=[b for b in node.data["badges"] if b != "qmcp-hubblind"])
+        self.assertIn("the hub may operate it, as any managed qube",
+                      gm.role_intro("manage", visible, records))
+        # A project that is not anonymous keeps its window, and no red line.
+        self.assertIsNone(gm.manage_red(node.data, {p.slot: dict(records[p.slot], anonymous=False)}))
+
     def test_a_project_points_to_its_model_qube_wherever_it_is(self):
         serve(self.app)
         ref = lambda: self.node("ref:p01:model").cells[1]  # noqa: E731
@@ -4099,12 +4135,97 @@ class Widgets(GuiBase):
         self.assertNotIn("slot:p01", keys)                      # never "no record" from a failure
         self.assertEqual(self.sensitive(), set())
         self.assertFalse(self.win.rotate_button.get_sensitive())
-        self.assertIn("Changes are off", self.win.status.get_text())
+        # What is off comes first: the bar cuts a long line.
+        self.assertTrue(self.win.status.get_text().startswith(self.gui.STATUS_OFF))
         self.assertFalse(self.win.write("t", gm.audit_rotate()))
+        # What only takes authority away stays on, and runs: its command
+        # decides for itself, and a failed read must not keep a badge on.
+        self.select("qube:ai-osint-w1")
+        self.assertEqual(self.sensitive(), {"revoke"})
+        self.submit(self.win.act("revoke"))
+        self.assertNotIn("ai-managed", self.app.domains["ai-osint-w1"].tags)
+        # Not Guard: on a qube revoked since the view was read it would add it
+        # to AI space again.
+        self.select("qube:ai-gw-unbadged")
+        self.assertEqual(self.sensitive(), set())
         self.runner.fail.clear()
         self.win.refresh()
         self.select("project:p01")
         self.assertIn("delete_project", self.sensitive())
+
+    def test_a_read_that_acts_is_never_killed(self):
+        # The gate badges and kills, and check runs it: cut off at the window's
+        # timeout, a stop would end half-way. Every other read is killed.
+        self.runner.calls.clear(), self.runner.kills.clear()
+        self.win.refresh()
+        kills = {tuple(c): k for c, k in zip(self.runner.calls, self.runner.kills)}
+        for name, argv in gm.READS.items():
+            self.assertEqual(kills[tuple(argv)], name not in ("gate", "check"), name)
+
+    def test_the_runner_answers_an_acting_read_at_its_timeout_and_lets_it_run(self):
+        from gi.repository import GLib
+        marker = self.tmp / "ran-to-its-end"
+        answers, loop = [], GLib.MainLoop()
+        argv = ["sh", "-c", f"sleep 2; touch {marker}"]
+        self.gui.Runner().run(argv, answers.append, timeout=1, kill=False)
+        GLib.timeout_add_seconds(4, loop.quit)
+        loop.run()
+        self.assertEqual([r.rc for r in answers], [124])           # answered once, at 1 s
+        self.assertIn("left to run to its end", answers[0].err)
+        self.assertTrue(marker.exists())                         # and not killed
+        answers.clear()
+        killed = self.tmp / "killed-first"
+        self.gui.Runner().run(["sh", "-c", f"sleep 2; touch {killed}"], answers.append, timeout=1)
+        GLib.timeout_add_seconds(4, loop.quit)
+        loop.run()
+        self.assertEqual([r.rc for r in answers], [128 + 9])
+        self.assertFalse(killed.exists())
+
+    def test_closing_while_a_change_runs_asks_first(self):
+        self.assertFalse(self.win.closing())                    # nothing runs: it closes
+        self.runner.hold = True
+        self.select("qube:ai-gw-unbadged")
+        self.win.act("guard").response(Gtk.ResponseType.OK)
+        self.assertTrue(self.win.busy)
+        self.assertTrue(self.win.closing())                     # kept open until answered
+        labels = [w.get_text() for w in self.win.last_ask.get_content_area().get_children()
+                  if isinstance(w, Gtk.Label)]
+        self.assertEqual(labels, [shlex.join(gm.role("guard", "ai-gw-unbadged")),
+                                  self.gui.CLOSE_NOTE])
+        self.win.last_ask.destroy()
+        self.release_all()
+        self.runner.hold = False
+
+    def test_while_a_refresh_runs_the_old_view_grants_nothing(self):
+        # A view goes stale when its refresh starts: after a change, until the
+        # refresh lands, only what takes authority away is on, and a form
+        # built from the old view runs nothing, then or after.
+        self.select("project:p01")
+        edit = self.win.act("edit_project")
+        self.runner.hold = True
+        self.select("qube:ai-gw-unbadged")
+        self.win.act("guard").response(Gtk.ResponseType.OK)
+        self.runner.release()                                   # the change; its refresh starts
+        self.assertTrue(self.runner.held)
+        self.assertFalse(self.win.fresh)
+        self.select("project:p01")
+        self.assertEqual(self.sensitive(), set())
+        self.select("qube:ai-osint-w1")
+        self.assertEqual(self.sensitive(), {"revoke"})
+        self.select("qube:ai-gw-unbadged")                      # Guard grants on a revoked qube
+        self.assertEqual(self.sensitive(), set())
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        before = writes()
+        edit.response(Gtk.ResponseType.OK)
+        self.assertIn("a refresh is running", edit.error.get_text())
+        self.release_all()
+        self.runner.hold = False
+        self.assertTrue(self.win.fresh)
+        edit.response(Gtk.ResponseType.OK)
+        self.assertIn("read the fleet again since this form opened", edit.error.get_text())
+        self.assertEqual(writes(), before)
+        self.select("project:p01")
+        self.assertIn("edit_project", self.sensitive())
 
     def test_records_never_read_judge_nothing(self):
         runner = CliRunner(self.app)
@@ -4500,7 +4621,8 @@ class Widgets(GuiBase):
         form.destroy()
         self.select("project:p02")
         self.win.act("delete_project")
-        self.assertIn("every member qube are removed", self.win.last_form.warning.get_text())
+        self.assertIn("Every qube this plan says it removes is removed",
+                      self.win.last_form.warning.get_text())
 
     def test_the_move_form_shows_whether_the_network_fits(self):
         # Checklist step 8, 2026-10-02: a qube on another network was refused only
@@ -5023,7 +5145,7 @@ class Widgets(GuiBase):
         self.assertEqual(self.deciding(), set())
         self.assertEqual([r[0] for r in self.rows(self.win.proposal_store)], [str(reply["id"])])
         self.assertEqual(self.win.proposals_tab.get_text(), "Proposals (1)")   # the last good list
-        self.assertIn("Changes are off", self.win.status.get_text())
+        self.assertTrue(self.win.status.get_text().startswith(self.gui.STATUS_OFF))
         self.assertEqual(self.sensitive(), set())
         self.runner.fail.clear()
         self.win.refresh()
@@ -6038,6 +6160,9 @@ class Widgets(GuiBase):
         self.assertIn("did not answer on this refresh", self.win.gate_note.get_text())
         self.assertIn("gate --json failed", self.win.status.get_text())
         self.assertEqual((self.sensitive(), self.gate_on()), (set(), set()))
+        # The gate failing to read (another run held its lock) keeps Revoke on.
+        self.select("qube:ai-osint-w1")
+        self.assertEqual(self.sensitive(), {"revoke"})
         # Never read: never "no anonymous project", and no project's status is guessed.
         runner = CliRunner(self.app)
         runner.fail.add(tuple(gm.READS["gate"]))
@@ -6635,7 +6760,7 @@ class Widgets(GuiBase):
         self.win.refresh()
         self.assertIn("restored", self.win.errors)
         self.select("qube:ai-back")
-        self.assertEqual(self.sensitive(), set())
+        self.assertEqual(self.sensitive(), {"reject_restored"})   # it only takes away
         self.assertEqual(self.grid(self.win.details)["Its badges make it"], "member of p01")
         self.assertEqual((self.checks_on(), self.settings_on()), (set(), set()))
         self.assertIsNone(self.win.act("accept_all_restored"))

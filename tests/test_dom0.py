@@ -253,6 +253,201 @@ class Funnel(Base):
             self.assertEqual(r, {"ok": True})
             self.assertEqual(len(self.audit_lines()), 1)
 
+    def counter(self, caller=HUB):
+        return os.path.join(core.RUN_DIR, "calls", caller + audit.REFUSED_SUFFIX)
+
+    def test_refusals_past_the_hourly_cap_are_counted_not_logged(self):
+        # A compromised principal must not fill the log's disk to the floor
+        # with refusals that change nothing: past the cap they are counted, on
+        # tmpfs, and qmcp check names the caller.
+        bad = {"name": "ai-work", "property": "no-such", "value": 1}
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 3):
+            for _ in range(5):
+                self.assertFalse(self.call("qmcp.SetPropertyAIManaged", bad)["ok"])
+            self.assertEqual(len(self.audit_lines()), 3)
+            found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                     system_info={"domains": {}})}
+            self.assertEqual(found["calls not logged"].status, "warn")
+            self.assertIn(f"{HUB}: 2 call(s) past 3 in a clock hour", found["calls not logged"].detail)
+            # A change is logged whatever the count.
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "memory", "value": 700})
+            self.assertEqual(r, {"ok": True})
+            self.assertEqual(len(self.audit_lines()), 4)
+            self.assertIsNone(audit.dropped())
+
+    def test_a_failed_call_that_created_nothing_is_capped_whatever_raised(self):
+        # The cap keys on what landed, not on whether an exception was behind
+        # the refusal: a malformed field that raises, or a qubesd call dom0
+        # refused, is as cheap to repeat as a plain refusal.
+        key = sorted(services.FEATURE_KEYS)[0]
+        self.app.fail.add("feature.set")
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            r = self.call("qmcp.SetFeatureAIManaged", {"name": "ai-work", "feature": key, "value": "1"})
+            self.assertEqual(r, {"ok": False, "error": "feature.Set failed"})
+            r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x", "template": "ai-debian-13",
+                                                      "klass": []})
+            self.assertFalse(r["ok"])
+        self.assertEqual(self.audit_lines(), [])
+        self.assertEqual(audit.unlogged_refusals(os.path.dirname(self.counter()))[0][:2], (HUB, 2))
+
+    def test_a_set_to_the_value_already_there_is_capped_and_still_answers_ok(self):
+        # A successful call that changes nothing is as cheap to repeat as a
+        # refusal: capped. A real change, and a pin of a default, still log.
+        vm = self.app.domains["ai-work"]
+        vm.label = "gray"
+        vm.__dict__["_defaults"].discard("label")
+        key = sorted(services.FEATURE_KEYS)[0]
+        vm.features[key] = "1"
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            for _ in range(3):
+                self.assertEqual(self.call("qmcp.SetPropertyAIManaged",
+                                           {"name": "ai-work", "property": "label", "value": "gray"}),
+                                 {"ok": True})
+                self.assertTrue(self.call("qmcp.SetFeatureAIManaged",
+                                          {"name": "ai-work", "feature": key, "value": "1"})["ok"])
+            self.assertEqual(self.audit_lines(), [])
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "label", "value": "blue"})
+            self.assertEqual(r, {"ok": True})
+            vm.__dict__["_defaults"].add("memory")
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "memory", "value": vm.memory})
+            self.assertEqual(r, {"ok": True})
+        self.assertEqual([l["args"].get("property") for l in self.audit_lines()], ["label", "memory"])
+        self.assertEqual(audit.unlogged_refusals(os.path.dirname(self.counter()))[0][:2], (HUB, 6))
+
+    def test_an_accepted_shut_down_and_kill_are_logged_past_the_cap(self):
+        # Nothing changes without its line: what dom0 carried out is logged.
+        vm = self.app.domains["ai-work"]
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            vm.start()
+            self.assertEqual(self.call("qmcp.LifecycleAIManaged",
+                                       {"name": "ai-work", "action": "shutdown"}), {"ok": True})
+            vm.start()
+            self.assertEqual(self.call("qmcp.LifecycleAIManaged",
+                                       {"name": "ai-work", "action": "kill"}), {"ok": True})
+        self.assertEqual([l["args"]["action"] for l in self.audit_lines()], ["shutdown", "kill"])
+
+    def test_the_cap_is_per_caller_and_per_hour(self):
+        a, b = self.counter("ai-lead-a"), self.counter("ai-lead-b")
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 2):
+            got = [audit.take_refusal(a, "2026-10-16T10:00:00Z") for _ in range(3)]
+            self.assertEqual(got, [True, True, False])
+            self.assertTrue(audit.take_refusal(b, "2026-10-16T10:00:01Z"))
+            # The next hour logs again; what was withheld stays counted.
+            self.assertTrue(audit.take_refusal(a, "2026-10-16T11:00:00Z"))
+        self.assertEqual(audit.unlogged_refusals(os.path.dirname(a)),
+                         [("ai-lead-a", 1, "2026-10-16T10:00:00Z")])
+
+    def test_a_counter_that_cannot_be_kept_logs_the_line(self):
+        # The cap only withholds a line it has counted.
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            self.assertTrue(audit.take_refusal(str(self.tmp / "no" / "dir" / "x.refused")))
+        # One that does not read: the cap logs the line; the budget, a gate,
+        # refuses; qmcp check names it.
+        p = self.counter()
+        pathlib.Path(p).write_text("not json")
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            self.assertTrue(audit.take_refusal(p))
+        self.assertIsNone(audit.budget_left(p))
+        self.assertEqual(audit.unlogged_refusals(os.path.dirname(p))[0][:2], (HUB, None))
+
+    def test_a_counter_the_services_cannot_keep_fails_check(self):
+        # It refuses that principal's every change (the budget fails closed),
+        # so the check fails on it, by its content, group and mode, whoever runs it.
+        p = pathlib.Path(self.counter())
+        for content, mode in (("{", 0o660), ("{}", 0o600)):
+            p.write_text(content)
+            os.chmod(p, mode)
+            if content == "{":
+                self.assertIsNone(audit.budget_left(str(p)))
+                r = self.call("qmcp.SetPropertyAIManaged",
+                              {"name": "ai-work", "property": "memory", "value": 777})
+                self.assertEqual(r, {"ok": False, "error": services.NO_AUDIT_COUNTER})
+            found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                     system_info={"domains": {}})}
+            self.assertEqual(found["audit counter"].status, "fail", (content, oct(mode)))
+            self.assertIn("every change of that principal but a kill is refused",
+                          found["audit counter"].detail)
+        os.chmod(p, 0o660)
+        found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                 system_info={"domains": {}})}
+        self.assertNotIn("audit counter", found)
+
+    def test_a_caller_past_its_daily_budget_is_refused_and_the_others_go_on(self):
+        # One principal spends only its own share: past it, a change is
+        # refused before it acts and not logged; a kill goes on; another
+        # caller is untouched; check names the caller.
+        vm = self.app.domains["ai-work"]
+        with mock.patch.object(audit, "AUDIT_LINES_PER_DAY", 2):
+            for value in (500, 600):
+                self.assertEqual(self.call("qmcp.SetPropertyAIManaged",
+                                           {"name": "ai-work", "property": "memory", "value": value}),
+                                 {"ok": True})
+            r = self.call("qmcp.SetPropertyAIManaged",
+                          {"name": "ai-work", "property": "memory", "value": 700})
+            self.assertEqual(r, {"ok": False, "error": services.NO_AUDIT_BUDGET})
+            self.assertEqual(vm.memory, 600)
+            self.assertEqual(len(self.audit_lines()), 2)
+            # Past the budget a kill still acts, its line under the hourly cap.
+            with mock.patch.object(audit, "REFUSALS_PER_HOUR", 1):
+                for n in range(3):
+                    vm.start()
+                    self.assertEqual(self.call("qmcp.LifecycleAIManaged",
+                                               {"name": "ai-work", "action": "kill"}), {"ok": True})
+                    self.assertEqual(vm.get_power_state(), "Halted")
+            self.assertEqual(len(self.audit_lines()), 3)            # one kill logged, two counted
+            found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
+                                                     system_info={"domains": {}})}
+            self.assertEqual(found["audit budget spent"].status, "warn")
+            self.assertIn(f"{HUB}: 2 line(s) today", found["audit budget spent"].detail)
+            self.assertIn(f"{HUB}: 2 call(s) past {audit.REFUSALS_PER_HOUR} in a clock hour", found["calls not logged"].detail)
+            self.assertIn("1 change(s) refused", found["audit budget spent"].detail)
+            # The cap's lines do not spend the budget, and another caller has its own.
+            other = self.counter("ai-osint-lead")
+            self.assertTrue(audit.budget_left(other))
+
+    def test_lines_of_calls_that_changed_nothing_do_not_spend_the_budget(self):
+        with mock.patch.object(audit, "AUDIT_LINES_PER_DAY", 1):
+            for _ in range(3):
+                self.assertFalse(self.call("qmcp.SetPropertyAIManaged",
+                                           {"name": "ai-work", "property": "no-such", "value": 1})["ok"])
+            self.assertEqual(self.call("qmcp.SetPropertyAIManaged",
+                                       {"name": "ai-work", "property": "memory", "value": 555}),
+                             {"ok": True})
+        self.assertEqual(len(self.audit_lines()), 4)
+
+    def test_check_reads_a_counter_under_its_lock(self):
+        # A writer truncates before it writes: an unlocked read could catch the
+        # gap and report a counter that does not read.
+        import threading
+        p = self.counter()
+        audit.spend(p)
+        stop, torn = threading.Event(), []
+
+        def writer():
+            while not stop.is_set():
+                audit.spend(p)
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            for _ in range(2000):
+                rec = dict(audit.counters(os.path.dirname(p))).get(HUB)
+                if not rec or "lines" not in rec:       # unreadable, or caught empty
+                    torn.append(rec)
+        finally:
+            stop.set()
+            t.join()
+        self.assertEqual(torn, [])
+
+    def test_the_budget_is_per_utc_day(self):
+        p = self.counter()
+        with mock.patch.object(audit, "AUDIT_LINES_PER_DAY", 1):
+            audit.spend(p, "2026-10-16T23:59:00Z")
+            self.assertFalse(audit.budget_left(p, "2026-10-16T23:59:30Z"))
+            self.assertTrue(audit.budget_left(p, "2026-10-17T00:00:01Z"))
+
     def test_a_log_directory_that_does_not_stat_has_no_room(self):
         self.assertTrue(audit.room())
         self.assertFalse(audit.room(str(self.tmp / "no" / "such" / "dir" / "log")))
@@ -532,6 +727,23 @@ class Creates(Base):
             self.assertFalse(r["ok"], name)
             self.assertIn("ai-hub-", r["error"], name)
         self.assertEqual(self.app.domains.lookups, lookups)
+
+    def test_a_failed_create_that_made_a_qube_is_logged_past_the_cap(self):
+        # It made something in dom0, rolled back or not: never withheld.
+        self.egress("ai-net-router")
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            self.app.fail.add("tag.add")
+            self.assertEqual(self.spawn()["error"], "birth stamp failed (rolled back)")
+            self.app.fail.add("remove")
+            self.assertIn("rollback failed", self.spawn(name="ai-hub-stuck")["error"])
+            self.app.fail.clear()
+            self.app.fail.add("tag.add")
+            r = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"})
+            self.assertEqual(r["error"], "birth stamp failed (rolled back)")
+        lines = self.audit_lines()
+        self.assertEqual([(l["service"], l["ok"]) for l in lines],
+                         [("qmcp.SpawnAIManagedQube", False)] * 2
+                         + [("qmcp.SpawnDisposableAIManaged", False)])
 
     def test_rollback_is_reported_truthfully(self):
         # "rolled back" only when the qube is really gone.

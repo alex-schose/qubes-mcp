@@ -518,6 +518,68 @@ class Operator(ProjectBase):
         self.assertEqual(report[-1], "p01: free")
         self.assertEqual(self.lcall("qmcp.ListAIManagedQubes"), core.NOT_AUTHORIZED)
 
+    def test_finishing_a_delete_names_what_goes_and_keeps_what_is_shared(self):
+        # A slot with no record (a delete that stopped half-way): the plan names
+        # every qube the delete removes, and the delete keeps a member of
+        # another project, a template and a gateway, which only lose p05's badges.
+        a, tpl = self.app, self.app.domains["ai-debian-13"]
+        a.vm("ai-p05-w1", template=tpl, tags={"ai-managed", "qmcp-proj-p05"})
+        a.vm("ai-p05-two", template=tpl, tags={"ai-managed", "qmcp-proj-p05", "qmcp-proj-p02"})
+        a.vm("ai-p05-tpl", klass="TemplateVM", tags={"ai-managed", "qmcp-proj-p05"})
+        a.vm("ai-p05-gw", template=tpl, provides_network=True, tags={"ai-managed", "qmcp-proj-p05"})
+        a.vm("ai-p05-back", template=tpl, tags={"ai-managed", "qmcp-proj-p05", core.QUARANTINE})
+        a.vm("ai-p05-model", template=tpl, tags={"ai-managed", "qmcp-guarded", "qmcp-model-p02",
+                                                 "qmcp-proj-p05"})
+        a.vm("ai-p05-grd", template=tpl, tags={"ai-managed", "qmcp-guarded", "qmcp-proj-p05"})
+        ok, plan = fleet.delete_plan(a, self.records(), "p05")
+        self.assertTrue(ok)
+        self.assertIn("(ai-p05-back, ai-p05-w1)", plan)
+        for name, why in (("ai-p05-two", "also a member of p02"), ("ai-p05-tpl", "a template"),
+                          ("ai-p05-gw", "a gateway"), ("ai-p05-model", "the model qube of p02"),
+                          ("ai-p05-grd", "guarded")):
+            self.assertIn(f"it keeps {name} ({why})", plan)
+        a.vm("ai-p05-old", template=tpl, tags={"ai-managed", "qmcp-lead", "qmcp-lead-p05"})
+        self.app.domains["personal"].tags.add("qmcp-dump-p05")
+        ok, plan = fleet.delete_plan(a, self.records(), "p05")
+        self.assertIn("it strips p05's badges from ai-p05-old, personal, which stay", plan)
+        report = fleet.delete_project(a, "p05")
+        for gone in ("ai-p05-w1", "ai-p05-back"):
+            self.assertNotIn(gone, a.domains, report)
+        self.assertEqual(self.tags("ai-p05-two"), {"ai-managed", "qmcp-proj-p02"})
+        self.assertEqual(self.tags("ai-p05-tpl"), {"ai-managed"})
+        self.assertEqual(self.tags("ai-p05-gw"), {"ai-managed"})
+        self.assertEqual(self.tags("ai-p05-model"), {"ai-managed", "qmcp-guarded", "qmcp-model-p02"})
+        self.assertEqual(self.tags("ai-p05-grd"), {"ai-managed", "qmcp-guarded"})
+        self.assertIn("p05: stripped qmcp-proj-p05 from ai-p05-two (kept: also a member of p02)",
+                      report)
+        for name in ("ai-p05-old", "personal"):                 # what the plan said stays
+            self.assertIn(name, a.domains)
+        self.assertEqual(report[-1], "p05: free")
+
+    def test_a_delete_with_a_record_keeps_a_member_of_another_project(self):
+        self.app.domains["ai-other-w1"].tags.add("qmcp-proj-p01")
+        ok, plan = fleet.delete_plan(self.app, self.records(), "osint")
+        self.assertIn("it keeps ai-other-w1 (also a member of p02)", plan)
+        fleet.delete_project(self.app, "osint")
+        self.assertEqual(self.tags("ai-other-w1"), {"ai-managed", "qmcp-proj-p02"})
+
+    def test_a_member_whose_class_does_not_read_is_left_as_it_is(self):
+        # A remove cannot be undone, and a strip would hide it from the next
+        # run: it keeps its badge, and the slot stays in use until a run reads it.
+        a = self.app
+        a.vm("ai-p05-w1", template=a.domains["ai-debian-13"], tags={"ai-managed", "qmcp-proj-p05"})
+        a.fail.add("get.provides_network:ai-p05-w1")
+        ok, plan = fleet.delete_plan(a, self.records(), "p05")
+        self.assertIn("ai-p05-w1 cannot be read now: a delete leaves it as it is while it cannot "
+                      "be read, and p05 stays in use; once it reads, it is removed or stripped like "
+                      "the rest", plan)
+        report = fleet.delete_project(a, "p05")
+        self.assertIn("p05: NOT reusable until these lose its badges: ai-p05-w1", report[-1])
+        self.assertEqual(self.tags("ai-p05-w1"), {"ai-managed", "qmcp-proj-p05"})
+        a.fail.clear()
+        self.assertEqual(fleet.delete_project(a, "p05")[-1], "p05: free")
+        self.assertNotIn("ai-p05-w1", a.domains)
+
     def test_remove_the_lead(self):
         fleet.remove_lead(self.app, "osint")
         self.assertNotIn(LEAD, self.app.domains)
@@ -1059,6 +1121,42 @@ class EditAndCli(ProjectBase):
         finally:
             cli._app = saved
         return rc, out.getvalue(), err.getvalue()
+
+    def test_a_change_whose_reader_went_away_is_recorded_as_it_ended(self):
+        # The window that ran it closed: every print hits a dead pipe. The
+        # change still lands, the command still exits 0, and its audit line
+        # says ok, not that a print failed.
+        from contextlib import redirect_stderr, redirect_stdout
+        from qmcp import cli
+
+        class Dead(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        saved = cli._app
+        cli._app = lambda: self.app
+        self.addCleanup(setattr, cli, "_app", saved)
+        with redirect_stdout(Dead()), redirect_stderr(Dead()), \
+                mock.patch("os.geteuid", return_value=0):
+            rc = cli.main(["project", "edit", "osint", "--quota", "31G"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(projects.find(self.records(), "osint").quota, 31 * GiB)
+        line = self.audit_lines()[-1]
+        self.assertEqual((line["service"], line["ok"], line["error"]), ("qmcp project edit", True, None))
+
+    def test_a_command_whose_reader_went_away_exits_with_its_own_status(self):
+        # Not 120 from the interpreter's exit flush into the dead pipe.
+        import subprocess
+        code = ("import sys; sys.path.insert(0, 'dom0'); from qmcp import cli; "
+                "sys.exit(cli.main(['version']))")
+        p = subprocess.Popen([sys.executable, "-c", code], cwd=str(HERE.parent),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdout.close()
+        p.stderr.close()
+        self.assertEqual(p.wait(timeout=60), 0)
 
     def test_cli_list_and_show(self):
         rc, out, _ = self.cli("project", "list", "--json")

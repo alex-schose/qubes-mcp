@@ -693,6 +693,36 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
             + f": what they recorded is not on the chain. Free space under "
               f"{os.path.dirname(audit.LOG_PATH)} if that is why, then remove the marker "
               f"(sudo rm {audit.DROPPED_PATH})")
+    # A caller's counter (the hourly cap and the day's budget, one file): one
+    # the services cannot keep refuses that principal's every change but a
+    # kill (`audit.budget_left` fails closed), so it fails here, whoever runs
+    # the check: by its group and mode, not by whether this process reads it.
+    for caller, rec in audit.counters(calls):
+        path = os.path.join(calls, caller + audit.REFUSED_SUFFIX)
+        cst = _safe(lambda path=path: os.stat(path))
+        if rec is None or not (shared(cst) and cst.st_mode & stat.S_IRGRP):
+            add("fail", "audit counter",
+                f"{caller}: {path} does not read, or is not the services group's and "
+                f"group-read-writable: every change of that principal but a kill is refused. "
+                f"Remove it (sudo rm {path}); it is made again as it should be")
+    for caller, count, first in audit.unlogged_refusals(calls):
+        if count is None:
+            continue                    # named above
+        add("warn", "calls not logged",
+            f"{caller}: {count} call(s) past {audit.REFUSALS_PER_HOUR} in a clock hour were "
+            f"counted, not logged, since {first} (calls that changed nothing, and kills past its "
+            f"daily budget); a principal that does that so often is worth a look. Removing the counter once read (sudo rm "
+            f"{os.path.join(calls, caller + audit.REFUSED_SUFFIX)}) also gives it a new day's "
+            f"budget")
+    for caller, today, over, first in audit.spent_budgets(calls):
+        add("warn", "audit budget spent",
+            f"{caller}: {today} line(s) today of its {audit.AUDIT_LINES_PER_DAY} a day"
+            + (f"; {over} change(s) refused for its budget since {first}" if over else "")
+            + (": its changes are refused until the next UTC day" if today >= audit.AUDIT_LINES_PER_DAY
+               else ": it has a new day's share now")
+            + ". A principal that busy is worth a look; removing its counter (sudo rm "
+              f"{os.path.join(calls, caller + audit.REFUSED_SUFFIX)}) gives it a new day's share "
+              "and clears this")
     if not audit.room():
         add("fail", "audit room", f"less than {audit.FLOOR_BYTES // (1024 * 1024)} MiB free under "
                                   f"{os.path.dirname(audit.LOG_PATH)}, or that cannot be read: "
@@ -5036,31 +5066,90 @@ def _gate_the_move(app, records: dict, name: str, after: set, p, mode: bool) -> 
                            f"it: " + "; ".join(d for _, d in v.problems) + "; nothing was moved")
 
 
-def delete_plan(app, records: dict, key: str) -> tuple:
-    """What `qmcp project delete KEY --yes` would do, changing nothing: (it can
-    run, the plan in words). Reads the records and the qube list only, so it
-    needs no root, and the window and a proposal show it before anyone asks."""
-    p = projects.find(records, key)
-    if p is None and key in projects.PROJECT_SLOTS:
-        return True, (f"{key} has no record: this finishes a delete, removing the qubes still "
-                      f"wearing its member badge and stripping its badges everywhere")
-    if p is None or p.slot == projects.HUB_SLOT:
-        return False, f"no project '{key}'"
-    members, unread = [], []
+def _kept_with_slot(vm, tags, slot: str) -> str | None:
+    """Why a qube wearing `slot`'s member badge is not removed with the slot,
+    or None. One that is a member of another slot too belongs to that project
+    as well; a template, a disposable template or a gateway is something other
+    qubes are built on or reach the network through; a model qube, a guarded
+    qube, a dump sink and the hub are never a project's members. Each loses
+    only `slot`'s badges. Raises `Unreadable` when its class cannot be read: the delete then
+    neither removes nor strips it, as for a qube whose tags do not read."""
+    others = sorted(projects.member_slots(tags) - {slot})
+    if others:
+        return f"also a member of {', '.join(others)}"
+    models = sorted(projects.model_slots(tags))
+    if models:
+        return f"the model qube of {', '.join(models)}"
+    if core.GUARDED in tags:
+        return "guarded"
+    if projects.DROP_BOX in tags:
+        return "a dump sink"
+    if vm.name == core.read_hub():
+        return "the hub"
+    if core.is_gateway(vm):
+        return "a gateway"
+    if core.is_template(vm):
+        return "a template" if core.klass_of(vm) == "TemplateVM" else "a disposable template"
+    return None
+
+
+def _slot_members(app, slot: str) -> tuple:
+    """([removed], [(kept, why)], [unread]) for the qubes wearing `slot`'s
+    member badge, as a delete of it would treat them; unread: tags or class
+    that do not read, neither removed nor stripped."""
+    members, kept, unread = [], [], []
     for vm in app.domains:
         try:
-            if core.is_member(vm, p.slot):
-                members.append(vm.name)
+            if core.is_member(vm, slot):
+                why = _kept_with_slot(vm, core.tags_of(vm), slot)
+                if why:
+                    kept.append((vm.name, why))
+                else:
+                    members.append(vm.name)
         except core.Gone:
             pass
         except core.Unreadable:
             unread.append(vm.name)
-    note = f"; the tags of {', '.join(sorted(unread))} cannot be read now" if unread else ""
+    return sorted(members), sorted(kept), sorted(unread)
+
+
+def delete_plan(app, records: dict, key: str) -> tuple:
+    """What `qmcp project delete KEY --yes` would do, changing nothing: (it can
+    run, the plan in words). Reads the records, the qubes and the hub file only, so it
+    needs no root, and the window and a proposal show it before anyone asks.
+    It names every qube the delete removes, record or not."""
+    p = projects.find(records, key)
+    if p is None and key in projects.PROJECT_SLOTS:
+        slot = key
+    elif p is None or p.slot == projects.HUB_SLOT:
+        return False, f"no project '{key}'"
+    else:
+        slot = p.slot
+    members, kept, unread = _slot_members(app, slot)
+    names = ", ".join(members) if members else "none"
+    keeps = "".join(f"; it keeps {n} ({why}), which loses only {slot}'s badges"
+                    for n, why in kept)
+    # Every other qube wearing a badge of the slot (a leftover lead, a sink, a
+    # stray badge) loses it and stays; the record's own are named below.
+    holders, _ = _badges_of_slot(app, slot)
+    named = set(members) | {n for n, _ in kept} | set(unread) | (
+        {p.lead, p.dump, p.model_qube} if p is not None else set())
+    strays = sorted(set(holders) - named)
+    if strays:
+        keeps += f"; it strips {slot}'s badges from {', '.join(strays)}, which stay"
+    note = (f"; {', '.join(unread)} cannot be read now: a delete leaves "
+            f"{'it' if len(unread) == 1 else 'each'} as it is while it cannot be read, and "
+            f"{slot} stays in use; once it reads, it is removed or stripped like the rest"
+            if unread else "")
+    if p is None:
+        return True, (f"{key} has no record: this finishes a delete, removing the qubes still "
+                      f"wearing its member badge ({names}) and stripping its badges "
+                      f"everywhere{keeps}{note}")
     model = f"; its model qube {p.model_qube} is kept and loses {p.slot}'s badge" \
         if p.model_qube else ""
     return True, (f"this removes {p.slot} '{p.label}': its lead {p.lead or '(none)'} and every "
-                  f"member qube ({', '.join(sorted(members)) if members else 'none'}), and keeps "
-                  f"its dump sink {p.dump or '(none)'}{model}{note}")
+                  f"member qube ({names}), and keeps "
+                  f"its dump sink {p.dump or '(none)'}{model}{keeps}{note}")
 
 
 def delete_project(app, key: str) -> list:
@@ -5092,13 +5181,11 @@ def _delete_project(report, app, key):
     # outside AI space is stripped below, never the qube. A qube whose tags
     # cannot be read is neither removed nor stripped: the delete reports it,
     # and the slot stays in use until a run reads it.
-    members = []
-    for vm in app.domains:
-        try:
-            if core.is_member(vm, p.slot):
-                members.append(vm.name)
-        except core.Unreadable:
-            pass                    # read again below: removed if a member, else reported
+    # A member of another slot too, a template, a disposable template, a
+    # gateway, a model qube, a guarded qube, a dump sink or the hub is kept and
+    # only loses this slot's badges, below (`_kept_with_slot`).
+    members, kept, _ = _slot_members(app, p.slot)
+    kept = dict(kept)
     for name in members:
         err = _remove_qube(app, name)
         report.append(f"{p.slot}: removed {name}") if not err else \
@@ -5108,7 +5195,15 @@ def _delete_project(report, app, key):
         try:
             vm = _vm(app, name)
             tags = set() if vm is None else _tags(vm)
-            if _member(tags, p.slot):
+            try:
+                why = kept.get(name) or (_kept_with_slot(vm, tags, p.slot) if vm is not None
+                                         and _member(tags, p.slot) else None)
+            except core.Unreadable as e:
+                # Neither removed nor stripped: still wearing the badge, it
+                # keeps the slot in use until a run reads it.
+                report.append(f"{p.slot}: left {name} as it is: {e}")
+                continue
+            if _member(tags, p.slot) and not why:
                 # A member the first pass could not read: removed like the rest.
                 err = _remove_qube(app, name)
                 report.append(f"{p.slot}: removed {name}") if not err else \
@@ -5127,7 +5222,8 @@ def _delete_project(report, app, key):
             hidden = projects.HUBBLIND in tags
             report.append(f"{p.slot}: stripped {', '.join(sorted(strip))} from {name}"
                           + (" (the dump sink, kept)" if name == p.dump else
-                             " (the model qube, kept)" if name == p.model_qube else "")
+                             " (the model qube, kept)" if name == p.model_qube else
+                             f" (kept: {why})" if why else "")
                           + (": still hidden from the hub, since it holds the project's "
                              "output" if hidden else ""))
         except Exception as e:

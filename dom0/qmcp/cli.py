@@ -1025,7 +1025,58 @@ def _record(line, rc: int) -> None:
     audit.audit(command, "operator", summary, rc == 0, None if rc == 0 else f"exit status {rc}")
 
 
+class _Unread:
+    """A text stream nobody reads any more (the window that ran the command
+    closed): the report goes nowhere, and the command still ends as it ran,
+    so its audit line says what it did rather than that a print failed."""
+
+    def __init__(self, stream):
+        self._stream, self.lost = stream, False
+
+    def write(self, text):
+        if not self.lost:
+            try:
+                return self._stream.write(text)
+            except (BrokenPipeError, ValueError):
+                self._gone()
+        return len(text)
+
+    def flush(self):
+        if not self.lost:
+            try:
+                self._stream.flush()
+            except (BrokenPipeError, ValueError):
+                self._gone()
+
+    def _gone(self):
+        # Python flushes stdout again at exit; point the descriptor at
+        # /dev/null so that flush finds a reader too.
+        self.lost = True
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, self._stream.fileno())
+            os.close(fd)
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def main(argv=None) -> int:
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Unread(sys.stdout), _Unread(sys.stderr)
+    try:
+        return _main(argv)
+    finally:
+        # Flushed through the wrapper, so a report still buffered for a reader
+        # that is gone ends here, not in the interpreter's exit flush (exit 120).
+        for stream in (sys.stdout, sys.stderr):
+            stream.flush()
+        sys.stdout, sys.stderr = saved
+
+
+def _main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "version":
         print(_version())

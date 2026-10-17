@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.31 — the audit round's medium fixes, second half.** Besides the hub, up to 15
+**Status: 0.9.32 — the audit round's window fixes, and limits on what one principal can put on the audit log.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -60,11 +60,11 @@ templates alike, and dom0 keeps its own copy of them, so
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
 `qmcp export` puts qmcp's settings where a Qubes backup carries them. The
-audit round of 0.9.28 is being fixed by severity: this release fixes the high
-findings (a revoke now kills, a lock per qube orders the hub's calls against
-the operator's commands, the gate kills a stopped qube it finds running, and
-creates set their network before they join AI space). Next: the medium and
-low findings, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+audit round of 0.9.28 is being fixed by severity: 0.9.29 fixed the high
+findings, 0.9.30 and 0.9.31 the medium ones, and this release the window's,
+with limits on what one principal can put on the audit log (60 lines an hour
+of calls that changed nothing, about 20,000 a day of changes).
+Next: the low findings and the docs, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -218,7 +218,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.31.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.32.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -249,7 +249,17 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.30? Install over it. A qube that changes slot (but between
+Coming from 0.9.31? Install over it. A principal's calls that changed nothing,
+past 60 in a clock hour, are counted rather than logged, and its changes past
+20,000 lines a day are refused; `qmcp check` warns on both; deleting a project keeps a qube that is also another project's member,
+or is a template, a disposable template, a gateway, a model qube, a guarded
+qube, a dump sink or the hub, and its plan names every
+qube it removes, keeps or strips; the window keeps Seal, Revoke and Reject
+restored on when a read fails, and turns the rest off from the moment a
+refresh starts. The CHANGELOG's 0.9.32 entry has the
+whole list. To roll back, run this release's `uninstall.sh` before 0.9.31's
+installer.
+Coming from 0.9.30? Install over it, then read the 0.9.31 note. A qube that changes slot (but between
 p00 and no slot), or becomes a lead, does so only once it is shut down (nothing
 is killed), and such a move waits 10 s under `qmcp-blocked` to be sure it
 stays so; a hub proposal
@@ -716,7 +726,8 @@ This is operator-grade infrastructure for one use case: AI agents working in
 Qubes-isolated qubes. It is not a hardened product. The hub is itself part of
 the trust boundary: a compromised hub controls all of AI space but hidden
 anonymous projects, and the audit log records what it does through the dom0
-services.
+services (past 60 calls that changed nothing in a clock hour, those are only
+counted).
 
 ## License
 

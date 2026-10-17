@@ -800,7 +800,8 @@ def reference(app, name, what: str, who: Principal):
 class Call:
     """One invocation: what the audit line will say about it."""
 
-    __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds", "acting")
+    __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds", "acting",
+                 "landed", "noop")
 
     def __init__(self, service: str) -> None:
         self.service = service
@@ -817,6 +818,14 @@ class Call:
         self.error_class = None
         #: Whether `fds` holds the caller's acting lock (`hold_acting`).
         self.acting = False
+        #: This call created a qube (kept, or rolled back since), or may have:
+        #: a create failed and a qube of that name exists or cannot be read.
+        #: Such a failed call is always logged, past the refusal cap
+        #: (`audit.REFUSALS_PER_HOUR`).
+        self.landed = False
+        #: The call succeeded without changing anything (a value the qube
+        #: already had): capped like a failed call, though it answers ok.
+        self.noop = False
 
 
 def emit(call: Call, payload: dict, audit: bool, out=None) -> int:

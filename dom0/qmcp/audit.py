@@ -201,6 +201,179 @@ DROPPED_PATH = "/run/qmcp/audit-dropped"
 FLOOR_BYTES = 64 * 1024 * 1024
 
 
+#: A principal's calls that changed nothing (refused, failed, or a feature, or
+#: a property set explicitly, set to the value already there) are logged up to this many in each clock hour (UTC)
+#: each; past it they are counted in `<run>/calls/<caller>.refused`, on
+#: tmpfs, and `qmcp check` warns while that counts one (a reboot clears it). A
+#: failed create that made a qube, or may have, is always logged.
+#: Without the cap a compromised principal could fill the log's disk down to
+#: the floor, one failed call at a time, and stop every lead's changes.
+REFUSALS_PER_HOUR = 60
+REFUSED_SUFFIX = ".refused"
+
+
+#: Each principal may put this many lines a day (UTC) on the log for calls
+#: that changed something; past it, its state-changing calls are refused
+#: before they act (a kill goes on), counted in the same file, not logged. One
+#: compromised principal then spends only its own budget, and the 64 MiB
+#: floor stays the backstop for all of them. Lines of calls that changed
+#: nothing are under the hourly cap above and do not spend it.
+AUDIT_LINES_PER_DAY = 20000
+
+
+def _update(path: str, change):
+    """Read-modify-write the caller's counter under its lock. `change(rec)`
+    edits the dict and returns the answer. Raises when the counter cannot be
+    opened, read or written: each caller decides which way that fails."""
+    old = os.umask(0o007)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+    finally:
+        os.umask(old)
+    with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        text = fh.read(4096)
+        rec = json.loads(text) if text.strip() else {}
+        if not isinstance(rec, dict):
+            raise ValueError("counter is not an object")
+        answer = change(rec)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        return answer
+
+
+def take_refusal(path: str, now: str | None = None) -> bool:
+    """Count one call that changed nothing, of the caller whose counter is
+    `path`. True when its line may be written (under the cap this hour);
+    False when it is counted instead. A counter that cannot be kept logs the
+    line: the cap only ever withholds a line it has counted."""
+    now = now or _utc_now_iso()
+
+    def change(rec):
+        if rec.get("hour") != now[:13]:
+            rec["hour"], rec["logged"] = now[:13], 0
+        if int(rec.get("logged", 0)) < REFUSALS_PER_HOUR:
+            rec["logged"] = int(rec.get("logged", 0)) + 1
+            return True
+        rec["unlogged"] = int(rec.get("unlogged", 0)) + 1
+        rec["first"] = rec.get("first") or now
+        return False
+    try:
+        return _update(path, change)
+    except Exception:
+        return True
+
+
+def budget_left(path: str, now: str | None = None) -> bool | None:
+    """May this caller still change something today? False once it has spent
+    `AUDIT_LINES_PER_DAY`, and then the refusal is counted here. None when the
+    counter cannot be kept: a gate, so the caller refuses then too (with its
+    own reason), and `qmcp check` fails on a counter that does not read or is
+    not the services group's to write."""
+    now = now or _utc_now_iso()
+
+    def change(rec):
+        if rec.get("day") == now[:10] and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY:
+            rec["over"] = int(rec.get("over", 0)) + 1
+            rec["over_first"] = rec.get("over_first") or now
+            return False
+        return True
+    try:
+        return _update(path, change)
+    except Exception:
+        return None
+
+
+def budget_spent(path: str, now: str | None = None) -> bool:
+    """Has this caller spent today's share? Read only, under the counter's
+    lock; a counter that does not read counts as spent. For a kill, which acts
+    whatever the answer: it decides only whether its line is capped."""
+    now = now or _utc_now_iso()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+            text = fh.read(4096)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        rec = json.loads(text) if text.strip() else {}
+        return rec.get("day") == now[:10] and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY
+    except Exception:
+        return True
+
+
+def spend(path: str, now: str | None = None) -> None:
+    """One line of a call that changed something, against the day's budget.
+    Best-effort: a counter that cannot be kept is caught by `budget_left`."""
+    now = now or _utc_now_iso()
+
+    def change(rec):
+        if rec.get("day") != now[:10]:
+            rec["day"], rec["lines"] = now[:10], 0
+        rec["lines"] = int(rec.get("lines", 0)) + 1
+    try:
+        _update(path, change)
+    except Exception:
+        pass
+
+
+def counters(calls_dir: str, now: str | None = None) -> list:
+    """[(caller, record or None)] for every caller's counter; None for one
+    that does not read."""
+    out = []
+    try:
+        names = sorted(os.listdir(calls_dir))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(REFUSED_SUFFIX):
+            continue
+        try:
+            with open(os.path.join(calls_dir, fn), encoding="utf-8") as fh:
+                # Under the writers' lock, shared: `_update` truncates before
+                # it writes, and an unlocked read could catch the gap.
+                fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+                text = fh.read(4096)
+            rec = json.loads(text) if text.strip() else {}
+            if not isinstance(rec, dict):
+                raise ValueError
+        except Exception:
+            rec = None
+        out.append((fn[:-len(REFUSED_SUFFIX)], rec))
+    return out
+
+
+def unlogged_refusals(calls_dir: str) -> list:
+    """[(caller, count or None, first)] for every counter that withheld a
+    line; count None for one that does not read."""
+    out = []
+    for caller, rec in counters(calls_dir):
+        if rec is None:
+            out.append((caller, None, None))
+        elif int(rec.get("unlogged", 0) or 0):
+            out.append((caller, int(rec["unlogged"]), rec.get("first")))
+    return out
+
+
+def spent_budgets(calls_dir: str, now: str | None = None) -> list:
+    """[(caller, lines today, refused past the budget, first such refusal)]
+    for every caller that reached its daily budget today or was refused for it
+    since its counter was made."""
+    now = now or _utc_now_iso()
+    out = []
+    for caller, rec in counters(calls_dir):
+        if rec is None:
+            continue
+        today = int(rec.get("lines", 0) or 0) if rec.get("day") == now[:10] else 0
+        over = int(rec.get("over", 0) or 0)
+        if today >= AUDIT_LINES_PER_DAY or over:
+            out.append((caller, today, over, rec.get("over_first")))
+    return out
+
+
 def room(path: str | None = None) -> bool:
     """True when the log's directory has `FLOOR_BYTES` free. False when it has
     not, or when that cannot be read: a gate, so it fails toward refusing."""

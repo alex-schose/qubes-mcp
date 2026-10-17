@@ -1314,9 +1314,14 @@ def second_tick(app, p: dict, records: dict) -> list:
         # Always: adopting or revoking a qube needs the second tick, and so
         # does a template's root, which every qube built on it runs.
         reasons += _qube_reasons(app, p, records)
-    if t == "project-delete":
-        reasons.append(f"deletes the project {p['project']}: its lead and every worker are removed "
-                       f"with everything in them; its dump sink is kept")
+    if t == "project-delete" and target is None:
+        reasons.append(f"deletes the project {p['project']}")
+    elif t == "project-delete":
+        # The command's own plan, so the tick names every qube it removes and
+        # keeps, and a change to that set changes the tick.
+        ok, plan = fleet.delete_plan(app, records, p["project"])
+        reasons.append(f"deletes the project {p['project']}: "
+                       + (f"{plan}; what it removes goes with everything in it" if ok else plan))
     if t == "project-lead" and target is not None and target.lead \
             and (p["remove"] or not p["keep_old"]):
         # Only a lead wearing its slot's badge is removed (`fleet._remove_lead`):

@@ -209,11 +209,23 @@ def _text_view() -> Gtk.TextView:
 READ_TIMEOUT_S = 120
 
 
+#: The status bar after a failed read, first, as the bar cuts a long line: only
+#: what takes authority away stays on (its commands decide for themselves).
+STATUS_OFF = "Only Seal, Revoke and Reject restored are on until a refresh reads everything."
+#: What closing the window while a change runs means, asked before it closes.
+CLOSE_NOTE = ("Closing the window does not stop it: it runs to its end, and its report is not "
+              "shown. If it changes something, the audit log records how it ended (Audit tab, or "
+              "qmcp audit tail).")
+
+
 class Runner:
     """Runs one command without blocking the window, then calls `done(Result)`.
-    stdin is /dev/null, so `sudo -n` can only refuse, never prompt."""
+    stdin is /dev/null, so `sudo -n` can only refuse, never prompt. At
+    `timeout` the command is killed, unless `kill` is False: then the window
+    stops waiting (`done` gets status 124) and the command runs on to its end,
+    unseen."""
 
-    def run(self, argv, done, timeout=None) -> None:
+    def run(self, argv, done, timeout=None, kill=True) -> None:
         argv = list(argv)
         try:
             proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE
@@ -231,13 +243,19 @@ class Runner:
 
         def expire():
             expired.append(True)
-            proc.force_exit()
+            if kill:
+                proc.force_exit()
+            else:
+                done(gm.Result(argv, 124, "", f"no answer after {timeout} s; it was left to run "
+                                              f"to its end"))
             return False
         timer = GLib.timeout_add_seconds(timeout, expire) if timeout else None
 
         def finished(p, res):
             if timer is not None and not expired:
                 GLib.source_remove(timer)
+            if expired and not kill:
+                return                  # answered at the timeout already
             try:
                 _, out, err = p.communicate_finish(res)
                 rc = p.get_exit_status() if p.get_if_exited() else 128 + p.get_term_sig()
@@ -1570,11 +1588,21 @@ class Window(Gtk.Window):
         self.report = report or self._report_dialog
         self.show_forms = show_forms
         self.busy = False
+        #: The change that runs while `busy`, as the close question names it.
+        self.running = ""
         self.pending = 0
         self.again = False
         #: Every read of the last refresh succeeded. Until one has, the window
         #: changes nothing: a failed read must never pass for the fleet's state.
         self.complete = False
+        #: The view on show was read by a refresh that started after the last
+        #: change: False from the moment any refresh starts until one lands
+        #: whole. While it is False the changes that grant or move authority
+        #: are off, and a form open on the old view refuses at OK.
+        self.fresh = False
+        #: Counts the complete refreshes: a form remembers it, and refuses at
+        #: OK when the window has read the fleet again since it opened.
+        self.view_gen = 0
         self.records_read = False
         #: When the qubes, records, audit lines and settings on show were read,
         #: in one complete refresh; None before the first.
@@ -1893,6 +1921,7 @@ class Window(Gtk.Window):
         # off until it is read again. So may the selected lead's firewall.
         self.pane.stale()
         self.fw_pane.stale()
+        self.fresh = False
         self._render_proposal()
         self._render_details()
         if self.pending:
@@ -1907,7 +1936,7 @@ class Window(Gtk.Window):
         for name in names:
             self.runner.run(gm.READS[name],
                             lambda result, name=name: self._read_done(name, result),
-                            timeout=READ_TIMEOUT_S)
+                            timeout=READ_TIMEOUT_S, kill=name not in gm.ACTING_READS)
 
     def _read_done(self, name, result):
         """One read answered. Once the first ones have (the gate, which acts),
@@ -1992,6 +2021,8 @@ class Window(Gtk.Window):
             self.restored_read = True
         if self.complete:
             self.view_time = time.strftime("%H:%M:%S")
+            self.fresh = True
+            self.view_gen += 1
 
     def _render(self):
         selected = self.selected
@@ -2055,8 +2086,10 @@ class Window(Gtk.Window):
         if self.errors:
             shown = (f"Showing the qubes and records read at {self.view_time}. "
                      if self.view_time else "")
-            _set(self.status, esc("Could not read: " + "; ".join(self.errors.values()) + ". "
-                                  + shown + "Changes are off until a refresh reads everything."))
+            # What is off goes first: the bar cuts a long line, and the
+            # failure's own text can be long.
+            _set(self.status, esc(STATUS_OFF + " Could not read: " + "; ".join(self.errors.values()) + ". "
+                                  + shown))
         elif not self.busy:
             _set(self.status, esc("Up to date"))
         self._sync()
@@ -2219,7 +2252,7 @@ class Window(Gtk.Window):
     def _gate_actions(self) -> set:
         """What the Anonymity tab allows now: Unblock for the selected project
         while the gate has it stopped, and changes are on."""
-        if not self.complete or self.busy:
+        if not self.changes_on():
             return set()
         rec = self._gate_record(self.gate_selected)
         return {"gate_unblock"} if (isinstance(rec, dict) and rec.get("anonymous")
@@ -2300,11 +2333,20 @@ class Window(Gtk.Window):
         self.proposal_tick.set_visible(key is not None)
         self._sync()
 
+    def changes_on(self) -> bool:
+        """Every change is on: the last refresh read everything, none has
+        started since, and no command runs."""
+        return self.complete and self.fresh and not self.busy
+
     def _sync(self):
-        writable = self.complete and not self.busy
+        writable = self.changes_on()
         available = (gm.actions(self.node(), self.records, self.fw_pane, self.fleet,
                                 self.settings.get("hub"))
-                     if writable else set())
+                     if not self.busy else set())
+        if not writable:
+            # A failed or running refresh turns off what grants or moves
+            # authority; what only takes it away decides for itself and stays.
+            available &= gm.LOWERING
         for ident, button in self.buttons.items():
             button.set_sensitive(ident in available)
         self.rotate_button.set_sensitive(writable)
@@ -2326,7 +2368,7 @@ class Window(Gtk.Window):
     def _check_actions(self) -> set:
         """What the Check tab allows now, while changes are on: Prepare a
         template, and Accept all held while any qube is held, as last read."""
-        if not self.complete or self.busy:
+        if not self.changes_on():
             return set()
         return {"prepare_template"} | (
             {"accept_all_restored"} if gm.held_rows(self.restored_view()) else set())
@@ -2334,7 +2376,7 @@ class Window(Gtk.Window):
     def _registry_actions(self) -> set:
         """What the Gateways tab allows now: Enroll, and Change and Remove for
         the selected gateway, while changes are on."""
-        if not self.complete or self.busy:
+        if not self.changes_on():
             return set()
         return gm.gateway_actions(self.gateway_row())
 
@@ -2342,25 +2384,42 @@ class Window(Gtk.Window):
         """What the Proposals tab allows now, buttons and forms alike: what the
         selected proposal's last show allows, with the tick as it is, while
         changes are on."""
-        if not self.complete or self.busy:
+        if not self.changes_on():
             return set()
         return self.pane.actions(self.proposal_tick.get_active())
 
     # ------------------------------------------------------------------ changes
-    def _open(self, form, title, then=None, check=None):
+    def _open(self, form, title, then=None, check=None, lowers=False):
         """`check`, asked at OK, returns why what the form was opened on no
-        longer holds, or None; then the form refuses and nothing runs."""
+        longer holds, or None; then the form refuses and nothing runs. Unless
+        it `lowers` (it only takes authority away and its command decides for
+        itself), a form refuses while a refresh runs or after one failed, and
+        one without a `check` refuses once the window has read another view
+        than the one it opened on."""
+        opened = self.view_gen
+
         def response(dialog, resp):
             if resp != Gtk.ResponseType.OK:
                 dialog.destroy()
                 return
-            if self.busy or not self.complete:
-                dialog.refuse("another command is running, or the last refresh failed")
+            if self.busy:
+                dialog.refuse("another command is running")
                 return
             why = check() if check is not None else None
             if why:
                 dialog.refuse(why)
                 return
+            if not lowers:
+                if not (self.complete and self.fresh):
+                    dialog.refuse("a refresh is running, or the last one failed: OK works "
+                                  "again once one reads everything")
+                    return
+                if check is None and self.view_gen != opened:
+                    # A form with no re-check of its own was built from the
+                    # view it opened on, and that view is gone.
+                    dialog.refuse("the window read the fleet again since this form opened: "
+                                  "close it and open it again, so it shows the fleet as it is")
+                    return
             try:
                 argv = dialog.argv()
             except gm.FormError as e:
@@ -2370,20 +2429,22 @@ class Window(Gtk.Window):
                 dialog.refuse(f"the form cannot build a command ({type(e).__name__})")
                 return
             dialog.destroy()
-            self.write(title, argv, then)
+            self.write(title, argv, then, lowers=lowers)
         form.connect("response", response)
         self.last_form = form
         if self.show_forms:
             form.show_all()
         return form
 
-    def write(self, title, argv, then=None, timeout=None):
+    def write(self, title, argv, then=None, timeout=None, lowers=False):
         """Run one change, or the plan a change shows first; then report it
         and refresh, or hand the result to `then`. One at a time: reads may
-        run beside it, another change may not."""
-        if self.busy or not self.complete:
+        run beside it, another change may not. Only one that `lowers` runs
+        on a view that is not fresh."""
+        if self.busy or not (lowers or (self.complete and self.fresh)):
             return False
         self.busy = True
+        self.running = shlex.join(argv)
         self._sync()
         self.spinner.start()
         _set(self.status, esc("Running: " + shlex.join(argv)))
@@ -2468,11 +2529,15 @@ class Window(Gtk.Window):
         if ident == "move":
             return self._open(MoveForm(self, node.data, self.records), "Move")
         if ident == "revoke":
-            return self._open(RevokeForm(self, name, gm.revoke_note(node.data)), "Revoke")
+            return self._open(RevokeForm(self, name, gm.revoke_note(node.data)), "Revoke",
+                              lowers=True)
         if ident in ("manage", "guard"):
             return self._open(ConfirmForm(self, f"{ident.capitalize()} {name}", ident.capitalize(),
-                                          gm.role_intro(ident, node.data),
-                                          gm.role(ident, name)), ident.capitalize())
+                                          gm.role_intro(ident, node.data, self.records),
+                                          gm.role(ident, name),
+                                          warning=(gm.manage_red(node.data, self.records)
+                                                   if ident == "manage" else None)),
+                              ident.capitalize())
         if ident == "open":
             return self._open(OpenForm(self, node.data), "Open")
         if ident == "prepare":
@@ -2496,7 +2561,7 @@ class Window(Gtk.Window):
                                           gm.seal_qube(name),
                                           warning="If the qube is running it is killed. Work it "
                                                   "has part-finished, a package install above "
-                                                  "all, is interrupted."), "Seal")
+                                                  "all, is interrupted."), "Seal", lowers=True)
         return None
 
     def review(self, ident, name):
@@ -2515,8 +2580,10 @@ class Window(Gtk.Window):
             title = f"Reject {name}"
             form = ConfirmForm(self, title, "Reject", gm.reject_restored_intro(name),
                                gm.restored_reject(name), warning=gm.reject_restored_red(name, rec))
+        # Reject only takes authority away: on while a refresh runs or failed.
         return self._open(form, title, check=lambda: gm.review_changed(
-            opened, gm.review_state(name, self.fleet, self.restored_view())))
+            opened, gm.review_state(name, self.fleet, self.restored_view())),
+            lowers=ident == "reject_restored")
 
     def _prepare_now(self, name):
         """Why the command refuses to prepare `name`, as the latest refresh
@@ -2567,8 +2634,9 @@ class Window(Gtk.Window):
                 return
             plan = plan.replace("qmcp project delete: ", "").replace(" Re-run with --yes.", "")
             self._open(ConfirmForm(self, title, "Delete", esc_lines(plan), gm.delete_project(key),
-                                   warning="The lead and every member qube are removed, with "
-                                           "everything in them. This cannot be undone."), title)
+                                   warning="Every qube this plan says it removes is removed, "
+                                           "with everything in it, and so is any member made "
+                                           "since. This cannot be undone."), title)
         return self.write(title, gm.delete_plan(key), planned, timeout=READ_TIMEOUT_S)
 
     def decide(self, ident):
@@ -2597,7 +2665,7 @@ class Window(Gtk.Window):
                 return None
             rec = self._gate_record(self.gate_selected)
         else:
-            if not self.complete or self.busy:
+            if not self.changes_on():
                 return None
             rec = gm.blocked_project(self.node(), self.records)
         if rec is None:
@@ -2637,7 +2705,7 @@ class Window(Gtk.Window):
         rules, through a form made from the firewall view on show. At OK the
         form runs only if the view still allows it and reads the same."""
         key = gm.firewall_key(self.node(), self.records)
-        if not self.complete or self.busy or ident not in self.fw_pane.actions(key, self.fleet):
+        if not self.changes_on() or ident not in self.fw_pane.actions(key, self.fleet):
             return None
         doc = self.fw_pane.doc
         form_class, title = self.FIREWALL_FORMS[ident]
@@ -2661,6 +2729,31 @@ class Window(Gtk.Window):
                 text = f"verify did not answer: {e}"
             _set(self.verify_label, esc(text))
         self.runner.run(gm.AUDIT_VERIFY, done, timeout=READ_TIMEOUT_S)
+
+    def closing(self, _win=None, _event=None) -> bool:
+        """The window's close button. While a change runs, ask first: closing
+        does not stop it, and its report would not be shown. True keeps the
+        window open."""
+        if not self.busy:
+            return False
+        ask = Gtk.Dialog(transient_for=self, modal=True, destroy_with_parent=True)
+        _title(ask, esc("A command is still running"))
+        _add_button(ask, esc("Keep the window open"), Gtk.ResponseType.CANCEL)
+        _add_button(ask, esc("Close anyway"), Gtk.ResponseType.CLOSE)
+        box = ask.get_content_area()
+        box.set_spacing(6)
+        for side in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{side}")(10)
+        box.pack_start(_label(esc(self.running), wrap=True, selectable=True), False, False, 0)
+        self.close_note = _label(esc(CLOSE_NOTE), wrap=True)
+        box.pack_start(self.close_note, False, False, 0)
+        self.last_ask = ask
+        if not self.show_forms:
+            return True
+        ask.show_all()
+        answer = ask.run()
+        ask.destroy()
+        return answer != Gtk.ResponseType.CLOSE
 
     def idle(self) -> bool:
         return not self.busy and not self.pending
@@ -2697,6 +2790,7 @@ def main(argv=None) -> int:
         print("qmcp-gui: no display", file=sys.stderr)
         return 1
     win = Window()
+    win.connect("delete-event", win.closing)
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
     win.refresh()
