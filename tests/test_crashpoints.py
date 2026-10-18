@@ -37,6 +37,7 @@ stays visible and the rest of the scenario keeps its teeth.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import unittest
@@ -187,12 +188,6 @@ ALLOWED = {"project-lead-new": lead_change_stopped("p02", removed=rf.OTHER_LEAD)
 #: Known issues deliberately left for a later release: (scenario, mode, verdict
 #: kind) -> what its expectedFailure test waits for.
 KNOWN: dict = {
-    ("restored-accept-all", "fail", "REPORTED-OK"):
-        "`restored accept --all` to refuse, not report \"nothing is held\", when a held qube's "
-        "tags or label cannot be read",
-    ("project-dump", "death", "UNNAMED-MIXED"):
-        "`qmcp check` (or a retry of `project dump`) to name a sink left bare by a killed "
-        "`project dump`",
 }
 
 
@@ -232,10 +227,27 @@ def run(name, mode=None, target=0, scenarios=SCENARIOS) -> dict:
 
 
 def finish(res):
-    """Close a run's fixture once the judge is done with it."""
+    """Close a run's fixture once the judge is done with it, and every file a
+    simulated death left open in it: a call that "died" never closed its
+    locks, and a sweep of every death point would otherwise hold thousands
+    (past dom0's default limit of open files)."""
     t = res.pop("t", None)
     if t is not None:
+        _close_left_open(str(t.tmp))
         t.doCleanups()
+
+
+def _close_left_open(root: str) -> None:
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith(root + os.sep):
+            try:
+                os.close(int(fd))
+            except OSError:
+                pass
 
 
 def _check(res):
@@ -473,9 +485,7 @@ class TornAudit(rf.Fixture):
                                                            "value": value})
         self.assertTrue(r["ok"], r)
 
-    @unittest.expectedFailure
     def test_the_record_after_a_torn_line_is_kept(self):
-        # Waits for the audit writer to start a new line when the log does not end in one.
         log = pathlib.Path(audit.LOG_PATH)
         self.change(500)
         full = log.read_text()

@@ -160,6 +160,9 @@ FLEET["w-p01-blocked-open"] = _dom(tags=[AI, "qmcp-proj-p01", "qmcp-anon", "qmcp
                                          "qmcp-open", "qmcp-open-fw"])
 FLEET["w-p05-hidden-open"] = _dom(tags=[AI, "qmcp-proj-p05", "qmcp-anon", "qmcp-hubblind",
                                         "qmcp-open", "qmcp-open-fw"])
+# A lead wearing an open window's firewall badge, which only a mistake in dom0
+# makes: its firewall stays the operator's.
+FLEET["lead-p09-open-fw"] = _dom(tags=[AI, "qmcp-lead", "qmcp-lead-p09", "qmcp-open-fw"])
 # 0.9.26's restore check: a member and a lead that came back from a backup with
 # their badges, held for the operator's review. Nothing reaches them and they
 # reach nothing, whatever their badges route.
@@ -292,6 +295,8 @@ def _cases() -> list[Case]:
         "allow target=@adminvm", "allow target=@adminvm")
     add("hub fw-reload open+fw", "admin.vm.firewall.Reload", HUB, "ai-tpl-open-fw",
         "allow target=@adminvm", "allow target=@adminvm")
+    for svc in ("admin.vm.firewall.Set", "admin.vm.firewall.Reload"):
+        add("hub fw-write lead+open-fw", svc, HUB, "lead-p09-open-fw", "deny", "deny")
     # A0 outranks the window: a qube the gate stopped and a hidden one stay
     # unreachable however they are badged.
     for svc in ("qmcp.RunInAIManaged", "qubes.Filecopy", "admin.vm.firewall.Set"):
@@ -473,6 +478,15 @@ def _cases() -> list[Case]:
     # template -- which is why the create path pins default_dispvm to None.
     add("RESIDUAL ai open in named non-ai template", "qubes.OpenInVM", "ai-work", "@dispvm:default-dvm", "ask", "allow")
     add("RESIDUAL revoked qube, non-ai default", "qubes.OpenInVM", "ai-revoked", "@dispvm", "allow", "allow")
+
+    # No app started and no image read in another qube, the dialog included,
+    # while OpenInVM and OpenURL keep Qubes' own dialog there (residual risks).
+    for svc in ("qubes.StartApp", "qubes.GetImageRGBA"):
+        for src in ("ai-work", "w-p01-a", "lead-p01"):
+            for tgt in ("personal", "@default", "no-such-qube"):
+                add("ai space starts or reads into another qube", svc, src, tgt, "deny", "deny")
+    for svc in ("qubes.OpenInVM", "qubes.OpenURL"):
+        add("RESIDUAL ai open in a named non-ai qube", svc, "ai-work", "personal", "ask", "allow")
 
     # --- AI never reaches the hub
     for svc in CHILD_TO_HUB:

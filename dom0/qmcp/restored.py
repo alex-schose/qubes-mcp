@@ -221,6 +221,20 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 qfd = core.acquire_qube_lock(name, HOLD_LOCK_WAIT_S, queue=True)
             except core.Refusal:
                 qfd = None
+            if qfd is not None:
+                # Judged again under the lock: an accept that held it while
+                # this pass waited has labelled the qube, and the operator was
+                # told it was accepted.
+                try:
+                    again = HOLD in core.tags_of(vm) or known(vm)
+                except core.Gone:
+                    again = True
+                except core.Unreadable as e:
+                    out.unread.append(str(e))
+                    again = True
+                if again:
+                    os.close(qfd)
+                    continue
             try:
                 vm.tags.add(HOLD)
                 if HOLD not in core.tags_of(vm):
@@ -229,10 +243,10 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 if _is_gone(app, name):
                     # A remove already running landed first: nothing is left to hold.
                     out.gone.append(name)
-                    _audit(name, False, "removed by a call that was already running")
+                    _audit(name, False, "removed by a call that was already running", app=app)
                 else:
                     out.failed.append((name, type(e).__name__))
-                    _audit(name, False, f"not held: {type(e).__name__}")
+                    _audit(name, False, f"not held: {type(e).__name__}", app=app)
                 continue
             finally:
                 if qfd is not None:
@@ -240,7 +254,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
             if qfd is None and _settle(app, vm, name, out):
                 continue
             out.held.append(name)
-            _audit(name, True)
+            _audit(name, True, app=app)
     finally:
         try:
             os.close(fd)
@@ -276,16 +290,24 @@ def _settle(app, vm, name: str, out: Held) -> bool:
             return False
         if _is_gone(app, name):
             out.gone.append(name)
-            _audit(name, False, "removed by a call that was already running")
+            _audit(name, False, "removed by a call that was already running", app=app)
             return True
         try:
+            # An accept that was already running labelled the qube and told
+            # the operator so: the hold this pass put on comes off again.
+            if known(vm):
+                vm.tags.discard(HOLD)
+                if HOLD in core.tags_of(vm):
+                    raise RuntimeError("the hold did not come off")
+                _audit(name, False, "accepted by a call that was already running", app=app)
+                return True
             if HOLD not in core.tags_of(vm):
                 vm.tags.add(HOLD)
                 if HOLD not in core.tags_of(vm):
                     raise RuntimeError("the hold did not read back")
         except Exception as e:
             out.failed.append((name, type(e).__name__))
-            _audit(name, False, f"not held: {type(e).__name__}")
+            _audit(name, False, f"not held: {type(e).__name__}", app=app)
             return True
         return False
     finally:
@@ -293,10 +315,10 @@ def _settle(app, vm, name: str, out: Held) -> bool:
             os.close(late)
 
 
-def _audit(name: str, ok: bool, error: str | None = None) -> None:
+def _audit(name: str, ok: bool, error: str | None = None, app=None) -> None:
     try:
         audit.audit(SERVICE, CALLER, {"qube": name[:128], "held": "label does not match"},
-                    ok, error)
+                    ok, error, app=app)
     except Exception:
         pass
 

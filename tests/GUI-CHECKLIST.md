@@ -39,9 +39,11 @@ what runs. While OK is off, that line says why instead, in orange, under
    Qubes tab, and the light reads `qmcp check: GREEN` next to the time it ran.
 2. **The tree matches the command.** Run `qmcp list` in a dom0 terminal.
    Expect: every qube it lists appears exactly once, under the hub (p00, or no
-   slot), a project, Templates, Gateways or Other guarded.
+   slot), a project, Templates, Gateways, Model qubes or Other guarded (Needs
+   attention stays empty while the check is GREEN).
 3. **Add a qube.** Make one outside AI space, with no network (step 8 moves it
-   into a project, which takes a qube only on one of its worker networks):
+   into a project, which takes a qube with no network or on one of its worker
+   networks):
    `qvm-create --class AppVM --template <template> --label gray ai-t1h`, then
    `qvm-prefs ai-t1h netvm ''`. Press Refresh, *Add a qube to AI space...*,
    choose `ai-t1h`, tick *managed* (the form starts on *guarded*), OK.
@@ -469,12 +471,12 @@ label (`p03 t6`); below, `pT6`, `pT7` and `pT8` stand for the slots of `t6`,
     model qube of pT6, pT7 and pT8: revoking takes its model badges too, ...`;
     Cancel. Press *Guard...*: the form reads `ai-hub-llm becomes guarded: it
     is listed and referenced, never operated. It stays the model qube of pT6,
-    pT7 and pT8; its maintenance window closes: if it runs, it is killed, so no
-    process the hub started in it runs on. Its files stay: what the hub left in
+    pT7 and pT8; its maintenance window closes: if it runs, it is killed, and
+    what the hub had running in it is stopped. Its files stay: what the hub left in
     /home, /usr/local or /rw (anywhere, in a StandaloneVM), and whatever is set
     to start from there runs at its next start.` OK. Expect a report
-    `ai-hub-llm: guarded`; if it was running, followed by `; killed, so no
-    process the hub started in it while it was managed runs on (...)`, and
+    `ai-hub-llm: guarded`; if it was running, followed by `; killed: what the
+    hub had running in it while it was managed is stopped (...)`, and
     `qvm-ls ai-hub-llm` in a dom0 terminal shows it Halted. Expect the *Role*
     without `not guarded`, and the WARN gone.
 37. **Take it away, and clean up.** Select `t7`, *Set model qube...*. Expect
@@ -497,13 +499,16 @@ and `systemctl is-active qmcp-gate.timer` printing `active` in a dom0
 terminal (the check fails while an anonymous project exists and the timer
 does not run). Besides `<template>`, `<gateway>`, `<router-template>` and
 `<model>` as above, they need Whonix's `sys-whonix`, whose `qvm-tags
-sys-whonix` lists `anon-gateway`, and a TemplateVM outside AI space for the
-lead, `<anon-template>` (such as your default template): an anonymous
-project's templates must be ones the hub cannot change, and `<template>` is
-usually one it manages. dom0's update policy must send `<anon-template>`'s
-updates to `sys-whonix` (Qubes Global Config, *Updates*): the gate judges a
-template whose updates go anywhere else unsound, and step 40's *Anonymity gate*
-line then says so. The name `sys-ai-tor` must not exist yet, and one slot must
+sys-whonix` lists `anon-gateway`, and a guarded TemplateVM in AI space for the
+lead, `<anon-template>`, one the hub never touched (a clone of a template of
+yours, prepared and guarded as the README's step 7 does for `anon-debian-13`):
+an anonymous project's templates must be ones the hub cannot change, a project
+needs an approved template in AI space, and `<template>` is usually one the
+hub manages. dom0's update policy must send `<anon-template>`'s updates to
+`sys-whonix` (Qubes Global Config, *Updates*): the gate judges a template
+unsound unless its updates are denied or go to the recorded upstream of a
+router enrolled with the updates tick (step 38), and step 40's *Anonymity
+gate* line then says so. The name `sys-ai-tor` must not exist yet, and one slot must
 be free, with 1 GiB of room under *Pool cap (all of AI space)*. The label of
 the project step 40 makes is picked by dom0; below, `<label>` stands for it
 and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
@@ -514,10 +519,10 @@ and `pA` for its slot, both shown in the tree (`pA <label>: t9 checklist`).
     `qvm-prefs sys-ai-tor netvm sys-whonix`. Press Refresh. On the Gateways tab,
     *Enroll...*, choose `sys-ai-tor`. Expect *Its upstream* `sys-ai-tor is on
     sys-whonix now`. Tick *Anonymising*: the line adds `; ticked, that is
-    recorded as its upstream`, and the command reads
-    `/usr/bin/sudo -n /usr/local/bin/qmcp gateway enroll sys-ai-tor --anonymising`.
+    recorded as its upstream`. Tick *Updates*: the command reads
+    `/usr/bin/sudo -n /usr/local/bin/qmcp gateway enroll sys-ai-tor --anonymising --updates`.
     OK. Expect a report ending `sys-ai-tor: enrolled (anonymising, on
-    sys-whonix)`. Select `sys-ai-tor`: *Upstream recorded when marked
+    sys-whonix; templates' updates may go to sys-whonix; label '')`. Select `sys-ai-tor`: *Upstream recorded when marked
     anonymising* `sys-whonix, where it is now`, and *Notes* `its own firewall
     rules have no effect upstream`.
 39. **The Anonymity tab, empty.** Open the Anonymity tab. Expect its label
@@ -803,8 +808,9 @@ qube, first; its timer does the same every 15 seconds.
     restore the qubes, then *Accept all held...*. Type the path from step 61:
     OK greyed out, `this install already has projects or gateways: an import
     is for a fresh install, and changes nothing here`. Cancel. The import
-    itself is drilled on a reinstalled box: install, *Import...*, restore the
-    qubes with `qvm-backup-restore`, then *Accept all held...*.
+    itself is drilled on a reinstalled box: restore everything with
+    `qvm-backup-restore` (dom0 ticked), install with the same hub,
+    *Import...*, then *Accept all held...*.
 63. **Clean up.** In dom0, `qvm-remove -f ai-t10 ai-t10c ai-t10r ai-t10a
     ai-t10b ai-t10x` (`qvm-shutdown --wait` first for any that runs), and
     remove the export file from step 61 unless you keep it. Refresh. Expect
@@ -824,9 +830,9 @@ qube, first; its timer does the same every 15 seconds.
 
 ### Packages, and the hub's proposals about one qube (0.9.28)
 
-Steps 65 to 72 cover *Install packages...* and the three proposals the hub
-can make about one qube: install packages into a template, manage a qube,
-revoke one. Run them in normal mode, with `qmcp check` GREEN. They need
+Steps 65 to 72 cover *Install packages...* and the three proposals 0.9.28
+added about one qube: install packages into a template, manage a qube, revoke
+one. Run them in normal mode, with `qmcp check` GREEN. They need
 `<base-template>`, a Debian or Fedora TemplateVM outside AI space whose
 updates work (Qubes Update updates it), and `<package>`, a package its
 repositories carry and it does not have yet, such as `sl`. Steps 68 to 71
@@ -896,7 +902,8 @@ button is greyed out and the window waits for the report; that is not a hang.
     pane: *Template to install into* `ai-t12-tpl`; *Packages (exact names)*
     `<package>`; *Equivalent command* `qmcp template install ai-t12-tpl
     <package>`; *Second tick* `needed: the reasons are in red below`. The red
-    text starts `INSTALLS 1 package(s) into the template ai-t12-tpl as root,
+    text, under `Accepting it needs the second tick:`, starts `- INSTALLS 1
+    package(s) into the template ai-t12-tpl as root,
     with its own package manager, from the repositories it already trusts,
     and what they depend on: <package>`, says that every qube built on it runs
     them from its first start after the template has shut down and that on
@@ -941,10 +948,10 @@ button is greyed out and the window waits for the report; that is not a hang.
     kills it if it runs`, *Equivalent command* `qmcp revoke ai-t12`, and
     in red `REVOKES ai-t12: every qmcp badge comes off, so it leaves AI space
     and any slot it is in; after that the hub reaches it only through your
-    dialogs, and what it left on its disk stays; it is killed if it runs, so
-    nothing the hub started in it runs on`. Tick the box, *Accept...*, OK.
-    Expect `ai-t12: revoked, killed, so nothing the hub started in it runs on;
-    what it wrote to disk stays` (only `ai-t12: revoked` if it was halted),
+    dialogs, and what it left on its disk stays; it is killed if it runs, and
+    what the hub had running in it is stopped`. Tick the box, *Accept...*, OK.
+    Expect `ai-t12: revoked, killed: what the hub had running in it was
+    stopped; what it wrote to disk stays` (only `ai-t12: revoked` if it was halted),
     then `proposal N: accepted`; `ai-t12` gone from the tree, and `qvm-ls
     ai-t12` listing it Halted.
 71. **A qube that is not there.** In the hub, send step 70's request again

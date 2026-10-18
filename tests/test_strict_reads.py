@@ -112,11 +112,12 @@ class Services(StrictBase):
         self.assertTrue(self.exists("ai-dvm-g"))
 
     def test_a_recheck_that_fails_refuses_even_a_managed_qube(self):
-        # The hub's first tag.List is the by-name check, its second the re-check
-        # on the object, there because its tags may have changed in between.
-        # Either read failing alone refuses the qube, as a qube outside AI
-        # space is refused.
-        for key, plan in (("tag.List:ai-work2", "fail"), ("tag.List:ai-work2", "ok fail")):
+        # The first tag.List of the qube is the audit's (where the line goes:
+        # one that fails sends it to RAM and refuses nothing); the hub's first
+        # is the by-name check, its second the re-check on the object, there
+        # because its tags may have changed in between. Either of those failing
+        # alone refuses the qube, as a qube outside AI space is refused.
+        for key, plan in (("tag.List:ai-work2", "ok fail"), ("tag.List:ai-work2", "ok ok fail")):
             self.app.fail_reads(key, plan)
             r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-work2", "action": "start"})
             fired = self.app.failed[key]
@@ -769,11 +770,18 @@ QUBE_PROPERTIES = frozenset({
     "netvm", "provides_network", "template", "template_for_dispvms", "default_dispvm",
     "klass", "label", "tags", "features", "volumes", "memory", "maxmem", "vcpus",
     "management_dispvm", "guivm", "audiovm", "default_template", "default_netvm",
-    "virt_mode", "kernel", "autostart"})
+    "virt_mode", "kernel", "autostart", "uuid", "auto_cleanup", "devices",
+    "get_power_state"})
 
 #: (module, function) whose `try` reads a qube property and does not re-raise,
 #: with the reason its answer on failure is the restrictive one, or is reported.
 ALLOWED_TRY = {
+    ("anon.py", "_power"): "a state that does not read is `unknown`, and only `Halted` is down",
+    ("inqube.py", "halted"): "a state that does not read is not halted: a copy's label claims "
+                             "less",
+    ("fleet.py", "_remove_qube"): "every failure is returned and reported as not removed",
+    ("proposals.py", "_qube_reasons"): "a read that fails adds a reason for the second tick: a "
+                                       "reason, never one fewer",
     ("restored.py", "_reject"): "only a label already absent (KeyError) is passed over; any other "
                                "failure raises and the reject reports it, with the badges off",
     ("restored.py", "_settle"): "the hold's read-back after its second wait: a read that fails "
@@ -818,6 +826,15 @@ def _own_nodes(fn):
             stack.append(node.body)
 
 
+def _power_not_halted(args) -> bool:
+    """`_safe(vm.get_power_state, <constant>)` whose default is not "Halted":
+    a state that does not read is then never taken for down, which is the
+    restrictive answer for every decision on power."""
+    return (isinstance(args[0], ast.Attribute) and args[0].attr == "get_power_state"
+            and len(args) == 2 and isinstance(args[1], ast.Constant)
+            and args[1].value != "Halted")
+
+
 def lenient_reads(tree) -> list:
     """(function, line, what) for each qube property read that turns a failure
     into a default: `getattr` with a default, `hasattr`, `_safe` around one,
@@ -833,10 +850,15 @@ def lenient_reads(tree) -> list:
                         and isinstance(args[1], ast.Constant) and args[1].value in QUBE_PROPERTIES \
                         and (name == "hasattr" or len(args) == 3):
                     found.append((fn.name, node.lineno, f"{name}(..., {args[1].value!r})"))
-                if name == "_safe" and args:
+                if name == "_safe" and args and not _power_not_halted(args):
                     for inner in ast.walk(args[0]):
                         if isinstance(inner, ast.Attribute) and inner.attr in QUBE_PROPERTIES:
                             found.append((fn.name, node.lineno, f"_safe(... .{inner.attr})"))
+                if name == "_shown" and args:
+                    # Display only: its UNREADABLE is never a tag set to decide on.
+                    for inner in ast.walk(args[0]):
+                        if isinstance(inner, ast.Attribute) and inner.attr == "tags":
+                            found.append((fn.name, node.lineno, "_shown(... .tags)"))
             if isinstance(node, ast.Try):
                 reads = {i.attr for s in node.body for i in ast.walk(s)
                          if isinstance(i, ast.Attribute) and i.attr in QUBE_PROPERTIES}
@@ -880,6 +902,13 @@ class NoLenientReads(unittest.TestCase):
             "def f(vm):\n    return getattr(vm, 'netvm', None)\n": "getattr",
             "def f(vm):\n    return hasattr(vm, 'klass')\n": "hasattr",
             "def f(vm):\n    return _safe(lambda: vm.template)\n": "_safe",
+            "def f(vm):\n    return getattr(vm, 'uuid', None)\n": "getattr",
+            "def f(vm):\n    return getattr(vm, 'auto_cleanup', False)\n": "getattr",
+            "def f(vm):\n    try:\n        return vm.uuid\n    except Exception:\n        return None\n": "try",
+            "def f(vm):\n    try:\n        return vm.get_power_state()\n    except Exception:\n        return 'Halted'\n": "try",
+            "def f(vm):\n    return _shown(lambda: vm.tags)\n": "_shown",
+            "def f(vm):\n    return _safe(vm.get_power_state, 'Halted')\n": "_safe",
+            "def f(vm):\n    try:\n        return list(vm.devices['pci'].get_attached_devices())\n    except Exception:\n        return []\n": "try",
             "def f(vm):\n    try:\n        return vm.tags\n    except Exception:\n        return set()\n": "try",
             "def f(vm):\n    def g():\n        try:\n            return vm.label\n        except Exception:\n            return None\n    return g\n": "try",
         }
@@ -890,6 +919,63 @@ class NoLenientReads(unittest.TestCase):
         self.assertEqual(lenient_reads(ast.parse("def f(vm):\n    try:\n        return vm.tags\n"
                                                  "    except Exception:\n        raise Unreadable()\n")),
                          [])                               # a try that re-raises is strict
+
+
+def undecoded_reads(tree) -> list:
+    """(function, line) for each text-mode `open(..., encoding=...)` read
+    whose enclosing `try`s catch neither UnicodeDecodeError nor one of its
+    bases: one byte that is not UTF-8 then raises out of the reader."""
+    covers = {"UnicodeDecodeError", "UnicodeError", "ValueError", "Exception", "BaseException"}
+    found = []
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "open"
+                and any(k.arg == "encoding" for k in node.keywords)
+                and not any(k.arg == "errors" for k in node.keywords)):
+            continue
+        mode = node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) \
+            else "r"
+        if set(mode) & set("wax"):
+            continue
+        caught, p, fn = set(), node, "?"
+        while p in parents:
+            p = parents[p]
+            if isinstance(p, ast.Try):
+                for h in p.handlers:
+                    if h.type is None:
+                        caught.add("BaseException")
+                    for n in ast.walk(h.type) if h.type is not None else ():
+                        if isinstance(n, ast.Name):
+                            caught.add(n.id)
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn = p.name
+                break
+        if not caught & covers:
+            found.append((fn, node.lineno))
+    return found
+
+
+class NoUndecodedReads(unittest.TestCase):
+    """An operator file, the records or the audit log holding a byte that is
+    not UTF-8 is a file that does not read, answered as such, never an
+    exception out of check, the gate or a service."""
+
+    def test_every_text_read_handles_a_bad_byte(self):
+        found = []
+        for path in sorted((HERE.parent / "dom0" / "qmcp").glob("*.py")):
+            for fn, line in undecoded_reads(ast.parse(path.read_text(), filename=str(path))):
+                found.append(f"{path.name}:{line} {fn}")
+        self.assertEqual(found, [], "catch UnicodeDecodeError where the OSError is caught")
+
+    def test_the_guard_finds_the_pattern(self):
+        bad = ("def f(p):\n    try:\n        with open(p, encoding='utf-8') as fh:\n"
+               "            return fh.read()\n    except OSError:\n        return ''\n")
+        self.assertEqual(len(undecoded_reads(ast.parse(bad))), 1)
+        for good in (bad.replace("except OSError", "except (OSError, UnicodeDecodeError)"),
+                     bad.replace("encoding='utf-8'", "encoding='utf-8', errors='replace'"),
+                     bad.replace("open(p, ", "open(p, 'w', ")):
+            self.assertEqual(undecoded_reads(ast.parse(good)), [], good)
 
 
 if __name__ == "__main__":

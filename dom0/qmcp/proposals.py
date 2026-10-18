@@ -453,10 +453,11 @@ def _open_window(req: dict, prefix) -> dict:
     decide that at accept, on the fleet as it is then.
 
     `for` is parsed here, so a duration the command would refuse is refused at
-    submit rather than at accept, and is STORED AS SENT: every field the hub
-    sends is stored verbatim, so the operator reads the hub's own words and
-    the command is built from them. The accept parses it again, with the same
-    parser.
+    submit rather than at accept, and is STORED AS SENT: the parser takes only
+    the bare form (no whitespace, no line break), so the hub's own words are
+    already the normal form, and the operator reads them in the command built
+    from them. The other fields are stored in the normal form `normalise`
+    returns. The accept parses `for` again, with the same parser.
     """
     from qmcp import fleet
     _fields(req, {"qube", "for"}, {"firewall"})
@@ -1151,7 +1152,7 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
         out.append(f"REVOKES {q}: every qmcp badge comes off, so it leaves AI space and any slot "
                    f"it is in; after that the hub reaches it only through your dialogs, and "
                    f"what it left on its disk stays"
-                   + ("; it is killed if it runs, so nothing the hub started in it runs on"
+                   + ("; it is killed if it runs, and what the hub had running in it is stopped"
                       if p["shutdown"] else "; it keeps running"))
     else:
         out.append(f"INSTALLS {len(p['packages'])} package(s) into the template {q} as root, "
@@ -1228,9 +1229,10 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
         # approved list, stops a project too. A judgement that cannot be made
         # is said, never dropped.
         try:
-            labels = fleet._would_stop(app, overlay={q: fleet.tags_after_manage(tags)})
-        except fleet.RoleError as e:
-            labels = [f"(cannot tell: {e})"]
+            labels = fleet._would_stop(app, overlay={q: fleet.tags_after_manage(tags)},
+                                       detail=False)
+        except fleet.RoleError:
+            labels = ["(cannot tell)"]
         hidden_labels = {r.label for r in records.values() if r.hidden}
         unsure = sorted(x for x in labels if "(cannot tell" in x)
         stopped = sorted(f"{x} (hidden)" if x in hidden_labels else x
@@ -1384,16 +1386,33 @@ def second_tick(app, p: dict, records: dict) -> list:
     return reasons
 
 
-def _execute(app, p: dict) -> list:
-    """Run the command a proposal is the options of; returns its report. One
-    that names a hidden anonymous project fails as one naming a project that
-    does not exist."""
+class _Unsure(Exception):
+    """A read the hidden checks need did not happen: whether the proposal
+    names a hidden project's qube is not known. Accept refuses before the
+    mark, so nothing runs and the proposal stays pending."""
+
+
+def _refuse_hidden(app, p: dict, records: dict) -> None:
+    """The hidden checks, for accept to make under the locks before the mark.
+    A proposal naming a hidden anonymous project, or one of its qubes, raises
+    the command's own error for a name that does not exist (accept then fails
+    it after the mark, as the command would fail for that name); a read the
+    check needs that fails raises `_Unsure`."""
     from qmcp import fleet
     t = p["type"]
-    if "project" in p and _hidden(projects.load(), p["project"]):
+    if "project" in p and _hidden(records, p["project"]):
         raise fleet.ProjectError(f"no project '{p['project']}'")
     if t.startswith("project-"):
         _refuse_hidden_names(app, p)
+    if t in ("qube-manage", "qube-revoke", "template-install"):
+        _refuse_hidden_qube(app, p)
+
+
+def _execute(app, p: dict) -> list:
+    """Run the command a proposal is the options of; returns its report. The
+    hidden checks are accept's, made before it (`_refuse_hidden`)."""
+    from qmcp import fleet
+    t = p["type"]
     if t == "project-create":
         return fleet.create_project(app, p["label"], p["lead"]["from"], p["lead"]["qube"],
                                     p["templates"], p["networks"], p["quota"], p["lead_netvm"],
@@ -1424,8 +1443,6 @@ def _execute(app, p: dict) -> list:
         # submit: the stored proposal holds the hub's own words.
         return fleet.open_window_report(app, p["qube"], fleet.duration_seconds(p["for"]),
                                         firewall=p["firewall"])
-    if t in ("qube-manage", "qube-revoke", "template-install"):
-        _refuse_hidden_qube(app, p)
     if t == "qube-manage":
         report = fleet.Report()
         report.append(fleet.manage(app, p["qube"], from_hub=True))
@@ -1524,7 +1541,7 @@ def _refuse_hidden_names(app, p: dict) -> None:
     template, a model qube, a lead's source) fails as one naming a qube that
     does not exist, in the command's own words for that, before the command
     reads anything else about it. A qube that cannot be looked up, or whose
-    tags cannot be read, refuses too, since it may be one."""
+    tags cannot be read, is `_Unsure`, since it may be one."""
     from qmcp import fleet
     for name, missing in _hidden_names(p):
         if not core.valid_qube_name(name):
@@ -1532,7 +1549,7 @@ def _refuse_hidden_names(app, p: dict) -> None:
         try:
             present = name in app.domains
         except Exception:
-            raise fleet.ProjectError(f"'{name}' cannot be looked up; try again") from None
+            raise _Unsure(f"'{name}' cannot be looked up") from None
         if not present:
             continue
         try:
@@ -1540,24 +1557,25 @@ def _refuse_hidden_names(app, p: dict) -> None:
         except core.Gone:
             continue
         except core.Unreadable:
-            raise fleet.ProjectError(f"'{name}''s badges cannot be read; try again") from None
+            raise _Unsure(f"'{name}''s badges cannot be read") from None
         if projects.HUBBLIND in tags:
             raise fleet.ProjectError(missing)
 
 
 def _refuse_hidden_qube(app, p: dict) -> None:
     """A qube of a hidden project, named by the hub, fails as a name that does
-    not exist: the same message as the command gives for one. A qube whose
-    tags cannot be read refuses too, since it may be one. The command makes
-    the hub's other refusals itself, on the tags it reads (`from_hub`)."""
+    not exist: the same message as the command gives for one. A qube that
+    cannot be looked up, or whose tags cannot be read, is `_Unsure`, since it
+    may be one. The command makes the hub's other refusals itself, on the
+    tags it reads (`from_hub`)."""
     from qmcp import fleet
     name = p[QUBE_FIELD[p["type"]]]
     try:
         vm, tags = _named_qube(app, p)
     except core.Unreadable:
-        raise fleet.RoleError(f"'{name}' cannot be looked up; try again") from None
+        raise _Unsure(f"'{name}' cannot be looked up") from None
     if vm is not None and tags is None:
-        raise fleet.RoleError(f"'{name}''s badges cannot be read; try again")
+        raise _Unsure(f"'{name}''s badges cannot be read")
     if p["type"] == "template-install" and tags is not None and projects.HUBBLIND in tags:
         # The install's own words for a name that does not exist (its own
         # refusal of a hidden project's template names it as one). For a
@@ -1634,6 +1652,12 @@ def show(app, pid: int, now: float | None = None, directory: str | None = None) 
     doc["second_tick"] = second_tick(app, p, records)
     doc["tick"] = tick_digest(doc["second_tick"])
     target = projects.find(records, p["project"]) if "project" in p else None
+    hidden = target is not None and target.hidden
+    if hidden:
+        # Accepting fails, as for a project that does not exist (`_execute`),
+        # so nothing is computed from its record: no before, no after, and no
+        # plan naming its qubes.
+        target = None
     if p["type"] == "project-edit" and target is not None and target.label:
         doc["before"] = {"templates": list(target.templates),
                          "networks": [NONE if n is None else n for n in target.networks],
@@ -1690,7 +1714,7 @@ def show(app, pid: int, now: float | None = None, directory: str | None = None) 
             why = _refusal_seen(app, p, vm, tags)
             if why:
                 doc["plan"] = f"{why}, so accepting it will fail and change nothing"
-    if p["type"] == "project-delete":
+    if p["type"] == "project-delete" and not hidden:
         # The command's own plan, which also covers finishing a half-done delete.
         doc["plan"] = fleet.delete_plan(app, records, p["project"])[1]
     elif "project" in p and target is None:
@@ -1762,8 +1786,10 @@ def _redecide(e: Entry, state: str, report, now: float, directory: str | None) -
     return os.path.basename(aside)
 
 
-def _audit(service: str, summary: dict, ok: bool, error=None) -> None:
-    audit.audit(service, "operator", summary, ok, error)
+def _audit(service: str, summary: dict, ok: bool, error=None, app=None) -> None:
+    # The proposal's subject is a project's label or a qube: its line follows
+    # that project's mode (`audit.place`).
+    audit.audit(service, "operator", summary, ok, error, app=app)
 
 
 def _open(e: Entry, now: float) -> None:
@@ -1780,7 +1806,7 @@ def _open(e: Entry, now: float) -> None:
 
 
 def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | None = None,
-           directory: str | None = None, lock_path: str | None = None) -> tuple:
+           directory: str | None = None, lock_path: str | None = None, clock=None) -> tuple:
     """Accept proposal `pid`, which must still hash to `sha256` (the fingerprint
     the operator was shown). `tick` is the second tick: the digest `show` gave
     of the reasons it needs one, refused when there are reasons now and they
@@ -1791,9 +1817,16 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
     second tick not given, the records unreadable) change nothing and leave the
     proposal as it was. Once the command runs, its outcome closes the proposal:
     `accepted`, or `failed` with the report of what it did before it stopped.
-    Every attempt leaves one line on the audit chain, as the operator."""
+    Every attempt leaves one line on the audit chain, as the operator.
+
+    The time is read when it is used, not once at the start: the locks may
+    take minutes to come and an install half an hour to run, so expiry is
+    judged under the store's lock, and the decision is stamped when it is
+    written. `now` fixes the time for every read; `clock` is read each time
+    (tests)."""
     from qmcp import fleet
-    now = time.time() if now is None else now
+    if clock is None:
+        clock = time.time if now is None else (lambda fixed=now: fixed)
     summary = {"id": pid, "sha256": str(sha256)[:64], "yes": tick is not None}
     held, interrupted = None, None
     try:
@@ -1806,23 +1839,33 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
         # before the second tick and the mark: the tick is judged on the fleet
         # the command will find, and locks that cannot be had now refuse before
         # anything is marked, so the proposal stays pending.
+        # `held` is set only once both are held: an interrupt while taking them
+        # is raised as itself, and the finally below has nothing to let go of.
         try:
-            held = fleet.hold_project_locks()
-            held.__enter__()
+            locks = fleet.hold_project_locks()
+            locks.__enter__()
+            held = locks
         except (fleet.ProjectError, RuntimeError) as err:
-            held = None
             raise Refused(f"proposal {pid} cannot be accepted now ({err}); nothing was run, "
                           f"and it is still pending") from None
+        except OSError as err:
+            # A lock file that cannot be opened: said as that, not as the
+            # store (which is what the command reports an OSError as).
+            raise Refused(f"proposal {pid} cannot be accepted now (the project locks cannot be "
+                          f"taken: {type(err).__name__}); nothing was run, and it is still "
+                          f"pending") from None
         with _Locked(DECIDE_WAIT_S, lock_path):
             e = _entry(pid, directory)
             if e.proposal is not None:
                 summary.update({"type": e.proposal["type"], "subject": subject(e.proposal)})
+            now = clock()
             _open(e, now)
             if e.sha256 != sha256:
                 raise Refused(f"proposal {pid} is not the one shown: its fingerprint differs; "
                               f"refresh and read it again")
             p = e.proposal
-            reasons = second_tick(app, p, _records_or_refuse())
+            records = _records_or_refuse()
+            reasons = second_tick(app, p, records)
             if reasons and tick is None:
                 needs = Refused(f"proposal {pid} needs the second tick (--yes {tick_digest(reasons)}): "
                                 + "; ".join(reasons))
@@ -1833,6 +1876,18 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
                                 f"it was given for; read it again: " + "; ".join(reasons))
                 moved.logged = "the second tick answers other reasons"
                 raise moved
+            # The hidden checks, before the mark: a read they need that fails
+            # changes nothing and leaves the proposal pending, to be accepted
+            # again. A hidden match is the command's failure, after the mark,
+            # so it closes the proposal as a name that does not exist would.
+            try:
+                _refuse_hidden(app, p, records)
+                hidden = None
+            except _Unsure as err:
+                raise Refused(f"proposal {pid} cannot be accepted now ({err}); nothing was "
+                              f"run, and it is still pending") from None
+            except fleet.RoleError as err:
+                hidden = err
             try:
                 claim_path, claim_fd = _claim(e, now, directory)
             except OSError as err:
@@ -1850,6 +1905,8 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
             h, held = held, None
             h.__exit__(None, None, None)
         try:
+            if hidden is not None:
+                raise hidden
             report = _execute(app, p)
             failure = "a step did not complete" if getattr(report, "failed", None) else None
             ok, report = failure is None, list(report)
@@ -1870,38 +1927,47 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
             report.append(f"stopped: {failure}")
             ok = False
         try:
-            _decide(e, "accepted" if ok else "failed", report, now, directory)
-            os.unlink(claim_path)
-        except OSError as err:
-            # The mark stays: once released below it reads as an accept that
-            # never finished, so the proposal is failed and is never run again.
-            unrecorded = Refused(
-                f"proposal {pid}: the command ran ({'it completed' if ok else 'it failed'}), "
-                f"but its decision could not be written ({type(err).__name__}); it reads "
-                f"as failed")
-            unrecorded.report = _report(report)
-            raise unrecorded from None
+            try:
+                _decide(e, "accepted" if ok else "failed", report, clock(), directory)
+            except OSError as err:
+                # The mark stays: once released below it reads as an accept that
+                # never finished, so the proposal is failed and is never run again.
+                unrecorded = Refused(
+                    f"proposal {pid}: the command ran ({'it completed' if ok else 'it failed'}), "
+                    f"but its decision could not be written ({type(err).__name__}); it reads "
+                    f"as failed")
+                unrecorded.report = _report(report)
+                raise unrecorded from None
+            try:
+                os.unlink(claim_path)
+            except OSError as err:
+                # The decision is written and closes the proposal; a mark left
+                # beside a decision reads as an accept that finished, so the
+                # outcome stands and is reported as it was.
+                report.append(f"decided; its mark {os.path.basename(claim_path)} could not be "
+                              f"removed ({type(err).__name__}), and the decision beside it "
+                              f"closes the proposal")
         finally:
             os.close(claim_fd)
     except Refused as r:
-        _audit("qmcp proposal accept", summary, False, getattr(r, "logged", str(r)))
+        _audit("qmcp proposal accept", summary, False, getattr(r, "logged", str(r)), app)
         raise
     except Exception as e:
         # Before its command ran (reading the fleet for the second tick, say):
         # nothing changed and the proposal is as it was.
-        _audit("qmcp proposal accept", summary, False, type(e).__name__)
+        _audit("qmcp proposal accept", summary, False, type(e).__name__, app)
         raise
     finally:
         if held is not None:
             held.__exit__(None, None, None)
-    _audit("qmcp proposal accept", summary, ok, failure)
+    _audit("qmcp proposal accept", summary, ok, failure, app)
     if interrupted is not None:
         raise interrupted
     return ok, _report(report)
 
 
 def reject(pid: int, now: float | None = None, directory: str | None = None,
-           lock_path: str | None = None) -> str:
+           lock_path: str | None = None, app=None) -> str:
     """Reject proposal `pid`: it closes, and nothing changes in the fleet.
     Returns the state it closed in. It also closes a proposal that needs
     closing, so `qmcp check` stops warning about it: an unreadable proposal
@@ -1936,10 +2002,10 @@ def reject(pid: int, now: float | None = None, directory: str | None = None,
                 closed = "rejected"
                 _decide(e, closed, [], now, directory)
     except Refused as r:
-        _audit("qmcp proposal reject", summary, False, str(r))
+        _audit("qmcp proposal reject", summary, False, str(r), app)
         raise
     summary["closed"] = closed
-    _audit("qmcp proposal reject", summary, True)
+    _audit("qmcp proposal reject", summary, True, app=app)
     return closed
 
 

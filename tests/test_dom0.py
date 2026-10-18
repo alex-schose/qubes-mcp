@@ -54,6 +54,8 @@ class Base(unittest.TestCase):
             (birth, "NAME_PREFIX_PATH", self.tmp / "name-prefix"),
             (birth, "BIRTH_EGRESS_PATH", self.tmp / "birth-egress"),
             (audit, "LOG_PATH", self.tmp / "audit.log"),
+            (audit, "MODE_PATH", self.tmp / "audit-mode"),
+            (audit, "KEEP_DAYS_PATH", self.tmp / "audit-keep-days"),
             (fleet, "TIER_DEFAULT_PATH", self.tmp / "tier-default"),
             (fleet, "ENFORCE_MODE_PATH", self.tmp / "enforce-mode"),
             (fleet, "GUARDED_LIST_PATH", self.tmp / "guarded"),
@@ -73,6 +75,10 @@ class Base(unittest.TestCase):
         ]:
             self._saved.append((mod, attr, getattr(mod, attr)))
             setattr(mod, attr, value if isinstance(value, float) else str(value))
+        # The gate's timer runs, as on an installed dom0: `qmcp check` judges it
+        # in every mode, and this host has no systemd unit to ask.
+        self._saved.append((anon, "TIMER_CHECK", anon.TIMER_CHECK))
+        anon.TIMER_CHECK = lambda: True
         self.addCleanup(self._restore)
         (self.tmp / "run" / "calls").mkdir(parents=True)
         (self.tmp / "run" / "open").mkdir()
@@ -112,6 +118,14 @@ class Base(unittest.TestCase):
     def audit_lines(self):
         p = pathlib.Path(audit.LOG_PATH)
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def logged(self):
+        """The audit lines of calls, without the one each cap leaves."""
+        return [l for l in self.audit_lines() if l["service"] != audit.CAPPED_SERVICE]
+
+    def capped(self):
+        return [(l["caller"], l["args"]["cap"]) for l in self.audit_lines()
+                if l["service"] == audit.CAPPED_SERVICE]
 
     def enroll(self, name, anonymising=False, label=""):
         registry = gateways.load()
@@ -183,6 +197,46 @@ class Funnel(Base):
                                             if k not in ("hash", "prev", "ts")}))
         ok, n, err = audit.verify()
         self.assertTrue(ok, err)
+
+    def test_a_log_line_that_is_not_utf8_breaks_the_chain_at_its_line(self):
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 777})
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 778})
+        self.assertEqual(audit.verify(), (True, 2, None))           # the positive
+        p = pathlib.Path(audit.LOG_PATH)
+        lines = p.read_bytes().splitlines()
+        p.write_bytes(lines[0] + b"\n" + lines[1][:-2] + b"\xff}\n")
+        self.assertEqual(audit.verify(), (False, 2, "line 2 is not UTF-8"))
+        p.write_bytes(lines[0] + b"\n[1]\n")
+        self.assertEqual(audit.verify(), (False, 2, "unparseable line 2"))
+
+    def test_a_rotation_never_leaves_the_log_missing(self):
+        # A writer finding no file at the log's name would start a fresh,
+        # unanchored chain from GENESIS.
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 777})
+        seen, real_link, real_rename = [], os.link, os.rename
+
+        def watch(fn):
+            def call(*a, **kw):
+                seen.append(os.path.exists(audit.LOG_PATH))
+                out = fn(*a, **kw)
+                seen.append(os.path.exists(audit.LOG_PATH))
+                return out
+            return call
+        with mock.patch.object(audit.os, "link", watch(real_link)), \
+                mock.patch.object(audit.os, "rename", watch(real_rename)):
+            aside = audit.rotate()
+        self.assertTrue(seen and all(seen), seen)
+        self.assertEqual(audit.verify(aside), (True, 1, None))
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 778})
+        self.assertEqual(audit.verify(), (True, 2, None))
+        self.assertFalse(os.path.exists(audit.LOG_PATH + ".rotating"))
+
+    def test_a_counter_rewrite_cut_short_keeps_its_counts(self):
+        path = os.path.join(self.tmp, "c.refused")
+        pathlib.Path(path).write_text('{"day": "2026-10-18", "lines": 12345, "unlogged": 7}\n')
+        # The new, shorter record written over the start, the truncate never run.
+        pathlib.Path(path).write_text('{"day": "2026-10-18", "lines": 9}\n' + "345, \"x\": 7}\n")
+        self.assertEqual(audit._update(path, lambda rec: rec["lines"]), 9)
 
     def test_reads_are_not_audited(self):
         self.call("qmcp.ListAIManagedQubes")
@@ -264,7 +318,10 @@ class Funnel(Base):
         with mock.patch.object(audit, "REFUSALS_PER_HOUR", 3):
             for _ in range(5):
                 self.assertFalse(self.call("qmcp.SetPropertyAIManaged", bad)["ok"])
-            self.assertEqual(len(self.audit_lines()), 3)
+            self.assertEqual(len(self.logged()), 3)
+            # The first call past the cap leaves one line, the second none:
+            # the counter is on tmpfs, the chain keeps that calls were withheld.
+            self.assertEqual(self.capped(), [(HUB, "hour")])
             found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
                                                      system_info={"domains": {}})}
             self.assertEqual(found["calls not logged"].status, "warn")
@@ -273,8 +330,23 @@ class Funnel(Base):
             r = self.call("qmcp.SetPropertyAIManaged",
                           {"name": "ai-work", "property": "memory", "value": 700})
             self.assertEqual(r, {"ok": True})
-            self.assertEqual(len(self.audit_lines()), 4)
+            self.assertEqual(len(self.logged()), 4)
             self.assertIsNone(audit.dropped())
+
+    def test_a_write_that_landed_before_it_raised_is_always_logged(self):
+        key = sorted(services.FEATURE_KEYS)[0]
+        with mock.patch.object(audit, "REFUSALS_PER_HOUR", 0):
+            for fail, service, req in (
+                    ("set.memory.landed", "qmcp.SetPropertyAIManaged",
+                     {"name": "ai-work", "property": "memory", "value": 701}),
+                    ("feature.set.landed", "qmcp.SetFeatureAIManaged",
+                     {"name": "ai-work", "feature": key, "value": "7"})):
+                with self.subTest(fail):
+                    self.app.fail.add(fail)
+                    n = len(self.audit_lines())
+                    self.assertFalse(self.call(service, req)["ok"])
+                    self.app.fail.discard(fail)
+                    self.assertEqual(len(self.audit_lines()), n + 1)
 
     def test_a_failed_call_that_created_nothing_is_capped_whatever_raised(self):
         # The cap keys on what landed, not on whether an exception was behind
@@ -288,7 +360,7 @@ class Funnel(Base):
             r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x", "template": "ai-debian-13",
                                                       "klass": []})
             self.assertFalse(r["ok"])
-        self.assertEqual(self.audit_lines(), [])
+        self.assertEqual(self.logged(), [])
         self.assertEqual(audit.unlogged_refusals(os.path.dirname(self.counter()))[0][:2], (HUB, 2))
 
     def test_a_set_to_the_value_already_there_is_capped_and_still_answers_ok(self):
@@ -306,7 +378,7 @@ class Funnel(Base):
                                  {"ok": True})
                 self.assertTrue(self.call("qmcp.SetFeatureAIManaged",
                                           {"name": "ai-work", "feature": key, "value": "1"})["ok"])
-            self.assertEqual(self.audit_lines(), [])
+            self.assertEqual(self.logged(), [])
             r = self.call("qmcp.SetPropertyAIManaged",
                           {"name": "ai-work", "property": "label", "value": "blue"})
             self.assertEqual(r, {"ok": True})
@@ -314,7 +386,7 @@ class Funnel(Base):
             r = self.call("qmcp.SetPropertyAIManaged",
                           {"name": "ai-work", "property": "memory", "value": vm.memory})
             self.assertEqual(r, {"ok": True})
-        self.assertEqual([l["args"].get("property") for l in self.audit_lines()], ["label", "memory"])
+        self.assertEqual([l["args"].get("property") for l in self.logged()], ["label", "memory"])
         self.assertEqual(audit.unlogged_refusals(os.path.dirname(self.counter()))[0][:2], (HUB, 6))
 
     def test_an_accepted_shut_down_and_kill_are_logged_past_the_cap(self):
@@ -389,7 +461,11 @@ class Funnel(Base):
                           {"name": "ai-work", "property": "memory", "value": 700})
             self.assertEqual(r, {"ok": False, "error": services.NO_AUDIT_BUDGET})
             self.assertEqual(vm.memory, 600)
-            self.assertEqual(len(self.audit_lines()), 2)
+            self.assertEqual(len(self.logged()), 2)
+            self.assertEqual(self.capped(), [(HUB, "day")])
+            self.call("qmcp.SetPropertyAIManaged",
+                      {"name": "ai-work", "property": "memory", "value": 800})
+            self.assertEqual(self.capped(), [(HUB, "day")])            # once a day
             # Past the budget a kill still acts, its line under the hourly cap.
             with mock.patch.object(audit, "REFUSALS_PER_HOUR", 1):
                 for n in range(3):
@@ -397,13 +473,13 @@ class Funnel(Base):
                     self.assertEqual(self.call("qmcp.LifecycleAIManaged",
                                                {"name": "ai-work", "action": "kill"}), {"ok": True})
                     self.assertEqual(vm.get_power_state(), "Halted")
-            self.assertEqual(len(self.audit_lines()), 3)            # one kill logged, two counted
+            self.assertEqual(len(self.logged()), 3)            # one kill logged, two counted
             found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
                                                      system_info={"domains": {}})}
             self.assertEqual(found["audit budget spent"].status, "warn")
             self.assertIn(f"{HUB}: 2 line(s) today", found["audit budget spent"].detail)
             self.assertIn(f"{HUB}: 2 call(s) past {audit.REFUSALS_PER_HOUR} in a clock hour", found["calls not logged"].detail)
-            self.assertIn("1 change(s) refused", found["audit budget spent"].detail)
+            self.assertIn("2 change(s) refused", found["audit budget spent"].detail)
             # The cap's lines do not spend the budget, and another caller has its own.
             other = self.counter("ai-osint-lead")
             self.assertTrue(audit.budget_left(other))
@@ -1102,6 +1178,16 @@ class Events(Base):
         self.assertIn("at most", r["error"])
         self.assertEqual(self.run_events([], qube="personal"), core.NOT_FOUND)
 
+    def test_a_hub_stopped_or_held_during_the_window_gets_nothing(self):
+        script = [("ai-work", "domain-start", {})]
+        self.assertEqual(len(self.run_events(script)["events"]), 1)       # the positive
+        for badge in (projects.BLOCKED, core.QUARANTINE):
+            with self.subTest(badge):
+                hold = lambda b=badge: self.app.domains[HUB].tags.add(b)  # noqa: E731
+                r = self.run_events(script + [(hold, None, None)])
+                self.assertEqual(r, core.NOT_AUTHORIZED)
+                self.app.domains[HUB].tags.discard(badge)
+
     def test_scope_and_tag_redaction(self):
         def delete_ai_work2():
             self.app.domains._drop("ai-work2")
@@ -1303,7 +1389,8 @@ class AuditFindings(Base):
             ("qmcp.AIManagedEvents", lambda n: {"duration": 1, "qube": n}),
         ]
         # A qube of a hidden anonymous project is the hub's to see no more than
-        # one outside AI space, and costs the same.
+        # one outside AI space, and gets the same reply and the same qubesd
+        # calls (not the same time: qubesd answers a missing qube sooner).
         self.app.vm("ai-hid-w1", tags={"ai-managed", "qmcp-proj-p05", "qmcp-anon",
                                        "qmcp-hubblind"})
         for svc, make in cases:
@@ -1314,8 +1401,17 @@ class AuditFindings(Base):
             self.assertEqual(missing, hidden, svc)
             # The first read is the caller's own tags: the services refuse a hub
             # the anonymity gate stopped or the restore check holds. It is the
-            # same for every name.
-            self.assertEqual(missing[1], ["admin.vm.tag.List", "admin.vm.tag.List"], svc)
+            # same for every name. A state-changing call also reads the badges
+            # of each qube its request names, before it acts and after, for the
+            # project its audit line belongs to: the same for every name too.
+            # Before: the keys the service acts on; after: the names its line
+            # records. Both the same for every name, as asserted above.
+            reads = missing[1]
+            self.assertEqual(set(reads), {"admin.vm.tag.List"}, svc)
+            if services.SERVICES[svc][1]:
+                self.assertGreaterEqual(len(reads), 2 + 2 * len(audit.REQUEST_KEYS[svc]), svc)
+            else:
+                self.assertEqual(len(reads), 2, svc)
             self.assertEqual(missing[2], 0, svc)
 
     def test_explicit_netvm_is_checked_by_name(self):
@@ -1569,6 +1665,41 @@ class Windows(Base):
     def tags(self, name=None):
         return self.app.domains[name or self.TPL].tags.raw()
 
+    def test_a_seal_says_the_hubs_firewall_rules_stay(self):
+        for firewall in (False, True):
+            with self.subTest(firewall=firewall):
+                fleet.open_window(self.app, "ai-tpl-g", 3600, firewall=firewall)
+                text = fleet.seal(self.app, "ai-tpl-g")
+                self.assertEqual("firewall rules the hub wrote stay" in text, firewall, text)
+
+    def test_manage_of_an_open_qube_ends_the_window_while_it_is_guarded(self):
+        vm = self.app.domains["ai-tpl-g"]
+        vm.start()
+        fleet.open_window(self.app, "ai-tpl-g", 3600)
+        seen = []
+        real = fakequbes.FakeTags.discard
+
+        def discard(tags, tag):
+            if tag in (core.OPEN, core.OPEN_FW):
+                seen.append(core.GUARDED in tags.raw())
+            return real(tags, tag)
+        self.addCleanup(setattr, fakequbes.FakeTags, "discard", real)
+        fakequbes.FakeTags.discard = discard
+        fleet.manage(self.app, "ai-tpl-g")
+        self.assertEqual(seen, [True])          # guarded still, when the window's badge came off
+        self.assertFalse(vm.tags.raw() & {core.OPEN, core.OPEN_FW, core.GUARDED})
+
+    def test_manage_whose_window_does_not_come_off_says_seal_and_keeps_the_guard(self):
+        vm = self.app.domains["ai-tpl-g"]
+        vm.start()
+        fleet.open_window(self.app, "ai-tpl-g", 3600)
+        self.app.fail.add(f"tag.discard:{core.OPEN}")
+        with self.assertRaisesRegex(fleet.RoleError, "run qmcp seal ai-tpl-g"):
+            fleet.manage(self.app, "ai-tpl-g")
+        self.app.fail.clear()
+        self.assertIn(core.GUARDED, vm.tags.raw())
+        self.assertEqual(vm._power, "Running")
+
     def test_open_gives_both_halves_only_when_asked(self):
         fleet.open_window(self.app, self.TPL, 3600)
         self.assertEqual(self.tags() & {core.OPEN, core.OPEN_FW}, {core.OPEN})
@@ -1609,7 +1740,7 @@ class Windows(Base):
     def test_the_duration_is_bounded_and_has_no_indefinite_form(self):
         self.assertEqual([fleet.duration_seconds(x) for x in ("90s", "30m", "2h", "45")],
                          [90, 1800, 7200, 45])
-        for junk in ("", "2 h", "1.5h", "-5", "2d", "h", None, 3600):
+        for junk in ("", "2 h", "1.5h", "-5", "2d", "h", None, 3600, " 2h", "2h\n", "2h\r"):
             with self.assertRaises(fleet.RoleError):
                 fleet.duration_seconds(junk)
         for bad in (0, -1, fleet.WINDOW_MAX_S + 1, True, 1.5):
@@ -1877,6 +2008,29 @@ class Windows(Base):
         lines = fleet.expire_windows(self.app)
         self.assertTrue(any("another qube of that name" in l for l in lines), lines)
         self.assertEqual(self.app.domains[self.TPL].get_power_state(), "Running")
+
+    def test_a_dropped_pending_kill_leaves_one_line(self):
+        vm = self.pending_after_failed_kill()
+        vm.kill()
+        vm.start()
+        n = len(self.audit_lines())
+        fleet.expire_windows(self.app)
+        new = self.audit_lines()[n:]
+        self.assertEqual([(l["service"], l["args"]["swept"]) for l in new],
+                         [("qmcp seal", "pending kill dropped: stopped and started again since "
+                                        "its seal")])
+        fleet.expire_windows(self.app)                     # nothing left: no second line
+        self.assertEqual(len(self.audit_lines()), n + 1)
+
+    def test_a_retry_that_fails_again_leaves_no_line(self):
+        self.pending_after_failed_kill()
+        self.app.fail.add("kill")
+        n = len(self.audit_lines())
+        fleet.expire_windows(self.app)
+        fleet.expire_windows(self.app)
+        self.app.fail.discard("kill")
+        self.assertEqual(len(self.audit_lines()), n)
+        self.assertEqual(fleet.pending_kills(), [self.TPL])
 
     def test_the_hub_is_never_left_with_a_pending_kill(self):
         a = self.app
@@ -2479,6 +2633,22 @@ class Turnstile(Base):
             self.assertTrue(core.queue_path(lock).endswith(".queue"))
             self.assertNotEqual(core.queue_path(lock), core.qube_lock_path("x"))
 
+class StampOrder(unittest.TestCase):
+    def test_routed_badges_come_off_before_the_guard(self):
+        # A disposable of a guarded disposable template with a window open on
+        # it arrives wearing both: the window's badge must never be the last
+        # one standing beside a removed guard.
+        tags = {"ai-managed", "qmcp-guarded", "qmcp-open", "qmcp-open-fw", "qmcp-proj-p02"}
+        removed = []
+        io = birth.TagIO(lambda: set(tags), tags.add,
+                         lambda t: (removed.append(t), tags.discard(t)))
+        birth.stamp(io, set(tags), HUB, "qmcp-proj-p02")
+        self.assertEqual(removed[-1], "qmcp-guarded")
+        self.assertEqual(set(removed), {"qmcp-guarded", "qmcp-open", "qmcp-open-fw"})
+        # Teeth: in sorted order the guard would come off first.
+        self.assertEqual(sorted(removed)[0], "qmcp-guarded")
+
+
 class CreatesUnderTheLock(Base):
     """A create judges its template again once it holds the create lock, sets
     its network before it joins AI space, and counts what qubesd will give it."""
@@ -2492,6 +2662,26 @@ class CreatesUnderTheLock(Base):
             return fd
         budget.acquire_create_lock = wait
         self.addCleanup(setattr, budget, "acquire_create_lock", real)
+
+    def test_a_source_taken_off_its_network_while_a_create_waited_is_refused(self):
+        self.egress("ai-net-router")
+        real = budget.acquire_create_lock
+        for service, req, src in (
+                ("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm-g"}, "ai-dvm-g"),
+                ("qmcp.SpawnAIManagedQube", {"name": "ai-hub-nd", "template": "ai-dvm-g",
+                                             "klass": "DispVM"}, "ai-dvm-g"),
+                ("qmcp.CloneAIManagedQube", {"source": "ai-work", "name": "ai-hub-cl"},
+                 "ai-work")):
+            with self.subTest(service):
+                vm = self.app.domains[src]
+                vm.netvm = self.app.domains["ai-net-router"]
+                before = set(self.app.domains._vms)
+                self.during_the_wait(lambda: setattr(vm, "netvm", None))
+                r = self.call(service, req)
+                self.assertFalse(r["ok"], r)
+                self.assertIn("network changed while this call waited", r["error"])
+                self.assertEqual(set(self.app.domains._vms), before)
+                budget.acquire_create_lock = real
 
     def test_a_template_stopped_while_a_spawn_waited_is_not_built_on(self):
         self.during_the_wait(lambda: self.app.domains["ai-debian-13"].tags.add("qmcp-blocked"))

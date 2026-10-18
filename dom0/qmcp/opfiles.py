@@ -22,9 +22,10 @@ import datetime
 import json
 import os
 import pwd
+import re
 import tempfile
 
-from qmcp import birth, budget, core, gateways, projects
+from qmcp import audit, birth, budget, core, gateways, projects
 
 FORMAT = "qubes-mcp-export/1"
 MAX_FILE = 1024 * 1024
@@ -32,7 +33,12 @@ MAX_EXPORT = 4 * 1024 * 1024
 
 
 class OpFilesError(Exception):
-    pass
+    """A refusal, or a failure part-way. `written` holds the lines of what
+    was changed before it (empty: nothing was)."""
+
+    def __init__(self, message: str, written=()):
+        super().__init__(message)
+        self.written = list(written)
 
 
 def _paths() -> dict:
@@ -40,7 +46,14 @@ def _paths() -> dict:
     return {"hub": core.HUB_PATH, "mode": core.MODE_PATH,
             "pool-cap": budget.CAP_PATH, "private-cap": budget.PRIVATE_CAP_PATH,
             "birth-egress": birth.BIRTH_EGRESS_PATH, "name-prefix": birth.NAME_PREFIX_PATH,
-            "gateways.json": gateways.GATEWAYS_PATH, "projects.json": projects.PROJECTS_PATH}
+            "gateways.json": gateways.GATEWAYS_PATH, "projects.json": projects.PROJECTS_PATH,
+            **_added_paths()}
+
+
+def _added_paths() -> dict:
+    """The files an export holds since 0.9.33; one from before has none of
+    them, and still imports."""
+    return {"audit-keep-days": audit.KEEP_DAYS_PATH, "audit-mode": audit.MODE_PATH}
 
 
 def _read(path: str):
@@ -91,13 +104,22 @@ def _locks():
 
 # ------------------------------------------------------------------ settings
 
-def settings_set(app, pool_cap=None, private_cap=None, birth_egress=None) -> list:
-    """Change the pool cap, the private-volume cap or birth egress. Each is
-    checked before anything is written, and the writes happen under both
-    locks. Returns one line per change."""
+def settings_set(app, pool_cap=None, private_cap=None, birth_egress=None,
+                 audit_keep_days=None) -> list:
+    """Change the pool cap, the private-volume cap, birth egress or how long a
+    rotated audit log is kept. Each is checked before anything is written, and
+    the writes happen under both locks. Returns one line per change."""
     from qmcp import fleet
-    if pool_cap is None and private_cap is None and birth_egress is None:
-        raise OpFilesError("nothing to change: give --pool-cap, --private-cap or --birth-egress")
+    if pool_cap is None and private_cap is None and birth_egress is None \
+            and audit_keep_days is None:
+        raise OpFilesError("nothing to change: give --pool-cap, --private-cap, --birth-egress "
+                           "or --audit-keep-days")
+    keep = None
+    if audit_keep_days is not None:
+        keep = audit.parse_keep_days(str(audit_keep_days).strip())
+        if keep is None:
+            raise OpFilesError(f"--audit-keep-days is a number of days, 1 to "
+                               f"{audit.KEEP_DAYS_MAX}, or off")
     pool = None if pool_cap is None else _size(fleet, pool_cap)
     private = None if private_cap is None else _size(fleet, private_cap)
     egress = None
@@ -116,10 +138,16 @@ def settings_set(app, pool_cap=None, private_cap=None, birth_egress=None) -> lis
             if egress not in enrolled:
                 raise OpFilesError(f"'{egress}' is not an enrolled gateway (qmcp gateway enroll "
                                    f"{egress} first)")
-            vm = core.lookup(app, egress)
-            if vm is None or core.QUARANTINE in core.tags_of(vm):
-                raise OpFilesError(f"'{egress}' is held for your review (qmcp restored list)"
-                                   if vm is not None else f"no qube '{egress}'")
+            # A lookup or a badge read that fails is no proof either way.
+            try:
+                vm = fleet._vm(app, egress)
+                held = vm is not None and core.QUARANTINE in core.tags_of(vm)
+            except core.Unreadable:
+                raise OpFilesError(f"'{egress}' cannot be looked up now; try again") from None
+            if vm is None:
+                raise OpFilesError(f"no qube '{egress}'")
+            if held:
+                raise OpFilesError(f"'{egress}' is held for your review (qmcp restored list)")
         if pool is not None:
             try:
                 used = budget.persistent_sum(app)
@@ -129,18 +157,32 @@ def settings_set(app, pool_cap=None, private_cap=None, birth_egress=None) -> lis
             if pool < used:
                 raise OpFilesError(f"a pool cap of {pool} bytes is below the {used} AI space "
                                    f"already uses")
-        if pool is not None:
-            _write(paths["pool-cap"], f"{pool}\n")
-            out.append(f"pool-cap: {pool}")
-        if private is not None:
-            _write(paths["private-cap"], f"{private}\n")
-            out.append(f"private-cap: {private}")
-        if egress == "none":
-            _remove(paths["birth-egress"])
-            out.append("birth-egress: not set")
-        elif egress is not None:
-            _write(paths["birth-egress"], f"{egress}\n")
-            out.append(f"birth-egress: {egress}")
+        name = None
+        try:
+            if pool is not None:
+                name = "pool-cap"
+                _write(paths["pool-cap"], f"{pool}\n")
+                out.append(f"pool-cap: {pool}")
+            if private is not None:
+                name = "private-cap"
+                _write(paths["private-cap"], f"{private}\n")
+                out.append(f"private-cap: {private}")
+            name = "birth-egress"
+            if egress == "none":
+                _remove(paths["birth-egress"])
+                out.append("birth-egress: not set")
+            elif egress is not None:
+                _write(paths["birth-egress"], f"{egress}\n")
+                out.append(f"birth-egress: {egress}")
+            if keep is not None:
+                name = "audit-keep-days"
+                _write(audit.KEEP_DAYS_PATH, f"{keep}\n")
+                out.append(f"audit-keep-days: {keep}" + (
+                    " (rotated audit logs are never removed)" if keep == "off" else
+                    " (the hourly timer removes a rotated audit log once it is older)"))
+        except Exception as e:
+            # Each file is written whole or not at all; say which were.
+            raise OpFilesError(f"{name} could not be written ({type(e).__name__})", out) from None
     return out
 
 
@@ -214,11 +256,14 @@ def _load_export(path: str) -> dict:
         raise OpFilesError(f"{path} is larger than an export can be")
     try:
         doc = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: nesting deeper than the parser goes.
         raise OpFilesError(f"{path} is not JSON") from None
     if not isinstance(doc, dict) or doc.get("format") != FORMAT:
         raise OpFilesError(f"{path} is not a qubes-mcp export ({FORMAT})")
     files = doc.get("files")
+    if isinstance(files, dict) and not set(files) & set(_added_paths()):
+        files.update({name: None for name in _added_paths()})     # an older export
     if not isinstance(files, dict) or set(files) != set(_paths()) or \
             any(v is not None and not isinstance(v, str) for v in files.values()):
         raise OpFilesError(f"{path} does not hold the operator files an export holds")
@@ -249,20 +294,14 @@ def plan_import(path: str) -> tuple:
     if mode and not anonymous_export:
         raise OpFilesError("this install is in anonymous mode and the export is not: its "
                            "projects could not live here")
-    try:
-        records = projects.load()
-        registry = gateways.load()
-    except Exception as e:
-        raise OpFilesError(f"this install's records cannot be read ({type(e).__name__})") from None
-    if set(records) - {projects.HUB_SLOT} or records[projects.HUB_SLOT].dump or registry:
-        raise OpFilesError("this install already has projects or gateways: an import is for a "
-                           "fresh install, and changes nothing here")
     write = []
     for name in ("pool-cap", "private-cap"):
         text = files[name]
         if text is None:
             raise OpFilesError(f"the export has no {name}")
-        if not _word(text) or not _word(text).isdigit() or int(_word(text)) <= 0:
+        # ASCII digits only: str.isdigit() also takes a superscript and other
+        # scripts' digits, which int() then refuses or reads as a number.
+        if not re.fullmatch(r"[0-9]{1,20}", _word(text) or "") or int(_word(text)) <= 0:
             raise OpFilesError(f"the export's {name} is not a positive number of bytes")
         write.append((name, f"{int(_word(text))}\n"))
     egress = _word(files["birth-egress"])
@@ -285,6 +324,26 @@ def plan_import(path: str) -> tuple:
         raise OpFilesError(f"the export's projects.json does not validate: {e}") from None
     if egress is not None and egress not in (new_registry or {}):
         raise OpFilesError(f"the export's birth-egress '{egress}' is not in its gateway registry")
+    try:
+        records = projects.load()
+        registry = gateways.load()
+    except Exception as e:
+        raise OpFilesError(f"this install's records cannot be read ({type(e).__name__})") from None
+    # Fresh: no project, and no gateway unless the registry is exactly the
+    # export's. The records are written last, so an import that failed
+    # part-way (the registry written, the records not) is finished by running
+    # it again, and a finished one is still refused.
+    same_registry = new_registry is not None and \
+        gateways.dump_json(registry) == gateways.dump_json(new_registry)
+    if (registry and not same_registry) or set(records) - {projects.HUB_SLOT} \
+            or records[projects.HUB_SLOT].dump:
+        raise OpFilesError("this install already has projects or gateways: an import is for a "
+                           "fresh install, and changes nothing here")
+    keep = _word(files["audit-keep-days"])
+    if keep is not None and audit.parse_keep_days(keep) is None:
+        raise OpFilesError("the export's audit-keep-days is not a number of days or off")
+    if keep is not None:
+        write.append(("audit-keep-days", f"{keep}\n"))
     write += [("birth-egress", None if egress is None else f"{egress}\n"),
               ("name-prefix", None if prefix is None else f"{prefix}\n"),
               ("gateways.json", new_registry), ("projects.json", new_records)]
@@ -303,20 +362,34 @@ def import_(path: str) -> list:
         # Checked again under the locks: a project made meanwhile stops it.
         _, write = plan_import(path)
         for name, value in write:
-            if name.endswith(".json") and value is None:
-                out.append(f"{name}: none in the export, left as it is")
-            elif name == "gateways.json":
-                gateways.save(value, paths[name])
-                out.append(f"{name}: {len(value)} gateway(s)")
-            elif name == "projects.json":
-                projects.save(value, paths[name])
-                out.append(f"{name}: {len(set(value) - {projects.HUB_SLOT})} project(s)")
-            elif value is None:
-                _remove(paths[name])
-                out.append(f"{name}: not set")
-            else:
-                _write(paths[name], value)
-                out.append(f"{name}: {value.strip()}")
+            try:
+                if name.endswith(".json") and value is None:
+                    out.append(f"{name}: none in the export, left as it is")
+                elif name == "gateways.json":
+                    gateways.save(value, paths[name])
+                    out.append(f"{name}: {len(value)} gateway(s)")
+                elif name == "projects.json":
+                    projects.save(value, paths[name])
+                    out.append(f"{name}: {len(set(value) - {projects.HUB_SLOT})} project(s)")
+                elif value is None:
+                    _remove(paths[name])
+                    out.append(f"{name}: not set")
+                else:
+                    _write(paths[name], value)
+                    out.append(f"{name}: {value.strip()}")
+            except Exception as e:
+                # The files are written one by one, in a fixed order: say which
+                # were, and that running the import again finishes it.
+                raise OpFilesError(f"{name} could not be written ({type(e).__name__}); what "
+                                   f"came before it was; run the import again to finish it",
+                                   out) from None
+    # The audit log's mode is the install's, chosen at install time: said,
+    # never written here.
+    theirs = _word(doc["files"]["audit-mode"]) or "disk"
+    mine = audit.install_mode()[0]
+    if theirs != mine:
+        out.append(f"audit-mode: the export's install logged to {theirs}, this one logs to "
+                   f"{mine}; install.sh --audit-log {theirs} makes them the same")
     if _word(doc["files"]["mode"]) == core.ANONYMOUS:
         try:
             on = core.anonymous_mode()

@@ -34,8 +34,10 @@ The label records what dom0 wrote, never what the qube's disk holds now: a
 check that read the disk would have to start the qube. Neither the hub nor a
 lead can write it: their feature allowlist holds only `menu-items`,
 `default-menu-items`, `service.*` and `vm-config.*`, and no rule gives the hub
-or AI space an `admin.vm.feature` method. dom0 reads nothing back but the exit status. The qube may be
-hostile, so its output is discarded and every write has a timeout.
+or AI space an `admin.vm.feature` method. Prepare and refresh read nothing back
+but the exit status: the qube may be hostile, so their output is discarded, and
+every write has a timeout. Install keeps the last lines of its output, read in
+bounded chunks and escaped, for the operator's report (below).
 
 - `install(app, name, packages)`, the operator's `qmcp template install` and
   an accepted `template-install` proposal (0.9.28), installs exact package
@@ -223,6 +225,29 @@ def halted(vm) -> bool:
         return False
 
 
+def _stop(vm) -> bool:
+    """Shut down a qube this started; True when it is halted after. A
+    shutdown that raises for a qube already halted (killed meanwhile, say)
+    has still left it stopped, and one whose state cannot be read is not."""
+    try:
+        vm.shutdown(wait=True)
+        return True
+    except Exception:
+        return halted(vm)
+
+
+def _lookup(app, name):
+    """The qube called `name`, or None when there is none. A lookup that
+    fails raises core.Unreadable: it is no proof that the qube is missing."""
+    if not core.valid_qube_name(name):
+        return None
+    try:
+        return app.domains[name] if name in app.domains else None
+    except Exception:
+        raise core.Unreadable(f"'{name}' cannot be looked up now, so nothing was "
+                              f"done") from None
+
+
 def after_copy(vm, source, halted_before: bool) -> None:
     """Keep a copy's label only when its source read as halted before the copy
     (`halted_before`) and after it, with the same label. That leaves one narrow
@@ -242,9 +267,11 @@ def after_copy(vm, source, halted_before: bool) -> None:
 
 def prepare(app, name: str, timeout: float = TIMEOUT_S) -> dict:
     """Write the services into the TemplateVM or StandaloneVM `name` and label
-    it. Returns {"qube", "version", "started"}. Raises InQubeError or
-    core.Unreadable; on either, the label is untouched."""
-    vm = core.lookup(app, name)
+    it. Returns {"qube", "version", "started", "stopped"}: `stopped` says
+    whether a qube this started is halted again (None when it was already
+    running). Raises InQubeError or core.Unreadable; on either, the label is
+    untouched."""
+    vm = _lookup(app, name)
     if vm is None or core.klass_of(vm) == "AdminVM":
         raise InQubeError(f"no qube '{name}'")
     klass = core.klass_of(vm)
@@ -283,12 +310,8 @@ def _prepare(vm, name, files, current, timeout) -> dict:
             raise InQubeError(f"the services were written, but the {LABEL} label was not "
                               f"({type(e).__name__}): run the prepare again") from None
     finally:
-        if started:
-            try:
-                vm.shutdown(wait=True)
-            except Exception:
-                pass
-    return {"qube": name, "version": current, "started": started}
+        stopped = _stop(vm) if started else None
+    return {"qube": name, "version": current, "started": started, "stopped": stopped}
 
 
 def refresh(app, timeout: float = TIMEOUT_S) -> list:
@@ -624,6 +647,10 @@ def install_refusal(vm, name: str) -> str | None:
         return f"'{name}' is held for your review: accept or reject it first (qmcp restored)"
     if projects.HUBBLIND in tags:
         return f"'{name}' is a hidden project's qube"
+    if tags & {core.OPEN, core.OPEN_FW}:
+        # The window's expiry kills the qube, which would stop the install
+        # part-way and leave the template needing repair.
+        return f"'{name}' is open to the hub: seal it first (qmcp seal {name})"
     return None
 
 
@@ -641,7 +668,7 @@ def install(app, name: str, packages, timeout: float = INSTALL_TIMEOUT_S) -> dic
     why = packages_refusal(packages)
     if why:
         raise InQubeError(why)
-    vm = core.lookup(app, name)
+    vm = _lookup(app, name)
     if vm is None or core.klass_of(vm) == "AdminVM":
         raise InQubeError(f"no qube '{name}'")
     why = install_refusal(vm, name)
@@ -676,11 +703,7 @@ def _install(vm, name, packages, timeout) -> dict:
         took = int(time.monotonic() - t0) if early is None else 0
     finally:
         if started:
-            try:
-                vm.shutdown(wait=True)
-                stopped = True
-            except Exception:
-                stopped = False
+            stopped = _stop(vm)
     if early is not None:
         # Stopped before the install's script ran (the probe, or reaching the
         # qube): said with what became of a template this started.

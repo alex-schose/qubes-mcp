@@ -17,8 +17,8 @@ issue.
    @dispvm:@tag:ai-managed deny`, which matches a bare `@dispvm` whose source's
    `default_dispvm` carries the tag and any `@dispvm:<name>` whose template does
    — from any source. That leaves a named template outside the group: the exec
-   services are denied by their own `@anyvm` rules, but OpenInVM, OpenURL,
-   StartApp and GetImageRGBA still reach Qubes' default `ask`. Read from
+   services, StartApp and GetImageRGBA are denied by their own `@anyvm` rules,
+   but OpenInVM and OpenURL still reach Qubes' default `ask`. Read from
    `qrexec/policy/parser.py` (4.3.14) and confirmed against a real 4.3.1 policy
    set and from inside a qube. Is there a rule form that denies every
    `@dispvm:<name>` for a source group without enumerating templates, or should

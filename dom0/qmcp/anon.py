@@ -120,6 +120,12 @@ CONDITION_WORDS = {"networks": "its networks", "model": "its model", "templates"
                    "badges": "its badges", "read": "a read that failed twice"}
 NOTICE = "qubes-mcp stopped the anonymous project {label} ({slot}): {why}."
 NOTICE_HUB = "qubes-mcp stopped {who} (anonymous mode): {why}."
+#: The same, when the blocks did not all land: never "stopped" for a stop that
+#: did not happen.
+NOTICE_FAILED = ("qubes-mcp could NOT stop the anonymous project {label} ({slot}): {why}. "
+                 "Some of its qubes are not blocked; qmcp check names them.")
+NOTICE_HUB_FAILED = ("qubes-mcp could NOT stop {who} (anonymous mode): {why}. None of them is "
+                     "blocked; qmcp check names them.")
 NOTICE_RECORDS = ("qubes-mcp blocked {n} anonymous qube(s): the project records do not read, so "
                   "no project is known to be sound. None was killed.")
 
@@ -128,14 +134,19 @@ TIMER = "qmcp-gate.timer"
 TIMER_CHECK = None
 
 
-def timer_active():
-    """Whether systemd runs the gate's timer: True, False, or None when that
-    cannot be told (no systemctl)."""
+def timer_active(unit: str | None = None):
+    """Whether systemd runs the gate's timer (or `unit`): True, False, or None
+    when that cannot be told (no systemctl)."""
+    unit = TIMER if unit is None else unit
     if TIMER_CHECK is not None:
-        return TIMER_CHECK()
+        # A test's stand-in: it may take the unit's name, to tell timers apart.
+        try:
+            return TIMER_CHECK(unit)
+        except TypeError:
+            return TIMER_CHECK()
     import subprocess
     try:
-        done = subprocess.run(["systemctl", "is-active", "--quiet", TIMER],
+        done = subprocess.run(["systemctl", "is-active", "--quiet", unit],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -244,20 +255,21 @@ def update_target(policy, info, name: str):
     `@ask` when a dialog would decide, or None when it is denied. Raises
     PolicyUnreadable when it cannot tell.
 
-    Asked as if the qube wore neither `qmcp-blocked` nor `qmcp-stopped`: the
-    rulebook denies a blocked qube every call, its updates included, so asked
-    as it is, a qube the gate stopped would read sound with its cause still in
-    place, and an unblock would pass only for the next run to stop it again.
-    The question is where its updates go once the stop is cleared."""
+    Asked as if the qube wore none of `qmcp-blocked`, `qmcp-stopped` and
+    `qmcp-quarantine`: the rulebook denies a blocked or held qube every call,
+    its updates included, so asked as it is, a qube the gate stopped or held
+    would read sound with its cause still in place, and an unblock would pass
+    only for the next run (or the accept) to stop it again. The question is
+    where its updates go once the stop or the hold is cleared."""
     from qrexec.exc import AccessDenied
     from qrexec.policy.parser import Request
     if name not in info.get("domains", {}):
         raise PolicyUnreadable(f"qubesd's system information has no {name}")
     tags = info["domains"][name].get("tags") or []
-    if projects.BLOCKED in tags or projects.STOPPED in tags:
+    masked = (projects.BLOCKED, projects.STOPPED, core.QUARANTINE)
+    if any(t in tags for t in masked):
         domains = dict(info["domains"])
-        domains[name] = dict(domains[name], tags=[t for t in tags if t not in
-                                                  (projects.BLOCKED, projects.STOPPED)])
+        domains[name] = dict(domains[name], tags=[t for t in tags if t not in masked])
         info = dict(info, domains=domains)
     try:
         req = Request(UPDATES, "+", name, "@default", system_info=info)
@@ -436,7 +448,7 @@ def p00_qubes(tags_by: dict) -> list:
     return sorted(n for n, tags in tags_by.items() if badge in tags)
 
 
-def hub_candidates(hub: str, records: dict, registry: dict, tags_by: dict) -> list:
+def hub_candidates(hub: str, records: dict, tags_by: dict) -> list:
     """The hub, then every qube in AI space or in p00 that no anonymous project
     judges (its lead, members and model qube). `hub_subjects` leaves out a
     guarded router among them."""
@@ -460,7 +472,7 @@ def hub_subjects(hub: str, records: dict, registry: dict, by_name: dict, tags_by
     cannot see `provides_network`, so the hub may run commands in it. Raises
     `core.Unreadable`."""
     out = []
-    for name in hub_candidates(hub, records, registry, tags_by):
+    for name in hub_candidates(hub, records, tags_by):
         vm = by_name[name]
         if name != hub and core.GUARDED in tags_by[name] and (
                 name in registry
@@ -595,14 +607,17 @@ def _locks(vms: dict, deadline: float) -> list:
 
 
 def _kill_again(v: Verdict, vms: dict) -> None:
-    """After the calls in flight on the killed qubes have finished: kill again
-    whatever one of them started."""
+    """After waiting for the calls in flight on the killed qubes (each lock up
+    to the run's deadline, so one may still be under way): kill again whatever
+    reads up."""
     for name, vm in vms.items():
         if _power(vm) == "Halted":
             continue
         try:
             vm.kill()
-            v.acted.append(f"{name}: killed again, after a call already running started it")
+            # Said for both a start that finished under the lock and one still
+            # under way when the wait ran out: it ran after the first kill.
+            v.acted.append(f"{name}: killed again: it ran after the first kill")
         except Exception as e:
             if _power(vm) != "Halted":
                 v.acted.append(f"{name}: NOT killed again ({type(e).__name__}); tried again on "
@@ -931,16 +946,18 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
                                  "conditions": ",".join(v.conditions() or ["read"]),
                                  "acted": len(v.acted)}
                                 | ({"hub": True, "qubes": len(stop)} if p is HUB else {}),
-                                False, f"{v.status}: {why}")
+                                False, f"{v.status}: {why}", slots=(p.slot,))
                 except Exception:
                     pass
                 if p is HUB:
                     hub = core.read_hub()
                     whom = ("the hub and its qubes in p00" if hub is not None and hub in stop
                             else ", ".join(stop))
-                    notify(NOTICE_HUB.format(who=whom, why=why))
+                    notify((NOTICE_HUB if v.blocked else NOTICE_HUB_FAILED)
+                           .format(who=whom, why=why))
                 else:
-                    notify(NOTICE.format(label=p.label, slot=p.slot, why=why))
+                    notify((NOTICE if v.blocked else NOTICE_FAILED)
+                           .format(label=p.label, slot=p.slot, why=why))
             out.append(v)
         if beat:
             _beat()
@@ -995,7 +1012,9 @@ def _stop_unread_records(app, err, lock_path) -> str:
             audit.audit(SERVICE, CALLER, {"project": RECORDS.slot, "status": UNREADABLE,
                                           "conditions": "records", "acted": len(v.acted),
                                           "qubes": len(names)}, False,
-                        f"{UNREADABLE}: the project records do not read")
+                        f"{UNREADABLE}: the project records do not read",
+                        # Whose qubes these are cannot be read: RAM.
+                        slots=audit.Where(unknown=True))
         except Exception:
             pass
         if told:
@@ -1031,7 +1050,11 @@ def unblock(app, records: dict, key: str, policy_loader=None, lock_path: str | N
                              + "; ".join(d for _, d in v.problems))
         out = []
         for name in v.names:
-            vm = app.domains[name]
+            try:
+                vm = app.domains[name]
+            except Exception:
+                out.append(f"{p.slot}: {name} NOT unblocked (it cannot be looked up)")
+                continue
             try:
                 tags = core.tags_of(vm)
             except core.Unreadable:
@@ -1071,13 +1094,12 @@ def unblock_hub(app, records: dict, policy_loader=None, lock_path: str | None = 
                                  + "; ".join(d for _, d in v.problems))
             names = v.names
         else:
-            try:
-                registry = gateways.load()
-            except gateways.GatewaysUnreadable:
-                registry = {}
-            names = hub_candidates(core.read_hub(), records, registry, _snapshot(app)[1]) \
-                if core.read_hub() else []
-        out = []
+            by_name, tags_by = _snapshot(app)
+            names = hub_candidates(core.read_hub(), records, tags_by) if core.read_hub() else []
+            # A qube whose tags do not read may wear the stop: said, never skipped.
+            unread = sorted(set(by_name) - set(tags_by))
+        out = [] if mode else [f"p00: {n} NOT unblocked (its tags cannot be read; run this "
+                               f"again once they read)" for n in unread]
         for name in names:
             try:
                 vm = app.domains[name]

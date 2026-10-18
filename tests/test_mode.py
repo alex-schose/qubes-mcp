@@ -362,6 +362,15 @@ class HubCheck(ModeBase):
                          [f"p00: {HUB} unblocked (autostart stays off)"])
         self.assertNotIn(BLOCKED, self.tags(HUB))
 
+    def test_unblock_p00_in_normal_mode_names_a_qube_whose_tags_do_not_read(self):
+        self.app.domains[HUB].tags.add(BLOCKED)
+        self.mode(None)
+        self.app.fail.add("tag.List:ai-hub-tpl")
+        out = fleet.unblock(self.app, "p00")
+        self.assertIn(f"p00: {HUB} unblocked (autostart stays off)", out)
+        self.assertIn("p00: ai-hub-tpl NOT unblocked (its tags cannot be read; run this again "
+                      "once they read)", out)
+
     def test_check_says_the_mode(self):
         def items(name):
             return [(f.status, f.detail) for f in fleet.check(self.app) if f.check == name]

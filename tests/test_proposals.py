@@ -590,6 +590,26 @@ class SecondTick(PBase):
         self.assertEqual(self.reasons(change), [])
 
 
+    def test_show_computes_nothing_from_a_hidden_projects_record(self):
+        # Accepting fails as for a project that does not exist, so `show` says
+        # that, and gives no before, after or plan read from the record.
+        reqs = [{"type": "project-edit", "title": "t", "project": "other", "quota": 30 * GiB},
+                {"type": "project-firewall", "title": "t", "project": "other",
+                 "model": "api.example.com:443"},
+                {"type": "project-delete", "title": "t", "project": "other"}]
+        ids = [self.submit(req)["id"] for req in reqs]
+        self.assertIsNotNone(proposals.show(self.app, ids[0])["after"])     # the control
+        self.assertIn("ai-other-lead", proposals.show(self.app, ids[2])["plan"])
+        rec = json.loads(json.dumps(RECORDS))
+        rec["slots"]["p02"].update({"anonymous": True, "hidden": True})
+        self.write_records(rec)
+        for pid in ids:
+            doc = proposals.show(self.app, pid)
+            self.assertIsNone(doc["before"], doc["type"])
+            self.assertIsNone(doc["after"], doc["type"])
+            self.assertEqual(doc["plan"], "there is no project other now: accepting it will fail")
+
+
 # ======================================================================= accepting and rejecting
 
 class Accept(PBase):
@@ -822,6 +842,110 @@ class Interrupted(PBase):
         self.assertEqual(seen, [proposals.ACCEPTING])
         self.assertEqual(sorted(p.name for p in self.store().iterdir()),
                          ["000001.decision", "000001.json"])
+
+
+class AcceptEdges(PBase):
+    """How an accept ends when taking the locks, the clock or the mark's
+    removal goes wrong."""
+
+    def test_an_error_taking_the_locks_is_said_as_that_and_nothing_stays_held(self):
+        pid = self.submit()["id"]
+        sha = proposals.show(self.app, pid)["sha256"]
+        saved = projects.LOCK_PATH
+        projects.LOCK_PATH = str(self.tmp / "no-such-dir" / "projects.lock")
+        try:
+            with self.assertRaisesRegex(proposals.Refused,
+                                        r"project locks cannot be taken: FileNotFoundError"):
+                proposals.accept(self.app, pid, sha)
+            rc, out, err = self.cli("proposal", "accept", str(pid), "--sha256", sha)
+            self.assertIn("project locks cannot be taken", err)
+            self.assertNotIn(proposals.PROPOSALS_DIR, err)
+        finally:
+            projects.LOCK_PATH = saved
+        self.assertEqual(fleet._HELD[0], 0)
+        # An interrupt between the two locks lets go of the first one too.
+        real = budget.acquire_create_lock
+
+        def interrupted(**kw):
+            raise KeyboardInterrupt
+        budget.acquire_create_lock = interrupted
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                proposals.accept(self.app, pid, sha)
+        finally:
+            budget.acquire_create_lock = real
+        self.assertEqual(fleet._HELD[0], 0)
+        with projects.Locked(timeout=0.5):         # the records' lock is free again
+            pass
+        self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+        ok, report = self.accept(pid)
+        self.assertTrue(ok, report)
+
+    def test_expiry_is_judged_once_the_locks_are_held_and_the_decision_when_written(self):
+        pid = self.submit()["id"]
+        sha = proposals.show(self.app, pid)["sha256"]
+        t = [proposals.entries()[0].submitted + 7 * DAY - 60]
+        real_hold = fleet.hold_project_locks
+
+        class Slow:
+            # The locks take two minutes to come: the proposal expires meanwhile.
+            def __enter__(self):
+                self.inner = real_hold()
+                self.inner.__enter__()
+                t[0] += 120
+                return self
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+        fleet.hold_project_locks = Slow
+        try:
+            with self.assertRaisesRegex(proposals.Refused, "expired"):
+                proposals.accept(self.app, pid, sha, clock=lambda: t[0])
+        finally:
+            fleet.hold_project_locks = real_hold
+        self.assertIsNone(projects.find(self.records(), "scrape"))
+        # The decision is stamped when it is written, after the command ran.
+        pid = self.submit()["id"]
+        sha = proposals.show(self.app, pid)["sha256"]
+        t[0] = proposals.entries()[-1].submitted + 10
+        real_exec = proposals._execute
+
+        def long(app, p):
+            t[0] += 1800
+            return real_exec(app, p)
+        proposals._execute = long
+        self.addCleanup(setattr, proposals, "_execute", real_exec)
+        ok, report = proposals.accept(self.app, pid, sha, clock=lambda: t[0])
+        self.assertTrue(ok, report)
+        decision = proposals.show(self.app, pid)["decision"]
+        self.assertEqual(decision["at"], proposals._iso(t[0]))
+
+    def test_a_mark_that_cannot_be_removed_leaves_the_outcome_as_it_was(self):
+        pid = self.submit()["id"]
+        real = os.unlink
+
+        def stuck(path, *a, **kw):
+            if str(path).endswith(".accepting"):
+                raise PermissionError("read-only")
+            return real(path, *a, **kw)
+        with mock.patch.object(proposals.os, "unlink", stuck):
+            ok, report = self.accept(pid)
+        self.assertTrue(ok, report)
+        self.assertIn("could not be removed", report[-1])
+        self.assertIsNotNone(projects.find(self.records(), "scrape"))
+        self.assertEqual(proposals.show(self.app, pid)["state"], "accepted")
+        line = [x for x in self.operator_lines() if x["service"] == "qmcp proposal accept"][-1]
+        self.assertTrue(line["ok"])
+
+
+class EditRemovals(PBase):
+    def test_an_accepted_removal_is_not_refused_for_an_entry_it_does_not_name(self):
+        self.app.domains["ai-dvm"].tags.add(core.QUARANTINE)
+        pid = self.submit({"type": "project-edit", "title": "drop the debian template",
+                           "project": "osint", "remove_templates": ["ai-debian-13"]})["id"]
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertEqual(projects.find(self.records(), "osint").templates, ("ai-dvm",))
 
 
 class AuditFixes(PBase):
@@ -1249,7 +1373,13 @@ class Install(PBase):
                     ("z", REAL["log"], "0660", "root", "qubes"),
                     # The open-window records: root writes one, and the expiry
                     # pass, which runs as the services' user, unlinks it.
-                    ("d", REAL["windows"], "2770", "root", "qubes")]:
+                    ("d", REAL["windows"], "2770", "root", "qubes"),
+                    # The gate's lock and heartbeat: the timer runs as the
+                    # services' user, and a root command takes the lock too.
+                    ("f", "/run/qmcp/gate.lock", "0660", "root", "qubes"),
+                    ("z", "/run/qmcp/gate.lock", "0660", "root", "qubes"),
+                    ("f", "/run/qmcp/gate.last", "0660", "root", "qubes"),
+                    ("z", "/run/qmcp/gate.last", "0660", "root", "qubes")]:
             self.assertIn(row, rows, row)
 
     def test_the_timer_runs_the_expiry_pass(self):
@@ -1271,6 +1401,29 @@ class Install(PBase):
         # And the timer must start that unit.
         timer = (HERE.parent / "deploy" / "qmcp-gate.timer").read_text()
         self.assertIn("OnUnitActiveSec=", timer)
+
+    def test_the_boot_seal_and_the_gate_keep_their_ordering_and_bounds(self):
+        """What makes the boot seal come first, and what keeps a hung gate
+        from holding its lock, is a line in a unit file each: pinned here."""
+        from qmcp import anon
+
+        def keys(name):
+            out = {}
+            for line in (HERE.parent / "deploy" / name).read_text().splitlines():
+                if line and not line.startswith(("#", "[")) and "=" in line:
+                    k, v = line.split("=", 1)
+                    out.setdefault(k.strip(), []).append(v.strip())
+            return out
+        seal = keys("qmcp-seal.service")
+        self.assertIn("qubesd.service", seal["After"][0].split())
+        self.assertEqual(seal["Before"], ["systemd-user-sessions.service"])
+        self.assertEqual(seal["ExecStart"], ["/usr/local/bin/qmcp seal --all"])
+        self.assertNotIn("Requires", seal)
+        self.assertEqual(keys("qubes-vm-qmcp-seal.conf"), {"After": ["qmcp-seal.service"]})
+        gate = keys("qmcp-gate.service")
+        self.assertEqual(gate["TimeoutStartSec"], ["60"])
+        self.assertEqual(gate["Environment"], [f"{anon.HEARTBEAT_ENV}=1"])
+        self.assertEqual(keys("qmcp-gate.timer")["OnBootSec"], ["10s"])
 
     def test_the_deploy_units_are_installed_and_uninstalled(self):
         """A unit list kept by hand beside its files drifts, and the drift has
@@ -1358,6 +1511,16 @@ class OpenProposal(PBase):
             self.assertFalse(reply["ok"], bad)
         self.assertEqual(len(list(self.store().glob("*.json"))), 0)
 
+    def test_a_duration_with_any_space_or_line_break_is_refused(self):
+        # Stored as sent and printed by `proposal show`: a carriage return
+        # would overwrite the command's line, so only the bare form is taken.
+        for bad in (" 2h", "2h ", "2h\r", "2h\n", "\r2h", "\x852h\x0b", "2h\u2003"):
+            reply = self.ask(**{"for": bad})
+            self.assertFalse(reply["ok"], repr(bad))
+        self.assertEqual(len(list(self.store().glob("*.json"))), 0)
+        self.assertTrue(self.ask()["ok"])
+        self.assertEqual(proposals.show(self.app, 1)["proposal"]["for"], "2h")
+
     def test_only_the_hub_may_ask(self):
         reply = self.ask()
         self.assertTrue(reply["ok"])
@@ -1408,6 +1571,21 @@ class QubeProposals(PBase):
                 self.assertIn("needs the second tick", str(cm.exception))
                 self.assertFalse(changed())
                 self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+
+    def test_a_transient_error_never_changes_a_manage_proposals_tick(self):
+        # The digest hashes the reasons: an error's own text in them would
+        # refuse at accept a tick shown a moment earlier.
+        from unittest import mock
+        self.app.vm("scratch", netvm=None)
+        pid = self.ask("qube-manage", qube="scratch")
+        ticks = []
+        for text in ("records busy", "records unreadable"):
+            with mock.patch.object(fleet, "_load_records",
+                                   side_effect=fleet.ProjectError(text)):
+                doc = proposals.show(self.app, pid)
+            self.assertNotIn(text, " ".join(doc["second_tick"]))
+            ticks.append(doc["tick"])
+        self.assertEqual(ticks[0], ticks[1])
 
     def test_the_equivalent_commands(self):
         for fields, command in (
@@ -1623,18 +1801,56 @@ class QubeProposals(PBase):
 
     def test_badges_that_cannot_be_read_refuse_rather_than_guess(self):
         # The second tick reads them once and gets them; the hidden check at
-        # accept reads them again and fails: the accept refuses, and the qube
-        # is not managed on the strength of a read that did not happen.
+        # accept reads them again and fails: the accept refuses before the
+        # mark, the qube is not managed on the strength of a read that did not
+        # happen, and the proposal stays pending, so trying again can work.
         self.app.vm("scratch", netvm=None)
         pid = self.ask("qube-manage", qube="scratch")
         doc = proposals.show(self.app, pid)
         self.app.fail_reads("tag.List:scratch", "ok fail")
-        ok, report = proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        with self.assertRaisesRegex(proposals.Refused, "badges cannot be read") as ctx:
+            proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertIn("still pending", str(ctx.exception))
         self.assertEqual(self.app.failed["tag.List:scratch"], 1)
-        self.assertFalse(ok)
-        self.assertIn("badges cannot be read", report[-1])
         self.assertNotIn("ai-managed", self.app.domains["scratch"].tags)
-        self.assertEqual(proposals.show(self.app, pid)["state"], "failed")
+        self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+        ok, report = proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertTrue(ok, report)
+        self.assertIn("ai-managed", self.app.domains["scratch"].tags)
+
+    def test_a_lookup_for_the_hidden_check_that_fails_leaves_a_project_proposal_pending(self):
+        # The same for a qube a project proposal names: an approved template
+        # whose lookup fails is not known not to be a hidden project's.
+        pid = self.submit({"type": "project-edit", "title": "t", "project": "osint",
+                           "add_templates": ["ai-tpl-g"]})["id"]
+        doc = proposals.show(self.app, pid)
+        self.app.fail_reads("lookup:ai-tpl-g", "fail")
+        with self.assertRaisesRegex(proposals.Refused, "cannot be looked up.*still pending"):
+            proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+        self.assertNotIn("ai-tpl-g", projects.find(self.records(), "osint").templates)
+
+    def test_an_install_into_an_open_template_is_shown_refused_and_never_runs(self):
+        tpl = self.app.domains["ai-tpl-g"]
+        tpl.tags.add(core.OPEN)
+        pid = self.ask("template-install", template="ai-tpl-g", packages=["curl"])
+        self.assertIn("open to the hub: seal it first", proposals.show(self.app, pid)["plan"])
+        ok, report = self.accept(pid, yes=True)
+        self.assertFalse(ok)
+        self.assertIn("open to the hub", report[-1])
+        self.assertEqual(tpl.installed_packages(), [])
+
+    def test_an_install_whose_template_cannot_be_looked_up_stays_pending(self):
+        pid = self.ask("template-install", template="ai-tpl-g", packages=["curl"])
+        doc = proposals.show(self.app, pid)
+        # The second tick's lookup succeeds; the hidden check's fails.
+        self.app.fail_reads("lookup:ai-tpl-g", "ok fail")
+        with self.assertRaisesRegex(proposals.Refused, "cannot be looked up.*still pending"):
+            proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertEqual(proposals.show(self.app, pid)["state"], "pending")
+        ok, report = proposals.accept(self.app, pid, doc["sha256"], tick=doc["tick"])
+        self.assertTrue(ok, report)
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), ["curl"])
 
     def test_the_hub_revokes_only_a_qube_in_ai_space(self):
         # `qmcp revoke` on a qube outside AI space still pins its default

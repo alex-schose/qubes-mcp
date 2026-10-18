@@ -41,10 +41,12 @@ qmcp.ListAIManagedQubes qmcp.GetPropertyAIManaged qmcp.SetPropertyAIManaged qmcp
 qmcp.LifecycleAIManaged qmcp.SpawnAIManagedQube qmcp.CloneAIManagedQube qmcp.SpawnDisposableAIManaged
 qmcp.AIManagedEvents qmcp.GetPoolStats qmcp.SubmitProposal qmcp.ProposalStatus"
 LEGACY_UNITS="qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reaper.service"
-UNITS="qmcp-gate.timer qmcp-gate.service qmcp-refresh.timer qmcp-refresh.service qmcp-seal.service"
+UNITS="qmcp-gate.timer qmcp-gate.service qmcp-refresh.timer qmcp-refresh.service qmcp-seal.service
+qmcp-audit.timer qmcp-audit.service"
 OTHER_PATHS="/usr/local/bin/qmcp /usr/local/bin/qmcp-gui /usr/share/applications/qubes-mcp.desktop
 /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer
 /etc/systemd/system/qmcp-refresh.service /etc/systemd/system/qmcp-refresh.timer
+/etc/systemd/system/qmcp-audit.service /etc/systemd/system/qmcp-audit.timer
 /etc/systemd/system/qmcp-seal.service
 /etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf
 /etc/tmpfiles.d/qmcp.conf /run/qmcp /run/qmcp-consent
@@ -101,7 +103,7 @@ if [ "$MODE" != check ]; then
     if [ -d "$LIB" ]; then rm -rf "$LIB"; say "removed $LIB"; fi
     systemctl daemon-reload
     if [ "$MODE" = purge ]; then
-        rm -rf /etc/qmcp /var/lib/qmcp /var/log/qmcp-audit.log
+        rm -rf /etc/qmcp /var/lib/qmcp /var/log/qmcp-audit.log /var/log/qmcp-audit.log.pad
         for f in $(rotated); do rm -f "$f"; done
         say "purged /etc/qmcp, /var/lib/qmcp (the hub's proposals), /var/log/qmcp-audit.log and its rotated files"
     fi
@@ -127,11 +129,13 @@ if [ "$MODE" = purge ]; then
     [ -e /etc/qmcp ] && report /etc/qmcp
     [ -e /var/lib/qmcp ] && report /var/lib/qmcp
     [ -e /var/log/qmcp-audit.log ] && report /var/log/qmcp-audit.log
+    [ -e /var/log/qmcp-audit.log.pad ] && report /var/log/qmcp-audit.log.pad
     for f in $(rotated); do report "$f"; done
 else
     [ -e /etc/qmcp ] && echo "    kept  /etc/qmcp (operator config; --purge removes it)"
     [ -e /var/lib/qmcp ] && echo "    kept  /var/lib/qmcp (the hub's proposals and their decisions; --purge removes it)"
     [ -e /var/log/qmcp-audit.log ] && echo "    kept  /var/log/qmcp-audit.log (--purge removes it)"
+    [ -e /var/log/qmcp-audit.log.pad ] && echo "    kept  /var/log/qmcp-audit.log.pad, zeros only (--purge removes it)"
     n=$(rotated | wc -l)
     [ "$n" -gt 0 ] && echo "    kept  $n rotated audit log(s), /var/log/qmcp-audit.log.<time> (--purge removes them)"
 fi

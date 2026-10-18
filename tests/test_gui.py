@@ -463,11 +463,26 @@ def _leaves(parser):
             yield (cmd,), (cmd,), sp, None
 
 
+def _choice_keys(sp, prefix, skip=None) -> set:
+    """An option's choice values select different code paths (`--anonymising
+    yes` and `no`), so each is a key of its own: (path..., option, value)."""
+    return {prefix + (max(a.option_strings, key=len), str(c)) for a in sp._actions
+            if a is not skip and a.option_strings and a.choices for c in a.choices}
+
+
+#: Values of a positional that send the command down another path: each is a
+#: key of its own, (path..., value), which the window must send.
+PATH_VALUES = {("project", "unblock"): ("name", ("p00",)),
+               # Each mode is a path of its own: off writes nothing, ram a chain of its own.
+               ("project", "audit"): ("mode", ("disk", "ram", "off"))}
+
+
 def cli_keys(parser) -> set:
-    keys = set()
+    keys = {path + (v,) for path, (_, values) in PATH_VALUES.items() for v in values}
     for path, prefix, sp, chooser in _leaves(parser):
         keys.add(path)
         keys |= {prefix + (opt,) for opt in _options(sp, chooser)}
+        keys |= _choice_keys(sp, prefix, chooser)
     return keys
 
 
@@ -485,13 +500,22 @@ def covered_by(parser, argv) -> set:
                 and getattr(ns, chooser.dest) is not None):
             continue
         keys = {path}
+        if path in PATH_VALUES:
+            dest, values = PATH_VALUES[path]
+            if getattr(ns, dest) in values:
+                keys.add(path + (getattr(ns, dest),))
         for a in sp._actions:
             if isinstance(a, argparse._HelpAction) or a is chooser:
                 continue
             if not (a.option_strings or a.nargs in ("?", "*")):
                 continue
-            if getattr(ns, a.dest) != a.default:
+            value = getattr(ns, a.dest)
+            if value != a.default:
                 keys.add(prefix + ((max(a.option_strings, key=len),) if a.option_strings else (a.dest,)))
+            # A choice the command takes by default is what the window sends by
+            # leaving the option out.
+            if a.option_strings and a.choices and value in a.choices:
+                keys.add(prefix + (max(a.option_strings, key=len), str(value)))
         return keys
     raise AssertionError(f"no command for {argv}")
 
@@ -538,28 +562,33 @@ SAMPLES = {
     gm.move: [dict(qube="ai-work2", target="osint", confirm=True)],
     gm.delete_plan: [dict(key="osint")],
     gm.delete_project: [dict(key="osint")],
+    gm.guard_qube: [dict(qube="x1")],
     gm.role: [dict(action="manage", qube="x1"), dict(action="guard", qube="x1"),
               dict(action="revoke", qube="x1", keep_running=True)],
     gm.open_qube: [dict(qube="x1", duration="2h"),
                    dict(qube="x1", duration="30m", firewall=True)],
     gm.seal_qube: [dict(qube="x1")],
     gm.audit_rotate: [dict()],
+    gm.project_audit: [dict(key="osint", mode="ram"), dict(key="osint", mode="off"),
+                       dict(key="p01", mode="disk")],
     gm.show_proposal: [dict(pid=1)],
     gm.accept_proposal: [dict(pid=1, sha256="0" * 64), dict(pid=2, sha256="ab" * 32, tick="cd" * 32)],
     gm.reject_proposal: [dict(pid=1)],
     gm.enroll_gateway: [dict(qube="sys-ai-tor", anonymising=True, label="Tor, CH"),
                         dict(qube="sys-ai-tor", anonymising=True, updates=True)],
     gm.change_gateway: [dict(qube="ai-net-router", anonymising=False, label="clearnet"),
-                        dict(qube="ai-net-tor", updates=True)],
+                        dict(qube="ai-net-tor", updates=True),
+                        dict(qube="ai-net-tor", anonymising=True, updates=False)],
     gm.remove_gateway: [dict(qube="ai-net-router")],
     gm.show_lead_firewall: [dict(key="osint")],
     gm.set_lead_model: [dict(key="osint", model="api.anthropic.com:443")],
     gm.set_lead_model_qube: [dict(key="osint", model_qube=MODEL), dict(key="p02", model_qube="none")],
     gm.set_lead_rules: [dict(key="osint", rules=RULES)],
     gm.accept_lead_rules: [dict(key="osint")],
-    gm.unblock_project: [dict(key="osint")],
+    gm.unblock_project: [dict(key="osint"), dict(key="p00")],
     gm.settings_set: [dict(pool_cap="2000G", private_cap="30G", birth_egress="ai-net-router"),
-                      dict(birth_egress="none")],
+                      dict(birth_egress="none"), dict(audit_keep_days="30"),
+                      dict(audit_keep_days="off")],
     gm.prepare_template: [dict(qube="debian-13")],
     gm.install_packages: [dict(template="ai-tpl-g", packages="curl jq"),
                           dict(template="ai-debian-13", packages=" g++\tgir1.2-gtk-3.0\n")],
@@ -856,6 +885,56 @@ class Model(GuiBase):
                 keys = [n.key for n in gm.walk(tree)]
                 self.assertEqual(len(keys), len(set(keys)))
 
+    #: A qube row's buttons, as the command each runs.
+    QUBE_ACTIONS = {
+        "open": lambda n: gm.open_qube(n, "1h"), "seal": gm.seal_qube,
+        "guard": gm.guard_qube,
+        "manage": lambda n: gm.role("manage", n), "revoke": lambda n: gm.role("revoke", n),
+        "accept_restored": gm.restored_accept, "reject_restored": gm.restored_reject,
+    }
+
+    def matrix_fleet(self):
+        """The base fleet, and a row of each kind the qube buttons judge."""
+        a = self.app
+        tpl = a.domains["ai-debian-13"]
+        a.vm("ai-g-blocked", template=tpl, tags={"ai-managed", "qmcp-guarded", projects.BLOCKED})
+        a.vm("ai-g-hidden", template=tpl, tags={"ai-managed", "qmcp-guarded", projects.HUBBLIND})
+        a.vm("ai-g-open", template=tpl, tags={"ai-managed", "qmcp-guarded", core.OPEN})
+        a.vm("mine-open", template=a.domains["debian-13"], netvm=None, tags={core.OPEN})
+        a.vm("ai-ref", template=tpl, tags={"ai-managed", "qmcp-guarded"},
+             netvm=a.domains["sys-firewall"])
+        self.app.domains["osint-dump"].tags.add(core.OPEN)
+        serve(a)
+        self.came_back("ai-back", hold=False)
+        self.gate()
+
+    def test_every_qube_button_on_is_one_the_command_takes(self):
+        # Driven through every row of the fleet: a button the window turns on,
+        # and whose form does not refuse, runs a command that succeeds.
+        self.matrix_fleet()
+        rows = self.read_json("list", "--all", "--json")
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        gws = self.read_json("gateway", "list", "--json")
+        cases = []
+        for node in gm.walk(self.tree()):
+            if node.kind != "qube":
+                continue
+            for ident in sorted(gm.actions(node, records, fleet_rows=rows, hub=HUB, mode="normal")
+                                & set(self.QUBE_ACTIONS)):
+                if ident in ("manage", "guard") and gm.role_refusal(ident, node.data, gws):
+                    continue
+                cases.append((node.data["name"], ident))
+        self.assertGreater(len(cases), 20)
+        self.assertTrue({i for _, i in cases} >= {"open", "seal", "guard", "manage", "revoke",
+                                                  "accept_restored", "reject_restored"})
+        for name, ident in cases:
+            with self.subTest(f"{ident} {name}"):
+                self.doCleanups()
+                self.setUp()
+                self.matrix_fleet()
+                result = self.runner.execute(self.QUBE_ACTIONS[ident](name))
+                self.assertEqual(result.rc, 0, result.err)
+
     def test_a_drop_box_wearing_an_open_badge_can_be_sealed_from_the_window(self):
         # `qmcp open` refuses a drop box, but a hand-written badge reaches one,
         # and the rulebook's window lines match the badge alone; `qmcp seal`
@@ -866,6 +945,40 @@ class Model(GuiBase):
         self.assertTrue(placed)
         for node in placed:
             self.assertIn("seal", gm.actions(node, {}))
+
+    def test_an_open_badge_outside_ai_space_has_a_row_and_a_seal(self):
+        # The rulebook's window lines route on the badge alone: a qube revoked,
+        # or badged by hand, outside AI space is still open to the hub. qmcp
+        # check fails on it, the window shows it there and offers Seal.
+        vm = self.app.domains["ai-work"]
+        vm.tags.add(core.OPEN)
+        vm.tags.discard("ai-managed")
+        doc = self.read_json("check", "--json")
+        self.assertTrue(any(f["status"] == "fail" and "ai-work" in f["detail"]
+                            for f in doc["findings"]))
+        placed = [n for n in gm.walk(self.tree()) if n.kind == "qube"
+                  and n.data.get("name") == "ai-work"]
+        self.assertEqual([n.data.get("attention") for n in placed], ["open_outside"])
+        self.assertIn("seal", gm.actions(placed[0], {}))
+        self.assertEqual(self.runner.execute(gm.seal_qube("ai-work")).rc, 0)
+        self.assertNotIn(core.OPEN, vm.tags)
+
+    def test_open_is_offered_exactly_where_the_command_opens(self):
+        # A guarded qube the gate blocked, or a hidden project's, is refused by
+        # `qmcp open`; the window offers Open on neither, and on the others.
+        a = self.app
+        for name, extra in (("ai-g-plain", set()), ("ai-g-blocked", {projects.BLOCKED}),
+                            ("ai-g-hidden", {projects.HUBBLIND}),
+                            ("ai-g-stopped", {projects.STOPPED})):
+            a.vm(name, template=a.domains["ai-debian-13"], tags={"ai-managed", "qmcp-guarded"} | extra)
+        tree = self.tree()
+        for name in ("ai-g-plain", "ai-g-blocked", "ai-g-hidden", "ai-g-stopped"):
+            with self.subTest(name):
+                node = next(n for n in gm.walk(tree) if n.key == f"qube:{name}")
+                offered = "open" in gm.actions(node, {})
+                opened = self.runner.execute(gm.open_qube(name, "1h")).rc == 0
+                self.assertEqual(offered, opened)
+                self.assertEqual(offered, name in ("ai-g-plain", "ai-g-stopped"))
 
     def test_a_qube_that_cannot_be_read_is_under_needs_attention(self):
         # A failed read is never state: the qube is shown, placed by none of
@@ -1669,6 +1782,9 @@ class GatewayModel(GuiBase):
         free = next(r for r in self.gateways() if r["name"] == "sys-ai-net")
         self.assertIsNone(gm.gateway_in_use(free))
         self.assertIn("The qube itself does not change", gm.remove_gateway_intro(free))
+        # The command's third refusal, for a gateway templates' updates go to.
+        self.assertIn("if templates' updates go to it, while the anonymity gate would then stop",
+                      gm.remove_gateway_intro(free))
         self.run_ok(gm.remove_gateway("sys-ai-net"))
 
     def test_settings_count_them_and_a_registry_that_does_not_read_is_no_registry(self):
@@ -2339,6 +2455,8 @@ class ModelQubes(GuiBase):
         a.vm("ai-m-standalone", klass="StandaloneVM", tags={"ai-managed"})
         a.vm("ollama", template=a.domains["debian-13"])                     # outside AI space
         a.vm("ai-m-tpl-managed", template=a.domains["ai-debian-13"], tags={"ai-managed"})
+        # Held for review: the command refuses it until it is accepted or rejected.
+        self.came_back("ai-m-held", tags=("ai-managed",), template=a.domains["debian-13"])
         rows = self.rows()
         by_name = {r["name"]: r for r in rows}
         vms = {vm.name: vm for vm in a.domains}
@@ -2353,7 +2471,8 @@ class ModelQubes(GuiBase):
                 self.assertEqual(name in offered, why is None)
                 if why:
                     kinds.add(why[0])
-        self.assertEqual(kinds, {"hub", "kind", "drop_box", "outside", "lead", "member", "template"})
+        self.assertEqual(kinds, {"hub", "kind", "drop_box", "held", "outside", "lead", "member",
+                                 "template"})
         self.assertEqual(offered, sorted([MODEL, "ai-m-standalone", "ai-on-operator-tpl"]))
         for name in (HUB, "ai-debian-13", "ai-dvm", "ai-net-router", "osint-dump", LEAD,
                      "ai-osint-w1", "ai-m-tpl-managed", "ai-hubq", "ollama", "personal"):
@@ -2637,6 +2756,53 @@ class AnonModel(GuiBase):
         self.assertEqual(result.rc, 1, (argv, result.out))
         return result.err
 
+
+    def test_the_gate_note_says_a_project_it_cannot_judge_is_blocked_not_killed(self):
+        rec = self.anonymous()
+        lead = self.app.domains[rec.lead]
+        lead.start()
+        anon.load_policy = lambda: (_ for _ in ()).throw(anon.PolicyUnreadable("down"))
+        self.assertEqual(gm.verdict_for(rec.slot, self.gate())["status"], "unreadable")
+        self.assertIn(projects.BLOCKED, lead.tags)
+        self.assertEqual(lead.get_power_state(), "Running")
+        self.assertIn("one it cannot judge is blocked, not killed", gm.GATE_NOTE)
+        self.assertNotIn("qmcp-blocked, killed,", gm.GATE_NOTE)
+
+    def test_unblock_says_both_badges_come_off_as_they_do(self):
+        rec = self.anonymous()
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.gate()
+        lead = self.app.domains[rec.lead]
+        self.assertTrue({projects.BLOCKED, projects.STOPPED} <= set(lead.tags))
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        intro = gm.unblock_intro(next(r for r in self.read_json("project", "list", "--json")
+                                      if r["slot"] == rec.slot))
+        self.assertIn("Takes qmcp-blocked and qmcp-stopped off", intro)
+        self.assertEqual(self.runner.execute(gm.unblock_project(rec.slot)).rc, 0)
+        self.assertFalse({projects.BLOCKED, projects.STOPPED} & set(lead.tags))
+        hub = gm.unblock_intro({"hub": True})
+        self.assertIn("Takes qmcp-blocked and qmcp-stopped off the hub", hub)
+        self.assertIn("every qube in AI space or p00 that no anonymous project owns", hub)
+        self.assertNotIn("the templates, disposable templates and disposables it made", hub)
+
+    def test_remove_lead_says_who_reaches_the_workers_after(self):
+        hidden = self.anonymous()
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        self.assertTrue(records[hidden.slot]["hidden"])
+        self.assertIn("nothing in AI space reaches them",
+                      gm.remove_lead_intro(records[hidden.slot]))
+        self.assertIn("only the hub reaches them", gm.remove_lead_intro(records["p01"]))
+        # The rulebook refuses the hub every call into a hidden project's qube.
+        self.assertIn(projects.HUBBLIND, self.app.domains[hidden.lead].tags)
+
+    def test_manage_on_a_hidden_qube_never_says_the_hub_may_run_commands_in_it(self):
+        row = {"name": "ai-hid-dvm", "klass": "AppVM", "dvmt": True, "gateway": False,
+               "badges": ["ai-managed", "qmcp-guarded", projects.HUBBLIND]}
+        intro = gm.role_intro("manage", row, {})
+        self.assertNotIn("the hub may run commands", intro)
+        self.assertIn("hidden from the hub, so the hub cannot operate it", intro)
+        self.assertIn("the hub may run commands in it as root",
+                      gm.role_intro("manage", dict(row, badges=["ai-managed", "qmcp-guarded"]), {}))
     def break_router(self, net="ai-net-tor"):
         """The router moved to clearnet, outside qmcp: the gate's networks condition."""
         self.app.domains[net].netvm = self.app.domains["sys-firewall"]
@@ -2661,7 +2827,7 @@ class AnonModel(GuiBase):
         self.assertEqual((rec["slot"], rec["blocked"]), ("p00", True))
         self.assertIn("still finds the hub unsound", gm.unblock_refusal(rec, doc))
         self.assertIsNone(gm.unblock_refusal(rec, dict(doc, status="green", problems=[])))
-        self.assertIn("the hub and every qube under its check", gm.unblock_intro(rec))
+        self.assertIn("the hub and every qube under the hub's check", gm.unblock_intro(rec))
         self.assertEqual(gm.unblock_project(rec["label"])[-2:], ["unblock", "p00"])
         # A project's verdict has neither field, and shows neither.
         self.assertNotIn("Qubes in violation", dict(gm.gate_details(dict(doc, hub=None))))
@@ -2930,7 +3096,7 @@ class AnonModel(GuiBase):
             rows = {r["slot"]: r for r in records()}
             mine = gm.shared_routers(rows[hidden.slot], records(),
                                      self.read_json("list", "--all", "--json"), HUB)
-            theirs = fleet.shared_routers(self.app, projects.load(), projects.load()[hidden.slot])
+            theirs = fleet.shared_routers(self.app, projects.load(), projects.load()[hidden.slot])[0]
             self.assertEqual(mine, theirs)
             return mine
         self.assertEqual(both(), [])
@@ -3020,6 +3186,82 @@ class RestoredModel(GuiBase):
     def placed(self, name, tree=None):
         return [n for n in gm.walk(tree or self.tree())
                 if n.kind == "qube" and n.data.get("name") == name]
+
+    def test_the_review_and_import_texts_say_what_the_commands_do(self):
+        vm = self.came_back("ai-back", features={core.ID_FEATURE: "another-qubes-uuid"})
+        self.assertIn("its qmcp label is removed", gm.reject_restored_intro("ai-back"))
+        self.assertEqual(self.runner.execute(gm.restored_reject("ai-back")).rc, 0)
+        self.assertNotIn(core.ID_FEATURE, vm.features)
+        self.assertIn("each is held from the gate's next pass: no qrexec call reaches it or "
+                      "leaves it (its network is unchanged)", gm.IMPORT_RED)
+        self.assertNotIn("it reaches nothing", gm.IMPORT_RED)
+        self.assertIn("is not held for review", gm.NO_MODEL_QUBE)
+
+    def test_no_form_offers_a_held_qube_where_the_command_refuses_one(self):
+        a = self.app
+        self.came_back("ai-tpl-back", tags=("ai-managed",), klass="TemplateVM", template=None)
+        self.came_back("ai-hub-back", tags=("ai-managed", "qmcp-proj-p00"))
+        self.came_back("mine-back", tags=("qmcp-guarded",), template=a.domains["debian-13"],
+                       netvm=None)
+        for name in ("ai-tpl-back", "ai-hub-back", "mine-back"):
+            self.assertIn(core.QUARANTINE, a.domains[name].tags)
+        rows = self.read_json("list", "--all", "--json")
+        self.assertNotIn("ai-tpl-back", gm.lead_templates(rows))
+        self.assertNotIn("ai-tpl-back", gm.approved_template_choices(rows))
+        self.assertNotIn("ai-hub-back", gm.hubs_own_qubes(rows, HUB))
+        self.assertNotIn("mine-back", gm.outside_choices(rows, HUB))
+        # The controls: the same qubes, unheld, are offered.
+        unheld = [dict(r, badges=[b for b in r["badges"] if b != core.QUARANTINE]) for r in rows]
+        self.assertIn("ai-tpl-back", gm.lead_templates(unheld))
+        self.assertIn("ai-tpl-back", gm.approved_template_choices(unheld))
+        self.assertIn("ai-hub-back", gm.hubs_own_qubes(unheld, HUB))
+        self.assertIn("mine-back", gm.outside_choices(unheld, HUB))
+        # And the command refuses each.
+        for argv in (gm.create_project("heldt", "template", "ai-tpl-back", lead_netvm="none",
+                                       networks=["none"], quota="1G"),
+                     gm.edit_project("osint", templates=["ai-debian-13", "ai-tpl-back"]),
+                     gm.change_lead("osint", "clone", "ai-hub-back"),
+                     gm.role("guard", "mine-back"), gm.role("manage", "mine-back")):
+            with self.subTest(argv):
+                result = self.runner.execute(argv)
+                self.assertNotEqual(result.rc, 0, result.out)
+                self.assertIn("held for your review", result.err)
+
+    def test_a_held_lead_offers_no_lead_change_and_a_held_gateway_no_birth_egress(self):
+        a = self.app
+        a.domains[LEAD].tags.add(core.QUARANTINE)
+        a.domains["ai-net-router"].tags.add(core.QUARANTINE)
+        rows = self.read_json("list", "--all", "--json")
+        node = self.node("project:p01")
+        offered = gm.actions(node, {}, fleet_rows=rows)
+        self.assertFalse({"change_lead", "remove_lead"} & offered)
+        self.assertTrue({"change_lead", "remove_lead"} <= gm.actions(self.node("project:p02"), {},
+                                                                     fleet_rows=rows))
+        doc = self.view("osint")
+        self.assertEqual(gm.firewall_actions(doc, rows), {"set_model_qube"})
+        self.assertIn("held for your review", gm.model_qube_refusal(doc, MODEL, rows))
+        self.assertIsNone(gm.model_qube_refusal(doc, "none", rows))
+        ids = [i for i, _ in gm.egress_choices(None, self.gateways(), rows)]
+        self.assertNotIn("ai-net-router", ids)
+        self.assertIn("ai-net-router", [i for i, _ in gm.egress_choices(None, self.gateways())])
+        # What the window leaves off, the command refuses.
+        for argv in (gm.remove_lead("osint"), gm.change_lead("osint", "template", "ai-debian-13"),
+                     gm.set_lead_rules("osint", RULES), gm.set_lead_model_qube("osint", MODEL),
+                     gm.settings_set(birth_egress="ai-net-router")):
+            with self.subTest(argv):
+                result = self.runner.execute(argv)
+                self.assertNotEqual(result.rc, 0, result.out)
+                self.assertIn("held for your review", result.err)
+
+    def test_accept_all_and_install_refuse_what_the_command_refuses(self):
+        held = {"name": "ai-a", "held": True}
+        self.assertIsNone(gm.accept_all_refusal([held]))
+        self.assertIn("cannot be read", gm.accept_all_refusal([held, {"name": "ai-b",
+                                                                     "unreadable": "x"}]))
+        row = {"name": "ai-tpl-g", "klass": "TemplateVM", "state": "managed", "power": "Halted",
+               "badges": ["ai-managed", "qmcp-guarded", "qmcp-open"]}
+        self.assertIn("seal it first", gm._install_why(row))
+        self.assertIsNone(gm._install_why(dict(row, badges=["ai-managed"])))
 
     def test_accept_alls_text_says_what_its_command_does(self):
         # On the dev box (2026-10-10) the form said "every qube held when it
@@ -3580,6 +3822,9 @@ BANNED = {"set_markup", "set_markup_with_mnemonic", "set_use_markup", "use_marku
           "set_text_with_mnemonic", "MessageDialog"}
 FUNNELS = {"_need", "_label", "_set", "_set_lines", "_title", "_named", "_button", "_add_button",
            "_placeholder", "_check", "_radio", "_fill", "_column", "_tree_append", "_list_append"}
+#: Helpers that set a NUMBER on a widget (a level bar's fill), never text: each
+#: refuses anything but a number (`AuditWindow.test_a_level_is_a_number_never_text`).
+NUMBER_HELPERS = {"_level"}
 
 
 def _literal(node) -> bool:
@@ -3646,7 +3891,7 @@ class Structure(unittest.TestCase):
                         "tooltip-markup", "placeholder-text", "secondary-text"}:
                     offenders.append(("set_property", node.lineno))
                 continue
-            if not texty or self.enclosing(node) in FUNNELS:
+            if not texty or self.enclosing(node) in FUNNELS | NUMBER_HELPERS:
                 continue
             if not all(_literal(a) for a in texty):
                 offenders.append((name, node.lineno))
@@ -3735,11 +3980,16 @@ class Structure(unittest.TestCase):
         self.assertIn("Terminal=false", desktop)
         categories = next(l for l in desktop.splitlines() if l.startswith("Categories=")).split("=", 1)[1]
         self.assertIn("X-XFCE-SettingsDialog", categories.split(";"))
-        self.assertIn("qubes", "qubes-mcp.desktop")
         install_lines = [l for l in (HERE.parent / "deploy" / "install.sh").read_text().splitlines()
                          if "qubes-mcp.desktop" in l and l.startswith("install ")]
         self.assertEqual(install_lines, ['install -m 0644 "$SRC/deploy/qubes-mcp.desktop" '
                                          '/usr/share/applications/qubes-mcp.desktop'])
+        # The name the menu reads is the installed file's, not a literal here.
+        self.assertIn("qubes", pathlib.PurePosixPath(shlex.split(install_lines[0])[-1]).name)
+        # The window runs the command where the installer puts it.
+        command = [shlex.split(l)[-1] for l in (HERE.parent / "deploy" / "install.sh").read_text()
+                   .splitlines() if l.startswith('install -m 0755 "$SRC/dom0/bin/qmcp" ')]
+        self.assertEqual(command, [gm.QMCP])
         launcher = (HERE.parent / "dom0" / "bin" / "qmcp-gui").read_text()
         self.assertIn('sys.path.insert(0, "/usr/local/lib/qmcp")', launcher)
         self.assertTrue(os.access(HERE.parent / "dom0" / "bin" / "qmcp-gui", os.X_OK))
@@ -3904,7 +4154,10 @@ class Widgets(GuiBase):
             gm.settings_set: (self.gui.SettingsForm(self.win, self.win.settings,
                                                     self.win.gateways), {
                 "pool_cap": "pool_cap", "private_cap": "private_cap",
-                "birth_egress": "birth_egress"}),
+                "birth_egress": "birth_egress", "audit_keep_days": "keep_days"}),
+            # A project's: the project from the selection, the mode from its combo.
+            gm.project_audit: (self.gui.AuditModeForm(self.win, "osint", record),
+                               {"key": "key", "mode": "mode"}),
             gm.export_config: (self.gui.ExportForm(self.win), {"file": "file"}),
             gm.import_config: (self.gui.ImportForm(self.win, {}, []), {"file": "file"}),
             # The Check tab's list of every template; a template's row has a
@@ -3936,7 +4189,8 @@ class Widgets(GuiBase):
             self.assertIn(builder.__name__, {"remove_lead", "delete_plan", "delete_project",
                                              "audit_rotate", "show_proposal", "remove_gateway",
                                              "show_lead_firewall", "unblock_project",
-                                             "seal_qube", "restored_accept", "restored_reject"},
+                                             "seal_qube", "guard_qube", "restored_accept",
+                                             "restored_reject"},
                           "a builder without a form")
         for ident in ("prepare", "packages", "accept_restored", "reject_restored"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
@@ -4018,6 +4272,92 @@ class Widgets(GuiBase):
         self.assertEqual((p.lead, p.networks, p.dump), ("ai-newp-lead", ("ai-net-router", None), "newp-dump"))
         self.assertIn(f"project:{p.slot}", [r[0] for r in self.rows(self.win.store)])   # refreshed
 
+    def refusal(self, argv):
+        """The command's own refusal of `argv`, without its `qmcp ...:` prefix."""
+        result = self.runner.execute(argv)
+        self.assertEqual(result.rc, 1, result.out)
+        return result.err.strip().split(": ", 1)[1]
+
+    def project_form(self, label="newz", origin="ai-debian-13", dump=False):
+        form = self.win.act("new_project")
+        form.label_entry.set_text(label)
+        form.source["template"].set_active(True)
+        form.origin.set_active_id(origin)
+        form.nets["none"].set_active(True)
+        form.quota.set_text("1G")
+        form.dump.set_active(dump)
+        form.update()
+        return form
+
+    def test_new_project_refuses_before_ok_what_the_view_shows_the_command_refuses(self):
+        a = self.app
+        form = self.project_form()                               # the control: it would run
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        form.destroy()
+        a.vm("ai-newz-x", template=a.domains["ai-debian-13"])
+        a.vm("newy-dump", template=a.domains["debian-13"])
+        self.win.refresh()
+        for label, origin, dump in (("osint", "ai-debian-13", False),   # the label is taken
+                                    ("newz", "ai-debian-13", False),    # a qube in its space
+                                    ("newy", "ai-debian-13", True),     # its sink's name exists
+                                    ("neww", "debian-13", False)):      # no approved template
+            with self.subTest(label):
+                form = self.project_form(label, origin, dump)
+                self.assertFalse(form.ok.get_sensitive())
+                self.assertEqual(form.error.get_text(), self.refusal(gm.create_project(
+                    label, "template", origin, lead_netvm=None, networks=["none"], quota="1G",
+                    dump=dump)))
+                form.destroy()
+        form = self.project_form("neww", "debian-13")            # a ticked template is one
+        form.templates["ai-dvm"].set_active(True)
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+        form.destroy()
+        # Fifteen projects: the form says so before OK, as the command does.
+        records = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        for slot in projects.PROJECT_SLOTS:
+            records["slots"].setdefault(slot, dict(records["slots"]["p02"], label=f"x{slot}",
+                                                   lead=None, dump=None))
+        self.write_records(records)
+        self.win.refresh()
+        form = self.project_form("newv")
+        self.assertEqual(form.error.get_text(), self.refusal(gm.create_project(
+            "newv", "template", "ai-debian-13", networks=["none"], quota="1G")))
+        self.assertIn("all 15 project slots are in use", form.error.get_text())
+
+    def test_lead_dump_and_edit_forms_refuse_before_ok_what_the_view_shows(self):
+        # A lead name that exists.
+        self.select("project:p02")
+        form = self.win.act("change_lead")
+        form.source["template"].set_active(True)
+        form.origin.set_active_id("ai-debian-13")
+        form.old_lead.set_active_id("remove")
+        form.lead_name.set_text("ai-other-w1")
+        form.update()
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), self.refusal(gm.change_lead(
+            "other", "template", "ai-debian-13", lead_name="ai-other-w1")))
+        form.lead_name.set_text(OTHER_LEAD)                     # the old lead, removed first
+        form.update()
+        self.assertNotIn("exists", form.error.get_text())
+        form.destroy()
+        # A sink inside the prefix, and one whose name exists.
+        for name in ("ai-other-sink", "personal"):
+            with self.subTest(name):
+                form = self.win.act("add_dump")
+                form.sink_name.set_text(name)
+                form.update()
+                self.assertFalse(form.ok.get_sensitive())
+                self.assertEqual(form.error.get_text(), self.refusal(gm.add_dump("other", name)))
+                form.destroy()
+        # A network a worker still sits on.
+        self.select("project:p01")
+        form = self.win.act("edit_project")
+        form.nets["ai-net-router"].set_active(False)
+        form.update()
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), self.refusal(gm.edit_project("osint",
+                                                                             networks=["none"])))
+
     def test_a_promoted_lead_has_no_name_field(self):
         form = self.win.act("new_project")
         form.source["promote"].set_active(True)
@@ -4091,6 +4431,84 @@ class Widgets(GuiBase):
         self.submit(form)
         self.assertLessEqual({"ai-managed", "qmcp-guarded"}, self.tags("ai-work"))
 
+    def test_add_and_manage_refuse_before_ok_what_the_command_refuses(self):
+        a = self.app
+        self.routers()                                           # sys-ai-net provides network
+        a.vm("stray-dump", template=a.domains["debian-13"], tags={"ai-dump"}, netvm=None)
+        a.vm("ai-ref", template=a.domains["ai-debian-13"], tags={"ai-managed", "qmcp-guarded"},
+             netvm=a.domains["sys-firewall"])
+        self.win.refresh()
+
+        def refused(argv):
+            result = self.runner.execute(argv)
+            self.assertEqual(result.rc, 1, result.out)
+            return result.err.strip().split(": ", 1)[1]
+        for name, managed in (("sys-ai-net", True), ("personal", False), ("stray-dump", False)):
+            with self.subTest(name):
+                form = self.win.act("add_to_ai_space")
+                form.qube.set_active_id(name)
+                (form.managed if managed else form.guarded).set_active(True)
+                form.update()
+                self.assertFalse(form.ok.get_sensitive())
+                self.assertEqual(form.error.get_text(),
+                                 refused(gm.role("manage" if managed else "guard", name)))
+                form.destroy()
+        self.select("qube:ai-ref")
+        form = self.win.act("manage")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertEqual(form.error.get_text(), refused(gm.role("manage", "ai-ref")))
+        # The control: one the command takes is not refused.
+        form = self.win.act("add_to_ai_space")
+        form.qube.set_active_id("sys-ai-net")
+        form.guarded.set_active(True)
+        form.update()
+        self.assertTrue(form.ok.get_sensitive(), form.error.get_text())
+
+    def test_a_held_gateway_is_refused_by_both_gateway_forms(self):
+        from qmcp import core
+        self.routers()
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-tor")).rc, 0)
+        self.win.refresh()
+        self.gateway_select("sys-ai-tor")
+        form = self.win.act("change_gateway")
+        form.label_entry.set_text("x")
+        form.argv()                                         # the positive: not held
+        self.app.domains["sys-ai-tor"].tags.add(core.QUARANTINE)
+        self.win.refresh()
+        self.gateway_select("sys-ai-tor")
+        form = self.win.act("change_gateway")
+        form.label_entry.set_text("x")
+        with self.assertRaisesRegex(gm.FormError, "held for your review"):
+            form.argv()
+        row = dict(next(r for r in self.win.fleet if r["name"] == "sys-ai-tor"))
+        self.assertIn("held for your review", gm._enroll_why(row, HUB))
+
+    def test_a_label_shown_escaped_is_never_sent_with_its_escapes(self):
+        self.routers()
+        label = 'say "hi" C:\\x'
+        self.assertEqual(self.runner.execute(gm.enroll_gateway("sys-ai-tor", label=label)).rc, 0)
+        self.win.refresh()
+        self.gateway_select("sys-ai-tor")
+        form = self.win.act("change_gateway")
+        self.assertEqual(form.label_entry.get_text(), "")       # never the escaped text
+        form.label_entry.set_text(label + "!")
+        self.assertEqual(form.argv()[-2:], ["--label", label + "!"])
+        self.submit(form)
+        self.assertEqual(gateways.load()["sys-ai-tor"].label, label + "!")
+        self.win.refresh()
+        self.gateway_select("sys-ai-tor")
+        form = self.win.act("change_gateway")
+        self.assertFalse(form.ok.get_sensitive())                # nothing changed yet
+        form.clear_label.set_active(True)
+        self.assertEqual(form.argv()[-2:], ["--label", ""])
+        form.label_entry.set_text("Tor")
+        self.assertFalse(form.ok.get_sensitive())                # one or the other
+        form.destroy()
+        # A label the field shows as it is is put in it, as before.
+        self.gateway_select("ai-net-router")
+        self.assertEqual(self.win.act("change_gateway").label_entry.get_text(),
+                         gateways.load()["ai-net-router"].label or "")
+
     def test_delete_shows_the_commands_own_plan_first(self):
         self.select("project:p02")
         self.win.act("delete_project")
@@ -4104,6 +4522,38 @@ class Widgets(GuiBase):
         self.submit(form)
         self.assertIsNone(projects.find(projects.load(), "other"))
         self.assertNotIn("project:p02", [r[0] for r in self.rows(self.win.store)])
+
+    def test_normal_mode_unblocks_badges_left_from_anonymous_mode(self):
+        a = self.app
+        for name in ("ai-hubq", "ai-osint-w1"):
+            a.domains[name].tags.update({projects.BLOCKED, projects.STOPPED})
+        self.win.refresh()
+        self.assertEqual(self.win.settings.get("mode"), "normal")
+        for name in ("ai-hubq", "ai-osint-w1"):
+            self.select(f"qube:{name}")
+            self.assertIn("unblock", self.sensitive())
+        self.select("qube:ai-osint-w2")                          # nothing on it to take off
+        self.assertNotIn("unblock", self.sensitive())
+        self.select("qube:ai-hubq")
+        form = self.win.act("unblock")
+        self.assertEqual(form.argv()[-2:], ["unblock", "p00"])
+        self.assertIn("Normal mode", form.intro.get_text())
+        self.submit(form)
+        for name in ("ai-hubq", "ai-osint-w1"):
+            self.assertFalse({projects.BLOCKED, projects.STOPPED} & set(a.domains[name].tags), name)
+        self.select("qube:ai-hubq")
+        self.assertNotIn("unblock", self.sensitive())
+
+    def test_unblock_is_never_offered_for_an_anonymous_projects_qube_without_a_verdict(self):
+        rec = self.anonymous()
+        a = self.app
+        a.domains[rec.lead].tags.update({projects.BLOCKED})
+        tree = self.tree()
+        node = next(n for n in gm.walk(tree) if n.key == f"qube:{rec.lead}")
+        self.assertTrue(gm.stopped_qube(node.data))
+        self.assertIsNone(gm.leftover_block(node, {r["slot"]: r for r in
+                                                   self.read_json("project", "list", "--json")},
+                                            "normal"))
 
     def test_one_command_at_a_time(self):
         self.runner.hold = True
@@ -4144,10 +4594,18 @@ class Widgets(GuiBase):
         self.assertEqual(self.sensitive(), {"revoke"})
         self.submit(self.win.act("revoke"))
         self.assertNotIn("ai-managed", self.app.domains["ai-osint-w1"].tags)
-        # Not Guard: on a qube revoked since the view was read it would add it
-        # to AI space again.
+        # Guard too: the window sends --only-in-ai-space, so on a qube revoked
+        # since the view was read the command refuses, and never adds it to AI
+        # space again.
         self.select("qube:ai-gw-unbadged")
-        self.assertEqual(self.sensitive(), set())
+        self.assertEqual(self.sensitive(), {"guard"})
+        form = self.win.act("guard")
+        self.assertEqual(form.argv()[-1], "--only-in-ai-space")
+        self.app.domains["ai-gw-unbadged"].tags.discard("ai-managed")     # revoked meanwhile
+        result = self.submit(form, ok=False)
+        self.assertIn("is outside AI space, and --only-in-ai-space refuses", result.err)
+        self.assertEqual(set(self.app.domains["ai-gw-unbadged"].tags) & {"ai-managed", "qmcp-guarded"},
+                         set())
         self.runner.fail.clear()
         self.win.refresh()
         self.select("project:p01")
@@ -4190,7 +4648,7 @@ class Widgets(GuiBase):
         self.assertTrue(self.win.closing())                     # kept open until answered
         labels = [w.get_text() for w in self.win.last_ask.get_content_area().get_children()
                   if isinstance(w, Gtk.Label)]
-        self.assertEqual(labels, [shlex.join(gm.role("guard", "ai-gw-unbadged")),
+        self.assertEqual(labels, [shlex.join(gm.guard_qube("ai-gw-unbadged")),
                                   self.gui.CLOSE_NOTE])
         self.win.last_ask.destroy()
         self.release_all()
@@ -4212,8 +4670,8 @@ class Widgets(GuiBase):
         self.assertEqual(self.sensitive(), set())
         self.select("qube:ai-osint-w1")
         self.assertEqual(self.sensitive(), {"revoke"})
-        self.select("qube:ai-gw-unbadged")                      # Guard grants on a revoked qube
-        self.assertEqual(self.sensitive(), set())
+        self.select("qube:ai-gw-unbadged")                      # refused on a revoked qube
+        self.assertEqual(self.sensitive(), {"guard"})
         writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
         before = writes()
         edit.response(Gtk.ResponseType.OK)
@@ -4242,6 +4700,34 @@ class Widgets(GuiBase):
         attention = {c.data["name"]: c.data["attention"] for c in nodes["group:attention"].children}
         self.assertEqual(attention, {"ai-gw-unbadged": "gateway"})
         self.assertFalse(any(b.get_sensitive() for b in win.buttons.values()))
+
+    def test_fleet_never_read_marks_nothing_missing(self):
+        runner = CliRunner(self.app)
+        runner.fail.add(tuple(gm.READS["fleet"]))
+        win = self.gui.Window(runner=runner, show_forms=False, report=lambda *a: None)
+        self.addCleanup(win.destroy)
+        win.refresh()
+        roles = {k: n.cells[1] for k, n in win.nodes.items() if n.kind == "ref"}
+        self.assertEqual(roles["ref:p01:lead"], "lead (not read)")
+        self.assertEqual(roles["ref:p01:dump"], "dump sink (not read)")
+        self.assertFalse(any("missing" in r for r in roles.values()), roles)
+        # The control: a recorded lead the fleet read as gone is missing.
+        self.app.domains[LEAD].kill()
+        self.app.domains[LEAD].tags.clear()
+        del self.app.domains[LEAD]
+        self.win.refresh()
+        self.assertEqual(self.win.nodes["ref:p01:lead"].cells[1], "lead (missing)")
+
+    def test_settings_never_read_states_nothing(self):
+        runner = CliRunner(self.app)
+        runner.fail.add(tuple(gm.READS["settings"]))
+        win = self.gui.Window(runner=runner, show_forms=False, report=lambda *a: None)
+        self.addCleanup(win.destroy)
+        win.refresh()
+        shown = self.grid(win.settings_grid)
+        self.assertEqual(set(shown.values()), {"not read: Refresh"})
+        self.assertEqual(win.nodes["hub"].cells[0], "(not read)")
+        self.assertEqual(self.win.nodes["hub"].cells[0], HUB)
 
     def test_a_failed_check_is_no_light(self):
         self.runner.fail.add(tuple(gm.READS["check"]))
@@ -4297,6 +4783,8 @@ class Widgets(GuiBase):
         parser = cli.build_parser()
         argvs = list(gm.READS.values()) + [gm.AUDIT_VERIFY]
         model_qube(self.app)                    # a qube the hub set up to serve a model
+        # A qube to add, on no network: on one not enrolled, Add refuses before OK.
+        self.app.domains["personal"].netvm = None
         self.win.refresh()
         rows = self.win.fleet
 
@@ -4379,6 +4867,12 @@ class Widgets(GuiBase):
         f.updates.set_active(True)
         f.label_entry.set_text("clearnet")
         forms.append(f)
+        # The mark and the updates tick taken off an anonymising gateway no project uses.
+        f = self.gui.GatewayForm(self.win, {"name": "sys-ai-tor", "anonymising": True,
+                                            "updates": True, "upstream": "sys-whonix",
+                                            "recorded_upstream": "sys-whonix"})
+        f.anonymising.set_active_id("no")
+        forms.append(f)
         f = self.gui.DumpForm(self.win, "other", "other-dump")
         f.sink_name.set_text("other-sink")
         forms.append(f)
@@ -4390,7 +4884,7 @@ class Widgets(GuiBase):
         f.keep.set_active(True)
         forms.append(f)
         for kind in ("managed", "guarded"):
-            f = self.gui.AddForm(self.win, rows, HUB, [])
+            f = self.gui.AddForm(self.win, rows, HUB, [], gws)
             f.qube.set_active_id("personal")
             getattr(f, kind).set_active(True)
             forms.append(f)
@@ -4407,6 +4901,15 @@ class Widgets(GuiBase):
         f.private_cap.set_text("30G")
         f.birth_egress.set_active_id("ai-net-router")
         forms.append(f)
+        for keep in ("30", "off"):                  # how long a rotated audit log is kept
+            f = self.gui.SettingsForm(self.win, self.win.settings, gws)
+            f.keep_days.set_text(keep)
+            forms.append(f)
+        # A project's audit log, every way: from the record's disk, then back.
+        for old, new in (("disk", "ram"), ("disk", "off"), ("ram", "disk")):
+            f = self.gui.AuditModeForm(self.win, "osint", dict(record, audit=old))
+            f.mode.set_active_id(new)
+            forms.append(f)
         f = self.gui.ExportForm(self.win)
         f.file.set_text(str(self.tmp / "qmcp-export.json"))
         forms.append(f)
@@ -4472,6 +4975,14 @@ class Widgets(GuiBase):
         self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
         self.win.refresh()                                  # sound again, still stopped
         self.select(f"project:{p.slot}")
+        form = self.win.act("unblock")
+        self.one_line(form)
+        argvs.append(form.argv())
+        form.destroy()
+        # Normal mode: the badges anonymous mode left on a qube of p00.
+        self.app.domains["ai-hubq"].tags.add(projects.BLOCKED)
+        self.win.refresh()
+        self.select("qube:ai-hubq")
         form = self.win.act("unblock")
         self.one_line(form)
         argvs.append(form.argv())
@@ -6847,6 +7358,115 @@ class RealRunner(unittest.TestCase):
         r = self.run_one(["/bin/sh", "-c", "printf '\\377\\376ok'"])
         self.assertEqual(r.rc, 0)
         self.assertTrue(r.out.endswith("ok"))
+
+
+
+class AuditWindow(GuiBase):
+    """The audit log's gauge, its keep-days setting and a project's audit
+    mode: read through the command, never shown from a read that failed, and
+    a switch away from disk says in red that the old lines stay on disk."""
+
+    def setUp(self):
+        super().setUp()
+        from qmcp import gui
+        self.gui = gui
+        self.reports = []
+        # A line of the hub's, so its budget is on the gauge.
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "memory",
+                                                "value": 900})
+        self.win = gui.Window(runner=self.runner, show_forms=False,
+                              report=lambda title, result: self.reports.append((title, result)))
+        self.addCleanup(self.win.destroy)
+        self.win.refresh()
+
+    def gauge(self):
+        return [c.get_text() for c in reversed(self.win.audit_gauge.get_children())
+                if isinstance(c, self.gui.Gtk.Label)]
+
+    def select(self, key):
+        def visit(model, path, it):
+            if model[it][0] == key:
+                self.win.tree.get_selection().select_iter(it)
+                return True
+            return False
+        self.win.store.foreach(visit)
+        self.assertEqual(self.win.selected, key)
+
+    def test_every_field_of_the_status_read_is_named(self):
+        doc = self.read_json("audit", "status", "--json")
+        self.assertEqual(set(doc), {k for k, _ in gm.AUDIT_STATUS_FIELDS})
+
+    def test_the_gauge_shows_the_log_the_floor_and_each_budget(self):
+        text = self.gauge()
+        self.assertIn("Budget: mcp-control", text)
+        self.assertIn("1 of 20000 lines today", text)
+        self.assertTrue(any("the services refuse changes below 64.0 MiB" in s for s in text), text)
+        bars = [c for c in self.win.audit_gauge.get_children()
+                if isinstance(c, self.gui.Gtk.LevelBar)]
+        self.assertEqual(len(bars), 2)                  # the free space, and the hub's budget
+
+    def test_a_status_read_that_fails_is_never_shown_as_state(self):
+        before = self.gauge()
+        self.runner.fail.add(tuple(gm.READS["audit_status"]))
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "memory",
+                                                "value": 901})
+        self.win.refresh()
+        self.assertFalse(self.win.complete)
+        self.assertEqual(self.gauge(), before)          # the last complete view, whole
+        fresh = self.gui.Window(runner=self.runner, show_forms=False, report=lambda *a: None)
+        self.addCleanup(fresh.destroy)
+        fresh.refresh()
+        texts = [c.get_text() for c in fresh.audit_gauge.get_children()
+                 if isinstance(c, self.gui.Gtk.Label)]
+        self.assertIn("not read: Refresh", texts)
+        self.assertNotIn("Budget: mcp-control", texts)
+
+    def test_the_project_form_says_the_old_lines_stay_on_disk(self):
+        self.select("project:p01")
+        self.assertIn("audit_mode", {k for k, b in self.win.buttons.items() if b.get_sensitive()})
+        form = self.win.act("audit_mode")
+        self.addCleanup(form.destroy)
+        with self.assertRaises(gm.FormError):          # disk already
+            form.argv()
+        form.mode.set_active_id("ram")
+        argv = form.argv()
+        self.assertEqual(argv, gm.write_cmd("project", "audit", "osint", "ram"))
+        self.assertIn("is not erasing it", form.warning.get_text())
+        self.assertEqual(self.runner.execute(argv).rc, 0)
+        self.assertEqual(projects.load()["p01"].audit, "ram")
+        self.win.refresh()
+        self.select("project:p01")
+        shown = dict(gm.details(self.win.node()))
+        self.assertIn("own chain under /run", shown["Audit log"])
+        form = self.win.act("audit_mode")
+        self.addCleanup(form.destroy)
+        form.mode.set_active_id("disk")
+        form.argv()
+        self.assertEqual(form.warning.get_text(), "")   # back to disk: nothing to warn of
+
+    def test_settings_show_both_and_the_form_sends_keep_days_only_when_changed(self):
+        rows = dict(gm.settings_rows(self.win.settings))
+        self.assertIn("disk: /var/log/qmcp-audit.log", rows["Audit log (set at install)"])
+        self.assertIn("90 days", rows["Keep rotated audit logs"])
+        form = self.gui.SettingsForm(self.win, self.win.settings, self.win.gateways)
+        self.addCleanup(form.destroy)
+        self.assertEqual(form.keep_days.get_text(), "90")
+        with self.assertRaises(gm.FormError):
+            form.argv()                                  # nothing changed
+        form.keep_days.set_text("0")
+        with self.assertRaises(gm.FormError):
+            form.argv()                                  # the command's own reader refuses it
+        form.keep_days.set_text("off")
+        self.assertEqual(form.argv(), gm.write_cmd("settings", "set", "--audit-keep-days", "off"))
+        # One that did not read starts empty, never a value the form guessed.
+        self.assertEqual(gm.keep_days_field(None), "")
+        self.assertIn("does not read", gm.keep_days_text(None))
+
+    def test_a_level_is_a_number_never_text(self):
+        for bad in ("0.5", None, True, 1.5, -0.1):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                self.gui._level(bad)
+        self.assertEqual(self.gui._level(0.25).get_value(), 0.25)
 
 
 if __name__ == "__main__":

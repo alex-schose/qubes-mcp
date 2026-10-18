@@ -98,7 +98,7 @@ def _read_word(path: str) -> str:
     try:
         with open(path, encoding="utf-8") as fh:
             return fh.read(256).split("#", 1)[0].strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 
@@ -181,6 +181,9 @@ PRECEDENCE_CLAIMS = (
     ("the hub's connection to a model qube", "qubes.ConnectTCP+11434", "hub", "model"),
     ("a TCP connection from AI space into another qube", "qubes.ConnectTCP+22", "ai", "peer"),
     ("a TCP connection from AI space through @default", "qubes.ConnectTCP+11434", "ai", "@default"),
+    ("an application started from AI space in a qube outside it", "qubes.StartApp", "ai",
+     "outside"),
+    ("an image read from AI space in a qube outside it", "qubes.GetImageRGBA", "ai", "outside"),
 )
 _PROBES = {"ai": "qmcp-probe-ai", "peer": "qmcp-probe-peer",
            "guarded": "qmcp-probe-guarded", "outside": "qmcp-probe-outside",
@@ -263,7 +266,7 @@ def policy_hub(path: str) -> str | None:
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     hits = re.findall(r"^\*\s+\*\s+(\S+)\s+@anyvm\s+deny\s*$", text, re.M)
     return hits[-1] if hits else None
@@ -626,9 +629,11 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     else:
         add("pass", "runtime dir", calls)
     # The services cannot create a file in /var/log: a missing log, like one
-    # of another group, stops their lines without a symptom.
+    # of another group, stops their lines without a symptom. Only while the
+    # install's lines go to disk: in mode ram or none nothing appends to it.
+    audit_mode, audit_mode_problem = audit.install_mode()
     log = _safe(lambda: os.stat(audit.LOG_PATH))
-    if not shared(log):
+    if audit_mode == "disk" and not shared(log):
         add("fail", "audit log", f"{audit.LOG_PATH} is "
                                  f"{'missing' if log is None else 'not writable by the services group'}: "
                                  f"their audit lines stop without a symptom "
@@ -681,9 +686,26 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("pass", "birth egress", egress or "not set (the hub's template spawns need the hub's "
                                               "own network enrolled)")
 
-    # 13. the audit chain
-    ok, n, err = audit.verify()
-    add("pass" if ok else "fail", "audit chain", f"{n} entries intact" if ok else err)
+    # 13. the audit chain. The records are judged in their own item below;
+    # here they say only which projects keep their lines off disk.
+    try:
+        audit_records = projects.load()
+    except projects.ProjectsUnreadable:
+        audit_records = None
+    _audit_modes(add, audit_records, audit_mode, audit_mode_problem)
+    if audit_mode == "disk" or os.path.exists(audit.LOG_PATH):
+        # In mode ram or none the lines on disk from before stay evidence.
+        ok, n, err = audit.verify()
+        add("pass" if ok else "fail", "audit chain", f"{n} entries intact" if ok else
+            f"{err}: keep the file as the record of the break; sudo qmcp audit rotate starts a new "
+            f"log, so a later break is not hidden behind this one")
+    for name, _ in audit.ram_chains():
+        path = os.path.join(audit.ram_dir(), name)
+        ok, n, err = audit.verify(path)
+        add("pass" if ok else "fail", "audit chain in RAM",
+            f"{path}: {n} entries intact" if ok else
+            f"{path}: {err}; it is gone at shutdown, so read it now if the break matters "
+            f"(qmcp audit tail 200 --path {path})")
     lost = audit.dropped()
     if lost is not None:
         count, first = lost
@@ -723,14 +745,23 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
             + ". A principal that busy is worth a look; removing its counter (sudo rm "
               f"{os.path.join(calls, caller + audit.REFUSED_SUFFIX)}) gives it a new day's share "
               "and clears this")
-    if not audit.room():
-        add("fail", "audit room", f"less than {audit.FLOOR_BYTES // (1024 * 1024)} MiB free under "
-                                  f"{os.path.dirname(audit.LOG_PATH)}, or that cannot be read: "
-                                  f"the services refuse every call that would change something, "
-                                  f"but a kill, until there is")
+    # The floor of every chain lines may go to: the log's disk while the
+    # install writes there, and the RAM chains' tmpfs (dom0's memory) always,
+    # since a project in RAM or an unknown place writes there in any mode but none.
+    floors = ([audit.LOG_PATH] if audit_mode == "disk" else []) + \
+        ([audit.ram_path()] if audit_mode != "none" else [])
+    for chain in floors:
+        if not audit.room(chain):
+            add("fail", "audit room", f"less than {audit.FLOOR_BYTES // (1024 * 1024)} MiB free "
+                                      f"under {os.path.dirname(chain)}, or that cannot be read: "
+                                      f"the services refuse every call that would change "
+                                      f"something, but a kill, wherever its line would go, "
+                                      f"until there is")
     size = _safe(lambda: os.path.getsize(audit.LOG_PATH), 0)
     if size > audit.ROTATE_AT_BYTES:
-        add("warn", "audit size", f"{size // (1024 * 1024)} MiB; rotate with: qmcp audit rotate")
+        add("warn", "audit size", f"{size // (1024 * 1024)} MiB; the hourly timer rotates it "
+                                  f"(qmcp-audit.timer), or by hand: sudo qmcp audit rotate")
+    _audit_retention(add, audit_records, audit_mode)
 
     # 14. nothing of v0.9.16 left behind
     left = [p for p in legacy_paths if os.path.lexists(p)]
@@ -889,9 +920,11 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
                 if vm is None:
                     lead_bad.append(f"{p.label}: {p.lead}")
                 # A lead the anonymity gate stopped is judged by the gate's own
-                # item: its record and badges still agree.
+                # item, and one held for review by the restore item's warning:
+                # its record and badges still agree.
                 elif vm.name in tags_by and (not core.lead_badges_agree(
-                        tags_by[vm.name] - {projects.BLOCKED, projects.STOPPED}, p.slot)
+                        tags_by[vm.name] - {projects.BLOCKED, projects.STOPPED,
+                                            core.QUARANTINE}, p.slot)
                         or role(vm)):
                     lead_bad.append(f"{p.label}: {p.lead}")
             for t in p.templates:
@@ -945,6 +978,18 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
         "; ".join(sink_bad) if sink_bad else "every sink is ai-dump, outside AI space, and named in its record")
     if sink_warn:
         add("warn", "dump sink network", "; ".join(sink_warn))
+    # A `project dump` that died after its create and before its last badge
+    # leaves a qube under the sink's name that its own retry refuses.
+    bare = []
+    for p in sorted(records.values(), key=lambda p: p.slot):
+        name = _sink_default_name(p)
+        if p.dump is None and name in tags_by and not _sink_badged(tags_by[name]):
+            bare.append(name)
+    if bare:
+        add("warn", "unfinished dump sinks",
+            f"named as a project's dump sink, which its record does not name, and wearing no "
+            f"dump badge: {', '.join(bare)}: a qmcp project dump that did not finish? If it is "
+            f"not yours, remove it (qvm-remove) and run the command again")
 
     unslotted = []
     for vm in vms:
@@ -1005,7 +1050,7 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hu
     # the gate may stop any of them.
     expected = set()
     if mode is not False and hub is not None and hub in tags_by:
-        expected = set(anon.hub_candidates(hub, records, registry or {}, tags_by))
+        expected = set(anon.hub_candidates(hub, records, tags_by))
         try:
             expected = set(anon.hub_subjects(hub, records, registry or {},
                                              {vm.name: vm for vm in vms}, tags_by))
@@ -1045,11 +1090,18 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hu
                                         f"disposable template: {', '.join(sorted(reachable))} "
                                         f"(remove them, or qmcp revoke them)")
     if not anonymous and mode is False:
+        # The timer also ends open windows and holds restored qubes, in every
+        # mode: its item stands without an anonymous project.
+        _gate_timer_item(add, anonymous=False)
         return out
     # Only the timer's runs touch the heartbeat: this check's own run below does not.
     age = anon.heartbeat_age()
-    if age is None or age > anon.HEARTBEAT_MAX_S:
+    # A negative age is a clock set back since the last run: the heartbeat then
+    # proves nothing about the timer, so it is stale, never fresh.
+    if age is None or age > anon.HEARTBEAT_MAX_S or age < -1:
         add("fail", "gate heartbeat", ("no run of the anonymity gate has completed" if age is None
+                                       else f"the anonymity gate's last run is dated "
+                                            f"{-age:.0f} s ahead of the clock" if age < 0
                                        else f"the anonymity gate last completed a run "
                                             f"{age:.0f} s ago")
             + f": nothing anonymous is being judged every 15 seconds (journalctl -u "
@@ -1079,22 +1131,34 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hu
             add("fail", "anonymity gate", f"{name} is not anonymous ("
                 + "; ".join(d for _, d in v.problems) + ")"
                 + ("; it was stopped" if v.blocked or v.acted else ""))
+    _gate_timer_item(add, anonymous=True)
+    for p in sorted(anonymous.values(), key=lambda p: p.slot):
+        if p.slot == projects.HUB_SLOT:
+            continue
+        shared, unread = shared_routers(app, records, p)
+        if shared:
+            add("warn", "shared routers", f"{p.label} ({p.slot}) shares {', '.join(shared)} with "
+                                          f"another project or the hub: {SHARED_ROUTER_WARNING}")
+        if unread:
+            add("error", "shared routers", f"cannot read the network of {', '.join(unread)}, so "
+                                           f"whether {p.label} ({p.slot}) shares a router with "
+                                           f"another project or the hub cannot be told")
+    return out
+
+
+def _gate_timer_item(add, anonymous: bool) -> None:
     active = anon.timer_active()
     if active is None:
         add("error", "gate timer", f"cannot tell whether {anon.TIMER} runs")
     elif not active:
-        add("fail", "gate timer", f"{anon.TIMER} is not running, so the gate judges only when "
-                                  f"a qmcp command runs (sudo systemctl enable --now {anon.TIMER})")
+        does = ("the gate judges only when a qmcp command runs, and " if anonymous else "")
+        add("fail", "gate timer", f"{anon.TIMER} is not running, so {does}no open window ends "
+                                  f"at its time and no restored qube is held until a qmcp "
+                                  f"command runs (sudo systemctl enable --now {anon.TIMER})")
     else:
-        add("pass", "gate timer", f"{anon.TIMER} runs the gate every 15 seconds")
-    for p in sorted(anonymous.values(), key=lambda p: p.slot):
-        if p.slot == projects.HUB_SLOT:
-            continue
-        shared = shared_routers(app, records, p)
-        if shared:
-            add("warn", "shared routers", f"{p.label} ({p.slot}) shares {', '.join(shared)} with "
-                                          f"another project or the hub: {SHARED_ROUTER_WARNING}")
-    return out
+        add("pass", "gate timer", f"{anon.TIMER} runs every 15 seconds"
+                                  + (": the gate, " if anonymous else ": ")
+                                  + "the window expiry and the restore hold")
 
 
 def _member(tags, slot: str) -> bool:
@@ -1389,15 +1453,20 @@ def _gateway_text(g) -> str:
             + f"; label '{g.label}'")
 
 
-def _would_stop(app, registry_after: dict | None = None, overlay: dict | None = None) -> list:
+def _would_stop(app, registry_after: dict | None = None, overlay: dict | None = None,
+                detail: bool = True) -> list:
     """What the gate judges sound now and would not with `registry_after`, or
     with the qubes in `overlay` (name -> tags) wearing those tags: the labels,
-    the hub's as "the hub". A read that fails counts as a stop."""
+    the hub's as "the hub". A read that fails counts as a stop. Without
+    `detail` a failed read is said without its error, so text that is hashed
+    (a proposal's second tick) does not change with a transient error."""
+    def unsure(e) -> str:
+        return f"cannot tell: {e}" if detail else "cannot tell"
     try:
         records = _load_records()
         subjects = anon.subjects(records)
     except (ProjectError, core.ModeUnreadable) as e:
-        return [f"(cannot tell: {e})"]
+        return [f"({unsure(e)})"]
     out = []
     for p in subjects:
         try:
@@ -1407,7 +1476,7 @@ def _would_stop(app, registry_after: dict | None = None, overlay: dict | None = 
             after = anon.judge(app, p, records=records, registry=registry_after,
                                overlay=overlay)
         except (core.Unreadable, anon.PolicyUnreadable) as e:
-            out.append(f"{p.label} (cannot tell: {e})")
+            out.append(f"{p.label} ({unsure(e)})")
             continue
         if after.status != anon.GREEN:
             out.append(p.label)
@@ -1654,7 +1723,9 @@ def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, h
         except core.Unreadable as e:
             unread.append(str(e).removeprefix("cannot read "))
             why = None
-        if why:
+        # A hold is the restore item's warning: nothing reaches a held qube
+        # until the operator accepts it, its leads included.
+        if why and why != HELD_WHY:
             bad.append(f"{name}: {why}")
         if projects.HUB_SLOT in projects.member_slots(tags):
             label = next((records[s].label for s in sorted(slots)
@@ -1719,7 +1790,7 @@ def read_tier_default(path: str | None = None) -> str | None:
     try:
         with open(TIER_DEFAULT_PATH if path is None else path, encoding="utf-8") as fh:
             return fh.read(64).split("#", 1)[0].strip() or None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -2172,16 +2243,23 @@ def _manage(app, name, from_hub: bool = False) -> str:
         raise RoleError(f"'{name}' is in AI space now"
                         + ("; its default disposable template was cleared" if pinned else "")
                         + f", but {e}; run qmcp manage {name} again") from None
-    for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
-        vm.tags.discard(t)
     # An open window ends: a managed qube needs none, and a badge left on it
     # would have the expiry pass kill it. No kill here: it is the hub's now.
+    # Its badges come off while the qube is still guarded, so the expiry pass,
+    # which reads without the qube's lock, never sees a managed qube that is
+    # open, and a failure leaves it guarded and open, which a seal ends.
     ended = ""
     if tags & {core.OPEN, core.OPEN_FW}:
-        for t in (core.OPEN_FW, core.OPEN):
-            vm.tags.discard(t)
+        try:
+            _set_tags(vm, remove=sorted(tags & {core.OPEN, core.OPEN_FW}))
+        except Exception as e:
+            raise RoleError(f"'{name}' is in AI space now, but its open window's badges could "
+                            f"not be taken off ({type(e).__name__}): run qmcp seal {name}, then "
+                            f"qmcp manage {name} again") from None
         clear_window(name)
         ended = "; its open window ended, with no kill: it is managed now"
+    for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
+        vm.tags.discard(t)
     serves = projects.model_slots(tags)
     kind = _model_qube_kind(vm) if serves else False
     if kind is False:
@@ -2240,9 +2318,12 @@ def _not_in_a_slot(vm, name, action: str) -> set:
     return tags
 
 
-def guard(app, name) -> str:
-    """`qmcp guard`, under the qube's lock (`_guard`)."""
-    return _with_qube_lock(name, False, lambda held: _guard(app, name),
+def guard(app, name, in_ai_space_only: bool = False) -> str:
+    """`qmcp guard`, under the qube's lock (`_guard`). `in_ai_space_only`
+    (`--only-in-ai-space`, which the window always sends) refuses a qube
+    outside AI space instead of adding it, guarded: the window's view may be
+    older than a revoke, and its Guard only takes authority away."""
+    return _with_qube_lock(name, False, lambda held: _guard(app, name, in_ai_space_only),
                            settle=lambda: _settle_guard(app, name))
 
 
@@ -2265,16 +2346,19 @@ def _gone_by_name(app, name) -> bool:
         return False
 
 
-def _guard(app, name) -> str:
+def _guard(app, name, in_ai_space_only: bool = False) -> str:
     vm = _target(app, name)
     _refuse_held(vm, name)
-    before = _not_in_a_slot(vm, name, "guard")
+    before = _not_in_a_slot(vm, name, "guard")      # a read that fails refuses
+    if in_ai_space_only and core.UMBRELLA not in before:
+        raise RoleError(f"'{name}' is outside AI space, and --only-in-ai-space refuses to add "
+                        f"it (qmcp guard {name} without it adds it to AI space, guarded)")
     _network_enrolled(vm, name)
     mode = anonymous_mode()                 # read before anything is written
     _label(vm, name)
     serves = sorted(projects.model_slots(before))
-    # A model qube's maintenance window closes (managed to guarded): nothing
-    # the hub started in it while it was managed runs on. It is killed right
+    # A model qube's maintenance window closes (managed to guarded): what the
+    # hub started in it while it was managed is stopped. It is killed right
     # after the guard lands, before any other read or write, so no later
     # failure leaves it guarded and still running (a second guard finds it
     # guarded and kills nothing). The kill ends the hub's processes, not its
@@ -2388,7 +2472,7 @@ def _kill_after_guard(vm, name, serves) -> str:
     if done != "killed":
         raise RoleError(f"'{name}' is guarded now, but it could NOT be killed ({done}): a process "
                         f"the hub started in it may still run; kill it by hand (qvm-kill {name})")
-    return (f"; killed, so no process the hub started in it while it was managed runs on "
+    return (f"; killed: what the hub had running in it while it was managed is stopped "
             f"(a lead of {', '.join(serves)} starts it again by connecting)")
 
 
@@ -2400,10 +2484,10 @@ def _kill_model_qube(report, slot, vm, name, managed: bool, guard_failed: str = 
     step failed and the guard may not have landed."""
     done = _kill_if_running(vm)
     started = ("the hub started in it while it was managed" if managed else
-               "started in it before it became a model qube")
+               "was started in it before it became a model qube")
     if done == "killed":
-        report.append(f"{slot}: {name} killed, so no process {started} runs on; its lead starts "
-                      f"it again by connecting")
+        report.append(f"{slot}: {name} killed: what {started} is stopped; its lead starts it "
+                      f"again by connecting")
     elif done != "halted":
         state = (f"may not be guarded (that step failed too: {guard_failed})" if guard_failed
                  else "is guarded")
@@ -2483,7 +2567,8 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
                             f"the hub started in it may still run, outside AI space; kill it by "
                             f"hand (qvm-kill {name})")
         if done == "killed":
-            msg += ", killed, so nothing the hub started in it runs on; what it wrote to disk stays"
+            msg += (", killed: what the hub had running in it was stopped; what it wrote to "
+                    "disk stays")
     return msg
 
 
@@ -2513,13 +2598,15 @@ class WindowUnreadable(Exception):
 
 #: `--for`: whole seconds, or one unit of s, m or h. No fractions, so no
 #: rounding to argue about, and `bool` cannot sneak in as an `int`.
-_DURATION = re.compile(r"^([0-9]{1,7})([smh]?)$")
+_DURATION = re.compile(r"([0-9]{1,7})([smh]?)")
 
 
 def duration_seconds(text) -> int:
     """`"90s"`, `"30m"`, `"2h"` or bare digits as seconds. Raises `RoleError`
-    on anything else, including an empty string and a float."""
-    m = _DURATION.match(text.strip()) if isinstance(text, str) else None
+    on anything else, including an empty string, a float and any whitespace
+    around it: the whole text is matched, so a duration that passes is
+    exactly its own normal form (a proposal stores it as sent)."""
+    m = _DURATION.fullmatch(text) if isinstance(text, str) else None
     if m is None:
         raise RoleError("--for wants a whole number of seconds, or one with s, m or h, "
                         "e.g. 90s, 30m, 2h")
@@ -2769,12 +2856,11 @@ OPEN_LOCK_WAIT_S = 5.0
 SWEEP_WAIT_S = 2.0
 
 
-def seal(app, name, dir_: str | None = None, kill: bool = True, wait=None) -> str:
+def seal(app, name, dir_: str | None = None, wait=None) -> str:
     """`qmcp seal`, under the qube's lock (`_seal`); it takes authority away,
     so it seals without the lock once `wait` has passed."""
-    return _with_qube_lock(name, False, lambda held: _seal(app, name, dir_, kill),
-                           timeout=wait,
-                           settle=lambda: (_settle_seal(app, name, dir_) if kill else ""))
+    return _with_qube_lock(name, False, lambda held: _seal(app, name, dir_),
+                           timeout=wait, settle=lambda: _settle_seal(app, name, dir_))
 
 
 def _settle_seal(app, name, dir_=None) -> str:
@@ -2834,7 +2920,7 @@ def _seal_target(app, name):
     return vm, None
 
 
-def _seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
+def _seal(app, name, dir_: str | None = None) -> str:
     """Close a window at once: the badges off, then the work the hub left
     running in the qube. Before the badges come off, the record becomes a
     pending kill (`KILL_PENDING`), and it goes only once the kill is read
@@ -2843,8 +2929,8 @@ def _seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
 
     A qube that was not open is left alone and said so, so this is safe to
     run twice. A qube whose tags cannot be read has both badges taken off
-    all the same. `kill` is false only where a caller has decided the cost of
-    a kill is not worth paying; the operator's own `qmcp seal` always pays it.
+    all the same. Firewall rules the hub wrote through the window stay, and
+    the report says so.
     """
     vm, no_kill = _seal_target(app, name)
     try:
@@ -2856,11 +2942,9 @@ def _seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
         if not kill_pending(name, dir_):
             _clear_record(name, dir_)   # a record without a badge opens nothing
             return f"{name}: not open"
-        if not kill:
-            return f"{name}: not open"
         # An earlier seal's kill was never read back: it is made now.
     else:
-        if kill and name != core.read_hub():
+        if name != core.read_hub():
             # Never for the hub, which no seal kills: a pending kill there could
             # never be made, and would fail `qmcp check` until a reboot.
             try:
@@ -2873,24 +2957,26 @@ def _seal(app, name, dir_: str | None = None, kill: bool = True) -> str:
         except Exception as e:
             raise RoleError(f"'{name}' may still wear {', '.join(worn)} ({type(e).__name__}); "
                             f"run qmcp seal {name} again") from None
-    if not kill:
-        return f"{name}: sealed" + _clear_record(name, dir_)
+    # The window's firewall half let the hub replace the rules; a seal takes
+    # the authority away, not what it wrote.
+    fw_note = (f"; the firewall rules the hub wrote stay (qvm-firewall {name} lists them)"
+               if core.OPEN_FW in worn else "")
     if no_kill is not None:
         # The badges are off; the record stays a pending kill, which a later
         # pass makes once it can tell this qube is not the hub (never the hub).
         return (f"{name}: sealed, but not killed: {no_kill}; if it is not the hub, kill it by "
-                f"hand (qvm-kill {name})" + record_note)
+                f"hand (qvm-kill {name})" + fw_note + record_note)
     done = _kill_if_running(vm)
     if done in ("killed", "halted"):
         note = _clear_record(name, dir_)
         if done == "halted":
-            return f"{name}: sealed" + note
-        return (f"{name}: sealed and killed, so nothing the hub started in it runs on; what it "
-                f"wrote to disk stays" + note)
+            return f"{name}: sealed" + fw_note + note
+        return (f"{name}: sealed and killed: what the hub had running in it was stopped; what "
+                f"it wrote to disk stays" + fw_note + note)
     return (f"{name}: sealed, but it could NOT be killed ({done}): a process the hub started in "
             f"it may still run; every pass of the gate's timer tries the kill again, and "
             f"qmcp check fails until it is done (or kill it by hand: qvm-kill {name})"
-            + record_note)
+            + fw_note + record_note)
 
 
 def _clear_record(name: str, dir_: str | None = None) -> str:
@@ -2937,9 +3023,14 @@ def retry_kills(app, dir_: str | None = None, skip=()) -> list:
 
 
 def _retry_kill(app, name: str, dir_) -> list:
+    """Make, or drop, a pending kill. A drop leaves its line on the audit
+    chain, as a kill made here does; a retry that fails again leaves none
+    (the timer runs every 15 seconds), and `qmcp check` fails until it is
+    made or dropped."""
     rec = _pending_record(name, dir_) or {}
     if _gone_by_name(app, name):
         _clear_record(name, dir_)
+        _swept(name, "pending kill dropped: the qube is gone", True, app=app)
         return []
     vm = app.domains[name]
     try:
@@ -2951,16 +3042,19 @@ def _retry_kill(app, name: str, dir_) -> list:
         _, no_kill = _seal_target(app, name)
     except RoleError as e:
         _clear_record(name, dir_)
+        _swept(name, f"pending kill dropped: {e}", True, app=app)
         return [f"{name}: its pending kill was dropped: {e}"]
     if name == core.read_hub():
         # Recorded while the hub file did not read: no seal kills the hub.
         _clear_record(name, dir_)
+        _swept(name, "pending kill dropped: it is the hub", True, app=app)
         return [f"{name}: its pending kill was dropped: it is the hub"]
     if no_kill is not None:
         return [f"{name}: NOT killed yet: {no_kill}"]
     now = _run_of(vm)
     if rec.get("uuid") and now.get("uuid") and now["uuid"] != rec["uuid"]:
         _clear_record(name, dir_)
+        _swept(name, "pending kill dropped: another qube of that name now", True, app=app)
         return [f"{name}: its pending kill was dropped: it is another qube of that name now"]
     # A start time that could not be read at the seal cannot be compared: the
     # kill is made, the restrictive answer for what the hub may have left. A
@@ -2969,6 +3063,7 @@ def _retry_kill(app, name: str, dir_) -> list:
     if rec.get("start_time") and now.get("start_time") \
             and now["start_time"] != rec["start_time"]:
         _clear_record(name, dir_)
+        _swept(name, "pending kill dropped: stopped and started again since its seal", True, app=app)
         return [f"{name}: its pending kill was dropped: it stopped and was started again "
                 f"since its seal, which ended what the hub had left running"]
     try:
@@ -2982,7 +3077,7 @@ def _retry_kill(app, name: str, dir_) -> list:
             os.close(fd)
     if done in ("killed", "halted"):
         _clear_record(name, dir_)
-        _swept(name, "the kill a seal could not make", True)
+        _swept(name, "the kill a seal could not make", True, app=app)
         return [f"{name}: killed on a later pass, after its seal's kill failed"
                 if done == "killed" else f"{name}: down, after its seal's kill failed"]
     return [f"{name}: NOT killed ({done}); tried again on the next pass"]
@@ -3014,7 +3109,9 @@ def expire_windows(app, dir_: str | None = None, now: float | None = None,
             # whose window record has run out, or does not read, is sealed all
             # the same, since `_seal` takes both badges off unread; one with no
             # record is only named, since nothing says it is open and the seal
-            # would kill it.
+            # would kill it. A record outlives a badge taken off by hand, so the
+            # qube sealed here may no longer be open: it is killed if it runs
+            # all the same, the restrictive answer when the tags cannot say.
             tags, reason = None, _record_over(name, dir_, now)
             if reason is None:
                 out.append(f"{name}: {e}; its window could not be judged")
@@ -3047,18 +3144,18 @@ def expire_windows(app, dir_: str | None = None, now: float | None = None,
             line = seal(app, name, dir_, wait=SWEEP_WAIT_S)
         except RoleError as e:
             out.append(f"{name}: NOT sealed: {e}")
-            _swept(name, reason, False, str(e))
+            _swept(name, reason, False, str(e), app=app)
             continue
         except Exception as e:
             # Never the end of the pass: the next window is sealed all the same.
             out.append(f"{name}: NOT sealed: {type(e).__name__}")
-            _swept(name, reason, False, type(e).__name__)
+            _swept(name, reason, False, type(e).__name__, app=app)
             continue
         out.append(f"{line}: {reason}")
         if kill_pending(name, dir_):
-            _swept(name, reason, False, "sealed, not killed")
+            _swept(name, reason, False, "sealed, not killed", app=app)
         else:
-            _swept(name, reason, True)
+            _swept(name, reason, True, app=app)
     out += retry_kills(app, dir_, skip=sealed)
     return out
 
@@ -3075,7 +3172,7 @@ def _record_over(name: str, dir_, now) -> str | None:
     return None if left > 0 else f"'{name}''s window ran out"
 
 
-def _swept(name: str, reason: str, ok: bool, error: str | None = None) -> None:
+def _swept(name: str, reason: str, ok: bool, error: str | None = None, app=None) -> None:
     """One audit line per window this sweep really closed, as the operator.
 
     The sweep itself leaves no line (`cli.operator_line`): the gate's timer
@@ -3085,7 +3182,7 @@ def _swept(name: str, reason: str, ok: bool, error: str | None = None) -> None:
     """
     try:
         audit.audit("qmcp seal", "operator",
-                    {"qube": name[:128], "swept": reason[:128]}, ok, error)
+                    {"qube": name[:128], "swept": reason[:128]}, ok, error, app=app)
     except Exception:
         pass
 
@@ -3146,6 +3243,83 @@ def _window_field(name: str, tags):
         return UNREADABLE
 
 
+#: dom0's journal keeps every qrexec call whatever qmcp's log mode: the
+#: policy daemon logs each request. qmcp does not change it (a system-wide
+#: setting); `qmcp check` prints this while any mode is not disk.
+JOURNAL_VOLATILE = ("sudo mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\\n"
+                    "Storage=volatile\\n' | sudo tee /etc/systemd/journald.conf.d/"
+                    "10-qmcp-volatile.conf && sudo systemctl restart systemd-journald")
+
+
+def _audit_modes(add, records, mode, problem) -> None:
+    """The install's audit mode, and the journal while any mode is not disk."""
+    if problem:
+        add("fail", "audit mode", f"{problem}: every line goes to RAM until it reads "
+                                  f"(write disk, ram or none, or run install.sh --audit-log)")
+    elif mode != "disk":
+        add("warn", "audit mode", f"{mode}: " + (
+            "no qmcp audit line is written, of any call" if mode == "none" else
+            "the install's lines go to a chain under /run, gone at shutdown"))
+    else:
+        add("pass", "audit mode", "disk")
+    private = [] if records is None else sorted(
+        f"{p.label or p.slot} ({p.slot}): {p.audit}" for p in records.values()
+        if p.slot != projects.HUB_SLOT and p.audit != "disk")
+    if private:
+        add("pass", "project audit modes", "; ".join(private))
+    if mode != "disk" or problem or private or records is None:
+        add("warn", "dom0 journal",
+            "dom0's journal still keeps every qrexec call (the policy daemon logs each "
+            "request, with its caller, service and target) on dom0's disk. qmcp does not "
+            "change it, a setting for all of dom0; to keep it in RAM only: "
+            + JOURNAL_VOLATILE)
+
+
+def _audit_retention(add, records, mode) -> None:
+    """Rotated logs are removed by age: the setting must read, the timer that
+    removes them must run, and the budgets of every principal for that many
+    days must fit the log's disk."""
+    active = anon.timer_active(audit.AUDIT_TIMER)
+    if active is None:
+        add("error", "audit timer", f"cannot tell whether {audit.AUDIT_TIMER} runs")
+    elif not active:
+        add("fail", "audit timer", f"{audit.AUDIT_TIMER} is not running, so the audit log is "
+                                   f"neither rotated nor its old files removed (sudo systemctl "
+                                   f"enable --now {audit.AUDIT_TIMER})")
+    if os.path.exists(audit.LOG_PATH + audit.ROTATING_SUFFIX):
+        add("warn", "audit retention", f"{audit.LOG_PATH}{audit.ROTATING_SUFFIX} is there: a "
+                                       f"rotation stopped part-way; the next one takes it over")
+    keep = audit.keep_days()
+    if keep is None:
+        add("fail", "audit retention", f"{audit.KEEP_DAYS_PATH} does not read, or holds neither "
+                                       f"a number of days (1-{audit.KEEP_DAYS_MAX}) nor off: no "
+                                       f"rotated log is removed until it does (qmcp settings set "
+                                       f"--audit-keep-days)")
+        return
+    if keep == "off":
+        add("warn", "audit retention", "off: rotated logs are never removed, and fill "
+                                       f"{os.path.dirname(audit.LOG_PATH)} by the day")
+        return
+    if mode != "disk":
+        add("pass", "audit retention", f"{keep} days (the install's lines are not on disk)")
+        return
+    principals = None if records is None else 1 + sum(1 for p in records.values() if p.lead)
+    need = None if principals is None else audit.room_needed(principals, keep)
+    free = audit.free_bytes()
+    if need is None or free is None:
+        add("warn", "audit retention", f"{keep} days; whether it fits cannot be read (the "
+                                       f"records or the free space under "
+                                       f"{os.path.dirname(audit.LOG_PATH)})")
+    elif need > free:
+        add("warn", "audit retention",
+            f"{keep} days: {principals} principal(s) at their full {audit.AUDIT_LINES_PER_DAY} "
+            f"lines a day, about {audit.LINE_BYTES} bytes each, need {need // 1024 ** 2} MiB, "
+            f"and {os.path.dirname(audit.LOG_PATH)} has {free // 1024 ** 2} MiB free: free space, "
+            f"or keep fewer days (qmcp settings set --audit-keep-days)")
+    else:
+        add("pass", "audit retention", f"{keep} days; a full budget for every principal fits")
+
+
 def settings(app) -> dict:
     """The operator files the services re-read on every call, read the way
     they read them, and the disk AI space uses against the cap."""
@@ -3165,6 +3339,9 @@ def settings(app) -> dict:
         "birth_egress": _read_word(birth.BIRTH_EGRESS_PATH) or None,
         "gateways_enrolled": _safe(lambda: len(gateways.load())),
         "mode": {True: "anonymous", False: "normal", None: UNREADABLE}[anon.mode_state()[0]],
+        # None: the file does not read (lines go to RAM; nothing is removed).
+        "audit_mode": (lambda m: None if m[1] else m[0])(audit.install_mode()),
+        "audit_keep_days": audit.keep_days(),
     }
 
 
@@ -3267,6 +3444,11 @@ class _Exclusive:
         except core.Refusal:
             self.records_lock.__exit__(None, None, None)
             raise ProjectError("a create is in progress; try again in a moment") from None
+        except BaseException:
+            # Anything else (an OSError, an interrupt) lets go of the records
+            # lock it took and is raised as itself; nothing is held after.
+            self.records_lock.__exit__(None, None, None)
+            raise
         _HELD[0] = 1
         return self
 
@@ -3541,26 +3723,29 @@ def _hide_disposable_templates(report, app, p) -> None:
                           f"template")
 
 
-def _qube_network(app, name):
-    """A qube's network, None when it has none or cannot be read: for a warning."""
-    try:
-        vm = _vm(app, name) if name else None
-        return None if vm is None else _netvm(vm)
-    except (core.Unreadable, NetvmUnreadable):
-        return None
-
-
-def shared_routers(app, records: dict, p) -> list:
+def shared_routers(app, records: dict, p) -> tuple[list, list]:
     """The anonymising routers a hidden project shares with another project or
-    the hub: its worker networks and its lead's, against theirs."""
+    the hub: its worker networks and its lead's, against theirs. Also the
+    qubes whose network could not be read, so a warning that could not be
+    worked out is said, never dropped."""
     if not p.hidden:
-        return []
-    mine = set(p.named_networks()) | {_qube_network(app, p.lead)}
-    theirs = {_qube_network(app, core.read_hub())}
+        return [], []
+    unread = []
+
+    def network(name):
+        try:
+            vm = _vm(app, name) if name else None
+            return None if vm is None else _netvm(vm)
+        except (core.Unreadable, NetvmUnreadable):
+            unread.append(name)
+            return None
+
+    mine = set(p.named_networks()) | {network(p.lead)}
+    theirs = {network(core.read_hub())}
     for q in records.values():
         if q.slot != p.slot and q.label:
-            theirs |= set(q.named_networks()) | {_qube_network(app, q.lead)}
-    return sorted(n for n in (mine & theirs) if n)
+            theirs |= set(q.named_networks()) | {network(q.lead)}
+    return sorted(n for n in (mine & theirs) if n), sorted(set(unread))
 
 
 #: The classes the operator's commands take as a lead's source or a qube to
@@ -3718,7 +3903,7 @@ def _remove_qube(app, name) -> str:
         deadline = time.monotonic() + HALT_WAIT_S
         # "NA": qubesadmin's answer for a qube it cannot read, one qubesd removed
         # when it was killed included; the remove below decides, as for any.
-        while _safe(vm.get_power_state, "Halted") not in ("Halted", "NA", None) \
+        while _safe(vm.get_power_state, "unknown") not in ("Halted", "NA", None) \
                 and time.monotonic() < deadline:
             time.sleep(0.5)
         if name in app.domains:
@@ -4202,10 +4387,14 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         _set_model_qube(report, app, records, records[slot], model_qube)
     if new.hidden:
         report.append(f"{slot}: WARNING: {HIDDEN_WARNING}")
-        shared = shared_routers(app, records, new)
+        shared, unread = shared_routers(app, records, new)
         if shared:
             report.append(f"{slot}: WARNING: it shares {', '.join(shared)} with another project "
                           f"or the hub: {SHARED_ROUTER_WARNING}")
+        if unread:
+            report.append(f"{slot}: WARNING: cannot read the network of {', '.join(unread)}, so "
+                          f"whether it shares a router with another project or the hub cannot "
+                          f"be told (qmcp check says once it can)")
 
 
 def _sink_template_refusal(tpl) -> None:
@@ -4219,10 +4408,24 @@ def _sink_template_refusal(tpl) -> None:
                            f"on, {why}")
 
 
+def _sink_default_name(p) -> str:
+    return f"{p.label}-dump" if p.label else "hub-dump"
+
+
+def _sink_badged(tags) -> bool:
+    """Wears a slot's dump badge: the last badge a sink is given."""
+    return any(t.startswith(projects.DUMP_PREFIX) for t in tags)
+
+
 def _make_sink(app, slot: str, name: str, hidden: bool = False):
     """A fresh drop box: ai-dump + the slot's dump badge, no network, outside AI
     space; a hidden project's also `qmcp-hubblind`, first."""
-    if _vm(app, name) is not None:
+    vm = _vm(app, name)
+    if vm is not None:
+        if name.endswith("-dump") and not _sink_badged(_read_tags(vm)):
+            raise ProjectError(f"'{name}' exists and wears no dump badge: a qmcp project dump "
+                               f"that did not finish? If it is not yours, remove it (qvm-remove "
+                               f"{name}) and run this again; a dump sink is always a fresh qube")
         raise ProjectError(f"'{name}' exists; a dump sink is always a fresh qube")
     try:
         tpl = app.default_template
@@ -4464,16 +4667,37 @@ def _networks_in_use(app, p, gone) -> list:
     return sorted(out)
 
 
-def _apply_edit(report, app, records, p, templates, networks, quota):
+def _apply_edit(report, app, records, p, templates, networks, quota, added=None):
+    """`added`, for an edit that names what it adds and removes: (templates,
+    networks) it adds, the only entries checked. An entry it does not name
+    stays as recorded even when it no longer qualifies (`qmcp check` reports
+    that), so an edit that only takes something off is never refused for
+    another entry. Without it, every entry of the new lists is checked."""
     if p.anonymous:
         # Refused here rather than stopped by the gate after it is saved.
-        for t in templates or ():
+        for t in (templates if added is None else added[0]) or ():
             _not_managed(app, t, "the template")
-        _anonymous_networks(app, networks or ())
+        if added is None or added[1]:
+            _anonymous_networks(app, (networks if added is None else added[1]) or ())
     if templates is not None:
-        p.templates = tuple(_check_templates(app, templates))
+        if added is None:
+            p.templates = tuple(_check_templates(app, templates))
+        else:
+            if not templates:
+                raise ProjectError("a project needs at least one approved template in AI space")
+            if added[0]:
+                _check_templates(app, added[0])
+            p.templates = tuple(templates)
     if networks is not None:
-        new = tuple(_check_networks(app, networks))
+        if added is None:
+            new = tuple(_check_networks(app, networks))
+        else:
+            if not networks:
+                raise ProjectError("a project needs at least one worker network (a gateway, "
+                                   "or none)")
+            if added[1]:
+                _check_networks(app, added[1])
+            new = tuple(networks)
         in_use = _networks_in_use(app, p, set(p.named_networks()) - set(new))
         if in_use:
             raise ProjectError(f"still in use: {', '.join(in_use)}; remove those workers, or "
@@ -4526,10 +4750,12 @@ def _edit_changes(report, app, key, add_templates, remove_templates, add_network
     p = _project(records, key)
     templates, networks, new_quota = edited(p, add_templates, remove_templates, add_networks,
                                             remove_networks, default_network, quota)
+    added = ([t for t in templates if t not in p.templates],
+             [n for n in networks if n not in p.networks])
     _apply_edit(report, app, records, p,
                 templates if tuple(templates) != p.templates else None,
                 networks if tuple(networks) != p.networks else None,
-                new_quota if new_quota != p.quota else None)
+                new_quota if new_quota != p.quota else None, added)
 
 
 def lead_firewall_view(app, records: dict, key: str) -> dict:
@@ -4784,7 +5010,7 @@ def _add_dump(report, app, key, name):
     if p.dump is not None:
         raise ProjectError(f"{p.slot} already has a dump sink, {p.dump}")
     prefix = birth.read_name_prefix()
-    name = name or (f"{p.label}-dump" if p.label else "hub-dump")
+    name = name or _sink_default_name(p)
     if name.startswith(prefix) or not core.valid_qube_name(name):
         raise ProjectError(f"a dump sink's name must be a qube name outside '{prefix}'")
     _make_sink(app, p.slot, name, p.hidden)
@@ -5236,6 +5462,44 @@ def _delete_project(report, app, key):
         report.append(f"{p.slot}: free")
 
 
+#: What switching a project's audit lines away from disk leaves behind, as the
+#: command and the window say it.
+AUDIT_LEAVES_DISK = ("the lines this project wrote before stay in dom0's audit log on disk, in "
+                     "its rotated files and in any backup, until the hourly timer removes a "
+                     "rotated file by age; deleting a file on dom0's disk is not erasing it: "
+                     "its bytes stay on the disk until they are overwritten")
+
+
+def set_project_audit(app, key: str, mode: str) -> list:
+    """Where a project's audit lines go from now: disk, ram (its own chain
+    under /run, gone at shutdown) or off. Allowed while it runs. Leaves one
+    line on the install's chain naming the slot only, so the chain explains
+    the gap and the label stays off it."""
+    return _run(_set_project_audit, app, key, mode)
+
+
+def _set_project_audit(report, app, key, mode):
+    if mode not in projects.AUDIT_MODES:
+        raise ProjectError(f"an audit mode is one of {', '.join(projects.AUDIT_MODES)}")
+    records = _load_records()
+    p = _project(records, key)
+    old = p.audit
+    if old == mode:
+        report.append(f"{p.slot}: its audit lines go to {mode} already; nothing changed")
+        return
+    p.audit = mode
+    projects.save(records)
+    audit.audit("qmcp project audit", "operator", {"slot": p.slot, "mode": mode}, True, slots=())
+    report.append(f"{p.slot}: its audit lines go to {mode} from now"
+                  + {"disk": "", "ram": " (its own chain under /run, gone at shutdown)",
+                     "off": " (none is written)"}[mode])
+    if old == "disk":
+        report.append(AUDIT_LEAVES_DISK)
+    if mode != "disk":
+        report.append("dom0's journal still keeps every qrexec call: qmcp check says how to "
+                      "keep it in RAM")
+
+
 def unblock(app, key: str) -> list:
     """Take `qmcp-blocked` off an anonymous project's lead and members once a
     fresh gate run finds it sound; `autostart` stays off. `p00` (or `hub`)
@@ -5283,5 +5547,6 @@ def project_rows(app, records: dict) -> list:
                      "model_qube": p.model_qube,
                      "lead_firewall": None if p.lead_firewall is None else list(p.lead_firewall),
                      "anonymous": p.anonymous, "hidden": p.hidden, "note": p.note,
+                     "audit": p.audit,
                      "blocked": None if members is None else blocked})
     return rows

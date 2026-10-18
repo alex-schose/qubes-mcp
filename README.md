@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.32 — the audit round's window fixes, and limits on what one principal can put on the audit log.** Besides the hub, up to 15
+**Status: 0.9.33 — the audit round's low findings, and the docs checked against the code.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -39,16 +39,18 @@ hub's services answer about them as about names that do not exist.
 An installation can be in **anonymous mode**: every project is anonymous, and
 the gate judges the hub too, with its own qubes and the templates it made.
 A **guarded** qube — a template kept as a clean root, a model qube, any
-reference — is sealed: the rulebook refuses the hub every way into it. The
+reference — is sealed: the rulebook refuses the hub every way into it but
+reading its firewall and your own dialogs. The
 operator can open one for a bounded time with `qmcp open QUBE --for 2h`, to
 install software in it or maintain it; the hub may then run commands in it and
 copy a file in behind your dialog, and with `--firewall` write its firewall
 rules, never its network. The window ends by itself, at every boot, and on
-`qmcp seal`, which kills the qube so nothing the hub started in it runs on.
+`qmcp seal`, which kills the qube, so what the hub had running in it was
+stopped; firewall rules it wrote through the window stay, and the seal says so.
 The operator runs it all from `qmcp-gui`, a window in dom0 that is the `qmcp`
 command with forms: every change it makes is a command it shows first. The hub
-may ask for a project, a change to one, a new lead, a lead's new firewall, a
-deletion, a window on a guarded qube, a qube brought into AI space or out of
+may ask for a project, a change to one, a dump sink, a new lead or none, a
+lead's new firewall, a deletion, a window on a guarded qube, a qube brought into AI space or out of
 the guarded state, a qube taken out of AI space, or exact packages installed
 into a template by its own package manager;
 nothing happens until the operator accepts it in dom0, in that window or with
@@ -61,10 +63,11 @@ time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
 `qmcp export` puts qmcp's settings where a Qubes backup carries them. The
 audit round of 0.9.28 is being fixed by severity: 0.9.29 fixed the high
-findings, 0.9.30 and 0.9.31 the medium ones, and this release the window's,
-with limits on what one principal can put on the audit log (60 lines an hour
-of calls that changed nothing, about 20,000 a day of changes).
-Next: the low findings and the docs, then 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+findings, 0.9.30 and 0.9.31 the medium ones, 0.9.32 the window's, with limits
+on what one principal can put on the audit log (60 lines an hour of calls that
+changed nothing, about 20,000 a day of changes), and this release the low ones
+and the docs.
+Next: 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
 
 ## How it works
 
@@ -72,8 +75,10 @@ Next: the low findings and the docs, then 1.0.0 once all of it is green on a rei
   dom0 (trusted)
     30-mcp-control.policy     static rulebook, checked by qrexec's own parser at install
     qmcp.* services           one shared, fail-closed check; identity = the qrexec caller
-    qmcp (command)            the operator's tool: check, list, gateway, manage, guard,
-                              revoke, project, proposal, migrate
+    qmcp (command)            the operator's tool: check, list, settings, template,
+                              restored, export, import, manage, guard, revoke,
+                              open, seal, gateway, project, gate, proposal,
+                              migrate, audit, version
         ▲  qrexec only
         │
   mcp-control (the hub)       MCP server, standard library only; reaches what dom0 allows
@@ -83,15 +88,18 @@ Next: the low findings and the docs, then 1.0.0 once all of it is green on a rei
     the hub's own qubes       slot p00: the hub operates them
     project p01 … p15         a lead (its own MCP server and agent) and the workers it makes;
                               the hub operates these too, the lead only its own project
-    guarded qubes             listed, read, spawned from — never operated (gateways always)
+    guarded qubes             listed, read, spawned from; never operated but through a
+                              window you open (gateways never)
 ```
 
 - **AI space** is every qube carrying `ai-managed`. Everything else is
   invisible: a qube outside AI space answers exactly like one that does not
   exist, and reads redact references to it, except the gateways the operator
-  enrolled, which the hub reads by name. Three things still tell the hub
+  enrolled, which the hub reads by name. Several things still tell the hub
   whether a name exists: a create colliding inside the reserved prefix; a
-  proposal the operator accepted, which succeeds or fails; and a call to
+  proposal the operator accepted, which succeeds or fails; a dialog service,
+  which is refused at once for a hidden project's qube, a held one or one the
+  gate stopped, where a missing name gets the dialog; and a call to
   `@dispvm:<name>`, which Qubes refuses at once unless the name is a
   disposable template (see the residual risks in [CLAUDE.md](CLAUDE.md)).
 - **Managed or guarded.** The hub operates managed qubes, including the
@@ -102,8 +110,10 @@ Next: the low findings and the docs, then 1.0.0 once all of it is green on a rei
   the templates the operator approved for the project, puts workers only on
   the project's networks, and creates only inside its names (`ai-<label>-`)
   and disk quota. Workers call no qmcp service, cannot reach their lead or
-  the hub, and reach another project only by a copy through the operator's
-  dialog, never a hidden one. Copies inside a project, and into its dump sink, need no dialog.
+  the hub, and reach another project only through the operator's dialog (a
+  copy, or opening a file or URL in it), never a hidden one. Copies among a
+  project's members, from its lead to them, and from a member into the dump
+  sink, need no dialog.
   What a project's workers can reach is bounded by the gateways you list for
   it, which must be enrolled; inside that, the hub and the lead narrow each
   worker's reach with its firewall rules. The lead's own reach is its
@@ -119,7 +129,8 @@ Next: the low findings and the docs, then 1.0.0 once all of it is green on a rei
   or a project, a network AI space does not use yet, promoting one of the
   hub's qubes, an over-committed quota, a model endpoint no project uses,
   giving a project a different model endpoint, every change to a lead's
-  firewall, naming a model qube or taking one away, and every window,
+  firewall, naming a model qube or taking one away, creating an anonymous
+  project, and every window,
   manage, revoke and package install need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
@@ -144,18 +155,20 @@ Next: the low findings and the docs, then 1.0.0 once all of it is green on a rei
   routers aside; each of them wears `qmcp-anon`. A violation by the hub or a
   p00 qube stops the hub and p00; one by any other of them stops that qube
   alone.
-- **Creates** take only names inside the caller's own space under a reserved
-  prefix (default `ai-`: the hub's `ai-hub-`, a lead's `ai-<label>-`; Qubes
-  names disposables itself), strip the qmcp badges a new
+- **Creates** take only names under a reserved prefix (default `ai-`): the
+  hub's `ai-hub-`, a lead's `ai-<label>-`, and for the hub's clone of a
+  project's member, that project's names; Qubes names disposables itself. They
+  strip the qmcp badges a new
   qube must not carry, stamp it, and prove its network before handing it back.
 - **AI space cannot call dom0** beyond the services a qube needs to boot and
   keep its clock (a lead also calls nine qmcp services), cannot reach the hub
   or a lead, cannot use Qubes' raw disposable shortcut, and cannot touch the
   Admin API, except a lead's firewall methods on its own workers. A copy needs
-  the operator's dialog unless it stays inside one slot or goes into that
-  slot's dump sink, and a copy into a guarded qube, the hub, a lead or a
-  hidden project from outside it is refused, as is every other dialog into a
-  hidden project.
+  the operator's dialog unless it goes between a slot's members, from a lead
+  to its members, or from a member into its slot's dump sink; a copy into a
+  guarded qube, the hub, a lead, a held or stopped qube, or a hidden project
+  from outside it is refused, as is every other dialog into a hidden
+  project.
 - **Every change made through a dom0 service** (creates, removes, lifecycle,
   properties, features, proposals), and every change the operator makes with
   the `qmcp` command or the window, is recorded on a hash-chained log in dom0
@@ -173,17 +186,22 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_spawn`, `qubes_clone`, `qubes_remove` | create (AppVM, standalone, disposable template, named disposable) and remove |
 | `qubes_start`, `qubes_shutdown` | lifecycle |
 | `qubes_props_set`, `qubes_feature_set` | label/memory/maxmem/vcpus, netvm only to none; features on an allowlist |
-| `qubes_run`, `qubes_copy` | run a command as root in a managed qube; copy a file out of one (operator dialog) |
+| `qubes_run`, `qubes_copy` | run a command as root in a managed qube; copy a file out of one (by your dialog, but inside a slot) |
 | `qubes_spawn_disposable`, `qubes_run_disposable` | disposables, or one command in a fresh disposable |
-| `qubes_firewall_get`, `qubes_firewall_set` | read any AI-space qube's firewall; replace a managed one's (a lead's is the operator's: propose it) |
+| `qubes_firewall_get`, `qubes_firewall_set` | read an AI-space qube's firewall (the hub: any but a hidden project's, a stopped or a held one; a lead: its workers'); replace a managed one's (a lead's is the operator's: propose it) |
 | `qubes_events` | a window of events for qubes in scope |
-| `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use and its model (an endpoint, or a model qube and its port) |
+| `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record but a hidden one's, and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use and its model (an endpoint, or a model qube and its port) |
 | `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_lead_firewall`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a lead's new firewall, a deletion |
 | `qubes_propose_open`, `qubes_propose_manage`, `qubes_propose_revoke`, `qubes_propose_packages` | the hub asks for a window on a guarded qube, a qube brought into AI space or out of the guarded state, a qube taken out of AI space, or exact packages installed into a template in AI space |
 | `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
 The hub and a lead run the same server and see the same tools; dom0 scopes
-each call to its caller. A lead has no event stream and cannot propose.
+each call to its caller. A lead has no event stream and cannot propose. A
+client's `notifications/cancelled` drops a call that has not started yet; one
+already running is not interrupted. `qubes_run` and `qubes_copy` take a
+timeout of 1 to 86,400 s, which the in-qube service enforces by killing the
+process group it started; a call that gets no answer by its timeout plus 30 s says so, since
+the work may have run.
 
 From `~/qubes-mcp` in the hub, `python3 -m qubes_mcp.cli <tool> key=value ...`
 runs any tool from a shell.
@@ -218,7 +236,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.32.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.33.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -228,13 +246,36 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 52 checked claims. It installs the anonymity gate's timer as
+overrides its 54 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user
 NAME`, `--anonymous` (step 8), `--updates-via GATEWAY`, `--dry-run`. `deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
 keeps.
+
+**The audit log.** One more installer option, `--audit-log disk|ram|none`,
+says where qmcp's audit lines go for the whole install: `disk` (the default)
+is `/var/log/qmcp-audit.log`; `ram` is a chain under `/run/qmcp/audit`, gone
+at shutdown; `none` writes none. Each project can keep its own lines more
+private still, while it runs: `sudo qmcp project audit LABEL ram` (or `off`,
+or back to `disk`), or the project's Audit log... form in the window. A line
+follows the most private mode of the install and of every project it is
+about: the lead's calls, the hub's calls into the project's qubes and your
+commands on it. Switching away from disk does not take back what is already
+there: the old lines stay on dom0's disk, and deleting a file there is not
+erasing it. dom0's journal keeps every qrexec call whatever the mode;
+`qmcp check` warns while any mode is not disk and prints the command that
+makes journald keep it in RAM only, which qmcp does not run itself. On disk,
+root's `qmcp-audit.timer` rotates the log once a UTC day, or past 32 MiB, and
+removes rotated logs once they are older than `sudo qmcp settings set
+--audit-keep-days N` days (90 by default; `off` keeps them all), by their age,
+never their size. The RAM chains are bounded by size instead, since they take
+dom0's memory: the same hourly run removes the oldest rotated RAM files while
+they all hold more than 64 MiB, so a flood can push earlier RAM lines off. A
+line kept nowhere still counts against its caller's budget and hourly cap.
+The window's Audit tab shows the log's size, the free space
+against the 64 MiB floor and each principal's share of its daily budget.
 
 It also installs **the operator's window**: *qubes-mcp* in the Qubes menu
 under Settings > Qubes Tools, or `qmcp-gui` in a dom0 terminal, run as your own
@@ -249,7 +290,28 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.31? Install over it. A principal's calls that changed nothing,
+Coming from 0.9.32? **Breaking:** within the hour after the install, the new
+`qmcp-audit.timer` removes rotated audit logs (`qmcp-audit.log.<UTC time>`)
+older than 90 days, the new default. 0.9.32's `qmcp settings set` has no option
+for it, and the installer leaves the setting's file alone, so to keep them, write
+the file before installing: `echo off | sudo tee /etc/qmcp/audit-keep-days` (or a
+number of days instead of `off`). Then install over it. The two in-qube services change (a
+timeout of at most a day that kills the command's whole process group, and a
+copy that takes its timeout from `qubes_copy`), so `qmcp check` warns on every
+template and standalone qmcp runs commands in until it is brought up to date (see
+"Updating"); `qmcp check` fails in every mode while `qmcp-gate.timer` is not
+running, since the timer also ends windows and holds restored qubes;
+`qubes_firewall_set` answers ok, with `reloaded` false and a warning, when it
+saved the rules but the reload failed; the rulebook refuses AI space starting
+an app in another qube or reading an image from one, which Qubes' own policy
+put to your dialog. The CHANGELOG's 0.9.33 entry has the
+whole list. To roll back, set every project back to disk (`sudo qmcp project
+audit LABEL disk`) and copy out the RAM chains under `/run/qmcp/audit` you
+want to keep, since `uninstall.sh` removes `/run/qmcp` and them with it; run
+this release's `uninstall.sh`, then 0.9.32's installer. 0.9.32 ignores `/etc/qmcp/audit-mode` and
+`/etc/qmcp/audit-keep-days`: it writes every line to disk and removes no
+rotated log.
+Coming from 0.9.31? Install over it, then read the 0.9.32 note. A principal's calls that changed nothing,
 past 60 in a clock hour, are counted rather than logged, and its changes past
 20,000 lines a day are refused; `qmcp check` warns on both; deleting a project keeps a qube that is also another project's member,
 or is a template, a disposable template, a gateway, a model qube, a guarded
@@ -295,7 +357,7 @@ column "Subject". The CHANGELOG's 0.9.28 entry has the whole list. To roll back,
 run this release's `uninstall.sh` before 0.9.27's installer; a pending
 proposal of a new type then reads as unreadable, and `qmcp proposal reject N`
 closes it.
-Coming from 0.9.26? Install over it. Clones, the hub's and a lead's, change:
+Coming from 0.9.26? Install over it, then read the 0.9.27 note. Clones, the hub's and a lead's, change:
 a clone lands where its source is, so the hub's clone of a project's member
 joins that project (named inside its names, counted against its quota, on its
 worker networks) and its clone of an AppVM in no slot joins none (0.9.26 put
@@ -314,7 +376,8 @@ once, each template `qmcp check` names under "in-qube services"
 copy loop wrote into it. Rolling back to 0.9.25 needs every held qube accepted
 or rejected first (`qmcp restored list`), then this release's `uninstall.sh`
 before 0.9.25's installer.
-Coming from 0.9.23? Install over it. If you have anonymous projects, the
+Coming from 0.9.23? Install over it, then read the note for any release
+before 0.9.26. If you have anonymous projects, the
 installer first checks them against this release's rule for template updates
 (step 7): a template's updates count only through a gateway you ticked. It
 names each project that would be stopped and changes nothing; run it again
@@ -323,14 +386,14 @@ itself (`sys-whonix`, a VPN qube), never `sys-firewall`. Rolling back to 0.9.23
 needs the tick off every gateway first (0.9.23 refuses a registry that carries
 it), then this release's `uninstall.sh` (it keeps `/etc/qmcp`) before 0.9.23's
 installer.
-Coming from 0.9.22? Install over it; nothing changes until you create an
-anonymous project (step 7). Rolling back to 0.9.22 needs every anonymous
+Coming from 0.9.22? Install over it, then read the 0.9.23 note. Nothing of
+0.9.23's own changes until you create an anonymous project (step 7). Rolling back to 0.9.22 needs every anonymous
 project deleted first, then the `upstream` keys removed from
 `/etc/qmcp/gateways.json`: 0.9.22 refuses both, and has nothing that keeps the
 hub out of a hidden project. Then run this release's `uninstall.sh` (it keeps
 `/etc/qmcp`) before installing 0.9.22, or 0.9.22 leaves `qmcp-gate.timer`
 running a command it does not have.
-Coming from 0.9.21? Install over it. A lead whose model endpoint is an address
+Coming from 0.9.21? Install over it, then read the 0.9.22 note. A lead whose model endpoint is an address
 keeps the DNS rule 0.9.21 gave it until you set its model again (`sudo qmcp
 project firewall NAME --model ADDRESS:PORT`); `qmcp check` warns until you do.
 Coming from 0.9.17 to 0.9.20? Install over it; nothing is retagged. Then enroll
@@ -349,8 +412,8 @@ Coming from 0.9.16?
 Run the staged migration first; see "Install, migrate, uninstall" in
 [CLAUDE.md](CLAUDE.md).
 
-**3. AI space.** Agents run commands only in qubes whose template carries the
-two in-qube services. Install them into a template and put it in AI space;
+**3. AI space.** Agents run commands only in qubes whose root carries the
+two in-qube services: a template's, or a standalone's own. Install them into a template and put it in AI space;
 then enroll the gateways AI qubes may sit on. Use a plain router of your own
 per kind of network (clearnet, Tor, a proxy, a VPN), in front of the qube that
 kind uses for your own work, named so it reads as yours: `sys-ai-net`,
@@ -515,8 +578,8 @@ stopped) makes the model answer on the lead's own `localhost:11434`; point
 the agent there. `qubes_get_pool_stats` tells the lead the model qube's name
 and port. To change the model qube later, un-guard it for a while (`sudo qmcp
 manage ai-hub-model`; `qmcp check` warns until you guard it again, and `sudo
-qmcp guard ai-hub-model` kills it if it runs, so no process the hub started in
-it runs on; what it left in `/home`, `/usr/local` or `/rw` stays, and whatever
+qmcp guard ai-hub-model` kills it if it runs, so what the hub had running in
+it is stopped; what it left in `/home`, `/usr/local` or `/rw` stays, and whatever
 is set to start from there runs at its next start). Pulling
 another model needs a network: take the qube off its projects first (`sudo
 qmcp project firewall osint --model-qube none`), because a model qube with a
@@ -667,7 +730,7 @@ before then.
 Until the gate's next pass holds it, normally within about 15 seconds, a worker
 restored months later is routed by its old badges into whatever project holds
 its slot now. If you must, shut the hub and the leads down first, then review
-each one (`qmcp restored accept QUBE` or `reject QUBE`). The same hold catches
+each one (`sudo qmcp restored accept QUBE` or `sudo qmcp restored reject QUBE`). The same hold catches
 an AI qube you copy by hand with `qvm-clone`.
 
 ## Tests
@@ -688,6 +751,12 @@ asked its self-hosted model qube (Ollama, `qwen2.5:0.5b`) a question through
 `tests/test_strict_reads.py` fails qube reads one at a time, at each point a
 call makes them, and requires the restrictive answer: a failed read is never
 taken for "no tags", "no network" or "not a gateway".
+`tests/test_inqube_services.py` runs the two in-qube services as a qube
+runs them: the timeout and the process group it kills, and the copy's target
+and path. `tests/test_audit_modes.py` covers where audit lines go (the
+install's and each project's mode), what a line kept in RAM or nowhere costs,
+the hourly rotation, removal by age and the RAM chains' bound by size, and
+the timer, installer and check wired to them.
 `tests/test_proposals.py` covers proposals: who may submit, the store, the
 second tick, accepting and rejecting through the real commands.
 `tests/test_gateways.py` covers the gateway registry, the networks AI qubes may
@@ -724,8 +793,8 @@ Where this has been discussed:
 
 This is operator-grade infrastructure for one use case: AI agents working in
 Qubes-isolated qubes. It is not a hardened product. The hub is itself part of
-the trust boundary: a compromised hub controls all of AI space but hidden
-anonymous projects, and the audit log records what it does through the dom0
+the trust boundary: a compromised hub controls every managed qube but a
+hidden anonymous project's (a guarded one only through a window you open), and the audit log records what it does through the dom0
 services (past 60 calls that changed nothing in a clock hour, those are only
 counted).
 

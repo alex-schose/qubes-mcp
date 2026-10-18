@@ -288,6 +288,22 @@ class Create(AnonBase):
                                       model="api.example.org:443", anonymous=True)
         self.assertIn("shares ai-net-tor", "\n".join(report))
 
+    def test_a_network_that_does_not_read_is_said_never_dropped(self):
+        fleet.create_project(self.app, None, "template", "ai-tpl-g", networks=["ai-net-tor"],
+                             quota="1G", lead_netvm="ai-net-tor", model="api.example.org:443",
+                             anonymous=True)
+        self.app.domains[HUB].netvm = self.app.domains["ai-net-tor"]
+
+        def routers():
+            return [(f.status, f.detail) for f in
+                    fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})
+                    if f.check == "shared routers"]
+        self.assertEqual([s for s, _ in routers()], ["warn"])          # the positive
+        self.app.fail.add(f"get.netvm:{HUB}")
+        found = routers()
+        self.assertEqual([s for s, _ in found], ["error"])
+        self.assertIn(f"cannot read the network of {HUB}", found[0][1])
+
 
 # ======================================================================= hub-blind
 
@@ -337,7 +353,7 @@ class HubBlind(AnonBase):
         out = __import__("io").StringIO()
         from qmcp import services
         call = core.Call("qmcp.AIManagedEvents")
-        call.principal = core.Principal(HUB, "hub")
+        call.caller, call.principal = HUB, core.Principal(HUB, "hub")
         r = services.svc_events(self.app, call, {"duration": 1}, dispatcher_factory=Dispatcher)
         subjects = [e["subject"] for e in r["events"]]
         self.assertEqual(subjects, ["ai-work"], out.getvalue())
@@ -505,6 +521,12 @@ class Acting(AnonBase):
         # The rulebook now refuses the lead's calls; the services refuse it too.
         self.assertEqual(self.lcall("qmcp.ListAIManagedQubes", lead=self.p.lead), core.NOT_AUTHORIZED)
 
+    def test_records_that_are_not_utf8_block_rather_than_crash(self):
+        pathlib.Path(projects.PROJECTS_PATH).write_bytes(b"{\xff")
+        with self.assertRaises(projects.ProjectsUnreadable) as cm:
+            anon.run(self.app, retry_wait=0)
+        self.assertIn("blocked, none killed", str(cm.exception))
+
     def test_records_that_do_not_read_twice_block_every_anonymous_qube_and_kill_none(self):
         for name in self.qubes_of(self.p):
             self.app.domains[name].__dict__["_power"] = "Running"
@@ -528,8 +550,10 @@ class Acting(AnonBase):
         for name in self.qubes_of(self.p):
             self.assertEqual(self.app.domains[name]._power, "Running", name)
         self.assertNotIn("qmcp-blocked", self.tags("ai-osint-w1"))
-        line = json.loads(pathlib.Path(audit.LOG_PATH).read_text().splitlines()[-1])
+        # Whose qubes these are cannot be read, so the line goes to RAM, not to disk.
+        line = json.loads(pathlib.Path(audit.ram_path()).read_text().splitlines()[-1])
         self.assertEqual((line["service"], line["args"]["conditions"]), (anon.SERVICE, "records"))
+        self.assertNotIn('"conditions":"records"', pathlib.Path(audit.LOG_PATH).read_text())
         self.assertEqual(len(self.notices), 1)
         self.assertIn("None was killed", self.notices[0])
         # The next run blocks nothing more and says so once.
@@ -635,7 +659,7 @@ class Acting(AnonBase):
         self.addCleanup(t.join, 5)
         self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
         v = self.gate()[self.p.slot]
-        self.assertIn(f"{w1}: killed again, after a call already running started it", v.acted)
+        self.assertIn(f"{w1}: killed again: it ran after the first kill", v.acted)
         self.assertEqual(vm._power, "Halted")
 
     def test_the_kill_waits_for_no_lock_and_one_wait_serves_the_whole_run(self):
@@ -722,6 +746,71 @@ class Acting(AnonBase):
             self.assertEqual(self.app.domains[name]._power, "Halted", name)
             self.assertIn("qmcp-stopped", self.tags(name))
         self.assertIn(f"{self.p.lead}: killed", v.acted)
+
+    def test_an_unblock_reports_a_qube_gone_since_its_verdict_and_goes_on(self):
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.gate()
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        real, w2 = anon.judge, f"ai-{self.p.label}-w2"
+
+        def judge_then_vanish(*a, **k):
+            v = real(*a, **k)
+            self.app.domains._drop(w2)               # removed by hand in between
+            return v
+        anon.judge = judge_then_vanish
+        self.addCleanup(setattr, anon, "judge", real)
+        out = fleet.unblock(self.app, self.p.label)
+        self.assertIn(f"{self.p.slot}: {w2} NOT unblocked (it cannot be looked up)", out)
+        self.assertIn(f"{self.p.slot}: {self.p.lead} unblocked (autostart stays off)", out)
+        self.assertNotIn("qmcp-blocked", self.tags(self.p.lead))
+
+    def test_a_stop_that_did_not_land_is_never_called_stopped(self):
+        import io
+        from contextlib import redirect_stderr
+        from qmcp import cli
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.app.fail.add("tag.add:qmcp-blocked")
+        self.app.fail.add("kill")
+        self.notices.clear()
+        v = self.gate()[self.p.slot]
+        self.assertFalse(v.blocked)
+        self.assertTrue(self.notices)
+        for notice in self.notices:
+            self.assertIn("could NOT stop", notice)
+        saved, cli._app = cli._app, lambda: self.app
+        self.addCleanup(setattr, cli, "_app", saved)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cli._gate_after(None)
+        self.assertIn("could NOT stop", err.getvalue())
+        self.assertNotIn("gate stopped", err.getvalue())
+        # The positive: once the blocks land, it is "stopped".
+        self.app.fail.clear()
+        self.notices.clear()
+        self.assertTrue(self.gate()[self.p.slot].blocked)
+        self.assertTrue(any(f"stopped the anonymous project {self.p.label}" in n
+                            for n in self.notices), self.notices)
+
+    def test_a_held_template_is_judged_as_it_would_be_once_accepted(self):
+        # The rulebook refuses a held qube every call, its updates included:
+        # asked as it is, a template whose updates go to the clearnet would
+        # read sound, and the stop it caused could be lifted.
+        anon.load_policy = lambda: policy_view(self.app, self.updates_to, self.extra, ours=True)
+        self.green(self.p)
+        self.updates_to = "sys-net"
+        self.assertEqual(self.gate()[self.p.slot].status, anon.RED)
+        self.app.domains["ai-tpl-g"].tags.add(core.QUARANTINE)
+        v = self.gate(act=False)[self.p.slot]
+        self.assertEqual(v.status, anon.RED, v.problems)
+        with self.assertRaises(fleet.ProjectError):
+            fleet.unblock(self.app, self.p.label)
+        # Teeth: our rulebook does deny the held template its updates.
+        policy, info = anon.load_policy()
+        from qrexec.exc import AccessDenied
+        from qrexec.policy.parser import Request
+        req = Request(anon.UPDATES, "+", "ai-tpl-g", "@default", system_info=info)
+        with self.assertRaises(AccessDenied):
+            policy.find_matching_rule(req).action.evaluate(req)
 
     def test_the_services_never_wake_or_copy_a_blocked_qube(self):
         p = self.other                       # visible: the hub may operate it, until it is stopped
@@ -1136,6 +1225,23 @@ class Commands(AnonBase):
         self.assertEqual(anon.run(self.app), [])          # a check's run never beats
         self.assertGreater(anon.heartbeat_age(), 1000)
 
+    def test_a_heartbeat_dated_in_the_future_is_stale(self):
+        # A clock set back makes the age negative; that proves no run.
+        import os
+        import time
+        self.make()
+        vms = list(self.app.domains)
+        tags_by = {v.name: v.tags.raw() for v in vms}
+
+        def beat():
+            return {x.status for x in fleet.anonymity_findings(
+                self.app, vms, self.records(), tags_by) if x.check == "gate heartbeat"}
+        anon.run(self.app, beat=True)
+        self.assertEqual(beat(), {"pass"})                              # the positive
+        future = time.time() + 3600
+        os.utime(anon.HEARTBEAT_PATH, (future, future))
+        self.assertEqual(beat(), {"fail"})
+
     def test_the_gate_makes_its_own_files_group_writable(self):
         import os
         import stat
@@ -1166,6 +1272,21 @@ class Commands(AnonBase):
         self.assertIn(("anonymity gate", "fail"), f)
         self.assertIn(("gate timer", "fail"), f)
         self.assertIn("qmcp-blocked", self.tags(p.lead))       # check acts as the gate does
+
+    def test_check_reports_the_timer_with_no_anonymous_project(self):
+        # Normal mode, nothing anonymous: the timer still ends open windows.
+        self.write_records({"version": 1, "slots": {}})
+        vms = list(self.app.domains)
+        tags_by = {vm.name: vm.tags.raw() for vm in vms}
+
+        def timer():
+            return [(x.status, x.detail) for x in fleet.anonymity_findings(
+                self.app, vms, self.records(), tags_by) if x.check == "gate timer"]
+        self.assertEqual([s for s, _ in timer()], ["pass"])
+        self.timer = False
+        [(status, detail)] = timer()
+        self.assertEqual(status, "fail")
+        self.assertIn("no open window ends at its time", detail)
 
     def test_the_gate_command_and_the_run_after_a_change(self):
         p = self.make()

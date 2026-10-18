@@ -212,6 +212,8 @@ class FakeFeatures(dict):
     def __setitem__(self, key, value):
         self._vm.app._maybe_fail("feature.set")
         super().__setitem__(key, value)
+        # qubesd applied it, and the reply was lost.
+        self._vm.app._maybe_fail("feature.set.landed")
 
     def __delitem__(self, key):
         self._vm.app._maybe_fail("feature.remove")
@@ -329,6 +331,8 @@ class FakeVM:
             value = self.app.domains[value]
         self._props[key] = value
         self.__dict__["_defaults"].discard(key)
+        # qubesd applied it, and the reply was lost.
+        self.app._maybe_fail(f"set.{key}.landed")
 
     # -- lifecycle
     def get_power_state(self):
@@ -756,7 +760,8 @@ class FakeApp:
             return "\n".join(f"{n} class=AppVM state=Halted" for n in names).encode()
         vm = self.domains._any(dest)
         if vm is None:
-            raise Injected("QubesVMNotFoundError")
+            # qubesadmin raises its QubesVMNotFoundError, a KeyError.
+            raise InjectedNotFound("QubesVMNotFoundError")
         if method == "admin.vm.tag.Get":
             return b"1" if arg in vm.tags else b"0"
         if method == "admin.vm.tag.List":

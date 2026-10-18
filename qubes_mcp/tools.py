@@ -40,6 +40,7 @@ CREATE_TIMEOUT = 300.0
 SPAWN_LOST_QUBE = "no reply to the spawn in time: a qube may exist; check qubes_list"
 CLONE_LOST = "no reply to the clone in time: a qube may exist; check qubes_list"
 SPAWN_LOST = "no reply to the spawn in time: a disposable may exist; check qubes_list"
+RULES_REFUSED = "firewall rules refused by qubesd"
 LIFECYCLE_TIMEOUT = 120.0
 # qubes_run and qubes_copy wait for the agent's own timeout plus this margin.
 EXEC_MARGIN = 30
@@ -95,13 +96,14 @@ def _prop(json_type, description: str, **extra) -> dict:
 
 # --------------------------------------------------------------------------
 # Argument validation: a small subset of JSON Schema (type, with unions as a
-# list; items; properties; required; additionalProperties: false; enum), at
-# any depth, then the tool's prepare hook, if it has one.
+# list; items; properties; required; additionalProperties: false; enum;
+# minimum and maximum, for integers), at any depth, then the tool's prepare
+# hook, if it has one.
 # --------------------------------------------------------------------------
 
 SCHEMA_KEYWORDS = frozenset({
     "type", "description", "default", "enum", "items",
-    "properties", "required", "additionalProperties",
+    "properties", "required", "additionalProperties", "minimum", "maximum",
 })
 
 _TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
@@ -160,6 +162,10 @@ def _problem(schema: dict, value, where: str) -> str | None:
     if "enum" in schema and not any(_same(value, e) for e in schema["enum"]):
         choices = ", ".join(json.dumps(e) for e in schema["enum"])
         return f"{where}: must be one of {choices}"
+    if _TYPE_CHECKS["integer"](value):
+        low, high = schema.get("minimum"), schema.get("maximum")
+        if (low is not None and value < low) or (high is not None and value > high):
+            return f"{where}: must be from {low} to {high}"
     if isinstance(value, list) and "items" in schema:
         for index, item in enumerate(value):
             problem = _problem(schema["items"], item, f"{where}[{index}]")
@@ -239,8 +245,12 @@ _CMD = _prop(["array", "string"],
              "/bin/sh -c when shell is true.",
              items={"type": "string"})
 _SHELL = _prop("boolean", "Run cmd through /bin/sh -c.", default=False)
-_RUN_TIMEOUT = _prop("integer", "Time limit for the command inside the qube, in seconds.",
-                     default=60)
+# The longest a command or a copy may be given inside a qube: one day. The
+# in-qube services check the same bounds, for a caller that is not this server.
+MAX_TIMEOUT = 86400
+_RUN_TIMEOUT = _prop("integer", "Time limit for the command inside the qube, in seconds "
+                                f"(1 to {MAX_TIMEOUT}).",
+                     default=60, minimum=1, maximum=MAX_TIMEOUT)
 _STDIN = _prop("string", "Text fed to the command's standard input.", default="")
 
 # A size as the operator's `qmcp project --quota` reads one: a whole number and
@@ -329,7 +339,8 @@ def _run_payload(args: dict) -> dict:
 @_register("qubes_list", """
     List the qubes in the caller's scope.
 
-    The hub's scope is all of AI space. A project's lead sees its project's
+    The hub's scope is all of AI space but the qubes of a hidden anonymous
+    project. A project's lead sees its project's
     workers, the templates its project may spawn from, and those of its
     project's worker networks that are in AI space (qubes_get_pool_stats
     names them all).
@@ -351,10 +362,15 @@ def _run_payload(args: dict) -> dict:
       so it can spawn from and onto them.
     - guarded (guarded: true): reference only. It is listed, can be read, and
       can be spawned from (as a template or a disposable template), but is
-      never operated.
+      never operated, except through a window the operator opened
+      (qubes_propose_open).
 
     Qubes out of scope are not listed. Every tool answers a qube that is out of
-    scope, or does not exist, with the same opaque "not found" refusal. A
+    scope the way it answers one that does not exist: one opaque refusal per
+    tool, given in its description ("not found", "not found or refused", or for
+    a template "template must reference an ai-managed qube", and for a lead's
+    template off its approved list "template is not on this project's approved
+    list"). A
     template out of scope is redacted in the `template` field.
 
     Returns {"ok": true, "qubes": [...]} or {"ok": false, "error": "..."}.
@@ -566,15 +582,20 @@ def _qubes_remove(args: dict) -> dict:
 @_register("qubes_run", """
     Run a command as root inside a managed qube.
 
-    The qube must be built on a template that carries the qubes-mcp in-qube
-    services. A halted qube is started to deliver the call, and is left running.
-    `cmd` is an argv list (the default), or one string run by /bin/sh -c when
-    shell is true. `timeout` limits the command inside the qube; `stdin` is
+    The qube, or the template it is built on, must carry the qubes-mcp
+    in-qube services (a standalone carries its own). A halted qube is started
+    to deliver the call, and is left running. `cmd` is an argv list (the
+    default), or one string run by /bin/sh -c when shell is true. `timeout`
+    limits the command inside the qube, 1 to 86400 seconds: at the limit the
+    command and every process it started in its group are killed. `stdin` is
     text fed to it.
 
     Returns {"ok": true, "rc": <int>, "stdout": "...", "stderr": "..."} or
     {"ok": false, "error": "<reason>"}. A qube the caller may not operate, or that
     does not exist, gives the opaque {"ok": false, "error": "not found or refused"}.
+    A call that gets no answer within timeout + 30 seconds gives {"ok": false,
+    "error": "no answer within N s; the work in the qube may have run, or may
+    still be running"}.
     """, {
         "name": _prop("string", "The qube to run in."),
         "cmd": _CMD,
@@ -584,43 +605,65 @@ def _qubes_remove(args: dict) -> dict:
     }, required=("name", "cmd"))
 def _qubes_run(args: dict) -> dict:
     return qrexec.call_service(args["name"], "qmcp.RunInAIManaged", _run_payload(args),
-                               timeout=args["timeout"] + EXEC_MARGIN)
+                               timeout=args["timeout"] + EXEC_MARGIN,
+                               on_timeout=_no_answer(args["timeout"] + EXEC_MARGIN))
+
+
+def _no_answer(seconds: int) -> dict:
+    """The reply for an in-qube call that got no answer in time. The qube was
+    reached (a refused or missing one answers at once), and the service there
+    stops its own work at the caller's timeout, so the work may have run."""
+    return {"ok": False, "error": f"no answer within {seconds} s; the work in the qube may "
+                                  f"have run, or may still be running"}
 
 
 @_register("qubes_copy", """
     Copy a file or directory from a managed qube to another qube.
 
-    A copy between two qubes of the same project slot, or into that slot's
-    dump sink, goes through at once. Every other copy goes through an operator
-    confirmation dialog in dom0, so this call may wait for a human to answer
-    it, and fails if the operator declines. A copy into a guarded qube, a lead
-    or the hub is refused. The copy lands on the target at
+    A copy from a member to another member of its slot or to the slot's dump
+    sink, or from a lead to its members, goes through at once. Every other
+    copy goes through an operator confirmation dialog in dom0, so this call
+    may wait for a human to answer it, and fails if the operator declines. A
+    copy into a guarded qube, a lead, the hub, dom0, a new disposable, a qube
+    stopped by the anonymity gate or held for review, or a hidden project's
+    qube from outside it, is refused. The copy lands on the target at
     /home/user/QubesIncoming/<source>/<basename of path>.
 
     Returns {"ok": true, "target": "...", "path": "..."} or
     {"ok": false, "error": "<reason>"}. A source the caller may not operate, or
-    that does not exist, gives the opaque
-    {"ok": false, "error": "not found or refused"}.
+    that does not exist, and a target that is not a qube name, give the opaque
+    {"ok": false, "error": "not found or refused"}. A call that gets no answer
+    within timeout + 30 seconds gives {"ok": false, "error": "no answer within
+    N s; the work in the qube may have run, or may still be running"}.
     """, {
         "source": _prop("string", "Managed qube holding the file."),
         "target": _prop("string", "Qube to copy into."),
         "path": _prop("string", "Absolute path of the file or directory on the source."),
         "timeout": _prop("integer", "Time limit for the whole copy, including the "
-                                    "operator's answer, in seconds.", default=300),
+                                    f"operator's answer, in seconds (1 to {MAX_TIMEOUT}); "
+                                    "the copy is stopped inside the source qube at it.",
+                         default=300, minimum=1, maximum=MAX_TIMEOUT),
     }, required=("source", "target", "path"))
 def _qubes_copy(args: dict) -> dict:
+    if not qrexec._valid_target(args["target"]):
+        # As for the source: byte-identical to a policy denial, nothing started.
+        return qrexec.refused()
     return qrexec.call_service(args["source"], "qmcp.CopyToAIManaged",
-                               {"target": args["target"], "path": args["path"]},
-                               timeout=args["timeout"] + EXEC_MARGIN)
+                               {"target": args["target"], "path": args["path"],
+                                "timeout": args["timeout"]},
+                               timeout=args["timeout"] + EXEC_MARGIN,
+                               on_timeout=_no_answer(args["timeout"] + EXEC_MARGIN))
 
 
 @_register("qubes_firewall_get", """
-    Read the firewall rules of a managed qube.
+    Read the firewall rules of a qube.
 
-    Returns {"ok": true, "rules": "<one rule per line>"} in the Qubes Admin API
-    rule grammar, for example "action=accept proto=tcp dstports=443" and a
-    final "action=drop". A qube the caller may not operate, or that does not
-    exist, gives the opaque {"ok": false, "error": "not found or refused"}.
+    For the hub, any qube in AI space, guarded ones included, but a hidden
+    project's, one the gate stopped or one held for review; for a lead, its
+    own workers. Returns {"ok": true, "rules": "<one rule per line>"} in the
+    Qubes Admin API rule grammar, for example "action=accept proto=tcp
+    dstports=443" and a final "action=drop". Any other qube, or one that does
+    not exist, gives the opaque {"ok": false, "error": "not found or refused"}.
     """, {
         "name": _prop("string", "The qube whose rules to read."),
     }, required=("name",))
@@ -634,7 +677,9 @@ def _qubes_firewall_get(args: dict) -> dict:
 @_register("qubes_firewall_set", """
     Replace the firewall rules of a managed qube.
 
-    A project's lead is the exception: its firewall is the operator's, dom0
+    The hub may also write a guarded qube's while the operator has opened it
+    with the firewall half (qubes_propose_open). A project's lead is the
+    exception: its firewall is the operator's, dom0
     writes it, and the hub's write is refused.
     Ask for a change with qubes_propose_lead_firewall.
 
@@ -643,10 +688,12 @@ def _qubes_firewall_get(args: dict) -> dict:
     also applied at once in the qube's netvm; pass reload=false when that netvm
     is not running yet: the rules are saved and apply when it starts.
 
-    Returns {"ok": true, "reloaded": <bool>}; the opaque
+    Returns {"ok": true, "reloaded": <bool>}, with a "warning" when the rules
+    were saved but the reload failed (they apply when the netvm next loads
+    them); {"ok": false, "error": "firewall rules refused by qubesd"} for a
+    ruleset qubesd would not take (nothing was changed); or the opaque
     {"ok": false, "error": "not found or refused"} for a qube the caller may not
-    operate or that does not exist; or {"ok": false, "error": "set ok but
-    reload failed: ..."} when the rules were saved but not applied.
+    operate or that does not exist.
     """, {
         "name": _prop("string", "The qube whose rules to replace."),
         "rules": _prop("string", "The new ruleset, one rule per line."),
@@ -660,15 +707,18 @@ def _qubes_firewall_set(args: dict) -> dict:
         # Only a lone surrogate escape in the JSON string gets here.
         return {"ok": False, "error": "rules must be valid Unicode text"}
     set_reply = qrexec.call_admin("admin.vm.firewall.Set", name, payload=body,
-                                  timeout=DOM0_TIMEOUT)
+                                  timeout=DOM0_TIMEOUT,
+                                  in_band={"ok": False, "error": RULES_REFUSED})
     if not set_reply.get("ok"):
         return set_reply
     if not args["reload"]:
         return {"ok": True, "reloaded": False}
     reload_reply = qrexec.call_admin("admin.vm.firewall.Reload", name, timeout=DOM0_TIMEOUT)
     if not reload_reply.get("ok"):
-        return {"ok": False,
-                "error": f"set ok but reload failed: {reload_reply.get('error')}"}
+        # The rules are in force in qubesd: a failure here must not read as
+        # "nothing changed".
+        return {"ok": True, "reloaded": False,
+                "warning": f"rules saved, reload failed: {reload_reply.get('error')}"}
     return {"ok": True, "reloaded": True}
 
 
@@ -685,7 +735,7 @@ def _qubes_firewall_set(args: dict) -> dict:
     that project's worker networks) is refused. So is a source built on a
     template the anonymity gate stopped, one held for the operator's review,
     and for a lead one off its project's approved list. A cloned template
-    stays off the network.
+    keeps its source's network, which for a TemplateVM is normally none.
 
     A clone lands where its source is: a clone of one of p00's qubes joins p00,
     and a clone of a project's member joins that project, counts against its
@@ -902,10 +952,16 @@ def _teardown(name: str, start_unsettled: bool = False) -> str:
     Returns {"ok": true, "name": "disp1234", "rc": <int>, "stdout": "...",
     "stderr": "..."} only once the disposable is confirmed killed. Otherwise
     {"ok": false, "stage": "spawn|start|wait|run|kill", "error": "...",
-    "name": "...", "teardown": "killed|failed|out of reach"}, with "name" and
-    "teardown" once the spawn succeeded. "failed" means it may still be
-    running; "out of reach" that dom0 no longer shows it to the caller (the
-    operator may have taken it out of scope) and it may still be running. Stage
+    "name": "...", "teardown": "killed|failed|out of reach|not started"}, with
+    "name" and "teardown" once the spawn succeeded. "not started" means dom0
+    refused the start before acting (its audit log has no room, or the
+    caller's budget there is spent or its counter cannot be kept) and the
+    disposable read halted, and still did 10 s later (a disposable Qubes is
+    starting reads halted too): it exists, halted, until it is removed. A
+    preloaded disposable, running already when that refusal came, is killed,
+    and "teardown" says how that went. "failed" means it may still be running;
+    "out of reach" that dom0 no longer shows it to the caller (the operator
+    may have taken it out of scope) and it may still be running. Stage
     "kill" (the command ran, its disposable could not be confirmed killed)
     also carries rc, stdout and stderr. A spawn whose reply never came says a
     disposable may exist; check qubes_list.
@@ -937,8 +993,30 @@ def _qubes_run_disposable(args: dict) -> dict:
             _live.discard(name)
 
 
+#: dom0's refusals made before a call acts, for want of room on its audit log
+#: or of the caller's budget there (dom0/qmcp/services.py): a start refused so
+#: never began. A disposable that reads halted then is left so, with no kill
+#: spent on it; a preloaded one, running already, is killed.
+NOT_ACTED = frozenset({
+    "refused: dom0's audit log has no room",
+    "refused: this caller's audit budget for today is spent",
+    "refused: this caller's audit counter cannot be kept",
+})
+
+
 def _run_in_disposable(name: str, args: dict) -> dict:
     start = _lifecycle(name, "start")
+    if not start.get("ok") and start.get("error") in NOT_ACTED:
+        # A preloaded disposable arrives running already: it is killed (a kill
+        # goes on past the budget and below the floor). One that reads halted,
+        # and still does after the settle time (Qubes' pre-start reads halted
+        # too), is left so, with no kill spent on it.
+        halted = _get_property(name, "power_state").get("value") == "Halted"
+        if halted:
+            time.sleep(_START_SETTLE_SECONDS)
+            halted = _get_property(name, "power_state").get("value") == "Halted"
+        return {"ok": False, "name": name, "stage": "start", "error": start.get("error"),
+                "teardown": "not started" if halted else _teardown(name)}
     if not start.get("ok"):
         # The transport's refusal may be a reply lost to the timeout, while
         # dom0 goes on starting it: its teardown waits out a pre-start.
@@ -951,7 +1029,8 @@ def _run_in_disposable(name: str, args: dict) -> dict:
                 "teardown": _teardown(name)}
 
     run = qrexec.call_service(name, "qmcp.RunInAIManaged", _run_payload(args),
-                              timeout=args["timeout"] + EXEC_MARGIN)
+                              timeout=args["timeout"] + EXEC_MARGIN,
+                              on_timeout=_no_answer(args["timeout"] + EXEC_MARGIN))
     # Killed, never asked to stop: a guest can ignore a shutdown request, and
     # dom0's "ok" for one means only that it was sent.
     teardown = _teardown(name)
@@ -1347,7 +1426,10 @@ def _qubes_propose_dump(args: dict) -> dict:
       proposal without keep_old is refused, even for a project that has no
       lead now, where it changes nothing. A kept lead keeps its name, so when
       it is named <reserved_prefix><label>-lead, give a fresh new lead a
-      lead_name (a promoted one keeps its own name). This is
+      lead_name (a promoted one keeps its own name), except in an anonymous
+      project, where dom0 names it (<reserved_prefix><label>-lead2 while the
+      kept one holds -lead) and refuses a lead_name when the proposal is
+      accepted. This is
       also how a project's lead moves to another network: a new lead on it,
       which can take what it needs from the old one, kept as a worker.
 
@@ -1457,19 +1539,24 @@ def _qubes_propose_project_delete(args: dict) -> dict:
     they read.
 
     - qube: the guarded qube to open.
-    - for: how long, as 90s, 30m or 2h. At most 24h, and there is no
-      indefinite form.
+    - for: how long: a whole number of seconds, or one ending in s, m or h
+      (90s, 30m, 2h), with no space. At most 24h, and there is no indefinite
+      form.
     - firewall: also let this hub write that qube's firewall rules while the
       window is open. Leave it out unless the work needs it.
 
     The window ends by itself, at the next boot of the machine, and whenever
-    the operator closes it, which kills the qube if it is running. Nothing
+    the operator closes it; when it ends, the qube is killed if it is running,
+    so what this hub had running in it is stopped, and firewall rules this hub
+    wrote stay (the operator's own manage of it ends the window with no
+    kill). Nothing
     tells this hub when it ended: a call that worked before and is refused
     now means it is closed.
     """), {
         "title": _TITLE,
         "qube": _prop("string", "The guarded qube to open."),
-        "for": _prop("string", "How long: 90s, 30m, 2h. At most 24h."),
+        "for": _prop("string", "How long: seconds, or with s, m or h (90s, 30m, 2h). "
+                               "At most 24h."),
         "firewall": _prop("boolean", "Also let the hub write that qube's firewall rules while "
                                      "it is open. Leave it out otherwise."),
     }, required=("title", "qube", "for"))
@@ -1522,11 +1609,13 @@ def _qubes_propose_manage(args: dict) -> dict:
     qube leaves AI space and any project slot it is in, with what it holds,
     and its default disposable template is set to none. From then on dom0
     answers this hub and every lead about it as about a name that does not
-    exist; bringing it back takes the operator, or an accepted
+    exist (an enrolled gateway stays enrolled, and is still named); bringing
+    it back takes the operator, or an accepted
     qubes_propose_manage. It is killed if it runs, unless shutdown is false,
-    so nothing this hub started in it runs on; killing a gateway cuts the
-    network of every qube on it. Nothing is removed: the qube and its files
-    stay, outside AI space.
+    so what this hub had running in it is stopped; killing a gateway cuts the
+    network of every qube on it. Nothing is removed but a disposable, which
+    Qubes removes when it stops: the qube and its files stay, outside AI
+    space.
 
     The command refuses a project's lead (removed or replaced with
     qubes_propose_lead) and a qube held for review, and accepting fails for a

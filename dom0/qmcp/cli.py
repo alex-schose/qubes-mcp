@@ -5,16 +5,20 @@
     qmcp settings [--json]         the operator files and the disk AI space uses
     qmcp settings set ...          change the pool cap, the private cap or birth egress
     qmcp template prepare|refresh  write qmcp's in-qube services into a template or standalone
+    qmcp template install T PKG... install exact packages into a TemplateVM in AI space
     qmcp restored list|accept|reject   qubes back from a backup or a copy, held for review
     qmcp export [FILE] / import FILE   the operator files, as one file a backup carries
     qmcp manage|guard|revoke QUBE  role actions
+    qmcp open QUBE --for DURATION  open a guarded qube to the hub for a bounded time
+    qmcp seal [QUBE|--all|--expired]   close a window now
     qmcp gateway ...               the networks AI space may use: list, enroll, set, remove
     qmcp project ...               projects: list, show, create, edit, lead, firewall, dump,
                                    move, delete, unblock
-    qmcp gate [--json]             judge the anonymous projects, and stop one that is not
+    qmcp gate [--json]             hold the qubes back from a backup, then judge the
+                                   anonymous projects and stop one that is not sound
     qmcp proposal ...              the hub's proposals: list, show, accept, reject
     qmcp migrate [--apply] ...     move a v0.9.16 tiered fleet to two states
-    qmcp audit verify|tail [N]|rotate   the hash-chained record of state changes
+    qmcp audit verify|tail [N]|rotate|status   the hash-chained record of state changes
     qmcp version
 
 The operator's window, `qmcp-gui`, runs these same commands: reads as you,
@@ -25,11 +29,22 @@ commands that change anything write /etc/qmcp/projects.json or
 /etc/qmcp/gateways.json, or take the records' lock, so they need root; so do
 accepting and rejecting a proposal.
 
-Every command that changes something leaves one line on the audit chain, as
-caller "operator": the command, the names it acts on and its options, a quota
-only as "set". Reads, plans and dry runs leave none, nor does a command the
-argument parser refuses (migrate's --map check included) or one refused for not
-running as root; one its own checks refuse leaves a line with ok false.
+A command the operator runs that changes something leaves one line on the
+audit chain, as caller "operator": the command, the names it acts on and its
+options, a quota only as "set". Reads, plans and dry runs leave none, nor does
+a command the argument parser refuses (migrate's --map check included), one
+refused for not running as root, or one refused for its arguments before it ran
+(restored, open and seal name what is missing); one its own checks refuse
+leaves a line with ok false. `restored accept --all` leaves one line per qube
+it accepted. What a timer runs (template refresh, the gate, the seal sweeps),
+and the gate run `qmcp check` makes, records only what it changed: one line per
+qube written into, held, stopped or sealed, under its own caller; so does
+the hourly rotation (`qmcp audit rotate --auto`): its anchor when it rotated,
+one line when it removed files, none when it did neither.
+
+Each line goes where its modes say (`audit.place`): an operator command's
+belongs to the projects it names and those whose badges its qubes wear, read
+before it runs and after.
 """
 from __future__ import annotations
 
@@ -52,7 +67,7 @@ def _version() -> str:
     try:
         with open(os.path.join(fleet.LIB_DIR, "VERSION"), encoding="utf-8") as fh:
             return fh.read().strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return "unknown"
 
 
@@ -89,8 +104,18 @@ def cmd_settings(args) -> int:
         try:
             lines = opfiles.settings_set(_app(), pool_cap=args.pool_cap,
                                          private_cap=args.private_cap,
-                                         birth_egress=args.birth_egress)
+                                         birth_egress=args.birth_egress,
+                                         audit_keep_days=args.audit_keep_days)
         except opfiles.OpFilesError as e:
+            # What was written before a failure is printed first, as on success.
+            for line in e.written:
+                print(line)
+            print(f"qmcp settings set: {e}" + ("" if e.written else "; nothing was changed"),
+                  file=sys.stderr)
+            return 1
+        except (fleet.ProjectError, RuntimeError) as e:
+            # The locks (a create in progress, another command holding them):
+            # taken before anything is written.
             print(f"qmcp settings set: {e}; nothing was changed", file=sys.stderr)
             return 1
         except Exception as e:
@@ -114,7 +139,8 @@ def cmd_role(args) -> int:
         if args.cmd == "revoke":
             print(fleet.revoke(_app(), args.qube, shutdown=not args.no_shutdown))
         else:
-            print(action(_app(), args.qube))
+            print(fleet.guard(_app(), args.qube, in_ai_space_only=args.only_in_ai_space)
+                  if args.cmd == "guard" else action(_app(), args.qube))
     except fleet.RoleError as e:
         print(f"qmcp {args.cmd}: {e}", file=sys.stderr)
         return 1
@@ -128,8 +154,9 @@ def cmd_window(args) -> int:
     """`qmcp open` and `qmcp seal`, both under the gate's lock, so a window
     never races the pass that expires one. `--expired` is the pass itself,
     which the gate's timer runs, and `--all` the boot seal: both report what
-    they did and exit 3 when something could not be judged, never 1, so the
-    unit's other command still runs."""
+    they did and exit 3 when something could not be judged, and 1 only when
+    the pass itself could not run. The gate's unit takes 1 and 3 as success,
+    so its other command still runs; the boot seal's fails on 1."""
     if args.cmd == "seal" and not args.all and not args.expired and args.qube is None:
         raise SystemExit("qmcp seal: name a qube, or --all, or --expired")
     if args.cmd == "seal" and args.qube is not None and (args.all or args.expired):
@@ -173,7 +200,7 @@ def _need_root(what: str, command: str = "project") -> None:
     if os.geteuid() != 0:
         cmd = " ".join(w for w in (command, what) if w)
         raise SystemExit(f"qmcp {cmd}: run as root (sudo qmcp {cmd} ...); "
-                         f"it writes /etc/qmcp or takes the records' lock")
+                         f"it changes the fleet or the operator's files, which only root does")
 
 
 def cmd_gateway(args) -> int:
@@ -333,6 +360,8 @@ def cmd_project(args) -> int:
             report = fleet.move(app, args.name, args.target, confirm=args.yes)
         elif what == "unblock":
             report = fleet.unblock(app, args.name)
+        elif what == "audit":
+            report = fleet.set_project_audit(app, args.name, args.mode)
         elif what == "delete":
             p = projects.find(fleet._load_records(), args.name)
             if (p is not None and p.slot == projects.HUB_SLOT) or \
@@ -387,9 +416,16 @@ def cmd_template(args) -> int:
         except Exception as e:
             print(f"qmcp template prepare: {type(e).__name__}", file=sys.stderr)
             return 1
-        print(f"{r['qube']}: prepared ({r['version']})"
-              + ("; it was started for this and shut down again" if r["started"] else ""))
-        return 0
+        if not r["started"]:
+            print(f"{r['qube']}: prepared ({r['version']})")
+            return 0
+        if r["stopped"]:
+            print(f"{r['qube']}: prepared ({r['version']}); it was started for this and shut "
+                  f"down again")
+            return 0
+        print(f"{r['qube']}: prepared ({r['version']}); it was started for this, and its "
+              f"shutdown did not complete: qvm-shutdown {r['qube']}, or qvm-kill {r['qube']}")
+        return 1
     try:
         done = inqube.refresh(_app())
     except inqube.InQubeError as e:
@@ -402,7 +438,9 @@ def cmd_template(args) -> int:
             rc = 3
             continue
         try:
-            audit.audit("qmcp template refresh", "refresh", {"qube": str(name)[:128]}, True)
+            # A standalone lead is prepared too: its line follows its project.
+            audit.audit("qmcp template refresh", "refresh", {"qube": str(name)[:128]}, True,
+                        slots=_place({"qube": str(name)[:128]}))
         except Exception:
             pass
     return rc
@@ -436,10 +474,7 @@ def cmd_restored(args) -> int:
     if args.what == "accept" and args.all:
         if args.qube:
             raise SystemExit("qmcp restored accept: name the qubes, or give --all, not both")
-        names = [r["name"] for r in restored.review(app, None) if r.get("held")]
-        if not names:
-            print("nothing is held")
-            return 0
+        return _accept_all(app)
     elif not args.qube:
         raise SystemExit(f"qmcp restored {args.what}: name a qube"
                          + (", or give --all" if args.what == "accept" else ""))
@@ -461,6 +496,52 @@ def cmd_restored(args) -> int:
     return rc
 
 
+def _accept_all(app) -> int:
+    """`qmcp restored accept --all`: one audit line per qube it acted on, each
+    with its own outcome, or one naming none when nothing was held."""
+    def line(qubes, ok, error=None):
+        audit.audit("qmcp restored accept", "operator", {"qubes": _names(qubes), "all": True},
+                    ok, error, app=app)
+    try:
+        rows = restored.review(app, None)
+    except BaseException:
+        line([], False, "exit status 1")
+        raise
+    names = [r["name"] for r in rows if r.get("held")]
+    # A qube whose tags or label do not read may be held: never "nothing is
+    # held" over it. The ones that read are accepted, and the command fails.
+    unread = sorted(r["name"] for r in rows if "unreadable" in r)
+    for name in unread:
+        print(f"qmcp restored accept: {name} cannot be read now, so whether it is held is not "
+              f"known; it was not accepted (qmcp restored list)", file=sys.stderr)
+    if unread:
+        line(unread, False, "cannot be read")
+    if not names:
+        if unread:
+            return 1
+        print("nothing is held")
+        line([], True)
+        return 0
+    rc = 1 if unread else 0
+    for name in names:
+        try:
+            print(restored.accept(app, name))
+            line([name], True)
+        except restored.ReviewError as e:
+            print(f"qmcp restored accept: {e}", file=sys.stderr)
+            line([name], False, "exit status 1")
+            rc = 1
+        except Exception as e:
+            print(f"qmcp restored accept: {name}: {type(e).__name__}; see qmcp restored list",
+                  file=sys.stderr)
+            line([name], False, "exit status 1")
+            rc = 1
+        except BaseException:
+            line([name], False, "exit status 1")
+            raise
+    return rc
+
+
 def cmd_export(args) -> int:
     _need_root("", "export")
     try:
@@ -470,7 +551,9 @@ def cmd_export(args) -> int:
         return 1
     print(f"wrote {path}: back it up with dom0 ticked. On a reinstalled Qubes: restore "
           f"everything, install qubes-mcp with the same --hub, sudo qmcp import FILE (it comes "
-          f"back under ~/home-restore-<time>/dom0-home/), then sudo qmcp restored accept --all")
+          f"back under ~/home-restore-<time>/dom0-home/), then sudo qmcp restored accept --all. "
+          f"With anonymous projects, send the templates' updates through the anonymiser again "
+          f"(the README's Setup, step 7) before the import")
     return 0
 
 
@@ -479,10 +562,16 @@ def cmd_import(args) -> int:
     try:
         lines = opfiles.import_(args.file)
     except opfiles.OpFilesError as e:
+        for line in e.written:
+            print(line)
+        print(f"qmcp import: {e}" + ("" if e.written else "; nothing was changed"),
+              file=sys.stderr)
+        return 1
+    except (fleet.ProjectError, RuntimeError) as e:
         print(f"qmcp import: {e}; nothing was changed", file=sys.stderr)
         return 1
-    except fleet.ProjectError as e:
-        print(f"qmcp import: {e}; nothing was changed", file=sys.stderr)
+    except Exception as e:
+        print(f"qmcp import: {type(e).__name__}", file=sys.stderr)
         return 1
     for line in lines:
         print(line)
@@ -564,7 +653,8 @@ def _gate_after(args) -> None:
               "anonymous projects within about 15 seconds", file=sys.stderr)
     for v in verdicts or ():
         if v.acted:
-            print(f"qmcp: the anonymity gate stopped {v.label} ({v.slot}): "
+            did = "stopped" if v.blocked else "could NOT stop (qmcp check names what is left)"
+            print(f"qmcp: the anonymity gate {did} {v.label} ({v.slot}): "
                   + "; ".join(d for _, d in v.problems), file=sys.stderr)
 
 
@@ -604,7 +694,7 @@ def cmd_proposal(args) -> int:
                 print(line)
             print(f"proposal {args.id}: {'accepted' if ok else 'failed'}")
             return 0 if ok else 1
-        closed = proposals.reject(args.id)
+        closed = proposals.reject(args.id, app=_app())
         print(f"proposal {args.id}: {closed}")
         return 0
     except proposals.Refused as e:
@@ -613,7 +703,7 @@ def cmd_proposal(args) -> int:
         print(f"qmcp proposal {what}: {e}", file=sys.stderr)
         return 1
     except OSError as e:
-        print(f"qmcp proposal {what}: cannot read {proposals.PROPOSALS_DIR} "
+        print(f"qmcp proposal {what}: cannot read or write {proposals.PROPOSALS_DIR} "
               f"({e.strerror or type(e).__name__})", file=sys.stderr)
         return 1
     except Exception as e:
@@ -657,6 +747,10 @@ def _choices(pairs) -> dict:
 
 
 def cmd_migrate(args) -> int:
+    if args.apply:
+        # Before anything is read: without root the badges would be applied
+        # and the flag saying how to read them could not be retired.
+        _need_root("--apply", "migrate")
     app = _app()
     steps, problems = fleet.plan_migration(app, _choices(args.map),
                                            exec_default=args.exec_default,
@@ -686,20 +780,79 @@ def cmd_migrate(args) -> int:
 
 def cmd_audit(args) -> int:
     if args.what == "rotate":
-        print(f"rotated: the old log is now {audit.rotate(args.path)}")
+        if args.auto:
+            # The timer's run: it writes its own lines, and only for what it did.
+            _need_root("rotate --auto", "audit")
+            lines, ok = audit.auto_rotate()
+            for line in lines:
+                print(line)
+            return 0 if ok else 1
+        # The install's own log, wherever it is: on disk, or its RAM chain. In
+        # mode none there is none; a mode that does not read could be either.
+        _need_root("rotate", "audit")
+        mode, problem = audit.install_mode()
+        path = args.path
+        if path is None:
+            if problem or mode == "none":
+                print(f"qmcp audit rotate: "
+                      + ("the install's audit mode cannot be read" if problem
+                         else "the install keeps no audit log (mode none)")
+                      + "; nothing was rotated", file=sys.stderr)
+                return 1
+            path = audit.install_chain()
+            if mode == "ram":
+                audit._ram_dir_ready()
+        print(f"rotated: the old log is now {audit.rotate(path)}")
         return 0
+    if args.what == "status":
+        return _audit_status(args)
+    # The live chain is the install's: the log on disk, its RAM chain, or none.
+    path = args.path if args.path is not None else audit.install_chain()
     if args.what == "verify":
-        ok, n, err = audit.verify(args.path)
+        if path is None:
+            print(json.dumps({"ok": True, "entries": 0, "error": None}))
+            return 0
+        ok, n, err = audit.verify(path)
         print(json.dumps({"ok": ok, "entries": n, "error": err}))
         return 0 if ok else 1
+    if path is None:
+        return 0                        # install mode none: no line is kept
     try:
-        records = audit.tail(args.n, args.path)
+        records = audit.tail(args.n, path)
     except OSError as e:
         print(f"qmcp audit tail: cannot read the log ({e.strerror or type(e).__name__})",
               file=sys.stderr)
         return 1
     for rec in records:
         print(json.dumps(rec, sort_keys=True))
+    return 0
+
+
+def _audit_status(args) -> int:
+    """The window's gauge: the log, the rotated files, the RAM chains, the
+    room against the floor and each principal's budget today. A read as the
+    operator's own user."""
+    try:
+        records = projects.load()
+        principals = 1 + sum(1 for p in records.values() if p.lead)
+    except projects.ProjectsUnreadable:
+        principals = None
+    doc = audit.status(os.path.join(str(core.RUN_DIR), "calls"), principals)
+    if args.json:
+        print(json.dumps(doc, indent=2))
+        return 0
+    mib = lambda n: "?" if n is None else f"{n / 1024 ** 2:.1f} MiB"  # noqa: E731
+    print(f"mode: {doc['mode'] or 'unreadable (lines go to RAM)'}")
+    print(f"keep rotated logs: {doc['keep_days'] if doc['keep_days'] is not None else 'unreadable (nothing removed)'}")
+    print(f"log: {doc['log']} {mib(doc['log_bytes'])}")
+    for r in doc["rotated"]:
+        print(f"rotated: {r['name']} {mib(r['bytes'])}")
+    for r in doc["ram"]:
+        print(f"ram chain: {r['name']} {mib(r['bytes'])}")
+    print(f"free: {mib(doc['free_bytes'])} (floor {mib(doc['floor_bytes'])})")
+    for b in doc["budgets"]:
+        print(f"budget: {b['caller']} {'?' if b['lines_today'] is None else b['lines_today']}"
+              f"/{b['budget']} lines today")
     return 0
 
 
@@ -716,14 +869,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("settings", help="the operator files and the disk AI space uses")
     p.add_argument("--json", action="store_true")
     ssub = p.add_subparsers(dest="what")
-    q = ssub.add_parser("set", help="change the pool cap, the private-volume cap or birth "
-                                    "egress (root)")
+    q = ssub.add_parser("set", help="change the pool cap, the private-volume cap, birth "
+                                    "egress or how long rotated audit logs are kept (root)")
     q.add_argument("--pool-cap", metavar="SIZE", help="the disk all of AI space may hold, e.g. 200G")
     q.add_argument("--private-cap", metavar="SIZE", help="the largest private volume one qube "
                                                          "may ask for, e.g. 20G")
     q.add_argument("--birth-egress", metavar="QUBE|none",
-                   help="where the hub's template-based qubes go online (an enrolled gateway)")
-    p = sub.add_parser("template", help="qmcp's in-qube services in a template or standalone")
+                   help="where the hub's qubes made from a TemplateVM go online when the hub's "
+                        "own network is not an enrolled gateway (an enrolled gateway)")
+    q.add_argument("--audit-keep-days", metavar="DAYS|off",
+                   help="how long a rotated audit log is kept before the hourly timer removes "
+                        "it, judged by its age, never its size (default 90), or off: never")
+    p = sub.add_parser("template", help="qmcp's in-qube services in a template or standalone, "
+                                        "and packages in a template")
     tsub = p.add_subparsers(dest="what", required=True)
     q = tsub.add_parser("prepare", help="write them into a TemplateVM or StandaloneVM, starting "
                                         "it if halted (root)")
@@ -760,6 +918,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "revoke":
             p.add_argument("--no-shutdown", action="store_true",
                            help="leave it running")
+        if name == "guard":
+            p.add_argument("--only-in-ai-space", action="store_true",
+                           help="refuse a qube outside AI space instead of adding it, guarded "
+                                "(the window always sends it)")
     p = sub.add_parser("open", help="open a guarded qube to the hub for a bounded time; the "
                                     "timer, qmcp seal and every boot close it")
     p.add_argument("qube")
@@ -861,6 +1023,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--yes", action="store_true",
                    help="confirm moving a qube out of one slot into another, or into or out of "
                         "an anonymous project")
+    q = psub.add_parser("audit", help="where a project's audit lines go: disk, ram (gone at "
+                                      "shutdown) or off; the lines already on disk stay there "
+                                      "(root)")
+    q.add_argument("name", help="label or slot")
+    q.add_argument("mode", choices=projects.AUDIT_MODES)
     q = psub.add_parser("unblock", help="clear the anonymity gate's stop once it finds the "
                                         "project sound, or the hub's: p00 (root)")
     q.add_argument("name", help="label or slot, or p00 for the hub and its qubes")
@@ -868,8 +1035,9 @@ def build_parser() -> argparse.ArgumentParser:
                                          "(root; without --yes, the plan only)")
     q.add_argument("name", help="label or slot; a slot with no record finishes a delete")
     q.add_argument("--yes", action="store_true")
-    p = sub.add_parser("gate", help="judge the anonymous projects (and the hub, in anonymous mode) "
-                                    "now, and stop what is not sound")
+    p = sub.add_parser("gate", help="hold the qubes back from a backup, then judge the anonymous "
+                                    "projects (and the hub, in anonymous mode) now, and stop "
+                                    "what is not sound")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("proposal", help="the hub's proposals: what it asks you to do")
     psub = p.add_subparsers(dest="what", required=True)
@@ -896,15 +1064,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--compat-default", choices=("managed", "guarded"),
                    help="state for umbrella-only qubes on a never-flipped fleet")
     p = sub.add_parser("audit", help="the audit chain")
-    p.add_argument("what", choices=("verify", "tail", "rotate"))
+    p.add_argument("what", choices=("verify", "tail", "rotate", "status"))
     p.add_argument("n", nargs="?", type=int, default=20)
     p.add_argument("--path", default=None)
+    p.add_argument("--auto", action="store_true",
+                   help="with rotate: what the hourly timer runs: rotate when the log's first "
+                        "line is from an earlier UTC day or it is past 32 MiB, then remove "
+                        "rotated logs older than the keep-days setting (root)")
+    p.add_argument("--json", action="store_true", help="with status")
     sub.add_parser("version")
     return ap
 
 
 def _names(values) -> list:
-    return [str(v)[:128] for v in list(values or ())[:32]]
+    """The first 32 names, and past them one last entry saying how many more
+    there were (no name holds a space, so it reads as no name)."""
+    values = list(values or ())
+    out = [str(v)[:128] for v in values[:32]]
+    if len(values) > 32:
+        out.append(f"and {len(values) - 32} more")
+    return out
 
 
 def operator_line(args):
@@ -917,10 +1096,14 @@ def operator_line(args):
     if c == "settings":
         if getattr(args, "what", None) != "set":
             return None
-        return "qmcp settings set", {"pool_cap": None if args.pool_cap is None else "set",
-                                     "private_cap": None if args.private_cap is None else "set",
-                                     "birth_egress": None if args.birth_egress is None
-                                     else str(args.birth_egress)[:128]}
+        summary = {"pool_cap": None if args.pool_cap is None else "set",
+                   "private_cap": None if args.private_cap is None else "set",
+                   "birth_egress": None if args.birth_egress is None
+                   else str(args.birth_egress)[:128]}
+        # Only when given, so the line of an ordinary settings change keeps its shape.
+        if args.audit_keep_days is not None:
+            summary["audit_keep_days"] = str(args.audit_keep_days)[:16]
+        return "qmcp settings set", summary
     if c == "template":
         # The refresh is the timer's: it writes one line per qube it changed.
         if args.what == "refresh":
@@ -931,6 +1114,10 @@ def operator_line(args):
         return "qmcp template prepare", {"qube": str(args.qube)[:128]}
     if c == "restored":
         if args.what == "list":
+            return None
+        if getattr(args, "all", False) and not args.qube:
+            # `cmd_restored` writes one line per qube it acted on: which ones
+            # is known only once it has read the fleet.
             return None
         qubes = args.qube if isinstance(args.qube, list) else ([] if args.qube is None
                                                                else [args.qube])
@@ -944,6 +1131,8 @@ def operator_line(args):
         summary = {"qube": str(args.qube)[:128]}
         if c == "revoke":
             summary["no_shutdown"] = bool(args.no_shutdown)
+        if c == "guard" and args.only_in_ai_space:
+            summary["only_in_ai_space"] = True
         return f"qmcp {c}", summary
     if c == "open":
         return "qmcp open", {"qube": str(args.qube)[:128], "for": str(args.duration)[:32],
@@ -965,10 +1154,14 @@ def operator_line(args):
         if args.what in ("enroll", "set"):
             summary["anonymising"] = args.anonymising if args.what == "set" else bool(args.anonymising)
             summary["label"] = None if args.label is None else str(args.label)[:128]
+            summary["updates"] = args.updates if args.what == "set" else bool(args.updates)
         return f"qmcp gateway {args.what}", summary
     if c == "migrate" and args.apply:
         return "qmcp migrate", {"map": _names(args.map), "exec_default": args.exec_default,
                                 "compat_default": args.compat_default}
+    if c == "project" and args.what == "audit":
+        # It writes its own line, naming the slot only, to the install's chain.
+        return None
     if c != "project" or args.what in ("list", "show") or \
             (args.what == "delete" and not args.yes) or \
             (args.what == "firewall" and args.model is None and not args.rule
@@ -1020,9 +1213,22 @@ def operator_line(args):
     return f"qmcp project {w}", summary
 
 
-def _record(line, rc: int) -> None:
+def _place(summary, before=None):
+    """Where an operator command's line belongs: the projects it names and
+    those whose badges its qubes wear, read before it runs and again after
+    (`before`), so a qube it removed or stripped and one it made both count.
+    An app that cannot be had is an unknown place: RAM."""
+    try:
+        app = _app()
+    except Exception:
+        return audit.Where(unknown=True)
+    return audit.place(app, summary, () if before is None else before)
+
+
+def _record(line, rc: int, before=()) -> None:
     command, summary = line
-    audit.audit(command, "operator", summary, rc == 0, None if rc == 0 else f"exit status {rc}")
+    audit.audit(command, "operator", summary, rc == 0, None if rc == 0 else f"exit status {rc}",
+                slots=_place(summary, before))
 
 
 class _Unread:
@@ -1093,15 +1299,16 @@ def _main(argv=None) -> int:
         if args.cmd == "proposal" and args.what == "accept":
             _gate_after(args)
         return rc
+    before = _place(line[1])
     try:
         rc = handler(args)
     except SystemExit:
         raise                   # refused before it ran: not root, or a malformed --map
     except BaseException:
-        _record(line, 1)
+        _record(line, 1, before)
         _gate_after(args)
         raise
-    _record(line, rc)
+    _record(line, rc, before)
     _gate_after(args)
     return rc
 

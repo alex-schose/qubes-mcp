@@ -469,6 +469,13 @@ def svc_set_property(app, call, req):
         setattr(vm, prop, value)
     except Exception as e:
         call.error_class = type(e).__name__
+        # qubesd may have applied the write before the call raised: unless the
+        # old value reads back, its line is a change's, never withheld.
+        try:
+            landed = _name_of(getattr(vm, prop)) == _name_of(value)
+        except Exception:
+            landed = True
+        call.landed = call.landed or landed
         raise refuse("set failed") from None
     return {"ok": True}
 
@@ -508,6 +515,12 @@ def svc_set_feature(app, call, req):
         vm.features[feature] = text
     except Exception as e:
         call.error_class = type(e).__name__
+        # As for a property: a write that may have landed is logged as one.
+        try:
+            landed = vm.features.get(feature, None) == text
+        except Exception:
+            landed = True
+        call.landed = call.landed or landed
         raise refuse("feature.Set failed") from None
     try:
         readback = vm.features.get(feature, None)
@@ -688,6 +701,14 @@ def _birth_netvm(app, call, req, source_vm, authoritative: bool):
     return resolved
 
 
+def _same_network(before, now, what: str) -> None:
+    """Under the create lock: the birth network, worked out again from the
+    reads made there, must be the one judged before the wait. A network the
+    operator took off the source meanwhile is never given to its child."""
+    if now != before:
+        raise refuse(f"the {what}'s network changed while this call waited; try again")
+
+
 def _set_netvm(vm, netvm) -> None:
     """Set explicitly and read back, value AND that it no longer follows a
     default: a qube left following the global default would move when the
@@ -784,6 +805,9 @@ def svc_spawn(app, call, req):
     # landed while this call waited must not be built on. Its tags below come
     # from this read.
     tpl = _spawn_template(app, template, klass, who)
+    _same_network(netvm, _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM")),
+                  "template")
+    budget.check_private_size(private_size)
     estimate = budget.estimate_new_private(private_size)
     if klass == "StandaloneVM":
         # A standalone's root is its own, counted at the template root's size.
@@ -982,6 +1006,7 @@ def svc_clone(app, call, req):
             or (now is not None and now.label != project.label):
         raise refuse("the source moved while this call waited; try again")
     project = now
+    _same_network(netvm, _birth_netvm(app, call, {}, src, authoritative=True), "source")
     _clone_network(who, project, netvm)
     _check_budget(app, call, _estimate(budget.persistent_bytes, src),
                   project if who.is_hub() else None)
@@ -1076,6 +1101,8 @@ def svc_spawn_disposable(app, call, req):
     # Judged again under the lock, as a spawn's template is; the tags below
     # come from this read.
     dvmt = _disposable_template(app, template, who)
+    _same_network(netvm, _birth_netvm(app, call, {}, dvmt, authoritative=True),
+                  "disposable template")
     _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
     _reviewed(dvmt)
 
@@ -1251,6 +1278,11 @@ def svc_events(app, call, req, dispatcher_factory=None):
         asyncio.run(listen())
     except Exception:
         warning[0] = "event stream failed"
+    # The window can outlast the hub's authority: the gate may stop it, or a
+    # restore hold it, while it listens. What it collected is answered only to
+    # a caller that is still the hub; a read that fails refuses.
+    if not core.principal(app, call.caller, core.read_hub()).is_hub():
+        raise core.Refusal(core.NOT_AUTHORIZED)
     out = {"ok": True, "events": collected}
     if warning[0] is not None:
         out["warning"] = warning[0]
@@ -1328,10 +1360,28 @@ SERVICES = {
 
 #: Fixed vocabulary: says only that dom0's audit log is out of room.
 NO_AUDIT_ROOM = "refused: dom0's audit log has no room"
+
+
 #: Fixed vocabulary: this caller has put its day's share of lines on the log.
 NO_AUDIT_BUDGET = "refused: this caller's audit budget for today is spent"
 #: Fixed vocabulary: the caller's audit counter cannot be kept (qmcp check fails).
 NO_AUDIT_COUNTER = "refused: this caller's audit counter cannot be kept"
+
+
+def _note_capped(caller, counter: str, kind: str, slot=None) -> None:
+    """One chain line for the first call of a caller withheld in an hour or
+    a day; the counter keeps the rest, and `qmcp check` names them. It names
+    no qube, and goes where the caller's own lines go (its project's, for a
+    lead), never where a qube its withheld call named would send it: that
+    name is the caller's to choose, and could send the line nowhere."""
+    where = audit_mod.place(None, None, () if slot is None else (slot,))
+    period = audit_mod.first_capped(counter, kind)
+    if period is None:
+        return
+    audit_mod.audit(audit_mod.CAPPED_SERVICE, caller, {"cap": kind, "period": period}, False,
+                    "this caller's lines past its " + ("hourly cap" if kind == "hour"
+                                                       else "daily budget")
+                    + " are counted, not logged", slots=where)
 
 
 def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> int:
@@ -1352,6 +1402,16 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
     # (`audit.AUDIT_LINES_PER_DAY`), refused before it acts once spent; a kill
     # acts past it, its line then under the hourly cap. So a principal adds
     # at most its budget and its hourly cap a day, kills included.
+    # Where the line goes is worked out before the call acts (its caller's
+    # project, and the badges of the qubes the request names) and again after
+    # (`audit.place`). A line whose mode is none is written nowhere, but it is
+    # counted, capped and spends the budget like any other, and is written
+    # (as the same padded write, `audit.audit`) exactly when another would be:
+    # otherwise the time a call takes past a cap tells a principal which names
+    # belong to a project logging nowhere. The room asked for is the room on
+    # every chain the install may write, whatever this line's place, so a
+    # refusal for room never says where a line was going. In install mode
+    # none every line goes nowhere, so none is counted: all cost the same.
     audited, only_done, over, kill_capped = False, False, False, False
     counter = None
     try:
@@ -1377,21 +1437,24 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
             # could be repeated without end; a kill of a halted qube is refused.
             lowers = (service == "qmcp.LifecycleAIManaged" and isinstance(req, dict)
                       and req.get("action") == "kill")
-            counter = os.path.join(core.RUN_DIR, "calls",
-                                   f"{call.caller}{audit_mod.REFUSED_SUFFIX}")
+            call.where = audit_mod.request_place(app, service, req, call.principal.slot)
+            counter = None if audit_mod.install_mode()[0] == "none" else os.path.join(
+                core.RUN_DIR, "calls", f"{call.caller}{audit_mod.REFUSED_SUFFIX}")
             # A day's share of the log per caller: past it, refused before it
             # acts, and counted rather than logged, so one principal cannot
             # spend the others' room. A kill goes on.
             # A kill acts past the budget too, since it only takes away; but
             # its line then falls under the hourly cap, so start-and-kill
             # cycles cannot bring the shared floor nearer for everyone.
-            kill_capped = lowers and audit_mod.budget_spent(counter)
-            left = True if lowers else audit_mod.budget_left(counter)
+            kill_capped = counter is not None and lowers and audit_mod.budget_spent(counter)
+            left = True if lowers or counter is None else audit_mod.budget_left(counter)
             if not left:
                 over = True
+                if left is False:
+                    _note_capped(call.caller, counter, "day", call.principal.slot)
                 raise core.Refusal({"ok": False, "error": NO_AUDIT_BUDGET if left is False
                                     else NO_AUDIT_COUNTER})
-            if not audit_mod.room():
+            if not audit_mod.install_room():
                 if not lowers:
                     raise core.Refusal({"ok": False, "error": NO_AUDIT_ROOM})
                 # Below the floor only a kill dom0 accepted is logged: a
@@ -1415,14 +1478,24 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         payload = {"ok": False, "error": "internal error"}
     ok = bool(payload.get("ok"))
     log = audited and (ok or not only_done) and not over
+    if log:
+        # After the call: a qube it created or moved wears its badges now.
+        # A proposal's subject is the hub's own words about what it asks for,
+        # never a qube it acts on: its line goes where the hub's own lines go.
+        if service != "qmcp.SubmitProposal":
+            call.where = audit_mod.place(app, call.summary, call.where)
     changed = ok and not call.noop or call.landed
-    if log and (not changed or kill_capped) and call.caller is not None:
+    if log and counter is None:
+        pass                            # install mode none: nothing is counted
+    elif log and (not changed or kill_capped) and call.caller is not None:
         # A call that changed nothing (failed without creating a qube, or a
         # set to the value already there): capped per caller. A shut-down
         # request dom0 accepted is logged every time, repeated or not. A qubesd
         # call that raised after its change landed is, past the cap, only
         # counted (per caller, on tmpfs): qmcp check names the caller.
         log = audit_mod.take_refusal(counter)
+        if not log:
+            _note_capped(call.caller, counter, "hour", call.principal.slot)
     elif log and counter is not None:
         audit_mod.spend(counter)        # a line of a change: against the day's budget
     rc = core.emit(call, payload, audit=log, out=out)

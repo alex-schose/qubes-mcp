@@ -77,6 +77,11 @@ def _valid_id(value) -> bool:
     return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
 
 
+def _id_key(value):
+    # 1 and "1" are different request ids.
+    return (type(value).__name__, value)
+
+
 def _brief(text: str, limit: int = 64) -> str:
     # Method and tool names come from the client; cap what is echoed back.
     shown = repr(text)
@@ -120,6 +125,10 @@ class Server:
         self._pending = 0
         self._pending_cv = threading.Condition()
         self._version: Optional[str] = None
+        # Calls submitted but not yet started, by request id: whoever takes a
+        # call out of here (the worker that starts it, or a cancel) owns it.
+        self._queued: dict = {}
+        self._queued_lock = threading.Lock()
 
     # ---- input -----------------------------------------------------------
 
@@ -196,11 +205,17 @@ class Server:
                           "invalid request: params must be an object or an array")
 
         if not has_id:
-            # A notification is never answered. notifications/initialized and
-            # notifications/cancelled need no action (a running call is not
-            # interrupted), unknown ones are ignored, and a request method sent
-            # without an id is NOT executed: a tool call whose result nobody
-            # can see would be all side effect and no report.
+            # A notification is never answered. notifications/cancelled drops
+            # a call that has not started yet (a running one is not
+            # interrupted: the work is already in a qube or in dom0);
+            # notifications/initialized needs nothing, unknown ones are
+            # ignored, and a request method sent without an id is NOT executed:
+            # a tool call whose result nobody can see would be all side effect
+            # and no report.
+            if method == "notifications/cancelled" and isinstance(params, dict):
+                request_id = params.get("requestId")
+                if _valid_id(request_id):
+                    self._cancel_queued(_id_key(request_id))
             return None
 
         if method == "initialize":
@@ -248,14 +263,44 @@ class Server:
         version = self._version or LATEST_VERSION
         with self._pending_cv:
             self._pending += 1
+        token = object()
+        key = _id_key(msg_id)
+        with self._queued_lock:
+            self._queued.setdefault(key, {})[token] = (msg_id, sink)
         try:
-            self._pool.submit(self._run_call, tool, args, msg_id, version, sink)
+            self._pool.submit(self._run_call, tool, args, msg_id, version, sink, key, token)
         except RuntimeError:     # the pool has been shut down
+            self._take(key, token)
             self._call_finished()
             return _error(msg_id, INTERNAL_ERROR, "server is shutting down")
         return _DEFERRED
 
-    def _run_call(self, tool: tools.Tool, args: dict, msg_id, version: str, sink: Sink) -> None:
+    def _take(self, key, token) -> bool:
+        """Take one queued call out of the queue; False when a cancel had it."""
+        with self._queued_lock:
+            calls = self._queued.get(key)
+            if not calls or token not in calls:
+                return False
+            del calls[token]
+            if not calls:
+                del self._queued[key]
+            return True
+
+    def _cancel_queued(self, key) -> None:
+        """Drop every not-yet-started call under `key`, unanswered, as MCP has
+        a cancelled request."""
+        with self._queued_lock:
+            dropped = list(self._queued.pop(key, {}).values())
+        for _, sink in dropped:
+            try:
+                sink(None)
+            finally:
+                self._call_finished()
+
+    def _run_call(self, tool: tools.Tool, args: dict, msg_id, version: str, sink: Sink,
+                  key=None, token=None) -> None:
+        if token is not None and not self._take(key, token):
+            return               # cancelled before it started; the cancel answered it
         try:
             sink(_result(msg_id, self._call(tool, args, version)))
         except Exception:
@@ -289,8 +334,11 @@ class Server:
                 self._pending_cv.notify_all()
 
     def drain(self, timeout: float) -> bool:
-        """Wait up to `timeout` seconds for in-flight calls to be answered,
-        then stop the worker pool. Returns True if none was left running."""
+        """Wait up to `timeout` seconds for in-flight calls, queued ones
+        included, to be answered, then stop the worker pool. Returns True if
+        none was left running. A queued call is not dropped at EOF: a client
+        that writes its requests and closes its end at once (a pipe) still
+        reads the answers; one it no longer wants it cancels."""
         deadline = time.monotonic() + timeout
         with self._pending_cv:
             while self._pending:

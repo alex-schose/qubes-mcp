@@ -113,6 +113,23 @@ class Principal(ProjectBase):
         r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-new", "template": "ai-debian-13"})
         self.assertEqual(r, {"ok": True, "name": "ai-hub-new"})
 
+    def test_the_records_file_is_world_readable(self):
+        # Every lead's call and the gate's timer read it as the services' user.
+        import stat
+        self.addCleanup(os.umask, os.umask(0o077))
+        projects.save(projects.load())
+        self.assertEqual(stat.S_IMODE(os.stat(projects.PROJECTS_PATH).st_mode), 0o644)
+
+    def test_records_that_are_not_utf8_refuse_leads_and_fail_check(self):
+        # One byte that is not UTF-8 is records that do not read, never a crash:
+        # the lead is refused as for any bad file, and check names it.
+        pathlib.Path(projects.PROJECTS_PATH).write_bytes(b'{"version": 1, "slots": {}}\xff')
+        self.assertEqual(self.lcall("qmcp.ListAIManagedQubes"), core.NOT_AUTHORIZED)
+        with self.assertRaisesRegex(projects.ProjectsUnreadable, "not UTF-8"):
+            projects.load()
+        f = {x.check: x for x in fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})}
+        self.assertIn("fail", {x.status for x in f.values()})
+
     def test_record_validation(self):
         bad = [
             {"version": 2, "slots": {}},
@@ -196,7 +213,11 @@ class LeadReads(ProjectBase):
             # The first call is the lead's own badges, the same for every request.
             traces[name] = ([c[1:] for c in self.app.calls[1:]], self.app.domains.lookups)
         self.assertEqual(len(set(map(repr, traces.values()))), 1, traces)
-        self.assertEqual(traces["no-such-qube"][0], [("admin.vm.tag.Get", "qmcp-proj-p01")])
+        # Around it, the audit's read of the named qube's badges, before the
+        # call acts and after: the same for every name.
+        self.assertEqual(traces["no-such-qube"][0], [("admin.vm.tag.List", None),
+                                                     ("admin.vm.tag.Get", "qmcp-proj-p01"),
+                                                     ("admin.vm.tag.List", None)])
 
     def test_references_are_scoped_to_the_project(self):
         r = self.lcall("qmcp.GetPropertyAIManaged", {"name": "ai-osint-w1", "property": "netvm"})
@@ -274,7 +295,11 @@ class LeadCreates(ProjectBase):
             r = self.spawn(name=name)
             self.assertFalse(r["ok"], name)
             self.assertEqual(self.app.domains.lookups, 0, name)
-            self.assertEqual([c[1] for c in self.app.calls], ["admin.vm.tag.List"], name)
+            # The lead's own badges, and the audit's reads of the badges: of the
+            # template before the call (the key a spawn acts on), and of the name
+            # and the template its line records after: the same for every name,
+            # and none is a lookup.
+            self.assertEqual([c[1] for c in self.app.calls], ["admin.vm.tag.List"] * 4, name)
 
     def test_spawn_joins_the_project_on_its_default_network(self):
         r = self.spawn()
@@ -622,6 +647,26 @@ class Operator(ProjectBase):
             with self.assertRaises(fleet.RoleError, msg=name):
                 action(self.app, name)
 
+    def test_guard_in_ai_space_only_refuses_a_qube_outside_it(self):
+        self.assertNotIn("ai-managed", self.tags("personal"))
+        with self.assertRaisesRegex(fleet.RoleError, "is outside AI space, and "
+                                                     "--only-in-ai-space refuses"):
+            fleet.guard(self.app, "personal", in_ai_space_only=True)
+        self.assertFalse({"ai-managed", "qmcp-guarded"} & self.tags("personal"))
+        # A tag read that fails refuses, and changes nothing.
+        self.app.fail_reads("tag.List:ai-work", "fail")
+        with self.assertRaises(fleet.RoleError):
+            fleet.guard(self.app, "ai-work", in_ai_space_only=True)
+        self.assertNotIn("qmcp-guarded", self.tags("ai-work"))
+        # One in AI space is guarded as without the option; the default still adds.
+        self.assertIn("guarded", fleet.guard(self.app, "ai-work", in_ai_space_only=True))
+        self.assertEqual(self.tags("ai-work") & {"ai-managed", "qmcp-guarded"},
+                         {"ai-managed", "qmcp-guarded"})
+        self.app.domains["personal"].netvm = None
+        fleet.guard(self.app, "personal")
+        self.assertEqual(self.tags("personal") & {"ai-managed", "qmcp-guarded"},
+                         {"ai-managed", "qmcp-guarded"})
+
 
 class NetworkBeforeBadges(ProjectBase):
     """A fresh lead (from a template, a clone, a standalone copy) and a dump
@@ -875,6 +920,32 @@ class CheckProjects(ProjectBase):
         self.app.domains["osint-dump"].tags.add("ai-managed")
         self.assertEqual(self.findings()["dump sinks"].status, "fail")
 
+    def test_a_held_lead_or_model_qube_is_the_restore_items_warning(self):
+        def failing():
+            return {(f.status, f.check) for f in
+                    fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})
+                    if f.status in ("fail", "warn", "error")}
+        fleet.set_lead_firewall(self.app, "osint", model_qube="ai-on-operator-tpl")
+        base = failing()
+        self.assertNotIn(("warn", "restored qubes"), base)
+        for name in (LEAD, "ai-on-operator-tpl"):
+            with self.subTest(name):
+                self.app.domains[name].tags.add(core.QUARANTINE)
+                self.assertEqual(failing() - base, {("warn", "restored qubes")})
+                self.app.domains[name].tags.discard(core.QUARANTINE)
+
+    def test_a_sink_left_bare_by_a_dump_that_died_is_named(self):
+        def unfinished():
+            return [f.detail for f in fleet.check(self.app, legacy_paths=(),
+                                                  system_info={"domains": {}})
+                    if f.check == "unfinished dump sinks"]
+        self.assertEqual(unfinished(), [])
+        self.app.vm("other-dump", netvm=None, tags={"ai-dump"})       # died before its badge
+        [detail] = unfinished()
+        self.assertIn("other-dump", detail)
+        with self.assertRaisesRegex(fleet.ProjectError, "wears no dump badge"):
+            fleet.add_dump(self.app, "other")
+
     def test_a_dump_sink_is_no_stray_badge(self):
         # Found on hardware: the generic stray-badge check flagged every sink.
         self.app.domains["personal"].tags.add("qmcp-something")
@@ -1105,6 +1176,33 @@ class EditAndCli(ProjectBase):
             with self.assertRaises(fleet.RoleError, msg=kwargs):
                 fleet.edit_project(self.app, "osint", **kwargs)
         self.assertEqual(projects.find(self.records(), "osint").quota, 30 * GiB)
+
+    def test_an_edit_that_names_removals_is_never_refused_for_an_entry_it_does_not_name(self):
+        # Another approved template held for review, or out of AI space, or a
+        # listed network no longer usable: an edit that only takes something
+        # off still removes exactly that, and an addition is still checked.
+        dvm, router = self.app.domains["ai-dvm"], self.app.domains["ai-net-router"]
+        dvm.tags.add(core.QUARANTINE)
+        router.tags.discard(core.GUARDED)
+        self.assertIsNotNone(fleet.gateway_refusal({vm.name: vm for vm in self.app.domains},
+                                                   "ai-net-router"))
+        with self.assertRaises(fleet.RoleError):                     # the full check refuses
+            fleet.edit_project(self.app, "osint", templates=["ai-debian-13", "ai-dvm"])
+        fleet.edit_project_changes(self.app, "osint", remove_templates=["ai-debian-13"])
+        fleet.edit_project_changes(self.app, "osint", remove_networks=["none"])
+        p = projects.find(self.records(), "osint")
+        self.assertEqual((p.templates, p.networks), (("ai-dvm",), ("ai-net-router",)))
+        self.app.domains["ai-debian-13"].tags.add(core.QUARANTINE)
+        with self.assertRaisesRegex(fleet.RoleError, "held for your review"):
+            fleet.edit_project_changes(self.app, "osint", add_templates=["ai-debian-13"])
+        dvm.tags.discard("ai-managed")
+        with self.assertRaisesRegex(fleet.RoleError, "not a template or disposable template"):
+            fleet.edit_project_changes(self.app, "osint", add_templates=["ai-work"])
+        with self.assertRaisesRegex(fleet.RoleError, "at least one approved template"):
+            fleet.edit_project_changes(self.app, "osint", remove_templates=["ai-dvm"])
+        with self.assertRaisesRegex(fleet.RoleError, "not an enrolled gateway"):
+            fleet.edit_project_changes(self.app, "osint", add_networks=["ai-work"])
+        self.assertEqual(projects.find(self.records(), "osint").templates, ("ai-dvm",))
 
     def cli(self, *argv):
         from qmcp import cli

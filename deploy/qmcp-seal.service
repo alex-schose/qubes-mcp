@@ -37,7 +37,8 @@ Before=systemd-user-sessions.service
 Type=oneshot
 ExecStart=/usr/local/bin/qmcp seal --all
 # 3 is "something could not be judged": the run happened and `qmcp check`
-# reports what is left. 1 is never returned by --all.
+# reports what is left. 1, when the pass itself could not run, fails the unit;
+# `qmcp check` fails on every badge it left on.
 SuccessExitStatus=3
 TimeoutStartSec=120
 NoNewPrivileges=yes

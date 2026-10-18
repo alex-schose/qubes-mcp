@@ -28,7 +28,7 @@ sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
 from qmcp import (audit, budget, cli, core, fleet, gateways, inqube, opfiles,  # noqa: E402
-                  projects, restored, services)
+                  projects, proposals, restored, services)
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, OTHER_LEAD, ProjectBase  # noqa: E402
@@ -130,7 +130,8 @@ class InQube(ToolsBase):
         tpl = self.app.domains["ai-debian-13"]
         self.assertEqual(tpl.get_power_state(), "Halted")
         r = inqube.prepare(self.app, "ai-debian-13")
-        self.assertEqual(r, {"qube": "ai-debian-13", "version": self.version, "started": True})
+        self.assertEqual(r, {"qube": "ai-debian-13", "version": self.version, "started": True,
+                             "stopped": True})
         self.assertEqual(tpl.rpc_files(), self.files)
         self.assertEqual(dict.get(tpl.features, inqube.LABEL), self.version)
         self.assertEqual(tpl.get_power_state(), "Halted")
@@ -166,6 +167,43 @@ class InQube(ToolsBase):
             self.assertIn(words, str(cm.exception))
             self.assertIsNone(dict.get(tpl.features, inqube.LABEL))
             self.assertEqual(tpl.get_power_state(), "Halted")
+
+    def test_the_stop_after_a_prepare_is_reported_as_it_went(self):
+        tpl = self.app.domains["ai-debian-13"]
+        # A stop that raises while the qube keeps running: not "shut down
+        # again", and the command exits 1 naming what to do.
+        self.app.fail.add("shutdown")
+        rc, out, err = self.cli("template", "prepare", "ai-debian-13")
+        self.app.fail.discard("shutdown")
+        self.assertEqual(rc, 1)
+        self.assertNotIn("shut down again", out)
+        self.assertIn("did not complete", out)
+        self.assertEqual(tpl.get_power_state(), "Running")
+        tpl.kill()
+        # A stop that raises for a qube already halted (killed meanwhile) has
+        # still left it stopped.
+        def raced(vm, force=False, wait=False):
+            vm._went_down()
+            raise RuntimeError("QubesVMNotStartedError")
+        with mock.patch.object(type(tpl), "shutdown", raced):
+            r = inqube.prepare(self.app, "ai-debian-13")
+        self.assertEqual((r["started"], r["stopped"]), (True, True))
+        rc, out, err = self.cli("template", "prepare", "ai-debian-13")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("shut down again", out)
+
+    def test_a_lookup_that_fails_is_not_a_missing_qube(self):
+        for argv in (("template", "prepare", "ai-debian-13"),
+                     ("template", "install", "ai-tpl-g", "curl")):
+            with self.subTest(argv=argv):
+                self.app.fail_reads(f"lookup:{argv[2]}", "fail")
+                rc, out, err = self.cli(*argv)
+                self.assertEqual(self.app.failed[f"lookup:{argv[2]}"], 1)
+                self.assertEqual(rc, 1)
+                self.assertIn("cannot be looked up", err)
+                self.assertNotIn("no qube", err)
+                self.app.failed.clear()
+        self.assertEqual(self.app.domains["ai-tpl-g"].installed_packages(), [])
 
     def test_a_missing_copy_in_dom0_is_reported_and_starts_nothing(self):
         (self.rpc_copy / "qmcp.CopyToAIManaged").unlink()
@@ -445,6 +483,33 @@ class Hold(ToolsBase):
         call.join(5)                                    # what the call did has landed
         self.assertEqual(held.held, ["ai-osint-w9"])
         self.assertIn(core.QUARANTINE, self.tags("ai-osint-w9"))
+
+    def test_an_accept_between_the_passs_read_and_its_hold_wins(self):
+        # The operator was told "accepted": the pass must not hold it after.
+        vm = self.restore_worker()
+        real_known, said = restored.known, []
+
+        def known(q):
+            answer = real_known(q)
+            if q.name == "ai-osint-w9" and not said:
+                said.append(restored.accept(self.app, "ai-osint-w9"))
+            return answer
+        self.addCleanup(setattr, restored, "known", real_known)
+        restored.known = known
+        held = restored.hold(self.app)
+        self.assertIn("accepted", said[0])
+        self.assertEqual(held.held, [])
+        self.assertNotIn(core.QUARANTINE, self.tags("ai-osint-w9"))
+        self.assertTrue(restored.labelled(vm))
+
+    def test_an_accept_in_flight_when_the_hold_went_on_without_the_lock_wins(self):
+        self.waits(0.1, 3.0)
+        vm = self.restore_worker()
+        call = self.hold_lock_then("ai-osint-w9", 0.5, lambda: restored.label(vm))
+        held = restored.hold(self.app)
+        call.join(5)
+        self.assertEqual(held.held, [])
+        self.assertNotIn(core.QUARANTINE, self.tags("ai-osint-w9"))
 
     def test_a_hold_whose_call_outlasts_both_waits_says_so(self):
         self.waits(0.1, 0.1)
@@ -872,11 +937,48 @@ class Review(ToolsBase):
         restored.hold(self.app)
         rc, out, _ = self.cli("restored", "list", "--json", root=False)
         self.assertEqual(sorted(r["name"] for r in json.loads(out) if r["held"]), ["ai-a", "ai-b"])
+        before = len(self.audit_lines())
         rc, out, _ = self.cli("restored", "accept", "--all")
         self.assertEqual(rc, 0, out)
         self.assertEqual(restored.review(self.app, {}), [])
-        line = self.audit_lines()[-1]
-        self.assertEqual((line["service"], line["args"]["all"]), ("qmcp restored accept", True))
+        # One line per qube it accepted, naming it: `--all` alone names none.
+        lines = self.audit_lines()[before:]
+        self.assertEqual([(x["service"], x["args"], x["ok"]) for x in lines],
+                         [("qmcp restored accept", {"qubes": [n], "all": True}, True)
+                          for n in ("ai-a", "ai-b")])
+        rc, out, _ = self.cli("restored", "accept", "--all")
+        self.assertEqual((rc, out.strip()), (0, "nothing is held"))
+        self.assertEqual(self.audit_lines()[-1]["args"], {"qubes": [], "all": True})
+
+    def test_accept_all_never_says_nothing_is_held_over_a_qube_it_cannot_read(self):
+        for n in ("ai-a", "ai-b"):
+            self.back(n, {"qmcp-proj-p00"})
+        restored.hold(self.app)
+        self.app.fail.add("tag.List:ai-b")
+        rc, out, err = self.cli("restored", "accept", "--all")
+        self.app.fail.clear()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("ai-a: accepted", out)
+        self.assertIn("ai-b cannot be read now", err)
+        self.assertIn(core.QUARANTINE, self.app.domains["ai-b"].tags.raw())
+        # And with nothing else held: refused, never "nothing is held".
+        self.app.fail.add("tag.List:ai-b")
+        rc, out, err = self.cli("restored", "accept", "--all")
+        self.app.fail.clear()
+        self.assertEqual(rc, 1)
+        self.assertNotIn("nothing is held", out)
+
+    def test_operator_lines_hold_every_option_and_say_how_many_names_were_cut(self):
+        def line(*argv):
+            return cli.operator_line(cli.build_parser().parse_args(list(argv)))
+        self.assertTrue(line("gateway", "enroll", "gw", "--anonymising", "--updates")[1]["updates"])
+        self.assertFalse(line("gateway", "enroll", "gw")[1]["updates"])
+        self.assertEqual(line("gateway", "set", "gw", "--updates", "no")[1]["updates"], "no")
+        self.assertIsNone(line("gateway", "set", "gw", "--label", "x")[1]["updates"])
+        names = [f"ai-q{i}" for i in range(40)]
+        qubes = line("restored", "accept", *names)[1]["qubes"]
+        self.assertEqual(qubes, names[:32] + ["and 8 more"])
+        self.assertEqual(line("restored", "accept", *names[:32])[1]["qubes"], names[:32])
 
     def test_unreadable_records_make_agreement_not_known_never_no(self):
         self.back("ai-n", {"qmcp-proj-p01"})
@@ -1010,6 +1112,36 @@ class OpFiles(ToolsBase):
             else:
                 self.assertEqual(pathlib.Path(p).read_text().strip(), text.strip(), n)
 
+    def test_keep_days_and_the_audit_mode_go_through_an_export(self):
+        pathlib.Path(audit.KEEP_DAYS_PATH).write_text("30\n")
+        pathlib.Path(audit.MODE_PATH).write_text("ram\n")
+        path = opfiles.export("0.9.33", self.export_path())
+        doc = json.loads(pathlib.Path(path).read_text())
+        self.assertEqual((doc["files"]["audit-keep-days"], doc["files"]["audit-mode"]),
+                         ("30\n", "ram\n"))
+        self.fresh()
+        os.unlink(audit.KEEP_DAYS_PATH)
+        os.unlink(audit.MODE_PATH)                          # this install logs to disk
+        out = opfiles.import_(path)
+        self.assertEqual(pathlib.Path(audit.KEEP_DAYS_PATH).read_text(), "30\n")
+        self.assertFalse(os.path.exists(audit.MODE_PATH))  # the mode is the install's
+        self.assertTrue(any("install.sh --audit-log ram" in line for line in out), out)
+
+    def test_an_export_from_before_still_imports(self):
+        path = opfiles.export("0.9.32", self.export_path())
+        doc = json.loads(pathlib.Path(path).read_text())
+        for name in ("audit-keep-days", "audit-mode"):
+            del doc["files"][name]
+        pathlib.Path(path).write_text(json.dumps(doc))
+        self.fresh()
+        opfiles.import_(path)
+        self.assertFalse(os.path.exists(audit.KEEP_DAYS_PATH))
+        # Half the new files is no export qmcp writes: refused.
+        doc["files"]["audit-mode"] = None
+        pathlib.Path(path).write_text(json.dumps(doc))
+        with self.assertRaises(opfiles.OpFilesError):
+            opfiles.plan_import(path)
+
     def test_import_refuses_a_populated_install_another_hub_mode_or_file(self):
         path = opfiles.export("0.9.26", self.export_path())
         with self.assertRaises(opfiles.OpFilesError) as cm:
@@ -1050,6 +1182,95 @@ class OpFiles(ToolsBase):
             opfiles.import_(path)
         self.assertIn("anonymous mode", str(cm.exception))
 
+    def test_a_crafted_export_is_refused_in_words_never_a_traceback(self):
+        path = opfiles.export("0.9.26", self.export_path())
+        self.fresh()
+        doc = json.loads(pathlib.Path(path).read_text())
+        for cap in ("\u00b2\n", "\u0663\u0660\n", "\uff13\uff10\n", "1" * 21 + "\n"):
+            with self.subTest(cap=cap):
+                d = json.loads(json.dumps(doc))
+                d["files"]["pool-cap"] = cap
+                p = self.tmp / "crafted.json"
+                p.write_text(json.dumps(d))
+                with self.assertRaisesRegex(opfiles.OpFilesError, "pool-cap is not a positive"):
+                    opfiles.import_(str(p))
+        deep = self.tmp / "deep.json"
+        deep.write_text("[" * 100000 + "]" * 100000)
+        rc, out, err = self.cli("import", str(deep))
+        self.assertEqual(rc, 1)
+        self.assertIn("is not JSON; nothing was changed", err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.exists(projects.PROJECTS_PATH))
+        self.assertFalse(os.path.exists(gateways.GATEWAYS_PATH))
+
+    def test_an_import_that_fails_part_way_says_what_it_wrote_and_a_rerun_finishes_it(self):
+        path = opfiles.export("0.9.26", self.export_path())
+        want = {n: pathlib.Path(opfiles._paths()[n]).read_text()
+                for n in ("gateways.json", "projects.json")}
+        self.fresh()
+        with mock.patch.object(projects, "save", side_effect=OSError(28, "No space left")):
+            rc, out, err = self.cli("import", path)
+        self.assertEqual(rc, 1)
+        self.assertIn("gateways.json: ", out)                    # what was written, first
+        self.assertIn("projects.json could not be written (OSError)", err)
+        self.assertIn("run the import again", err)
+        self.assertNotIn("nothing was changed", err)
+        self.assertTrue(os.path.exists(gateways.GATEWAYS_PATH))
+        self.assertFalse(os.path.exists(projects.PROJECTS_PATH))
+        rc, out, err = self.cli("import", path)
+        self.assertEqual(rc, 0, err)
+        for n, text in want.items():
+            self.assertEqual(json.loads(pathlib.Path(opfiles._paths()[n]).read_text()),
+                             json.loads(text), n)
+        # Finished, it is refused again: an import is for a fresh install.
+        with self.assertRaisesRegex(opfiles.OpFilesError, "fresh install"):
+            opfiles.import_(path)
+        # And a registry that is not the export's still refuses, records or not.
+        os.unlink(projects.PROJECTS_PATH)
+        registry = gateways.parse(want["gateways.json"])
+        self.assertTrue(registry)
+        gateways.save({"ai-net-other": next(iter(registry.values()))}, gateways.GATEWAYS_PATH)
+        with self.assertRaisesRegex(opfiles.OpFilesError, "fresh install"):
+            opfiles.import_(path)
+
+    def test_settings_set_says_what_it_wrote_before_a_failure_and_names_a_busy_lock(self):
+        real = opfiles._write
+        calls = []
+
+        def second_fails(path, text, mode=0o644):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError(28, "No space left")
+            return real(path, text, mode)
+        with mock.patch.object(opfiles, "_write", second_fails):
+            rc, out, err = self.cli("settings", "set", "--pool-cap", "900G", "--private-cap", "5G")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.splitlines(), [f"pool-cap: {900 * GiB}"])
+        self.assertIn("private-cap could not be written (OSError)", err)
+        self.assertNotIn("nothing was changed", err)
+        self.assertEqual(budget.read_cap(), 900 * GiB)
+        with projects.Locked():
+            # Another command holds the records' lock; this one gives up soon.
+            with mock.patch.object(projects.Locked.__init__, "__defaults__", (None, 0.1)):
+                rc, out, err = self.cli("settings", "set", "--pool-cap", "800G")
+        self.assertEqual(rc, 1)
+        self.assertIn("another qmcp project command holds the lock; nothing was changed", err)
+        self.assertNotIn("RuntimeError", err)
+        self.assertEqual(budget.read_cap(), 900 * GiB)
+
+    def test_birth_egress_whose_lookup_fails_is_not_a_missing_qube(self):
+        self.app.fail_reads("lookup:ai-net-router", "fail")
+        with self.assertRaises(opfiles.OpFilesError) as cm:
+            opfiles.settings_set(self.app, birth_egress="ai-net-router")
+        self.assertEqual(self.app.failed["lookup:ai-net-router"], 1)
+        self.assertIn("cannot be looked up", str(cm.exception))
+        self.assertFalse(os.path.exists(fleet.birth.BIRTH_EGRESS_PATH))
+        self.app.fail.add("tag.List:ai-net-router")
+        with self.assertRaisesRegex(opfiles.OpFilesError, "cannot be looked up"):
+            opfiles.settings_set(self.app, birth_egress="ai-net-router")
+        self.app.fail.discard("tag.List:ai-net-router")
+        opfiles.settings_set(self.app, birth_egress="ai-net-router")          # the control
+
     def test_birth_egress_refuses_a_held_gateway(self):
         self.app.domains["ai-net-router"].tags.add(core.QUARANTINE)
         with self.assertRaises(opfiles.OpFilesError) as cm:
@@ -1075,6 +1296,108 @@ class OpFiles(ToolsBase):
                      ("template", "prepare", "x")):
             rc, _, err = self.cli(*argv, root=False)
             self.assertIn("run as root", str(rc) + err, argv)
+
+
+class MigrateRoot(ToolsBase):
+    def test_migrate_apply_refuses_a_non_root_user_before_reading_anything(self):
+        # Without root it would apply the badges, then fail to retire the flag
+        # that says how to read them, and a second run would guard the
+        # managed qubes. The dry run reads only, and needs no root.
+        planned = []
+        with mock.patch.object(fleet, "plan_migration",
+                               side_effect=lambda *a, **kw: planned.append(a) or ([], [])), \
+                mock.patch.object(fleet, "apply_migration") as apply:
+            rc, out, err = self.cli("migrate", "--apply", root=False)
+            self.assertIn("qmcp migrate --apply: run as root", str(rc))
+            self.assertEqual((planned, apply.call_count), ([], 0))
+            rc, out, err = self.cli("migrate", root=False)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(len(planned), 1)
+            rc, out, err = self.cli("migrate", "--apply")
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(len(planned), 2)
+
+
+class UsageText(unittest.TestCase):
+    def test_the_modules_usage_names_every_command_and_template_action(self):
+        import argparse
+        usage = cli.__doc__.split("\n\n")[1]
+        words = set(usage.replace("|", " ").replace("/", " ").split())
+        parser = cli.build_parser()
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        self.assertEqual(sorted(set(sub.choices) - words), [])
+        tpl = next(a for a in sub.choices["template"]._actions
+                   if isinstance(a, argparse._SubParsersAction))
+        self.assertEqual(sorted(set(tpl.choices) - words), [])
+
+
+class StampMode(ToolsBase):
+    """The installer's anonymous-mode stamp, cut out of install.sh: it runs
+    under the gate's lock, writes the mode file between its two passes, and
+    leaves an audit line for what it changed."""
+
+    TEXT = (HERE.parent / "deploy" / "install.sh").read_text()
+    _start = TEXT.index("<<'PYEOF'\n", TEXT.index("stamp_mode() {")) + len("<<'PYEOF'\n")
+    PROGRAM = TEXT[_start:TEXT.index("\nPYEOF\n", _start) + 1]
+
+    def stamp(self, write_mode: bool):
+        import types
+        qa = types.ModuleType("qubesadmin")
+        qa.app = types.ModuleType("qubesadmin.app")
+        qa.app.QubesLocal = lambda: self.app
+        self.mode_path = self.tmp / "mode"
+        env = {"QMCP_HUB": HUB, "QMCP_MODE_PATH": str(self.mode_path),
+               "QMCP_WRITE_MODE": "1" if write_mode else "0"}
+        with mock.patch.dict(sys.modules, {"qubesadmin": qa, "qubesadmin.app": qa.app}), \
+                mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO()):
+            try:
+                exec(compile(self.PROGRAM, "install.sh stamp", "exec"), {"__name__": "__main__"})
+                return 0
+            except SystemExit as e:
+                return e.code or 0
+
+    def test_it_turns_the_mode_on_under_the_gate_lock_and_says_so(self):
+        from qmcp import anon, projects
+        self.assertEqual(self.stamp(write_mode=True), 0)
+        self.assertEqual(self.mode_path.read_text(), "anonymous\n")
+        self.assertIn(projects.ANON, self.tags(HUB))
+        line = self.audit_lines()[-1]
+        self.assertEqual((line["service"], line["caller"], line["args"]["turned_on"]),
+                         ("qmcp install", "operator", True))
+        n = len(self.audit_lines())
+        self.assertEqual(self.stamp(write_mode=False), 0)       # nothing new: no line
+        self.assertEqual(len(self.audit_lines()), n)
+
+    def test_the_updates_tick_leaves_its_line(self):
+        import re
+        import types
+        program = re.search(r"python3 -c '([^']*set_gateway[^']*)' \"\$g\"", self.TEXT).group(1)
+        qa = types.ModuleType("qubesadmin")
+        qa.app = types.ModuleType("qubesadmin.app")
+        qa.app.QubesLocal = lambda: self.app
+        from qmcp import fleet
+        fleet.set_gateway(self.app, "ai-net-router", anonymising=True)
+        with mock.patch.dict(sys.modules, {"qubesadmin": qa, "qubesadmin.app": qa.app}), \
+                mock.patch.object(sys, "argv", ["-c", "ai-net-router"]), \
+                redirect_stdout(io.StringIO()):
+            exec(compile(program, "install.sh tick", "exec"), {"__name__": "__main__"})
+        line = self.audit_lines()[-1]
+        self.assertEqual((line["service"], line["args"]), ("qmcp gateway set",
+                                                           {"qube": "ai-net-router", "updates": True}))
+
+    def test_a_held_gate_lock_stops_it_before_anything(self):
+        import fcntl
+        from qmcp import anon, projects
+        fd = os.open(anon.LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o660)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with mock.patch.object(anon._GateLock, "__init__",
+                               lambda s, path=None, wait=None: (
+                                   setattr(s, "path", anon.LOCK_PATH),
+                                   setattr(s, "wait", 0.2), setattr(s, "fd", None))[0]):
+            self.assertIn("held its lock", str(self.stamp(write_mode=True)))
+        self.assertFalse(self.mode_path.exists())
+        self.assertNotIn(projects.ANON, self.tags(HUB))
 
 
 class Seed(ToolsBase):
@@ -1311,6 +1634,31 @@ class Install(unittest.TestCase):
             self.assertIn(unit, un)
             self.assertIn(unit, self.TEXT)
 
+    def test_the_refresh_unit_runs_the_refresh_as_the_gates_user_on_its_timer(self):
+        # A refresh "every minute, as the gate's user" is true only while the
+        # unit and the timer say so, and the installer enables the timer.
+        def keys(name):
+            out = {}
+            for line in (HERE.parent / "deploy" / name).read_text().splitlines():
+                if "=" in line and not line.startswith(("#", "[")):
+                    k, v = line.split("=", 1)
+                    out.setdefault(k.strip(), []).append(v.strip())
+            return out
+        unit = keys("qmcp-refresh.service")
+        self.assertEqual(unit["ExecStart"], ["/usr/local/bin/qmcp template refresh"])
+        self.assertEqual(unit["User"], ["@GATE_USER@"])                # never root
+        self.assertEqual(unit["Type"], ["oneshot"])
+        # The refresh exits 3 for a qube it could not judge or write into; the
+        # unit counts that a success, so the timer keeps running it.
+        self.assertEqual(unit["SuccessExitStatus"], ["3"])
+        self.assertEqual(unit["NoNewPrivileges"], ["yes"])
+        self.assertGreater(int(unit["TimeoutStartSec"][0]), 0)
+        timer = keys("qmcp-refresh.timer")
+        self.assertEqual((timer["OnBootSec"], timer["OnUnitActiveSec"]), (["60s"], ["60s"]))
+        self.assertIn("systemctl enable qmcp-refresh.timer", self.TEXT)
+        self.assertIn('sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-refresh.service"',
+                      self.TEXT)
+
 
 
 # ======================================================================= packages (0.9.28)
@@ -1394,6 +1742,38 @@ class Packages(ToolsBase):
         probe, script = self.app.vmshell_scripts[-2:]
         self.assertEqual(probe, inqube.PROBE)
         self.assertEqual(script, inqube.install_script("apt-get", ["curl", "jq"]))
+
+    def test_the_stop_after_an_install_is_reported_as_it_went(self):
+        tpl = self.tpl()
+
+        def raced(vm, force=False, wait=False):
+            vm._went_down()
+            raise RuntimeError("QubesVMNotStartedError")
+        with mock.patch.object(type(tpl), "shutdown", raced):
+            report = proposals.install_report(self.app, self.TPL, ["curl"])
+        self.assertEqual(report.failed, [])
+        self.assertIn("shut down again", " ".join(report))
+        self.app.fail.add("shutdown")
+        try:
+            r = inqube.install(self.app, self.TPL, ["jq"])
+        finally:
+            self.app.fail.discard("shutdown")
+        self.assertEqual((r["started"], r["stopped"]), (True, False))
+        self.assertEqual(tpl.get_power_state(), "Running")
+
+    def test_an_open_template_is_refused_before_anything_runs(self):
+        # The window's expiry kills it, which would stop the install part-way.
+        for badges in ({core.OPEN}, {core.OPEN_FW}, {core.OPEN, core.OPEN_FW}):
+            with self.subTest(badges=badges):
+                for badge in badges:
+                    self.tpl().tags.add(badge)
+                with self.assertRaisesRegex(inqube.InQubeError, "open to the hub: seal it first"):
+                    inqube.install(self.app, self.TPL, ["curl"])
+                for badge in badges:
+                    self.tpl().tags.discard(badge)
+        self.assertEqual(self.app.vmshell_scripts, [])
+        self.assertEqual(self.tpl().get_power_state(), "Halted")
+        self.assertTrue(inqube.install(self.app, self.TPL, ["curl"])["ok"])   # the control
 
     def test_a_running_template_keeps_running_and_each_manager_is_used(self):
         for manager in ("dnf", "pacman"):

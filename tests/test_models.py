@@ -275,8 +275,8 @@ class MakeModelQube(ModelBase):
         self.assertEqual(self.app.domains[MODEL].get_power_state(), "Running")
         report = fleet.set_lead_firewall(self.app, "osint", model_qube=MODEL)
         self.assertEqual(self.app.domains[MODEL].get_power_state(), "Halted")
-        self.assertTrue(any("killed, so no process the hub started in it while it was managed "
-                            "runs on" in line for line in report), report)
+        self.assertTrue(any("killed: what the hub started in it while it was managed is "
+                            "stopped" in line for line in report), report)
         # One that already serves a project, guarded, is left running: the hub
         # could not reach it since, and its leads may be using it.
         self.app.domains[MODEL].start()
@@ -293,8 +293,8 @@ class MakeModelQube(ModelBase):
         self.assertEqual(self.app.domains[MODEL].get_power_state(), "Running")
         report = fleet.set_lead_firewall(self.app, "osint", model_qube=MODEL)
         self.assertEqual(self.app.domains[MODEL].get_power_state(), "Halted")
-        self.assertTrue(any("killed, so no process started in it before it became a model qube"
-                            in line for line in report), report)
+        self.assertTrue(any("killed: what was started in it before it became a model qube is "
+                            "stopped" in line for line in report), report)
 
     def test_a_power_state_that_cannot_be_read_is_never_taken_for_halted(self):
         # qubesadmin answers "NA" for a qube it cannot read: the kill is tried,

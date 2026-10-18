@@ -1,0 +1,33 @@
+# /etc/systemd/system/qmcp-audit.service -- qubes-mcp
+#
+# The audit log's rotation and retention, once an hour (qmcp-audit.timer):
+#
+#   1. rotate /var/log/qmcp-audit.log when its first line is from an earlier
+#      UTC day, or it is past 32 MiB, with the same gap-free rotation as
+#      `qmcp audit rotate`: the new log's first line anchors on the old head;
+#   2. remove the rotated logs (qmcp-audit.log.<UTC time>) older than the
+#      keep-days setting (`qmcp settings set --audit-keep-days`, 90 by
+#      default, or off), judged by the time in their names, never by their
+#      size, so a flood cannot push anyone's earlier lines off the disk. A
+#      setting that does not read removes nothing;
+#   3. the RAM chains under /run/qmcp/audit, which a reboot clears, are bounded
+#      by size instead: one past 8 MiB is rotated, and the oldest rotated RAM
+#      files are removed while all of them hold more than 64 MiB. A flood can
+#      push earlier RAM lines off; a live chain is never removed.
+#
+# A run that did neither writes no line; a rotation writes its anchor, a
+# removal one line naming the files, as caller "rotate". In install mode ram
+# or none nothing is appended to the log, so it is not rotated; old rotated
+# files are still removed by age.
+#
+# Root: the services' user cannot create files in /var/log.
+
+[Unit]
+Description=qubes-mcp: rotate the audit log daily, and remove rotated logs by age
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/qmcp audit rotate --auto
+TimeoutStartSec=300
+NoNewPrivileges=yes

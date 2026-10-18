@@ -350,6 +350,24 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(qubes_mcp.__version__, want)
         self.assertNotEqual(qubes_mcp.__version__, "0.0.0+unknown")
 
+    def test_the_trees_version_wins_over_an_installed_one(self):
+        # A checkout run beside an older install reports the code it runs.
+        import importlib, sys
+        from importlib import metadata
+        want = self.pyproject_version()
+        saved = {k: v for k, v in sys.modules.items() if k.startswith("qubes_mcp")}
+        try:
+            for k in list(saved):
+                del sys.modules[k]
+            with mock.patch.object(metadata, "version", lambda name: "0.0.1"):
+                mod = importlib.import_module("qubes_mcp")
+            self.assertEqual(mod.__version__, want)
+        finally:
+            for k in list(sys.modules):
+                if k.startswith("qubes_mcp"):
+                    del sys.modules[k]
+            sys.modules.update(saved)
+
     def test_a_tree_without_a_pyproject_still_imports(self):
         # The fallback reads a file, so it must answer when the file is gone
         # rather than raising inside an import.
@@ -792,6 +810,8 @@ class QrexecTests(InProcessFakeCase):
             ({"raw": "2\x00QubesException\x00\x00internal detail\x00"}, REFUSED),
             ({"raw": "0\x00action=drop\n", "rc": 1}, REFUSED),
             ({"raw": "", "rc": 126}, REFUSED),
+            # qubesd's empty answer to an exception it did not catch, exit 0.
+            ({"raw": ""}, REFUSED),
             ({"raw": "action=drop\n"}, {"ok": True, "stdout": "action=drop\n"}),  # unframed
         ]
         for response, expected in cases:
@@ -1000,6 +1020,48 @@ class DisposableTeardownTests(InProcessFakeCase):
         self.assertLess(time.monotonic() - began, 4)
         self.assertEqual(result["teardown"], "failed", result)
 
+    def test_a_start_refused_before_acting_is_not_started_and_never_killed(self):
+        # The texts are dom0's: pinned to its source, so a reworded refusal
+        # there cannot quietly fall back to a kill here.
+        import re
+        source = (PUBLIC_DIR / "dom0" / "qmcp" / "services.py").read_text()
+        dom0s = set(re.findall(r'^NO_AUDIT_[A-Z]+ = "([^"]+)"$', source, re.M))
+        self.assertEqual(len(dom0s), 3)
+        self.assertEqual(tools.NOT_ACTED, dom0s)
+        for text in sorted(dom0s):
+            with self.subTest(text):
+                self.fake.reset()
+                self.fake.answer({LIFE: [{"match": {"action": "start"},
+                                          "json": {"ok": False, "error": text}}],
+                                  PROP: [{"match": {"property": "power_state"},
+                                          "json": {"ok": True, "value": "Halted"}}]})
+                self.assertEqual(self.run_disposable(),
+                                 {"ok": False, "name": D, "stage": "start", "error": text,
+                                  "teardown": "not started"})
+                self.assertNotIn(KILL, self.fake.calls())
+
+    def test_a_disposable_that_reads_halted_once_then_runs_is_killed(self):
+        # Qubes' pre-start reads halted: one read is not enough to leave it.
+        self.fake.answer({LIFE: [{"match": {"action": "start"},
+                                  "json": {"ok": False, "error": sorted(tools.NOT_ACTED)[0]}}],
+                          PROP: [{"match": {"property": "power_state"},
+                                  "sequence": [{"json": {"ok": True, "value": "Halted"}},
+                                               {"json": {"ok": True, "value": "Running"}},
+                                               {"json": {"ok": True, "value": "Halted"}}]}]})
+        result = self.run_disposable()
+        self.assertEqual(result["teardown"], "killed", result)
+
+    def test_a_preloaded_disposable_whose_start_was_refused_is_killed(self):
+        # It arrives running: a start refused before acting leaves it running.
+        self.fake.answer({LIFE: [{"match": {"action": "start"},
+                                  "json": {"ok": False, "error": sorted(tools.NOT_ACTED)[0]}}],
+                          PROP: [{"match": {"property": "power_state"},
+                                  "sequence": [{"json": {"ok": True, "value": "Running"}},
+                                               {"json": {"ok": True, "value": "Halted"}}]}]})
+        result = self.run_disposable()
+        self.assertEqual((result["stage"], result["teardown"]), ("start", "killed"), result)
+        self.assertIn(KILL, self.fake.calls())
+
     def test_a_failed_run_says_whether_its_disposable_was_killed(self):
         failed = {"json": {"ok": False, "error": "no such file"}}
         self.fake.answer({"qmcp.RunInAIManaged": failed})
@@ -1124,6 +1186,34 @@ class DisposableTeardownTests(InProcessFakeCase):
             self.run_disposable()
         self.assertEqual(seen[0], [D])
         self.assertEqual(sorted(getattr(tools, "_live", ())), [])
+
+
+class LostInQubeCallTests(InProcessFakeCase):
+    """An in-qube call whose reply never came reached its qube (a refusal is
+    answered at once), so the tool says the work may have run."""
+
+    CASES = [
+        ("qubes_run", {"name": "ai-a", "cmd": ["true"], "timeout": 1}, "qmcp.RunInAIManaged"),
+        ("qubes_copy", {"source": "ai-a", "target": "ai-b", "path": "/x", "timeout": 1},
+         "qmcp.CopyToAIManaged"),
+    ]
+
+    def test_no_answer_in_time_says_the_work_may_have_run(self):
+        for tool, arguments, service in self.CASES:
+            with self.subTest(tool):
+                self.fake.answer({service: {"sleep": 1.5, "json": {"ok": True}}})
+                with mock.patch.object(tools, "EXEC_MARGIN", -0.5), \
+                        self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+                    reply = tools.call_tool(tool, arguments)
+                self.assertFalse(reply["ok"])
+                self.assertIn("may have run, or may still be running", reply["error"])
+
+    def test_a_refusal_stays_opaque(self):
+        for tool, arguments, service in self.CASES:
+            with self.subTest(tool):
+                self.fake.answer({service: {"raw": "", "rc": 126}})
+                with _quiet():
+                    self.assertEqual(tools.call_tool(tool, arguments), REFUSED)
 
 
 class LostCreateTests(InProcessFakeCase):
@@ -1382,6 +1472,58 @@ class InProcessServerTests(unittest.TestCase):
     def call_line(name: str, msg_id=1) -> bytes:
         return json.dumps({"jsonrpc": "2.0", "id": msg_id, "method": "tools/call",
                            "params": {"name": name}}).encode() + b"\n"
+
+    def queue_behind_a_running_call(self):
+        """One worker, held by a running call (id 1); a second call (id 2)
+        queued behind it, which records that it ran."""
+        release, started, ran = threading.Event(), threading.Event(), []
+
+        def hold(args):
+            started.set()
+            release.wait(10)
+            return {"ok": True}
+
+        out = io.BytesIO()
+        srv = server.Server(out, registry={t.name: t for t in (
+            _tool("hold", hold), _tool("mark", lambda args: ran.append(1) or {"ok": True}))},
+            workers=1)
+        self.addCleanup(srv.drain, 5)
+        self.addCleanup(release.set)
+        srv.handle_line(self.call_line("hold", 1))
+        self.assertTrue(started.wait(5))
+        srv.handle_line(self.call_line("mark", 2))
+        return srv, out, release, ran
+
+    def test_a_queued_call_runs_when_nothing_cancels_it(self):
+        # The positive for the two tests below.
+        srv, out, release, ran = self.queue_behind_a_running_call()
+        release.set()
+        deadline = time.monotonic() + 5
+        while not ran and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(srv.drain(5))
+        self.assertEqual(ran, [1])
+        self.assertEqual(sorted(r["id"] for r in self.replies(out)), [1, 2])
+
+    def test_a_cancelled_queued_call_never_runs_and_is_not_answered(self):
+        srv, out, release, ran = self.queue_behind_a_running_call()
+        srv.handle_line(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                    "params": {"requestId": "2"}}).encode() + b"\n")
+        srv.handle_line(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                    "params": {"requestId": 2}}).encode() + b"\n")
+        release.set()
+        self.assertTrue(srv.drain(5))
+        self.assertEqual(ran, [])
+        self.assertEqual([r["id"] for r in self.replies(out)], [1])
+
+    def test_eof_still_answers_a_queued_call(self):
+        # A client that writes its requests and closes its end at once (a pipe)
+        # still reads every answer.
+        srv, out, release, ran = self.queue_behind_a_running_call()
+        threading.Timer(0.3, release.set).start()
+        self.assertTrue(srv.drain(5))
+        self.assertEqual(ran, [1])
+        self.assertEqual(sorted(r["id"] for r in self.replies(out)), [1, 2])
 
     def test_an_exception_is_an_internal_error_and_its_text_stays_on_stderr(self):
         def boom(args):
@@ -1744,7 +1886,8 @@ PAYLOAD_CASES = [
      [("ai-a", "qmcp.RunInAIManaged", {"cmd": "echo hi | wc -c", "shell": True, "timeout": 5,
                                         "stdin": "x\n"})]),
     ("qubes_copy", {"source": "ai-a", "target": "ai-b", "path": "/srv/out.txt"},
-     [("ai-a", "qmcp.CopyToAIManaged", {"target": "ai-b", "path": "/srv/out.txt"})]),
+     [("ai-a", "qmcp.CopyToAIManaged",
+       {"target": "ai-b", "path": "/srv/out.txt", "timeout": 300})]),
     ("qubes_firewall_get", {"name": "ai-a"}, [("ai-a", "admin.vm.firewall.Get", "")]),
     ("qubes_firewall_set", {"name": "ai-a", "rules": _RULES},
      [("ai-a", "admin.vm.firewall.Set", _RULES), ("ai-a", "admin.vm.firewall.Reload", "")]),
@@ -1918,19 +2061,22 @@ class ToolCallTests(ServerCase):
                 self.fake.answer({"qmcp.GetPoolStats": response})
                 self.assertEqual(self.call("qubes_get_pool_stats"), REFUSED)
 
-    def test_a_timeout_reaches_the_agent_as_the_opaque_refusal(self):
-        # qubes_run waits timeout + 30 s: -29 leaves one second, and the fake takes five.
-        self.fake.answer({"qmcp.RunInAIManaged": {"sleep": 5, "json": {"ok": True}}})
-        start = time.monotonic()
-        self.assertEqual(self.call("qubes_run", {"name": "ai-a", "cmd": ["true"], "timeout": -29}),
-                         REFUSED)
-        self.assertLess(time.monotonic() - start, 4.5)
-        self.assertEqual(self.proc.request("ping")["result"], {})
+    def test_a_timeout_out_of_range_is_refused_before_any_call(self):
+        for tool, arguments in (("qubes_run", {"name": "ai-a", "cmd": ["true"]}),
+                                ("qubes_copy", {"source": "ai-a", "target": "ai-b", "path": "/x"}),
+                                ("qubes_run_disposable", {"template": "ai-dvm", "cmd": ["true"]})):
+            for bad in (0, -29, 86401):
+                with self.subTest(tool=tool, timeout=bad):
+                    error = self.proc.call(tool, dict(arguments, timeout=bad))["error"]
+                    self.assertEqual(error["code"], -32602)
+                    self.assertIn("'timeout': must be from 1 to 86400", error["message"])
+        self.assertEqual(self.fake.calls(), [])
 
     def test_invalid_target_names_never_reach_qrexec(self):
         for bad in ("dom0", "@adminvm", "a\n", "DOM0", "@dispvm", "@default", "", "-x", "a" * 32):
             for tool, arguments in (("qubes_run", {"name": bad, "cmd": ["id"]}),
                                     ("qubes_copy", {"source": bad, "target": "ai-b", "path": "/x"}),
+                                    ("qubes_copy", {"source": "ai-a", "target": bad, "path": "/x"}),
                                     ("qubes_firewall_get", {"name": bad}),
                                     ("qubes_firewall_set", {"name": bad, "rules": "action=drop"})):
                 with self.subTest(tool=tool, name=bad):
@@ -2024,14 +2170,27 @@ class ToolCallTests(ServerCase):
 
     def test_firewall_set_reload_failure(self):
         self.fake.answer({"admin.vm.firewall.Reload": {"raw": "", "rc": 1}})
+        # The rules are in force: the reply must not say nothing changed.
         self.assertEqual(self.call("qubes_firewall_set", {"name": "ai-a", "rules": _RULES}),
-                         {"ok": False, "error": "set ok but reload failed: not found or refused"})
+                         {"ok": True, "reloaded": False,
+                          "warning": "rules saved, reload failed: not found or refused"})
 
     def test_firewall_set_failure_skips_the_reload(self):
+        # qubesd's in-band refusal says so, without its exception text; a
+        # policy denial (empty reply) stays the opaque refusal.
         self.fake.answer({"admin.vm.firewall.Set": {"raw": "2\x00QubesException\x00\x00x\x00"}})
         self.assertEqual(self.call("qubes_firewall_set", {"name": "ai-a", "rules": _RULES}),
-                         REFUSED)
+                         {"ok": False, "error": "firewall rules refused by qubesd"})
         self.assertEqual(self.fake.calls(), [("ai-a", "admin.vm.firewall.Set", _RULES)])
+        # What qubesd 4.3 sends for a ruleset it cannot parse (measured on the
+        # development box): no reply, exit 0, the exception only in its journal.
+        self.fake.answer({"admin.vm.firewall.Set": {"raw": ""}})
+        self.assertEqual(self.call("qubes_firewall_set", {"name": "ai-a", "rules": _RULES}),
+                         {"ok": False, "error": "firewall rules refused by qubesd"})
+        self.fake.answer({"admin.vm.firewall.Set": {"raw": "", "rc": 126}})
+        self.assertEqual(self.call("qubes_firewall_set", {"name": "ai-a", "rules": _RULES}),
+                         REFUSED)
+        self.assertEqual(self.fake.calls(), [("ai-a", "admin.vm.firewall.Set", _RULES)] * 3)
 
     def test_firewall_results(self):
         self.assertEqual(self.call("qubes_firewall_set", {"name": "ai-a", "rules": _RULES}),
@@ -2211,6 +2370,14 @@ class CliTests(FakeCase):
         self.assertEqual(self.fake.calls(), [("ai-a", "qmcp.RunInAIManaged",
                                               {"cmd": ["ls", "-l"], "shell": False, "timeout": 5,
                                                "stdin": "hello world"})])
+
+    def test_a_lone_surrogate_in_a_result_is_printed_escaped(self):
+        # The call has run; its result must reach the caller, not a traceback.
+        self.fake.answer({"qmcp.RunInAIManaged": {"raw": '{"ok": true, "rc": 0, '
+                                                         '"stdout": "a\\ud800b", "stderr": ""}'}})
+        done = self.cli("qubes_run", "name=ai-a", 'cmd=["id"]')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b'"stdout": "a\\ud800b"', done.stdout)
 
     def test_null_and_quoted_strings(self):
         self.assertEqual(self.cli("qubes_spawn", "name=ai-new", "template=ai-tpl",

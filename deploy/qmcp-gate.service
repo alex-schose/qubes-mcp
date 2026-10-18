@@ -45,7 +45,9 @@ Environment=QMCP_GATE_HEARTBEAT=1
 # earlier one); 3: a
 # project could not be judged, or the run could not (the gate's lock held, the
 # records unreadable), or a window could not be judged: `qmcp check` reports
-# each, and the next run tries again. `qmcp seal --expired` never returns 1.
+# each, and the next run tries again. `qmcp seal --expired` returns 1 only when
+# the pass itself could not run; it is not told apart from the gate's 1 here, and
+# `qmcp check` fails on a window it left open.
 SuccessExitStatus=1 3
 # A run takes well under a second; one that hangs would hold the gate's lock
 # and keep every later run out. `qmcp check` fails when no run completes.

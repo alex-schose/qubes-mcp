@@ -18,8 +18,10 @@ objects and pass through unchanged.
 Two answers are not that refusal, and neither is an oracle, because each can
 only follow a call the policy allowed and its far end answered or worked on:
 a reply longer than MAX_REPLY gives {"ok": false, "error": "reply too large"},
-and call_qmcp's caller may name its own reply for a call that got no answer in
-time (a create that dom0 may still finish).
+and the caller of call_qmcp or call_service may name its own reply for a call
+that got no answer in time (a create that dom0 may still finish, a command
+still running in its qube). A refused call, or one to a qube that does not
+exist, is answered at once, so a timeout is no oracle either.
 """
 from __future__ import annotations
 
@@ -97,8 +99,10 @@ def _encode(payload: dict | None) -> bytes:
 
 
 # qubes_run and qubes_copy derive their wait from an agent-chosen integer, and
-# subprocess raises OverflowError for an absurd one (10**30). Clamp instead.
-_MAX_WAIT = 86400.0
+# subprocess raises OverflowError for an absurd one (10**30). Clamp instead,
+# past the longest wait a tool asks for (a day, and its margin), so a call
+# never gives up before the service in the qube has.
+_MAX_WAIT = 86400.0 + 60
 _CHUNK = 65536
 
 # What _run returns, besides a CompletedProcess, when no whole reply was read.
@@ -264,29 +268,35 @@ def call_qmcp(service: str, payload: dict | None = None, timeout: float = 60.0, 
 
 
 def call_service(qube: str, service: str, payload: dict | None = None,
-                 timeout: float = 120.0) -> dict:
+                 timeout: float = 120.0, *, on_timeout: dict | None = None) -> dict:
     """Invoke a qmcp.* service inside a NAMED qube (qmcp.RunInAIManaged,
-    qmcp.CopyToAIManaged). Policy decides whether the caller may reach it."""
+    qmcp.CopyToAIManaged). Policy decides whether the caller may reach it.
+    `on_timeout` as for call_qmcp."""
     if not _valid_target(qube):
         # Byte-identical to a policy denial, so a rejected name is no
         # validation oracle; no subprocess is started.
         return refused()
     proc = _run(qube, service, _encode(payload), timeout)
-    failed = _no_reply(proc)
+    failed = _no_reply(proc, on_timeout)
     if failed is not None:
         return failed
     return _decode(proc.stdout, service)
 
 
-def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float = 60.0) -> dict:
+def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float = 60.0, *,
+               in_band: dict | None = None) -> dict:
     """Invoke an admin.* qrexec method aimed at a named qube (the firewall
     methods). Returns {"ok": true, "stdout": "<payload>"} or the opaque refusal.
 
     Admin API framing: a reply starts with a status byte and a NUL, b"0\\x00" on
     success or b"2\\x00<exception>..." on an in-band failure, followed by the
-    payload. The header is stripped on success; an in-band failure collapses to
-    the opaque refusal like every other failure. A reply without the header is
-    passed through as it is.
+    payload. The header is stripped on success. An in-band failure, or an
+    empty reply from a call that exited 0 (qubesd's answer to an exception
+    its handler did not catch), collapses to the opaque refusal, or gives
+    `in_band` when the caller names one: qubesd sends either only for a call
+    the policy allowed, into a qube that exists, so naming it is no oracle;
+    its exception text is never forwarded.
+    A reply without the header is passed through as it is.
     """
     if not _valid_target(vm_name):
         return refused()
@@ -297,8 +307,13 @@ def call_admin(method: str, vm_name: str, payload: bytes = b"", timeout: float =
     if proc.returncode != 0:
         return refused()
     raw = proc.stdout
+    if not raw:
+        # No reply at all from a call that exited 0: qubesd's answer to an
+        # exception its handler did not catch (a ruleset it cannot parse, as
+        # measured on Qubes 4.3), which the policy allowed. Never a success.
+        return refused() if in_band is None else dict(in_band)
     if len(raw) >= 2 and raw[1:2] == b"\x00":
         if raw[0:1] != b"0":
-            return refused()
+            return refused() if in_band is None else dict(in_band)
         raw = raw[2:]
     return {"ok": True, "stdout": raw.decode("utf-8", errors="replace")}

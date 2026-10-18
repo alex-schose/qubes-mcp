@@ -26,11 +26,17 @@ def _from_pyproject() -> str | None:
     return m.group(1) if m else None
 
 
-try:
-    # Installed package metadata first: it is what an installed copy is, and it
-    # cannot drift from pyproject.toml.
-    __version__ = _version("qubes-mcp")
-except PackageNotFoundError:          # a source checkout or the release tarball
-    __version__ = _from_pyproject() or "0.0.0+unknown"
+def _installed() -> str | None:
+    try:
+        return _version("qubes-mcp")
+    except PackageNotFoundError:
+        return None
+
+
+# The tree's own pyproject.toml first: it describes the code that is running.
+# Installed metadata names whichever qubes-mcp was installed, which is not this
+# code when a checkout is run beside an older install. An installed copy has
+# no pyproject.toml beside its package, and falls through to its metadata.
+__version__ = _from_pyproject() or _installed() or "0.0.0+unknown"
 
 __all__ = ["__version__"]

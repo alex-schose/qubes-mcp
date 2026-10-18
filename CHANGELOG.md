@@ -26,6 +26,294 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.33] — 2026-10-18
+
+**The audit round's low findings, audit-log rotation and retention, and audit-log modes.** The
+audit log now rotates itself and removes old rotated files by age; the install, and each project,
+can keep its lines in RAM or write none. Besides that: two Qubes dialogs closed to AI space, in-qube
+services that stop what they started, MCP replies that say what happened, and fixes to the
+commands, the window's forms and the gate's reports.
+
+### Added
+
+- **BREAKING:** `qmcp-audit.timer` runs `qmcp audit rotate --auto` as root every hour, and
+  removes rotated logs older than 90 days by default. An install updated to this release starts
+  removing them within the hour, with nothing asked. To keep them, write the setting before
+  installing (0.9.32's `qmcp settings set` has no option for it, and the installer leaves the
+  file alone): `echo off | sudo tee /etc/qmcp/audit-keep-days`, or a number of days; after the
+  install, `qmcp settings set --audit-keep-days` changes it. The run rotates
+  `/var/log/qmcp-audit.log` when its first line is from an earlier UTC day (and it holds more
+  than the last rotation's anchor) or does not parse, or when it is past 32 MiB, with the same
+  anchored rotation as `qmcp audit rotate`. Then it removes rotated logs whose name's time is
+  more than keep-days old, judged by age only, never by size, so a flood cannot push older lines
+  off the disk. A rotation leaves its anchor; a removal leaves one line, as caller `rotate`, on
+  the install's chain, naming the files (the first 32, and how many more); a run that did
+  neither writes nothing. In mode ram or none the log is not rotated, and old rotated files are
+  still removed. Before, rotation was by hand only, and only `uninstall.sh --purge` removed a
+  rotated log.
+- The RAM chains are bounded by size, unlike the log on disk: the same hourly run rotates a RAM
+  chain past 8 MiB and removes the oldest rotated RAM files while the files under
+  `/run/qmcp/audit` together hold more than 64 MiB. A live chain is never removed. A flood can so
+  push earlier RAM lines off; a reboot clears them all anyway. `qmcp audit status` lists the
+  rotated RAM files with the chains.
+- Keep-days: `sudo qmcp settings set --audit-keep-days N|off` (1 to 36500, default 90), in
+  `/etc/qmcp/audit-keep-days`, also in the window's Edit settings form. A file that does not
+  read, or holds neither a number of days nor `off`, removes nothing, and `qmcp check` fails on
+  it. `qmcp check` warns when keep-days is `off`, and, in mode disk, when every principal's full
+  daily budget (about 400 bytes a line) for that many days would not fit the free space under
+  `/var/log`.
+- `install.sh --audit-log disk|ram|none` sets where the install's audit lines go
+  (`/etc/qmcp/audit-mode`): `disk`, the log as before and the default; `ram`, a hash chain under
+  `/run/qmcp/audit`, gone at shutdown; `none`, no line at all. A file that is there but does not
+  read, or holds another word, counts as ram (a project set to `off` still writes none), and
+  `qmcp check` fails. A change of mode leaves one line on the less private of the two; leaving
+  disk, the installer says that the lines already there stay. An update without the option keeps
+  the mode.
+- **BREAKING:** `sudo qmcp project audit LABEL|SLOT disk|ram|off`, and the project's Audit log...
+  form in the window: where one project's lines go, switchable while it runs, under both project
+  locks. A line belongs to a project when its caller is the project's lead, when a qube it names
+  wears one of the project's slot badges, or when it names the project. The badges are read before
+  the call acts and again after, so a removed qube and a created one both count; before it acts,
+  only the request key the service acts on is read (`name` for a property, feature or lifecycle
+  call, `template` for a spawn or a disposable spawn, `source` for a clone), never another key the
+  caller sends. The line takes the most private mode of the install's and of every project it
+  belongs to. A line that belongs to one project only, logging to RAM, goes to that project's own
+  chain under `/run/qmcp/audit`; a line of several projects goes to the install's RAM chain. A
+  line whose project cannot be worked out (a badge read that failed, records that do not read, a
+  slot badge with no record) goes to the install's RAM chain (nowhere in install mode none), never
+  to disk. A switch leaves one line on the install's chain naming the slot, never the label;
+  switching away from disk says that the old lines stay on dom0's disk and that deleting a file
+  there is not erasing it. A line that goes nowhere is counted, capped and spends its caller's
+  budget like any other (in install mode none, where every line goes nowhere, nothing is counted).
+  The room asked for is the room on every chain the install may write, whatever the line's own
+  place. The mode is the record's `audit` key, written only for `ram` or `off`; an older release
+  refuses a record holding it, so set every project back to `disk` before rolling back.
+- A line kept more privately than the install's mode pays what an install line pays: the
+  install chain's lock and tail read, and a durable 512-byte write of zeros to
+  `/var/log/qmcp-audit.log.pad` (in mode ram, beside the RAM chain). Without it, the time a
+  refused call took could tell a principal that a name it cannot see belongs to a project logging
+  to RAM or nowhere; past a caller's hourly cap neither kind writes anything. Measured on the
+  development box, with the hub's refused property sets naming the lead of a project with audit
+  off, ram or disk: past the cap, off against disk and ram against disk could not be told apart
+  (paired median differences -0.06 ms and +0.12 ms, 240 pairs each); under it, ram against disk
+  could not either (+0.12 ms, 285 pairs), and off against disk came out 0.41 ms slower for disk
+  over 285 pairs, at the edge of what the probe resolves (the first 75 pairs told them apart, a
+  replicate of 150 did not). Only the hub's refused calls were timed. In the same pass, a refused
+  call from the hub naming a hidden project's qube took about 1 ms longer than one naming a qube
+  that does not exist, with the same reply, in every run, because qubesd reads an existing qube's
+  tags more slowly than it refuses a missing one; a hidden project's names come from a random
+  label, so this confirms a name the hub already has rather than finding one. The project
+  records that decide where a line goes are read for every line, whatever its names, unless a
+  badge read failed (the line then goes to RAM). The pad file never grows and holds nothing of any
+  line; `uninstall.sh --purge` removes it.
+- `qmcp audit status [--json]`: the install's mode, keep-days, the log's size, the rotated files,
+  the RAM chains and their rotated files, the free space under `/var/log` against the 64 MiB floor
+  (judged there in mode disk; the floor is also judged on the RAM chains' tmpfs in modes disk
+  and ram, which this does not show), the room a
+  full budget needs, and the lines today against its budget of every caller with a counter. A
+  value that does not read is null, never 0. The window's Audit tab shows it as a gauge (level
+  bars for the free space and each budget) from its first good read; after the first complete
+  refresh it changes only on a complete refresh.
+- `qmcp check` items: `audit mode`; `project audit modes`; `dom0 journal`, a warning while any
+  mode is not disk (or the records do not read) that dom0's journal still keeps every qrexec call,
+  with the command that makes journald volatile, which qmcp does not run; `audit chain in RAM`,
+  each RAM chain verified; `audit timer`, which fails while `qmcp-audit.timer` does not run;
+  `audit retention`, which also warns when a `qmcp-audit.log.rotating` file shows a rotation
+  stopped part-way (the next rotation takes it over); `unfinished dump sinks`, a qube under the
+  default sink name of a project whose record names no sink, wearing no dump badge, which a
+  `qmcp project dump` that died part-way leaves. `settings --json` gains `audit_mode` and
+  `audit_keep_days`, and `project list` rows `audit`.
+- The first call of a caller withheld in an hour (the cap on calls that changed nothing, and on
+  kills past the budget) or in a day (the budget) leaves one `qmcp.calls-capped` line where the
+  caller's own lines go (its project's, for a lead; none when that project's audit is off), never
+  where a qube the withheld call named would send it. Before, qmcp's only trace was the counter on tmpfs,
+  which a reboot or an `rm` clears.
+- **BREAKING:** `qmcp export` carries keep-days and the install's audit mode. `qmcp import` takes
+  exports with or without them, writes keep-days when the export holds it, and says when the
+  export's mode differs from this install's (the mode is the installer's to set). An export from
+  this release does not import into an older one.
+- `qmcp guard --only-in-ai-space` refuses a qube outside AI space instead of adding it, guarded.
+  The command's default is unchanged; the window's Guard always sends it.
+- In normal mode the window offers Unblock (`qmcp project unblock p00`) on the hub, or on a p00
+  or AI-space qube no anonymous project owns, still wearing `qmcp-blocked` or `qmcp-stopped`
+  (left from anonymous mode).
+
+### Changed
+
+- **BREAKING:** the rulebook denies `qubes.StartApp` and `qubes.GetImageRGBA` from AI space to
+  every target, `@default` included. Before, to any qube the rulebook did not already refuse,
+  both fell to Qubes' own policy, which asks: an allowed GetImageRGBA hands over any image the
+  target can read, and nothing in AI space needs either. `qubes.OpenInVM` and `qubes.OpenURL`
+  keep Qubes' dialog, named as residual risks. `qmcp check`'s `policy precedence` item checks 54
+  claims, these two added.
+- **BREAKING:** the hub's firewall-write denies for a lead (A8) sit above the open window's lines
+  (A6b), so a qube that wears a lead badge and an open window's firewall badge keeps its firewall
+  the operator's; before, the hub could write it.
+- **BREAKING:** the in-qube services. `qmcp.RunInAIManaged` runs a command in a session of its own
+  and, at its timeout, kills the whole process group, not only the first process; before, a
+  shell's children ran on. After the kill it waits at most 5 s more for the output pipes, so a
+  descendant that left the group no longer holds the reply. A timeout that is not a whole number
+  from 1 to 86400 seconds, or a `stdin` that is not a string, is refused. `qmcp.CopyToAIManaged`
+  takes its timeout from the caller (default 300, a whole number from 1 to 86400) and kills the
+  copy's process group at it, with the same bounded wait after; refuses a target that is not a
+  qube name, or is `dom0`; refuses a relative path; and passes `--` before its arguments. Before,
+  it waited a fixed 300 s and passed the target to `qvm-copy-to-vm` as given. Installing this
+  release updates dom0's copy of the services only, so `qmcp check` warns on every template and
+  standalone qmcp runs commands in until it carries the new services. The refresh timer writes
+  the new services into each prepared one that is running, within about a minute; it never starts a halted
+  one and skips one that is stopped, blocked or held. For a halted one, run `sudo qmcp template
+  prepare QUBE` (it starts the qube and shuts it down again), or let the timer reach it the next
+  time it runs. A qube built on a template gets the new services once the template has shut down
+  and the qube restarts. Until then the old services answer, without these limits.
+- **BREAKING:** `qubes_run`, `qubes_copy` and `qubes_run_disposable` take a timeout of 1 to 86400
+  seconds; another integer is refused by the schema. A call that gets no answer within its
+  timeout plus 30 s gives `"no answer within N s; the work in the qube may have run, or may still
+  be running"`. The MCP server's cap on any wait is a day plus 60 s, so it never gives up before the
+  service in the qube. Before, it gave the opaque refusal, which reads as "nothing ran".
+- **BREAKING:** `qubes_copy` sends its timeout to the service, and a target that is not a qube
+  name gets the opaque refusal without any call being made, as a bad source does.
+- **BREAKING:** `qubes_firewall_set` answers `{"ok": true, "reloaded": false, "warning": ...}`
+  when the rules were saved and the reload failed. Before, it answered `ok: false` for rules that
+  were in force. A ruleset qubesd refuses gives `"firewall rules refused by qubesd"` (nothing
+  changed); qubesd's text is not forwarded. qubesd 4.3 answers a ruleset it cannot parse with an
+  empty reply and exit status 0 (the exception goes only to its journal), and before, that empty
+  reply read as success: `ok: true`, with the rules unchanged. The hub now reads an empty reply
+  with exit 0 from any Admin API call it makes (the firewall's Get, Set and Reload) as a refusal,
+  never a success.
+- **BREAKING:** `qubes_run_disposable` reports `teardown: "not started"`, at stage `start`, when
+  dom0 refused the start before acting (no room on the audit log, the caller's budget spent, or
+  its counter unkept) and the disposable reads halted, and still does 10 s later (a qube Qubes is starting reads
+  halted too): it is left halted, and no kill is spent on
+  it. A preloaded disposable, running already, is killed, and `teardown` says how that went.
+  Before, it was killed and reported as such.
+- **BREAKING:** the MCP server drops a call that has not started yet when the client sends
+  `notifications/cancelled` for its id, and answers nothing for it; a running call is not
+  interrupted. Request ids `1` and `"1"` are different. Calls still queued at EOF are answered,
+  within the end-of-input grace (600 s).
+- **BREAKING:** `qmcp check`'s `gate timer` item is there in normal mode too, and fails while
+  `qmcp-gate.timer` is not running: the timer also ends open windows and holds restored qubes.
+  Before, a normal-mode install could have no timer and a green check.
+- **BREAKING:** `qmcp open --for` and `qubes_propose_open`'s `for` refuse anything around or after
+  the duration, whitespace included. Before, the text was stripped and only its start was read,
+  so `30m` followed by anything, a line break included, passed: a proposal could show a `for`
+  that said more than the duration that ran.
+- **BREAKING:** `qmcp template prepare` exits 1, naming `qvm-shutdown` and `qvm-kill`, when it
+  prepared a qube it had started and could not shut it down again (a prepare that fails exits 1
+  with its own error). Before, it reported "shut down again" whatever happened.
+- **BREAKING:** `qmcp template install` refuses a template with an open window ("seal it first"):
+  the window's expiry would kill it part-way through the install. The window's form refuses it
+  too.
+- **BREAKING:** `qmcp migrate --apply` refuses before reading anything when not run as root.
+  Before, it could apply the badges and then fail to retire the flag that says how to read them.
+- **BREAKING:** `qmcp restored accept --all` no longer says "nothing is held" while a restored
+  qube cannot be read: it names that qube, accepts the ones that read and exits 1. It leaves one
+  audit line per qube it accepted or failed to accept, with that qube's outcome, one more naming
+  the qubes it could not read, and one naming none when nothing is held, where before it left one
+  for the command. The window's Accept all held refuses while any restored qube cannot be read.
+- The window's Guard sends `--only-in-ai-space` and stays on during or after a failed refresh, as
+  Seal, Revoke and Reject restored already did. Before, Guard on a qube revoked since the view was
+  read added it back to AI space, guarded.
+- **BREAKING:** `qmcp audit rotate` by hand refuses unless run as root (`--path` included;
+  0.9.32 checked no user, so anyone who could write the log's directory could rotate it), and
+  rotates the install's own chain:
+  the log on disk, or its RAM chain in mode ram; in mode none, or with a mode that does not read,
+  it refuses unless given `--path`. `qmcp audit verify` and `tail` read the install's chain by
+  default. `qmcp check`'s `audit log` item applies only in mode disk, and the chain on disk is
+  verified while it is in use or still there. A broken chain's message says to keep the file and
+  rotate, so a later break is not hidden behind it.
+- **BREAKING:** the 64 MiB floor is judged on every chain the install may write: the log's disk
+  in mode disk, and the RAM chains' tmpfs in modes disk and ram; mode none has none. The services
+  ask it for every line, whatever its own place, so a refusal for room never says where a line
+  was going, and `qmcp check`'s `audit room` fails on either. Before, only `/var/log` was judged.
+- The version the MCP server reports (its `serverInfo`) comes from the tree's own
+  `pyproject.toml` first and from installed metadata after. Before, a checkout run beside an
+  older install reported the installed version.
+- `qmcp gateway set` with `--updates` and the installer's `--updates-via` tick leave an audit
+  line that says `updates` (every gateway enroll and set line now carries the key), and an
+  anonymous-mode stamp that turned the mode on or stamped a qube leaves one. The stamp and the
+  mode file are written under one hold of the gate's lock (stamp, mode file, stamp again), so a
+  gate run cannot judge in between and stop the hub for a qube not yet stamped.
+
+### Fixed
+
+- The crash-point tests run under dom0's default limit of 1024 open files: they closed none of
+  the locks their simulated deaths left open, about 5,500 over a run.
+- The audit log: a write cut short (a kill, a full disk) left a last line with no newline, and the
+  next record was glued onto it and lost with it; the next record now starts a line of its own.
+  Rotation renamed the log aside and then created the new one, and a writer in that gap made a
+  fresh log from the start of the chain, unanchored; the new log is now written under a temporary
+  name and renamed over the old one, so the name is never empty. A caller's call counter and the
+  dropped-lines marker were truncated before being written, so a failure in between read as a
+  fresh day, or left a marker that does not read; both are now written over and then cut to
+  length, and readers take their first JSON value. A set of a property or a feature that raised
+  after qubesd applied it was capped as a call that changed nothing; it is logged as a change
+  unless the value read back is not the one set.
+- Pending kills the gate's timer drops (the qube gone, the hub, another qube of that name now, one
+  restarted since its seal, or no longer a qube a seal can take) leave a line on the chain; a
+  retry that fails again leaves none, and `qmcp check` fails until the kill is made or dropped.
+- dom0 services: a spawn, clone or disposable spawn works out the birth network again under the
+  create lock and refuses when it changed meanwhile ("the template's network changed while this
+  call waited; try again", or the source's, or the disposable template's), and a spawn checks
+  its private-volume size against the cap again there. The event stream checks again, when its
+  window ends, that its caller is still the hub, so a hub the gate stopped or a restore held
+  while it listened gets nothing. A new qube's badges come off with every other badge first and
+  `qmcp-guarded` last.
+- The restore hold judges a qube again under its lock: an accept that ran while the hold waited
+  keeps it accepted, and a hold put on in that moment comes off again with a line saying so.
+- The anonymity gate: a template held for review read as sound (the hold denies its updates), so
+  an accept was followed by a stop; its updates are now judged as they will be once accepted. Its
+  desktop notice and the line after a command said "stopped" for a project when its blocks did
+  not all land, and for the hub when none did; they now say "could NOT stop". `project unblock`
+  reports a qube that cannot be looked up as not unblocked; in normal mode, `project unblock
+  p00` names the qubes whose tags do not read. A heartbeat dated more than a second ahead of the
+  clock is stale, not fresh. A held lead or model qube is the restore item's warning, not a
+  project failure. A hidden project whose router network cannot be read is reported (an error in
+  `qmcp check`, a warning at create) rather than passed as not shared. A kill made again after
+  the run's wait now says it ran after the first kill.
+- `qmcp manage` on an open guarded qube takes the window's badges off while it is still guarded,
+  so the expiry pass never sees a managed qube that is open; a failure says to seal it. `qmcp
+  seal` says, for a window with the firewall half, that firewall rules the hub wrote through the
+  window stay.
+- Proposals: an accept whose check for a hidden project's qube cannot read leaves the proposal
+  pending and runs nothing; before, it closed it as failed. Expiry is judged under the store's
+  lock and the decision stamped when written, not at the time the accept started. A mark that
+  cannot be removed after the decision is written no longer turns an accepted proposal into a
+  failure. A lock file that cannot be opened is said as such. `proposal show` of a hidden project
+  computes no before, after or plan from its record. The second tick's text no longer carries a
+  transient read error, so two reads that fail give the same digest.
+- `qmcp project edit` checks only the templates and networks it adds; before, an entry that no
+  longer qualified refused every edit. `qmcp project dump` refuses a leftover sink under a
+  `-dump` name with no dump badge in words that say what it is.
+- `qmcp settings set` and `qmcp import` print what they wrote before a failure part-way, instead
+  of "nothing was changed". `settings set` refuses a birth-egress gateway that cannot be looked
+  up rather than calling it missing. `qmcp import` checks the export before this install's
+  records, writes the records last, and may be run again over a partial import of the same file.
+  An export's caps take ASCII digits only. JSON nested past the parser's depth is "not JSON".
+- The window: the forms named here now refuse before OK more of what their commands refuse, as
+  far as the view shows it (New project, Edit project, Change lead, Dump sink, Add to AI space, the lead's
+  model qube and firewall, Template install, birth egress, and Change gateway and Enroll, which
+  refuse a held gateway). Qubes held for review are left out of the lists of the lead's
+  templates, the hub's own qubes, approved templates, qubes outside AI space, birth egress and
+  model qubes. Change lead and Remove lead are off while the lead is held, and Open on a blocked
+  or hidden qube. A qube outside AI space wearing an open window's badge is under Needs
+  attention, where Seal takes it off. A gateway label the field would show escaped is shown
+  beside it, so an edit no longer sends the escapes as typed. Before the first read, the tree
+  and the Settings tab say "not read" rather than "missing" or "no hub".
+- The dom0 library's text reads (the operator files, the records, the audit chain, the version
+  file) no longer raise on a byte that is not UTF-8: the file reads as unreadable, a chain line
+  that does not decode is a break at that line, and a test refuses a new text-mode `open()` read
+  that does not handle it. A qube's power state that cannot be read is no longer taken for halted
+  while a remove waits for it to stop. The MCP command line writes a lone surrogate in a result as
+  its escape, not a traceback.
+- Comments and tool descriptions corrected: the installer's header (it seals every open window),
+  the seal and gate units' exit statuses, the in-qube services' callers, and the tools' scopes,
+  copy routes, a clone template's network and an anonymous project's second lead name.
+
+To roll back: set every project back to disk (`sudo qmcp project audit LABEL disk`) and copy out
+the RAM chains under `/run/qmcp/audit` you want to keep, since `uninstall.sh` removes `/run/qmcp`
+and them with it; run this release's `uninstall.sh`, then 0.9.32's installer. 0.9.32 ignores `/etc/qmcp/audit-mode` and
+`/etc/qmcp/audit-keep-days`: it writes every line to disk and removes no rotated log.
+
 ## [0.9.32] — 2026-10-17
 
 **The audit round's window findings, and limits on what one principal can put on the audit log.** A window

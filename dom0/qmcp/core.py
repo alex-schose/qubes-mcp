@@ -149,7 +149,7 @@ def read_hub(path: str | None = None) -> str | None:
     try:
         with open(HUB_PATH if path is None else path, encoding="utf-8") as fh:
             word = fh.read(256).split("#", 1)[0].strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     return word if valid_qube_name(word) else None
 
@@ -635,7 +635,11 @@ def in_ai_space_by_name(app, name, hub: bool = False) -> bool:
     on 2026-10-01 at ~0.7 ms apart. `admin.vm.tag.Get` answers "1"/"0" for a
     qube and fails for a missing one, after the same single call. For the hub
     the one call is `admin.vm.tag.List`, so a qube of a hidden anonymous project
-    (`qmcp-hubblind`) costs what a missing one costs too.
+    (`qmcp-hubblind`) takes the same calls as a missing one, but not the same
+    time: qubesd answers a missing qube about 0.25 ms sooner, and a service
+    call reads tags several times, so from the hub such a call took about 1 ms
+    longer (measured on the development box, 2026-10-18). Its names come from
+    a random label, so this confirms a name rather than finding one.
     """
     if not valid_qube_name(name):
         return False
@@ -801,7 +805,7 @@ class Call:
     """One invocation: what the audit line will say about it."""
 
     __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds", "acting",
-                 "landed", "noop")
+                 "landed", "noop", "where")
 
     def __init__(self, service: str) -> None:
         self.service = service
@@ -826,6 +830,9 @@ class Call:
         #: The call succeeded without changing anything (a value the qube
         #: already had): capped like a failed call, though it answers ok.
         self.noop = False
+        #: The projects its line belongs to (`audit.place`), worked out before
+        #: the call acts and again after; () until then: no project.
+        self.where = ()
 
 
 def emit(call: Call, payload: dict, audit: bool, out=None) -> int:
@@ -839,7 +846,7 @@ def emit(call: Call, payload: dict, audit: bool, out=None) -> int:
             from qmcp import audit as audit_mod
             audit_mod.audit(call.service, call.caller, call.summary,
                             bool(payload.get("ok")), payload.get("error"),
-                            error_class=call.error_class)
+                            error_class=call.error_class, slots=call.where)
         except Exception:
             pass
     stream = sys.stdout if out is None else out

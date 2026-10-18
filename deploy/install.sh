@@ -33,6 +33,15 @@
 #                        (qmcp gateway set GATEWAY --updates yes), before the gate's timer
 #                        runs the new code (repeatable): an entry written before 0.9.24 is
 #                        unticked
+#   --audit-log disk|ram|none   where qmcp's audit lines go, for the whole install
+#                        (/etc/qmcp/audit-mode): disk (the default), /var/log/qmcp-audit.log;
+#                        ram, a chain under /run/qmcp/audit, gone at shutdown; none, no line
+#                        at all. A project may keep its own lines more private still (qmcp
+#                        project audit). An update keeps the mode without the option; a change
+#                        leaves one line on the less private of the two. Lines already on disk
+#                        stay there: deleting a file on dom0's disk is not erasing it. dom0's
+#                        journal keeps every qrexec call whatever the mode (qmcp check says
+#                        how to keep it in RAM)
 #   --dry-run            run every check, change nothing
 #
 # What it installs:
@@ -75,6 +84,11 @@
 #   /etc/systemd/system/qmcp-refresh.{service,timer}   every minute, as the gate's user, the
 #                                    in-qube services brought up to date in every RUNNING
 #                                    prepared template or standalone; it never starts one
+#   /etc/systemd/system/qmcp-audit.{service,timer}   hourly, as root: the audit log rotated
+#                                    once a UTC day or past 32 MiB, and rotated logs removed
+#                                    once older than /etc/qmcp/audit-keep-days (90 by default;
+#                                    qmcp settings set --audit-keep-days), by age, never size
+#   /etc/qmcp/audit-mode             with --audit-log: disk, ram or none
 #   the qmcp-id label                on an upgrade from before 0.9.26 (v0.9.16, which wrote no
 #                                    version file, known by the files it installed), or a
 #                                    reinstall over the operator files a plain uninstall of
@@ -91,7 +105,8 @@
 #   /etc/qmcp/mode                   with --anonymous: the word anonymous, written after the
 #                                    policy, once qmcp-anon is on the hub and on every qube
 #                                    under the hub's check; then they are stamped once more
-# It changes no qube's tags, but anonymous mode puts qmcp-anon on the hub and on every
+# It takes every open window off (seal --all, which kills an open qube that runs), and
+# anonymous mode puts qmcp-anon on the hub and on every
 # qube in AI space that is not an anonymous project's lead, member or model qube,
 # guarded routers aside: managed qubes from an older release stay in no project slot
 # until `qmcp project move` puts them in one.
@@ -117,11 +132,13 @@ DRY_RUN=0
 GATE_USER=""
 ANONYMOUS=0
 UPDATES_VIA=""
+AUDIT_LOG_MODE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
         --anonymous) ANONYMOUS=1; shift ;;
         --updates-via) UPDATES_VIA="$UPDATES_VIA $2"; shift 2 ;;
+        --audit-log) AUDIT_LOG_MODE="$2"; shift 2 ;;
         --gate-user) GATE_USER="$2"; shift 2 ;;
         --birth-egress) BIRTH_EGRESS="$2"; shift 2 ;;
         --pool-cap) POOL_CAP="$2"; shift 2 ;;
@@ -166,7 +183,8 @@ for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/pr
          dom0/qmcp/anon.py deploy/qmcp-gate.service deploy/qmcp-gate.timer \
          dom0/qmcp/restored.py dom0/qmcp/inqube.py dom0/qmcp/opfiles.py \
          template-rpc/qmcp.RunInAIManaged template-rpc/qmcp.CopyToAIManaged \
-         deploy/qmcp-refresh.service deploy/qmcp-refresh.timer; do
+         deploy/qmcp-refresh.service deploy/qmcp-refresh.timer \
+         deploy/qmcp-audit.service deploy/qmcp-audit.timer; do
     [ -s "$SRC/$f" ] || die "the source tree at $SRC is incomplete: $f missing or empty"
 done
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/pyproject.toml")"
@@ -246,6 +264,10 @@ id -nG "$GATE_USER" | tr ' ' '\n' | grep -qx qubes || die "the gate's user '$GAT
 # instead of surfacing as a failed `qmcp check` once the new policy is live.
 [[ "$POOL_CAP" =~ ^[0-9]+$ ]] || die "--pool-cap wants a number of bytes, got '$POOL_CAP'"
 [[ "$PRIVATE_CAP" =~ ^[0-9]+$ ]] || die "--private-cap wants a number of bytes, got '$PRIVATE_CAP'"
+case "$AUDIT_LOG_MODE" in
+    ""|disk|ram|none) ;;
+    *) die "--audit-log is disk, ram or none, got '$AUDIT_LOG_MODE'" ;;
+esac
 if [ -n "$BIRTH_EGRESS" ]; then
     [[ "$BIRTH_EGRESS" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,30}$ ]] || die "'$BIRTH_EGRESS' is not a qube name"
     qvm-check -q "$BIRTH_EGRESS" 2>/dev/null || die "the birth-egress qube '$BIRTH_EGRESS' does not exist"
@@ -473,7 +495,8 @@ for f in "$RPC"/qmcp.* "$RPC"/qmcp_*.py; do [ -e "$f" ] && cp -a "$f" "$BACKUP/"
 [ -d "$LIB" ] && cp -a "$LIB" "$BACKUP/usr-local-lib-qmcp"
 [ -f /etc/tmpfiles.d/qmcp.conf ] && cp -a /etc/tmpfiles.d/qmcp.conf "$BACKUP/"
 for f in /etc/systemd/system/qmcp-gate.service /etc/systemd/system/qmcp-gate.timer \
-         /etc/systemd/system/qmcp-refresh.service /etc/systemd/system/qmcp-refresh.timer; do
+         /etc/systemd/system/qmcp-refresh.service /etc/systemd/system/qmcp-refresh.timer \
+         /etc/systemd/system/qmcp-audit.service /etc/systemd/system/qmcp-audit.timer; do
     [ -f "$f" ] && cp -a "$f" "$BACKUP/"
 done
 say "backed up to $BACKUP (root-only)"
@@ -613,6 +636,37 @@ chown root:root "$ETC_QMCP/projects.json"
 touch "$AUDIT_LOG"
 chown root:qubes "$AUDIT_LOG"
 chmod 0660 "$AUDIT_LOG"
+# --- the install's audit mode: written only when given and different. The
+# change leaves one line on the less private of the old and the new mode
+# (disk if either is), so the chain says why it stops or starts.
+if [ -n "$AUDIT_LOG_MODE" ]; then
+    AUDIT_SAID="$(PYTHONPATH="$LIB" QMCP_NEW="$AUDIT_LOG_MODE" python3 - <<'PYEOF'
+import os
+from qmcp import audit
+new = os.environ["QMCP_NEW"]
+old, problem = audit.install_mode()
+if problem is None and old == new:
+    print(f"kept {audit.MODE_PATH} ({new})")
+    raise SystemExit(0)
+tmp = audit.MODE_PATH + ".new"
+with open(tmp, "w", encoding="ascii") as fh:
+    fh.write(new + "\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, audit.MODE_PATH)
+kept = max((old, new), key=audit.MODES.index)
+if kept != "none":
+    dest = audit.LOG_PATH if kept == "disk" else audit.ram_path()
+    if kept == "ram":
+        audit._ram_dir_ready()
+    audit.audit("qmcp install", "operator", {"audit_log": new, "was": old}, True,
+                path=dest, slots=())
+print(f"wrote {audit.MODE_PATH} = {new} (was {old})"
+      + ("; the lines already in /var/log stay there: deleting a file on dom0's disk is not "
+         "erasing it" if old == "disk" else ""))
+PYEOF
+)" || die "could not write $ETC_QMCP/audit-mode"
+    say "$AUDIT_SAID"
+fi
 
 # --- the anonymity gate's timer, as the services' user
 sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-gate.service" > "$SCRATCH/qmcp-gate.service"
@@ -623,9 +677,12 @@ sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-refresh.service" > "$SCRATCH/q
 grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-refresh.service" || die "the refresh unit did not render"
 install -m 0644 "$SCRATCH/qmcp-refresh.service" /etc/systemd/system/qmcp-refresh.service
 install -m 0644 "$SRC/deploy/qmcp-refresh.timer" /etc/systemd/system/qmcp-refresh.timer
+install -m 0644 "$SRC/deploy/qmcp-audit.service" /etc/systemd/system/qmcp-audit.service
+install -m 0644 "$SRC/deploy/qmcp-audit.timer" /etc/systemd/system/qmcp-audit.timer
 systemctl daemon-reload
 systemctl enable qmcp-gate.timer >/dev/null
 systemctl enable qmcp-refresh.timer >/dev/null
+systemctl enable qmcp-audit.timer >/dev/null
 TIMER_STOPPED=1
 say "the anonymity gate will run every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 
@@ -655,11 +712,12 @@ say "every boot seals the open guarded qubes before any user session (qmcp-seal.
 
 # --- the updates ticks, before the gate's timer runs the new code
 for g in $UPDATES_VIA; do
-    PYTHONPATH="$LIB" python3 -c 'import sys, qubesadmin.app; from qmcp import fleet; print(fleet.set_gateway(qubesadmin.app.QubesLocal(), sys.argv[1], updates=True))' "$g" \
+    PYTHONPATH="$LIB" python3 -c 'import sys, qubesadmin.app; from qmcp import audit, fleet; print(fleet.set_gateway(qubesadmin.app.QubesLocal(), sys.argv[1], updates=True)); audit.audit("qmcp gateway set", "operator", {"qube": sys.argv[1][:128], "updates": True}, True, slots=())' "$g" \
         || die "could not tick $g for updates; the new policy is NOT installed (nor, with --anonymous, the mode), but the gate's timer starts again on the new code and may stop a project, or in anonymous mode the hub, whose templates update through $g: run the install again at once"
 done
 
-# --- the policy, last: until it is in place no AI caller reaches the new code
+# --- the policy last: the services run the new library under the old rulebook from the
+# library step on, and under the new one from here
 install -m 0644 -o root -g root "$RENDERED" "$POLICY_DST"
 say "installed $POLICY_DST"
 systemctl reset-failed qubes-qrexec-policy-daemon >/dev/null 2>&1 || true
@@ -673,47 +731,67 @@ done
 say "qrexec policy daemon restarted"
 
 # --- anonymous mode, last: qmcp-anon on the hub and the rest of AI space first, so
-# the gate never judges a qube of the mode without it
+# the gate never judges a qube of the mode without it. The stamps, and with
+# QMCP_WRITE_MODE=1 the mode file between them, run under the gate's lock: a
+# gate run (qmcp gate, qmcp check, the run after any command) cannot judge in
+# the gap and stop the hub for a qube not yet stamped.
 stamp_mode() {   # qmcp-anon on the hub and on every qube under its check
-    PYTHONPATH="$LIB" QMCP_HUB="$HUB" python3 - <<'PYEOF'
+    PYTHONPATH="$LIB" QMCP_HUB="$HUB" QMCP_MODE_PATH="$ETC_QMCP/mode" python3 - <<'PYEOF'
 import os, sys
 import qubesadmin.app
-from qmcp import anon, core, gateways, projects
+from qmcp import anon, audit, core, gateways, projects, restored
 hub = os.environ["QMCP_HUB"]
 app = qubesadmin.app.QubesLocal()
-records, registry = projects.load(), gateways.load()
-by_name, tags_by = anon._snapshot(app, strict=True)
-# The hub's subjects, and the anonymous projects' model qubes, which join them
-# when their project goes (its leads and members wear it already).
-models = sorted({p.model_qube for p in records.values() if p.anonymous and p.model_qube
-                 and p.model_qube in by_name})
-from qmcp import restored
-for name in anon.hub_subjects(hub, records, registry, by_name, tags_by) + models:
-    vm = app.domains[name]
-    tags = core.tags_of(vm)
-    if projects.ANON not in tags:
-        # A qube outside the restore check's scope (no ai-managed, ai-dump or
-        # qmcp badge) and with no label yet (the hub) is labelled before it gets
-        # this one; one carrying another qube's label keeps it. One already badged
-        # is never labelled here: if it has no label of its own it came back from
-        # a backup, and the gate holds it.
-        if not restored.in_scope(tags):
-            restored.label_if_missing(vm)
-        vm.tags.add(projects.ANON)
-    if projects.ANON not in core.tags_of(vm):
-        sys.exit(f"    {name} does not read back wearing {projects.ANON}")
-    print(f"==> {name} wears {projects.ANON}")
+
+
+def stamp() -> int:
+    records, registry = projects.load(), gateways.load()
+    by_name, tags_by = anon._snapshot(app, strict=True)
+    # The hub's subjects, and the anonymous projects' model qubes, which join
+    # them when their project goes (its leads and members wear it already).
+    models = sorted({p.model_qube for p in records.values() if p.anonymous and p.model_qube
+                     and p.model_qube in by_name})
+    added = 0
+    for name in anon.hub_subjects(hub, records, registry, by_name, tags_by) + models:
+        vm = app.domains[name]
+        tags = core.tags_of(vm)
+        if projects.ANON not in tags:
+            # A qube outside the restore check's scope (no ai-managed, ai-dump or
+            # qmcp badge) and with no label yet (the hub) is labelled before it
+            # gets this one; one carrying another qube's label keeps it. One
+            # already badged is never labelled here: if it has no label of its
+            # own it came back from a backup, and the gate holds it.
+            if not restored.in_scope(tags):
+                restored.label_if_missing(vm)
+            vm.tags.add(projects.ANON)
+            added += 1
+        if projects.ANON not in core.tags_of(vm):
+            sys.exit(f"    {name} does not read back wearing {projects.ANON}")
+        print(f"==> {name} wears {projects.ANON}")
+    return added
+
+
+with anon._GateLock(wait=120) as got:
+    if not got:
+        sys.exit("    the anonymity gate held its lock past 120 s; nothing was stamped")
+    added = stamp()
+    wrote = os.environ.get("QMCP_WRITE_MODE") == "1"
+    if wrote:
+        path = os.environ["QMCP_MODE_PATH"]
+        with open(path + ".new", "w", encoding="ascii") as fh:
+            fh.write("anonymous\n")
+        os.chmod(path + ".new", 0o644)
+        os.replace(path + ".new", path)
+        # A qube the hub made between the first pass and the mode file was born
+        # without it (the services stamp only in the mode): a second pass.
+        added += stamp()
+    if wrote or added:
+        audit.audit("qmcp install", "operator",
+                    {"mode": "anonymous", "turned_on": wrote, "stamped": added}, True, slots=())
 PYEOF
 }
 if [ "$ANONYMOUS" -eq 1 ] && [ ! -e "$ETC_QMCP/mode" ]; then
-    stamp_mode || die "could not put qmcp-anon on every qube of the mode; the mode is NOT on (the qubes named above wear it)"
-    printf 'anonymous\n' > "$ETC_QMCP/mode.new"
-    chmod 0644 "$ETC_QMCP/mode.new"
-    mv "$ETC_QMCP/mode.new" "$ETC_QMCP/mode"
-    # A qube the hub made between the first pass and the mode file was born
-    # without it (the services stamp only in the mode): a second pass, while
-    # the timer is still stopped.
-    stamp_mode > /dev/null || die "anonymous mode is on, but a qube made during the install could not be given qmcp-anon; run the install again"
+    QMCP_WRITE_MODE=1 stamp_mode || die "could not put qmcp-anon on every qube of the mode, or write $ETC_QMCP/mode (the qubes named above wear it; the mode is on only if that file exists): run the install again"
     say "anonymous mode is on ($ETC_QMCP/mode); no qmcp command turns it off, uninstall.sh --purge does"
 elif [ -e "$ETC_QMCP/mode" ]; then
     say "kept $ETC_QMCP/mode ($(head -c 40 "$ETC_QMCP/mode" | tr '\n' ' '))"
@@ -726,7 +804,9 @@ systemctl start qmcp-gate.timer
 systemctl start qmcp-gate.service || true
 TIMER_STOPPED=0
 systemctl start qmcp-refresh.timer
+systemctl start qmcp-audit.timer
 say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
+say "the audit log is rotated daily and rotated logs removed by age, hourly (qmcp-audit.timer)"
 
 # ===================================================================== verify
 echo

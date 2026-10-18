@@ -17,9 +17,10 @@ in two places, and the two must agree:
   once set, the lead's model: a remote endpoint (`model`) or a self-hosted model
   qube (`model_qube`), never both; and the firewall the operator accepted for
   the lead (`lead_firewall`); and, for an anonymous project (0.9.23), `anonymous`,
-  `hidden` when the hub may not see it, and the operator's private `note`. Those
-  keys are written only when set, so a record without them stays in the format
-  of 0.9.18 to 0.9.20.
+  `hidden` when the hub may not see it, and the operator's private `note`; and
+  `audit`, where the project's audit lines go when not to disk (`ram` or `off`,
+  `qmcp project audit`; 0.9.33). Those keys are written only when set, so a
+  record without them stays in the format of 0.9.18 to 0.9.20.
 
 Four more badges carry an anonymous project (0.9.23): `qmcp-anon` on its lead
 and every member (the anonymity gate watches it, `qmcp.anon`),
@@ -89,6 +90,10 @@ _RESERVED_LABEL_RE = re.compile(r"\Ap[0-9]{2}\Z")
 HUB_LABEL = "hub"
 RESERVED_LABELS = frozenset({"none", HUB_LABEL})
 _QUBE_RE = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,30}\Z")
+
+#: Where a project's audit lines go (`qmcp project audit`): `disk` is never
+#: stored, so a record without the key is a project on disk.
+AUDIT_MODES = ("disk", "ram", "off")
 
 #: A random label is this long: 36^7 names after its first letter.
 RANDOM_LABEL_LEN = 8
@@ -184,11 +189,12 @@ class Project:
     """One slot's record. p00 carries only `dump`."""
 
     __slots__ = ("slot", "label", "lead", "templates", "networks", "quota", "dump",
-                 "model", "lead_firewall", "model_qube", "anonymous", "hidden", "note")
+                 "model", "lead_firewall", "model_qube", "anonymous", "hidden", "note",
+                 "audit")
 
     def __init__(self, slot, label=None, lead=None, templates=(), networks=(), quota=None,
                  dump=None, model=None, lead_firewall=None, model_qube=None,
-                 anonymous=False, hidden=False, note=None):
+                 anonymous=False, hidden=False, note=None, audit="disk"):
         self.slot, self.label, self.lead = slot, label, lead
         self.templates = tuple(templates)
         self.networks = tuple(networks)
@@ -199,6 +205,7 @@ class Project:
         self.anonymous = bool(anonymous)
         self.hidden = bool(anonymous and hidden)
         self.note = note
+        self.audit = audit
 
     def badges(self) -> set:
         """The badges every lead and member of this project wears besides its
@@ -230,6 +237,8 @@ class Project:
             out["hidden"] = True
         if self.note is not None:
             out["note"] = self.note
+        if self.audit != "disk":
+            out["audit"] = self.audit
         return out
 
     def __repr__(self):
@@ -252,7 +261,7 @@ def _validate_slot(slot: str, entry) -> Project:
             raise _bad(f"{slot}: bad dump")
         return Project(slot, dump=dump)
     want = {"label", "lead", "templates", "networks", "quota", "dump"}
-    optional = {"model", "lead_firewall", "model_qube", "anonymous", "hidden", "note"}
+    optional = {"model", "lead_firewall", "model_qube", "anonymous", "hidden", "note", "audit"}
     if not want <= set(entry) <= want | optional:
         raise _bad(f"{slot}: keys must be {sorted(want)}, and optionally {sorted(optional)}")
     label = entry["label"]
@@ -300,8 +309,12 @@ def _validate_slot(slot: str, entry) -> Project:
         raise _bad(f"{slot}: hidden is true, and only on an anonymous project")
     if note is not None and (anonymous is not True or note_refusal(note)):
         raise _bad(f"{slot}: note is 1-{MAX_NOTE} printable characters, on an anonymous project")
+    # Written only when not disk, so a present key is ram or off.
+    audit = entry.get("audit", "disk")
+    if "audit" in entry and audit not in ("ram", "off"):
+        raise _bad(f"{slot}: audit is ram or off, or absent")
     return Project(slot, label, lead, templates, networks, quota, dump, model, lead_firewall,
-                   model_qube, anonymous is True, hidden is True, note)
+                   model_qube, anonymous is True, hidden is True, note, audit)
 
 
 def parse(text: str) -> dict:
@@ -334,6 +347,8 @@ def load(path: str | None = None) -> dict:
             text = fh.read(1024 * 1024 + 1)
     except FileNotFoundError:
         return {HUB_SLOT: Project(HUB_SLOT)}
+    except UnicodeDecodeError:
+        raise _bad("not UTF-8") from None
     except OSError as e:
         raise _bad(f"cannot read ({type(e).__name__})") from None
     if len(text) > 1024 * 1024:

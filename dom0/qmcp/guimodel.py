@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import shlex
 
-from qmcp import anon, birth, core, firewall, fleet, gateways, inqube, projects, proposals
+from qmcp import anon, audit, birth, core, firewall, fleet, gateways, inqube, projects, proposals
 
 QMCP = "/usr/local/bin/qmcp"
 SUDO = ("/usr/bin/sudo", "-n")
@@ -160,6 +160,7 @@ READS = {
     "check": read_cmd("check", "--json"),
     "settings": read_cmd("settings", "--json"),
     "audit": read_cmd("audit", "tail", str(AUDIT_TAIL)),
+    "audit_status": read_cmd("audit", "status", "--json"),
     "proposals": read_cmd("proposal", "list", "--json"),
     "gateways": read_cmd("gateway", "list", "--json"),
     # After the gate, whose pass holds what came back from a backup first.
@@ -462,6 +463,8 @@ def delete_project(key) -> list:
 
 
 def role(action, qube, keep_running=False) -> list:
+    """Manage, guard or revoke; Add to AI space guards a qube outside it with
+    this. The Guard button on a row is `guard_qube`."""
     if action not in ("manage", "guard", "revoke"):
         raise FormError(f"unknown action {action}")
     argv = write_cmd(action, _qube(qube, "the qube"))
@@ -470,6 +473,14 @@ def role(action, qube, keep_running=False) -> list:
             raise FormError("only revoke shuts a qube down")
         argv.append("--no-shutdown")
     return argv
+
+
+def guard_qube(qube) -> list:
+    """The Guard button on a row: it guards only a qube the window showed in
+    AI space, so it always sends `--only-in-ai-space`, and on one revoked
+    since the view was read the command refuses rather than adding it to AI
+    space."""
+    return role("guard", qube) + ["--only-in-ai-space"]
 
 
 def open_qube(qube, duration, firewall=False) -> list:
@@ -488,6 +499,13 @@ def seal_qube(qube) -> list:
 
 def audit_rotate() -> list:
     return write_cmd("audit", "rotate")
+
+
+def project_audit(key, mode) -> list:
+    """Where a project's audit lines go from now: disk, ram or off."""
+    if mode not in projects.AUDIT_MODES:
+        raise FormError("choose disk, ram or off")
+    return write_cmd("project", "audit", _key(key), mode)
 
 
 def enroll_gateway(qube, anonymising=False, label=None, updates=False) -> list:
@@ -610,11 +628,14 @@ def _size(text, what: str, example: str) -> str:
     return text
 
 
-def settings_set(pool_cap=None, private_cap=None, birth_egress=None) -> list:
+def settings_set(pool_cap=None, private_cap=None, birth_egress=None,
+                 audit_keep_days=None) -> list:
     """Only what changed: None leaves a part as it is. `birth_egress` is an
-    enrolled gateway, or `none`, which unsets it. The command has no option
-    for the hub, the mode or the name prefix."""
-    if pool_cap is None and private_cap is None and birth_egress is None:
+    enrolled gateway, or `none`, which unsets it. `audit_keep_days`: a number
+    of days or `off`, checked with the command's own reader. The command has
+    no option for the hub, the mode, the audit mode or the name prefix."""
+    if pool_cap is None and private_cap is None and birth_egress is None \
+            and audit_keep_days is None:
         raise FormError("nothing changed")
     argv = write_cmd("settings", "set")
     if pool_cap is not None:
@@ -623,6 +644,12 @@ def settings_set(pool_cap=None, private_cap=None, birth_egress=None) -> list:
         argv += ["--private-cap", _size(private_cap, "the private-volume cap", "20G")]
     if birth_egress is not None:
         argv += ["--birth-egress", _network(birth_egress, "birth egress")]
+    if audit_keep_days is not None:
+        text = str(audit_keep_days).strip()
+        if audit.parse_keep_days(text) is None:
+            raise FormError(f"keep rotated audit logs: a number of days, 1 to "
+                            f"{audit.KEEP_DAYS_MAX}, or off")
+        argv += ["--audit-keep-days", text]
     return argv
 
 
@@ -689,8 +716,8 @@ def import_config(file) -> list:
 
 #: Every builder the window calls. The parity test calls each one.
 BUILDERS = (create_project, edit_project, remove_lead, change_lead, add_dump, move,
-            delete_plan, delete_project, role, open_qube, seal_qube,
-            audit_rotate, show_proposal, accept_proposal,
+            delete_plan, delete_project, role, guard_qube, open_qube, seal_qube,
+            audit_rotate, project_audit, show_proposal, accept_proposal,
             reject_proposal, enroll_gateway, change_gateway, remove_gateway,
             show_lead_firewall, set_lead_model, set_lead_model_qube, set_lead_rules,
             accept_lead_rules, unblock_project, settings_set, prepare_template,
@@ -703,6 +730,8 @@ CLI_ONLY = {
     ("migrate",): "a one-time step from v0.9.16, run before the first install of this release",
     ("audit", "--path"): "reads a log other than the live one, such as a rotated file; "
                          "the window shows the live log",
+    ("audit", "--auto"): "the hourly rotation and removal: qmcp-audit.timer runs it as root, and "
+                         "the window rotates by hand with Rotate",
     ("seal", "--all"): "the boot seal: qmcp-seal.service runs it before any user session exists, "
                        "so there is no window open for the operator to close by hand",
     ("seal", "--expired"): "the expiry pass: the gate's timer runs it every 15 seconds, and the "
@@ -740,6 +769,7 @@ PROJECT_FIELDS = (
     ("model", "Lead's model endpoint"), ("model_qube", "Lead's model qube"),
     ("lead_firewall", "Lead firewall you accepted"),
     ("anonymous", "Anonymous"), ("hidden", "Hidden from the hub"), ("note", "Note (dom0 only)"),
+    ("audit", "Audit log"),
     ("blocked", "Stopped by the anonymity gate"),
 )
 #: Every field of `settings --json`.
@@ -749,6 +779,7 @@ SETTINGS_FIELDS = (
     ("ai_space_bytes", "AI space disk used"), ("private_cap", "Private-volume cap (one qube)"),
     ("birth_egress", "Birth egress"), ("gateways_enrolled", "Gateways enrolled"),
     ("mode", "Mode (fixed at install)"), ("version", "qubes-mcp version"),
+    ("audit_mode", "Audit log (set at install)"), ("audit_keep_days", "Keep rotated audit logs"),
 )
 #: How the Settings tab says the mode.
 MODE_TEXT = {
@@ -799,6 +830,12 @@ def field_text(key, value) -> Shown:
     if key == "mode":
         return esc(MODE_TEXT.get(value, f"{value}: /etc/qmcp/mode cannot be read, so the gate "
                                         f"blocks the hub"))
+    if key == "audit_mode":
+        return esc(AUDIT_MODE_TEXT.get(value, AUDIT_MODE_UNREAD))
+    if key == "audit_keep_days":
+        return esc(keep_days_text(value))
+    if key == "audit":
+        return esc(PROJECT_AUDIT_TEXT.get(value, f"{value}: not a mode qmcp writes"))
     if key == "blocked":
         return esc(BLOCKED_TEXT.get(value, value))
     if key == "open":
@@ -876,7 +913,11 @@ def audit_hint(rows) -> str:
 
 
 def settings_rows(values: dict) -> list:
-    """(heading, text) for the Settings tab, every field of `settings --json`."""
+    """(heading, text) for the Settings tab, every field of `settings --json`;
+    `values` None: never read, and every field says so, never what an
+    unreadable file would."""
+    if values is None:
+        return [(label, esc("not read: Refresh")) for _, label in SETTINGS_FIELDS]
     values = values if isinstance(values, dict) else {}
     return [(label, field_text(key, values.get(key))) for key, label in SETTINGS_FIELDS]
 
@@ -1013,6 +1054,9 @@ ATTENTION = {
     "gateway": ("gateway not guarded",
                 "a gateway without qmcp-guarded: the rulebook lets the hub run commands in it"),
     "outside": ("badges outside AI space", "slot badges outside AI space: the rulebook acts on them"),
+    "open_outside": ("open badge outside AI space",
+                     "an open window's badge outside AI space: the rulebook's window lines act on "
+                     "the badge alone, so the hub may run commands in it. Seal... takes it off"),
     "sink": ("stray sink badge", "a sink badge that is not its record's"),
     "model_kind": ("model badge on a template or gateway",
                    "a model badge on a template, a disposable template, a disposable or a "
@@ -1084,6 +1128,10 @@ def classify(row, records, hub=None, by_name=None, review=None):
     if row.get("state") is None:
         if b["member"] or b["lead"] or b["lead_tag"] or b["model"]:
             return _attention("outside")
+        # The window's lines route on the badge alone, so it opens the qube to
+        # the hub wherever it is; the row is where Seal takes it off.
+        if b["open"]:
+            return _attention("open_outside")
         if b["dump"] and records is not None:
             slot = next(iter(b["dump"]))
             rec = records.get(slot)
@@ -1137,8 +1185,8 @@ def _model_why(row, by_name=None, hub=None):
     command's order and words; None when they show no reason. `kind` is
     `unreadable` (a value it needs could not be read, its template's
     included), `hub`, `kind` (a class, a disposable template or a gateway),
-    `drop_box`, `outside` (outside AI space: the command never brings one
-    in), `lead`, `member` (of a project other than p00) or `template` (one
+    `drop_box`, `held` (held for review), `outside` (outside AI space: the
+    command never brings one in), `lead`, `member` (of a project other than p00) or `template` (one
     the hub manages, anywhere in its template chain, read from `by_name`)."""
     if unread_row(row) or UNREADABLE in row.values():
         return "unreadable", "cannot be read now; refresh"
@@ -1154,6 +1202,8 @@ def _model_why(row, by_name=None, hub=None):
     b = badges(row)
     if b["drop_box"] or b["dump"]:
         return "drop_box", "is a drop box"
+    if b["held"]:
+        return "held", fleet.HELD_WHY
     if row.get("state") is None:
         return "outside", f"is outside AI space: guard it first (qmcp guard {row.get('name')})"
     if b["lead_tag"] or b["lead"]:
@@ -1232,7 +1282,11 @@ def build_tree(fleet_rows, project_rows, settings, gate=None, restored=None) -> 
     `gate`: the verdicts of `gate --json`, None when never read; an anonymous
     project's row says what kind it is, its note, whether the gate stopped it
     and what the gate found (`project_role`). `restored`: the rows of
-    `restored list --json`, None when never read."""
+    `restored list --json`, None when never read. `fleet_rows` None: the
+    qubes were never read, and a recorded lead, sink or model qube is "not
+    read", never "missing"; `settings` None: never read, and the hub is "not
+    read", never "no hub"."""
+    fleet_read, settings_read = fleet_rows is not None, settings is not None
     rows = [r for r in fleet_rows or () if isinstance(r, dict) and isinstance(r.get("name"), str)]
     by_name = {r["name"]: r for r in rows}
     records = None if project_rows is None else {
@@ -1249,10 +1303,12 @@ def build_tree(fleet_rows, project_rows, settings, gate=None, restored=None) -> 
         buckets.setdefault(where, []).append(_qube_node(row, role, attention))
         placed[row["name"]] = where
 
+    gone = "missing" if fleet_read else "not read"
+
     def sink_child(slot, name):
         row = by_name.get(name)
         if row is None:
-            return _ref(slot, "dump", name, "dump sink (missing)")
+            return _ref(slot, "dump", name, f"dump sink ({gone})")
         if placed.get(name) == "attention":
             return _ref(slot, "dump", name, "dump sink (see Needs attention)")
         return _qube_node(row, "dump sink")
@@ -1260,7 +1316,7 @@ def build_tree(fleet_rows, project_rows, settings, gate=None, restored=None) -> 
     def model_child(slot, name):
         row = by_name.get(name)
         if row is None:
-            return _ref(slot, "model", name, "model qube (missing)")
+            return _ref(slot, "model", name, f"model qube ({gone})")
         if placed.get(name) == "attention":
             return _ref(slot, "model", name, "model qube (see Needs attention)")
         if slot not in badges(row)["model"]:
@@ -1268,7 +1324,8 @@ def build_tree(fleet_rows, project_rows, settings, gate=None, restored=None) -> 
         return _ref(slot, "model", name, "model qube (see Model qubes)",
                     model_shared(records.get(slot), rows))
 
-    hub = Node("hub", "hub", _cells(hub_name or "(no hub)", "hub", {"power": settings.get("hub_power")}),
+    hub = Node("hub", "hub", _cells(hub_name or ("(no hub)" if settings_read else "(not read)"),
+                                    "hub", {"power": settings.get("hub_power")}),
                {"name": hub_name})
     p00 = Node("slot:p00", "slot", _cells("p00", "the hub's own qubes"), {"slot": "p00"})
     p00.children = buckets.pop("p00", [])
@@ -1299,7 +1356,7 @@ def build_tree(fleet_rows, project_rows, settings, gate=None, restored=None) -> 
         lead_name = rec.get("lead")
         if lead_name and not leads:
             role = ("lead (see Needs attention)" if placed.get(lead_name) == "attention"
-                    else "lead (missing)")
+                    else f"lead ({gone})")
             leads = [_ref(slot, "lead", lead_name, role)]
         node.children = leads + [m for m in members if m.data.get("role") != "lead"]
         if rec.get("dump"):
@@ -1420,32 +1477,40 @@ def details(node: Node, project_rows=None, fleet_rows=None, gate=None, hub=None,
 #: The selection's changes that only take authority away, and whose command
 #: decides everything itself: on while a refresh runs or after one failed.
 #: (Revoke on a qube that left AI space since the view was read still sets
-#: its default disposable template to none and kills it if it runs.)
-#: Not Guard: on a qube outside AI space (one revoked since the view was
-#: read) `qmcp guard` adds it to AI space, guarded, where the hub lists it.
-LOWERING = frozenset({"seal", "revoke", "reject_restored"})
+#: its default disposable template to none and kills it if it runs.) Guard
+#: is one because the button sends `--only-in-ai-space` (`guard_qube`): without it,
+#: on a qube revoked since the view was read, `qmcp guard` would add it to
+#: AI space, guarded, where the hub lists it.
+LOWERING = frozenset({"seal", "revoke", "guard", "reject_restored"})
 
 
 def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=None,
-            hub=None) -> set:
+            hub=None, mode=None) -> set:
     """The buttons that make sense for a selection. The command decides; a
     button left on is refused with the command's own reason. Reject restored
     is never offered for `hub`, the hub's name, which the command refuses
     (nor while the hub is not known, as it refuses then too). The lead's
     firewall buttons come from `firewall_pane`, the selected project's last
     firewall read, and only while it is that project's and read; Set lead
-    model unless `model_refusal` finds why the command refuses it."""
+    model unless `model_refusal` finds why the command refuses it. `mode`
+    (the settings' mode) offers Unblock on badges left from anonymous mode
+    (`leftover_block`)."""
     out = {"new_project", "add_to_ai_space"}
     if node is None:
         return out
     if firewall_pane is not None:
         out |= firewall_pane.actions(firewall_key(node, records), fleet_rows)
-    if blocked_project(node, records) is not None:
+    if (blocked_project(node, records) is not None
+            or leftover_block(node, records, mode, fleet_rows) is not None):
         out.add("unblock")
     if node.kind == "project":
-        out |= {"edit_project", "change_lead", "delete_project"}
-        if node.data.get("lead"):
-            out.add("remove_lead")
+        out |= {"edit_project", "delete_project", "audit_mode"}
+        # A lead held for review is accepted or rejected first: the command
+        # refuses to change or remove it until then.
+        if not held_row(node.data.get("lead"), fleet_rows):
+            out.add("change_lead")
+            if node.data.get("lead"):
+                out.add("remove_lead")
         if not node.data.get("dump"):
             out.add("add_dump")
     elif node.kind == "slot" and node.key == "slot:p00":
@@ -1486,10 +1551,12 @@ def actions(node: Node | None, records: dict, firewall_pane=None, fleet_rows=Non
         if state == "guarded" and role != "gateway":
             out.add("manage")
         # The window is the bounded alternative to Manage, on a guarded qube
-        # the command will take: never a gateway, never one the gate stopped
-        # or a hidden project's (`attention` and `state is None` returned
-        # above cover the rest). Seal is decided above, for every row.
-        if state == "guarded" and role != "gateway" and not open_window_of(node.data):
+        # the command will take: never a gateway, never one the gate blocked
+        # or a hidden project's, whose badges the command refuses
+        # (`fleet._open_refusal`); `attention` and `state is None` returned
+        # above cover the rest. Seal is decided above, for every row.
+        if (state == "guarded" and role != "gateway" and not open_window_of(node.data)
+                and not {projects.BLOCKED, projects.HUBBLIND} & set(node.data.get("badges") or ())):
             out.add("open")
         # A model qube is managed only for its maintenance window, which Guard closes.
         if state == "managed" and (role in ("hub's qube, no slot", "template", "disposable template")
@@ -1540,7 +1607,7 @@ def seal_intro(row) -> str:
     run out while something is mid-install."""
     name = (row or {}).get("name")
     return (f"{name} goes back to sealed at once: the badges come off, and if it is running it is "
-            f"KILLED, so nothing the hub started in it runs on. A package manager stopped "
+            f"KILLED, and what the hub had running in it is stopped. A package manager stopped "
             f"part-way may leave the qube needing repair. Its files stay: what the hub wrote "
             f"to disk is still there, and whatever is set to start from there runs at its next "
             f"start.")
@@ -1559,7 +1626,10 @@ def role_intro(action, row, records=None) -> str:
     anonymous project there is none: its gate requires the model qube guarded,
     so managing it stops the project (`manage_red`)."""
     name = row.get("name")
-    becomes, what = (("managed", "the hub may run commands in it as root and change it")
+    hidden = projects.HUBBLIND in set(row.get("badges") or ())
+    becomes, what = (("managed", "it is hidden from the hub, so the hub cannot operate it, "
+                                 "managed or not" if hidden else
+                                 "the hub may run commands in it as root and change it")
                      if action == "manage" else
                      ("guarded", "it is listed and referenced, never operated"))
     text = f"{name} becomes {becomes}: {what}."
@@ -1580,9 +1650,7 @@ def role_intro(action, row, records=None) -> str:
                  f"and start its qubes."
                  + (f" The leads of {_and(plain)} still reach it on port {projects.MODEL_PORT}."
                     if plain else ""))
-        if projects.HUBBLIND in set(row.get("badges") or ()):
-            text += " It is hidden from the hub, so the hub cannot operate it, managed or not."
-        else:
+        if not hidden:
             text += " Until you guard it again the hub may operate it, as any managed qube."
     elif serves and action == "manage":
         text += (f" It stays the model qube of {_and(serves)}, and their leads still reach it on "
@@ -1590,11 +1658,20 @@ def role_intro(action, row, records=None) -> str:
                  f"warns until you guard it again.")
     elif serves:
         text += (f" It stays the model qube of {_and(serves)}; its maintenance window closes: if "
-                 f"it runs, it is killed, so no process the hub started in it runs on. Its files "
+                 f"it runs, it is killed, and what the hub had running in it is stopped. Its files "
                  f"stay: what the hub left in /home, /usr/local or /rw (anywhere, in a "
                  f"StandaloneVM), and whatever is set to start from there runs at its next "
                  f"start.")
     return text
+
+
+def remove_lead_intro(record) -> str:
+    """What Remove lead does, for the form that confirms it. A hidden
+    project's workers are refused to the hub too."""
+    who = ("nothing in AI space reaches them" if record.get("hidden")
+           else "only the hub reaches them")
+    return (f"Removes {record.get('lead')}: its badges, then the record, then the qube. The "
+            f"project keeps its workers; {who} until it has a new lead.")
 
 
 def manage_red(row, records) -> str | None:
@@ -2265,7 +2342,9 @@ def gateway_in_use(row) -> str | None:
 def remove_gateway_intro(row) -> str:
     return (f"Takes {row.get('name')} out of the gateway registry: AI space may no longer use "
             f"it as a network, and the forms stop offering it. The qube itself does not "
-            f"change. The command refuses while a project lists it or an AI qube is on it.")
+            f"change. The command refuses while a project lists it or an AI qube is on it, or, "
+            f"if templates' updates go to it, while the anonymity gate would then stop a "
+            f"project or the hub.")
 
 
 def enroll_choices(fleet_rows, gw_rows, hub=None) -> list:
@@ -2287,6 +2366,8 @@ def _enroll_why(row, hub=None) -> str | None:
         return "is the hub"
     if b["drop_box"] or b["lead_tag"] or b["member"] or b["lead"]:
         return "is a drop box, a lead or a project's member"
+    if b["held"]:
+        return "is held for your review: accept or reject it first (qmcp restored)"
     if row.get("state") is not None and not b["guarded"]:
         return f"is in AI space without qmcp-guarded (qmcp guard {row.get('name')})"
     return None
@@ -2471,7 +2552,7 @@ def lead_info(network, carried=None, change=False, qube=None, project_qube=None)
 #: Why a model-qube field offers nothing to choose.
 NO_MODEL_QUBE = ("no qube here can be a model qube: an AppVM or a StandaloneVM in AI space that "
                  "is no disposable template, gateway, drop box, lead or member of a project but "
-                 "p00, on no template the hub manages (a qube of yours outside AI space joins it "
+                 "p00, is not held for review, on no template the hub manages (a qube of yours outside AI space joins it "
                  "with qmcp guard NAME, once it has no network or sits on an enrolled gateway)")
 #: Why it offers nothing when the hub is not known: the command refuses every qube then.
 NO_HUB = ("the hub is not known (Settings: the hub file cannot be read), so the command refuses "
@@ -2593,11 +2674,14 @@ def model_qube_info(qube, fleet_rows=(), slot=None, current=None) -> str:
 def model_qube_refusal(doc, choice, fleet_rows) -> str | None:
     """Why the command refuses `--model-qube choice` for the firewall view's
     project, where the window can see why, in its words
-    (`fleet._set_model_qube`): nothing chosen, and a lead whose network cannot
-    be read, which it must take to none."""
+    (`fleet._set_model_qube`): nothing chosen, a lead held for review (only
+    none is taken then), and a lead whose network cannot be read, which it
+    must take to none."""
     if not choice:
         return "choose the model qube, or none"
     lead = (doc or {}).get("lead")
+    if choice != "none" and held_row(lead, fleet_rows):
+        return f"the lead {lead} {fleet.HELD_WHY}: accept or reject it first"
     lrow = _row(fleet_rows, lead)
     if choice != "none" and lrow is not None and lrow.get("netvm") == UNREADABLE:
         return f"the network of {lead} cannot be read"
@@ -2708,6 +2792,14 @@ def firewall_details(doc) -> list:
     return out
 
 
+def held_row(name, fleet_rows) -> bool:
+    """Whether `name`'s `list` row wears the hold: the command refuses a lead
+    change, removal or firewall change while the lead is held, and a held
+    gateway as birth egress."""
+    row = _row(fleet_rows, name)
+    return row is not None and badges(row)["held"]
+
+
 def lead_on_network(doc, fleet_rows):
     """Whether the lead the view names has a network, from the lead's `list`
     row: True, False, or None when no row of that name is on show or its
@@ -2761,7 +2853,9 @@ def firewall_actions(doc, fleet_rows=None) -> set:
     rest."""
     if not isinstance(doc, dict):
         return set()
-    if not doc.get("lead") or lead_rules_refusal(doc):
+    # A held lead's firewall waits for the review; taking the project's model
+    # qube away does not, as the command takes it (`model_qube_refusal`).
+    if not doc.get("lead") or lead_rules_refusal(doc) or held_row(doc.get("lead"), fleet_rows):
         return {"set_model_qube"}
     out = {"set_model_qube", "set_rules"}
     if model_refusal(doc, fleet_rows) is None:
@@ -2955,8 +3049,9 @@ GATE_STATUS = {
 NOT_JUDGED = ("not judged by this refresh's run: it was made after the gate ran. Refresh")
 #: The line above the Anonymity tab's list.
 GATE_NOTE = ("Each refresh runs qmcp gate --json, which judges every anonymous project now and "
-             "stops one that is not sound: its lead and members are badged qmcp-blocked, killed, "
-             "and their autostart turned off. Its timer runs it every 15 seconds as well, and "
+             "stops one that is not sound: its lead and members are badged qmcp-blocked and "
+             "their autostart turned off, and those running are killed when it finds the project "
+             "unsound (one it cannot judge is blocked, not killed). Its timer runs it every 15 seconds as well, and "
              "every qmcp command that changes qubes, projects or gateways runs it at its end.")
 
 
@@ -3007,6 +3102,35 @@ def blocked_project(node, records):
             and rec.get("label"):
         return rec
     return None
+
+
+def leftover_block(node, records, mode, fleet_rows=()):
+    """In normal mode, p00's stand-in for Unblock on a qube that still wears
+    qmcp-blocked or qmcp-stopped from anonymous mode: the hub, or a qube in
+    AI space or p00 that no anonymous project owns as its lead, member or
+    model qube (`anon.hub_candidates`). `qmcp project unblock p00` takes both
+    badges off every such qube, with no gate run first, since in normal mode
+    nothing about the hub claims anonymity. None for anything else, a qube
+    under Needs attention included, and in any other mode."""
+    if mode != "normal" or node is None or records is None:
+        return None
+    if node.kind == "hub":
+        row = _row(fleet_rows, node.data.get("name"))
+    elif node.kind == "qube" and not node.data.get("attention"):
+        row = node.data
+        b = badges(row)
+        if not (b["umbrella"] or projects.HUB_SLOT in b["member"]):
+            return None
+        owned = {s for s in _slots_of(row) if (records.get(s) or {}).get("anonymous")}
+        owned |= {s for s, r in records.items() if isinstance(r, dict) and r.get("anonymous")
+                  and r.get("model_qube") == row.get("name")}
+        if owned - {projects.HUB_SLOT}:
+            return None
+    else:
+        return None
+    if row is None or unread_row(row) or not stopped_qube(row):
+        return None
+    return {"slot": projects.HUB_SLOT, "label": projects.HUB_SLOT, "leftover": True}
 
 
 def verdict_for(slot, gate):
@@ -3210,7 +3334,10 @@ def unblock_refusal(record, verdict) -> str | None:
     """Why the command refuses `project unblock` where the window can see it,
     in its words (`anon.unblock`): not an anonymous project, and a gate
     verdict on show that is not green. The command judges the project again
-    when it runs; the verdict on show is this refresh's."""
+    when it runs; the verdict on show is this refresh's. Badges left from
+    anonymous mode (`leftover_block`) come off in normal mode with no verdict."""
+    if record.get("leftover"):
+        return None
     if record.get("hub"):
         if verdict is None or verdict.get("status") not in ("green", "red", "unreadable"):
             return "the gate did not judge the hub on this refresh: Refresh, then unblock it"
@@ -3236,15 +3363,21 @@ def unblock_refusal(record, verdict) -> str | None:
 
 
 def unblock_intro(record) -> str:
+    if record.get("leftover"):
+        return ("Normal mode: takes qmcp-blocked and qmcp-stopped, left from anonymous mode, off "
+                "the hub and every qube in AI space or p00 that no anonymous project owns. "
+                "Nothing about the hub claims anonymity in normal mode, so the command runs no "
+                "gate check first. Their autostart stays off: start the qubes you need by hand.")
     if record.get("hub"):
-        return ("Takes qmcp-blocked off the hub and every qube under its check (p00, and the "
-                "templates, disposable templates and disposables it made) once a fresh run of "
-                "the anonymity gate finds them sound: the command judges them again, and refuses "
+        return ("Takes qmcp-blocked and qmcp-stopped off the hub and every qube under the "
+                "hub's check (every qube in AI space or p00 that no anonymous project owns, "
+                "guarded routers aside) once a fresh run of the anonymity gate finds them sound: the command judges them again, and refuses "
                 "while they are not. Their autostart stays off. The gate stopped them because a "
                 "condition failed; make sure whatever broke it is fixed, not only that it reads "
                 "sound now.")
     note = f" ({record['note']})" if record.get("note") else ""
-    return (f"Takes qmcp-blocked off the lead and members of {record.get('label')}{note}, "
+    return (f"Takes qmcp-blocked and qmcp-stopped off the lead and members of "
+            f"{record.get('label')}{note}, "
             f"{record.get('slot')}, once a fresh run of the anonymity gate finds the project "
             f"sound: the command judges it again, and refuses while it is not. Their autostart "
             f"stays off: start the qubes you need by hand. The gate stopped the project because "
@@ -3399,40 +3532,159 @@ def gate_tab(rows, read) -> str:
     return (f"Anonymity ({sum(1 for r in rows if r.get('status') != 'green' or r.get('blocked_now'))})")
 
 
+# ======================================================================= what the view already holds
+
+def _names(fleet_rows) -> set:
+    return {r["name"] for r in fleet_rows or () if isinstance(r, dict)
+            and isinstance(r.get("name"), str)}
+
+
+def create_refusal(label, prefix, project_rows, fleet_rows, dump=False, templates=(),
+                   lead_source=None, lead_origin=None) -> str | None:
+    """Why the command refuses a new project, as far as the view tells it, in
+    its order and words (`fleet._create_project`): a label taken, all 15
+    slots in use, qubes already in its name space, its default dump sink
+    existing, and no approved template in AI space (the ticked ones, and the
+    lead's own template when it is in AI space). `label` None: anonymous,
+    dom0 picks it, and nothing that rests on it is judged. The command checks
+    everything again when it runs."""
+    records = [r for r in project_rows or () if isinstance(r, dict)]
+    rows = {r["name"]: r for r in fleet_rows or () if isinstance(r, dict)
+            and isinstance(r.get("name"), str)}
+    if label is not None and label in {r.get("label") for r in records}:
+        return f"label '{label}' is taken"
+    if len([r for r in records if r.get("slot") in projects.PROJECT_SLOTS]) >= len(
+            projects.PROJECT_SLOTS):
+        return f"all {len(projects.PROJECT_SLOTS)} project slots are in use"
+    if label is not None:
+        space = f"{prefix}{label}-"
+        squatters = sorted(n for n in rows if n.startswith(space))
+        if squatters:
+            return f"qubes already sit in '{space}': {', '.join(squatters)}"
+        if dump and f"{label}-dump" in rows:
+            return (f"the dump sink '{label}-dump' would be inside '{prefix}', is no qube name, "
+                    f"or exists")
+    tpl = lead_origin if lead_source == "template" else (rows.get(lead_origin) or {}).get("template")
+    if tpl == UNREADABLE:
+        return None                     # the command reads it again
+    trow = rows.get(tpl) if tpl else None
+    lead_tpl = trow is not None and trow.get("state") is not None
+    if not templates and not lead_tpl:
+        return "a project needs at least one approved template in AI space"
+    return None
+
+
+def lead_name_refusal(name, space, old, keep, fleet_rows) -> str | None:
+    """Why the command refuses the new lead's name, from the view: a qube of
+    that name (`name`, or `<space>lead` when none is typed) exists, and is not
+    the old lead being removed first (`fleet._plan_lead`)."""
+    name = name or f"{space}lead"
+    freed = old if old and not keep else None
+    if name in _names(fleet_rows) and name != freed:
+        return f"'{name}' exists; pass --lead-name for the new lead"
+    return None
+
+
+def dump_refusal(name, prefix, fleet_rows) -> str | None:
+    """Why the command refuses a dump sink's name, in its words
+    (`fleet._add_dump`, `_make_sink`): inside the reserved prefix, or the name
+    of a qube that exists. `name` is the typed name, or the default."""
+    if name.startswith(prefix):
+        return f"a dump sink's name must be a qube name outside '{prefix}'"
+    if name in _names(fleet_rows):
+        return f"'{name}' exists; a dump sink is always a fresh qube"
+    return None
+
+
+def role_refusal(action, row, gw_rows) -> str | None:
+    """Why `qmcp manage` or `qmcp guard` refuses `row`'s qube where its `list`
+    row shows it, in the command's words (`fleet._target`, `_manage`,
+    `_network_enrolled`): a drop box, a gateway made managed, and a qube that
+    is no gateway on a network that is not enrolled. None when the row shows
+    no reason; the command checks everything again when it runs."""
+    if not isinstance(row, dict):
+        return None
+    name, b = row.get("name"), badges(row)
+    if b["drop_box"]:
+        return f"'{name}' is a drop box (ai-dump); a drop box is never in AI space"
+    if action == "manage" and row.get("gateway") is True:
+        return f"'{name}' provides network; gateways are always guarded (qmcp guard)"
+    net = row.get("netvm")
+    if net == UNREADABLE:
+        return f"'{name}''s network cannot be read; try again"
+    if net is not None and row.get("gateway") is not True and net not in enrolled(gw_rows):
+        return (f"'{name}' is on {net}, which is not an enrolled gateway: enroll it "
+                f"(qmcp gateway enroll {net}) or clear the qube's network first")
+    return None
+
+
+def networks_in_use(record, networks, fleet_rows) -> str | None:
+    """Why the command refuses a new list of worker networks for `record`, in
+    its words (`fleet._apply_edit`): a member of the slot still sits on a
+    network the list takes off. A qube whose tags cannot be read, or a member
+    whose network cannot be, counts as one, as the command counts it."""
+    slot = record.get("slot")
+    gone = {n for n in record.get("networks") or () if n not in (None, "none")} - set(networks)
+    if not gone:
+        return None
+    out = []
+    for r in fleet_rows or ():
+        if not isinstance(r, dict) or not isinstance(r.get("name"), str):
+            continue
+        if r.get("state") == UNREADABLE:
+            out.append(f"{r['name']} (tags unreadable)")
+            continue
+        b = badges(r)
+        if not (b["umbrella"] and slot in b["member"] and not b["lead_tag"]):    # core.is_member
+            continue
+        if r.get("netvm") == UNREADABLE:
+            out.append(f"{r['name']} (network unreadable)")
+        elif r.get("netvm") in gone:
+            out.append(f"{r['name']} on {r['netvm']}")
+    if not out:
+        return None
+    return (f"still in use: {', '.join(sorted(out))}; remove those workers, or clear their "
+            f"networks, before taking the network off the list")
+
+
 # ======================================================================= choices for the forms
 
 def lead_templates(fleet_rows) -> list:
     """Any TemplateVM, in AI space or not: one outside it is the stronger
     choice for a lead, since the hub cannot edit it."""
     return sorted(r["name"] for r in fleet_rows if r.get("klass") == "TemplateVM"
-                  and not unread_row(r))
+                  and not unread_row(r) and not badges(r)["held"])
 
 
 def hubs_own_qubes(fleet_rows, hub=None) -> list:
     """Managed AppVMs and StandaloneVMs of the hub's (p00 or no slot): a lead's
     clone source or a qube to promote. Never a model qube, even one managed for
-    its maintenance: the command refuses it (`fleet._hubs_own_qube`)."""
+    its maintenance, nor one held for review: the command refuses both
+    (`fleet._hubs_own_qube`)."""
     out = []
     for r in fleet_rows:
         if (r.get("state") == "managed" and r.get("klass") in fleet.WORKLOAD_KLASSES
                 and not r.get("dvmt")
                 and not r.get("gateway") and not r.get("lead") and not r.get("model")
-                and (r.get("slot") in (None, projects.HUB_SLOT)) and r.get("name") != hub):
+                and (r.get("slot") in (None, projects.HUB_SLOT)) and r.get("name") != hub
+                and not badges(r)["held"]):
             out.append(r["name"])
     return sorted(out)
 
 
 def approved_template_choices(fleet_rows) -> list:
-    """TemplateVMs and disposable templates in AI space."""
+    """TemplateVMs and disposable templates in AI space, none held for review
+    (`fleet._check_templates` refuses one)."""
     return sorted(r["name"] for r in fleet_rows if r.get("state") is not None and _is_template_row(r)
-                  and not r.get("gateway") and not unread_row(r))
+                  and not r.get("gateway") and not unread_row(r) and not badges(r)["held"])
 
 
 def outside_choices(fleet_rows, hub=None, sinks=()) -> list:
     """Qubes a role action can bring into AI space: outside it, not the hub,
-    not a dump sink."""
+    not a dump sink, not held for review (the command refuses one)."""
     return sorted(r["name"] for r in fleet_rows if r.get("state") is None
-                  and r.get("name") not in (hub, *sinks) and not unread_row(r))
+                  and r.get("name") not in (hub, *sinks) and not unread_row(r)
+                  and not badges(r)["held"])
 
 
 def move_targets(records: dict) -> list:
@@ -3658,8 +3910,8 @@ def accept_restored_red(rec) -> str:
 
 def reject_restored_intro(name) -> str:
     return (f"Takes every qmcp badge off {name}: ai-managed, qmcp-guarded, ai-dump and each "
-            f"qmcp- badge, the ones the rulebook routes on first and the hold last. It leaves AI "
-            f"space and any project. The qube and its data stay.")
+            f"qmcp- badge, the ones the rulebook routes on first and the hold last, and its qmcp "
+            f"label is removed. It leaves AI space and any project. The qube and its data stay.")
 
 
 def reject_restored_red(name, rec) -> str:
@@ -3703,6 +3955,9 @@ def accept_all_red(rows) -> str:
 
 
 def accept_all_refusal(rows) -> str | None:
+    # A row that does not read may be held: never "nothing is held" over it.
+    if any(isinstance(r, dict) and "unreadable" in r for r in rows or ()):
+        return "a restored qube cannot be read now, so what is held is not known; refresh"
     return None if held_rows(rows) else "nothing is held"
 
 
@@ -3851,6 +4106,8 @@ def _install_why(row) -> str | None:
         return "is held for your review: accept or reject it first (qmcp restored)"
     if projects.HUBBLIND in tags:
         return "is a hidden project's qube"
+    if tags & {core.OPEN, core.OPEN_FW}:
+        return f"is open to the hub: seal it first (qmcp seal {row.get('name')})"
     power = row.get("power")
     if isinstance(power, str) and power not in ("Running", "Halted") + POWER_UNREAD:
         return f"is {power}: install while it runs or is halted"
@@ -3865,6 +4122,123 @@ def install_refusal(row) -> str | None:
     return None if why is None else f"'{row.get('name')}' {why}"
 
 
+# ======================================================================= the audit log's modes and gauge
+
+#: How the Settings tab says the install's audit mode (`install.sh --audit-log`).
+AUDIT_MODE_TEXT = {
+    "disk": "disk: /var/log/qmcp-audit.log, rotated daily, rotated files removed by age "
+            "(install.sh --audit-log ram or none changes it)",
+    "ram": "ram: the lines go to a chain under /run/qmcp/audit, gone at shutdown (install.sh "
+           "--audit-log changes it)",
+    "none": "none: no qmcp audit line is written, of any call (install.sh --audit-log changes "
+            "it)",
+}
+AUDIT_MODE_UNREAD = ("not known: /etc/qmcp/audit-mode does not read, so every line goes to RAM "
+                     "until it does (qmcp check fails)")
+#: A project's audit modes, as `qmcp project audit` takes them.
+AUDIT_MODES = projects.AUDIT_MODES
+#: How a project's record says where its lines go.
+PROJECT_AUDIT_TEXT = {
+    "disk": "disk (with the install's: the audit log)",
+    "ram": "ram: its own chain under /run/qmcp/audit, gone at shutdown",
+    "off": "off: none of its lines is written",
+}
+#: The plain warning a switch away from disk carries, in the command's words.
+AUDIT_LEAVES_DISK = fleet.AUDIT_LEAVES_DISK
+AUDIT_FORM_INTRO = (
+    "Where this project's audit lines go from now: its lead's calls, the hub's calls into its "
+    "qubes, and your commands on it. disk is the install's log; ram is a chain of its own "
+    "under /run, gone at shutdown; off writes none. The install's own mode is the floor: a "
+    "line goes to the more private of the two. The switch itself leaves one line on the "
+    "install's log naming the slot, not the label. dom0's journal keeps every qrexec call "
+    "whatever the mode: qmcp check says how to keep it in RAM.")
+
+
+def keep_days_field(value) -> str:
+    """The keep-days setting as the form shows it, and sends it back: empty
+    when it did not read."""
+    if value == "off" or (isinstance(value, int) and not isinstance(value, bool)):
+        return str(value)
+    return ""
+
+
+def keep_days_text(value) -> str:
+    if value == "off":
+        return "off: rotated logs are never removed"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return (f"{value} days: the hourly timer removes a rotated log once it is older, by its "
+                f"age, never its size")
+    return ("not known: /etc/qmcp/audit-keep-days does not read, so no rotated log is removed "
+            "(qmcp check fails)")
+
+
+def audit_form_warning(old, new) -> str | None:
+    """The red text of a switch away from disk, else None."""
+    return AUDIT_LEAVES_DISK if old == "disk" and new != "disk" else None
+
+
+#: Every field of `audit status --json`, as the gauge names it.
+AUDIT_STATUS_FIELDS = (
+    ("mode", "Install mode"), ("keep_days", "Keep rotated logs"), ("log", "Log"),
+    ("log_bytes", "Log size"), ("rotated", "Rotated logs"), ("ram", "Chains in RAM"),
+    ("free_bytes", "Free under the log"), ("floor_bytes", "Floor"),
+    ("principals", "Principals"), ("needed_bytes", "A full budget for that long needs"),
+    ("budgets", "Budget used today"),
+)
+
+
+def _mib(n) -> str:
+    return "not known" if not isinstance(n, int) or isinstance(n, bool) else \
+        f"{n / 1024 ** 2:.1f} MiB"
+
+
+def audit_gauge(doc) -> list:
+    """(heading, text, fraction or None) per row of the Audit tab's gauge:
+    the log and its files, the free space against the floor, and each
+    principal's budget today. `doc` None: never read, and it says so, never
+    a size it did not read. A fraction is how full a bar is (0..1)."""
+    if not isinstance(doc, dict):
+        return [("Audit log", "not read: Refresh", None)]
+    rows = [("Install mode", AUDIT_MODE_TEXT.get(doc.get("mode"), AUDIT_MODE_UNREAD), None),
+            ("Keep rotated logs", keep_days_text(doc.get("keep_days")), None),
+            ("Log", f"{doc.get('log')}: {_mib(doc.get('log_bytes'))}", None)]
+    rotated = doc.get("rotated") if isinstance(doc.get("rotated"), list) else []
+    total = [r.get("bytes") for r in rotated if isinstance(r, dict)]
+    rows.append(("Rotated logs", f"{len(rotated)} file(s), "
+                 + (_mib(sum(total)) if all(isinstance(b, int) for b in total) else "not known"),
+                 None))
+    ram = doc.get("ram") if isinstance(doc.get("ram"), list) else []
+    if ram:
+        rows.append(("Chains in RAM", ", ".join(f"{r.get('name')} {_mib(r.get('bytes'))}"
+                                                for r in ram if isinstance(r, dict)), None))
+    free, floor = doc.get("free_bytes"), doc.get("floor_bytes")
+    if isinstance(free, int) and isinstance(floor, int) and free >= 0 and floor > 0:
+        # Full when the floor is reached: the services then refuse every change but a kill.
+        rows.append(("Free under the log",
+                     f"{_mib(free)} free; the services refuse changes below {_mib(floor)}",
+                     min(1.0, floor / free) if free else 1.0))
+    else:
+        rows.append(("Free under the log", "not known: the services refuse changes until it "
+                     "reads", None))
+    need = doc.get("needed_bytes")
+    if isinstance(need, int):
+        rows.append(("A full budget for that long needs",
+                     f"{_mib(need)} for {doc.get('principals')} principal(s)"
+                     + ("; more than is free" if isinstance(free, int) and need > free else ""),
+                     None))
+    for b in doc.get("budgets") if isinstance(doc.get("budgets"), list) else []:
+        if not isinstance(b, dict):
+            continue
+        used, cap = b.get("lines_today"), b.get("budget")
+        if isinstance(used, int) and isinstance(cap, int) and cap > 0:
+            rows.append((f"Budget: {b.get('caller')}", f"{used} of {cap} lines today",
+                         min(1.0, used / cap)))
+        else:
+            rows.append((f"Budget: {b.get('caller')}", "its counter does not read: its changes "
+                         "are refused (qmcp check)", None))
+    return rows
+
+
 # ======================================================================= settings, export, import
 
 SETTINGS_INTRO = (
@@ -3872,14 +4246,17 @@ SETTINGS_INTRO = (
     "space may hold, and the command refuses one below what AI space uses then. The "
     "private-volume cap bounds the private volume one qube may ask for. Birth egress is the "
     "network the hub's qubes made from a template are born on when the hub's own network is not "
-    "an enrolled gateway; with none, such a create is refused unless it asks for no network. The "
+    "an enrolled gateway; with none, such a create is refused unless it asks for no network. "
+    "Keep-days is how long a rotated audit log is kept before the hourly timer removes it, by "
+    "its age, never its size; off keeps every one. The "
     "hub is fixed at install, the mode is turned on only by install.sh and off only by "
     "uninstall.sh --purge, and the name prefix is "
     "/etc/qmcp/name-prefix (default ai-), which this form does not write.")
 #: The note under the Settings tab's values.
 SETTINGS_NOTE = (
-    "Edit settings... changes the pool cap, the private-volume cap and birth egress (qmcp "
-    "settings set). The hub is fixed at install; the mode is turned on only by install.sh "
+    "Edit settings... changes the pool cap, the private-volume cap, birth egress and how long "
+    "rotated audit logs are kept (qmcp settings set). The hub is fixed at install, and so is "
+    "where the audit log is kept (install.sh --audit-log); the mode is turned on only by install.sh "
     "and off only by uninstall.sh --purge; the gateway "
     "registry, /etc/qmcp/gateways.json, changes on the Gateways tab. Export... writes the "
     "operator files into one file in your dom0 home, which a Qubes backup with dom0 ticked "
@@ -3887,14 +4264,17 @@ SETTINGS_NOTE = (
     "tab lets the restored qubes back in.")
 EXPORT_INTRO = (
     "Writes the operator files under /etc/qmcp (the hub, the mode, the caps, birth egress, the "
-    "name prefix, the gateway registry and the project records) into one JSON file that only "
+    "name prefix, the audit log's keep-days and mode, the gateway registry and the project "
+    "records) into one JSON file that only "
     "you can read. A Qubes backup takes dom0 in as your home directory only, so keep the file "
     "there and back up with dom0 ticked. Left empty, the file is "
     "qmcp-export-<UTC time>.json in your dom0 home. The command never writes over a file that "
     "exists. Not in it: the proposals and the audit chain, which a new install starts afresh.")
 IMPORT_INTRO = (
     "Puts an export's operator files back under /etc/qmcp: the caps, birth egress, the name "
-    "prefix, the gateway registry and the project records. The command refuses an export of "
+    "prefix, the audit log's keep-days, the gateway registry and the project records (the "
+    "audit log's mode is the install's: the command only names it when it differs). The "
+    "command refuses an export of "
     "another hub, or an ordinary one onto an install in anonymous mode, and then changes "
     "nothing. An export of an install in anonymous mode goes onto a normal install; once the "
     "qubes are restored and accepted, install.sh --anonymous turns the mode on.")
@@ -3902,23 +4282,24 @@ IMPORT_RED = (
     "For a fresh install only: the command refuses if this install has a project, a sink for "
     "p00 or an enrolled gateway. The order on a reinstalled Qubes: restore everything with "
     "dom0 ticked, install qubes-mcp with the same hub, import, then accept the restored AI "
-    "qubes with Accept all held... on the Check tab. Until you do, each is held: no call from "
-    "another qube reaches it, and it reaches nothing. With anonymous projects, send your "
+    "qubes with Accept all held... on the Check tab. Until you do, each is held from the gate's "
+    "next pass: no qrexec call reaches it or leaves it (its network is unchanged). With anonymous projects, send your "
     "templates' updates through the anonymiser again (Global Config) before the import: a "
     "backup does not carry it, and the gate runs right after the import.")
 
 
-def egress_choices(current, gw_rows) -> list:
+def egress_choices(current, gw_rows, fleet_rows=()) -> list:
     """(id, text) for the birth-egress field: unchanged first, then none,
     which unsets it, then the enrolled gateways, the only qubes the command
-    takes. The services use the file only while it names an enrolled one."""
+    takes, but one whose `list` row in `fleet_rows` is held for review, which
+    it refuses. The services use the file only while it names an enrolled one."""
     have = enrolled(gw_rows)
     now = current or "not set"
     if current and current not in have:
         now += ", which is not enrolled, so the services do not use it"
     return ([("unchanged", f"unchanged: {now}"),
              ("none", "none: not set; a create the hub's own network does not place is refused")]
-            + [(n, network_text(n, gw_rows)) for n in have])
+            + [(n, network_text(n, gw_rows)) for n in have if not held_row(n, fleet_rows)])
 
 
 def in_use_text(used) -> str:

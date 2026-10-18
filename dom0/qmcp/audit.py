@@ -1,7 +1,7 @@
 """qmcp.audit — the hash-chained, AI-unreachable record of state changes.
 
-Every state-changing qmcp.* call appends one JSON line to
-/var/log/qmcp-audit.log, and so does every command of the operator's that
+Every state-changing qmcp.* call appends one JSON line to the audit chain
+(/var/log/qmcp-audit.log, unless the modes below send it elsewhere), and so does every command of the operator's that
 changes something (caller "operator": the command and the names it acts on),
 accepting and rejecting the hub's proposals included. Each line carries `prev`, the sha256 of the line
 before it, and `hash`, the sha256 of its own canonical form, so an edit, a
@@ -30,6 +30,20 @@ operator's commands as root or as a member of `qubes`. The installer and tmpfile
 root:qubes 0660, and `qmcp check` fails when the services could not write it;
 this module never chmods it, because a non-owner fchmod is EPERM and would make
 every append fail.
+
+Where a line goes (0.9.33). The install has a mode (`install.sh --audit-log`,
+`/etc/qmcp/audit-mode`): `disk`, the log above; `ram`, a chain under
+/run/qmcp/audit, gone at shutdown; `none`, no line at all. A project has one
+too (its record's `audit`, `qmcp project audit`): disk, ram or off. A line
+belongs to a project when its caller is the project's lead, a qube it names
+wears one of the project's slot badges (read before the call acts and after,
+so a removed qube and a created one both count), or it names the project. Its
+effective mode is the most private of the install's and of every project it
+belongs to (none, then ram, then disk). A line whose project cannot be worked
+out (a badge read that failed, records that do not read, a slot badge with no
+record) goes to RAM (nowhere only in install mode none), never to disk.
+Every caller says where its line belongs (`slots=`, `app=`, or a `Where` it worked out
+before, which `audit()` takes as final), and a test refuses one that does not.
 """
 from __future__ import annotations
 
@@ -37,6 +51,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import stat
 
 LOG_PATH = "/var/log/qmcp-audit.log"
 GENESIS = hashlib.sha256(b"").hexdigest()
@@ -61,12 +77,25 @@ def _body_hash(record: dict) -> str:
 #: well under 2 KiB, so a write costs the same however long the log has grown.
 TAIL_BYTES = 64 * 1024
 
-#: Past this size `qmcp check` asks the operator to rotate. The services run as
-#: an unprivileged user who cannot create files in /var/log, so rotation is the
-#: operator's (`qmcp audit rotate`), not automatic.
+#: Past this size the hourly rotation (`qmcp-audit.timer`, `auto_rotate`)
+#: rotates the log whatever the day, and `qmcp check` warns. The services run
+#: as an unprivileged user who cannot create files in /var/log, so rotation is
+#: root's: the timer's, or `qmcp audit rotate`.
 ROTATE_AT_BYTES = 32 * 1024 * 1024
+#: The RAM chains (tmpfs, dom0's memory) are bounded by size, unlike the log on
+#: disk: the hourly run rotates one past `RAM_ROTATE_AT_BYTES`, and removes the
+#: oldest rotated RAM files while all RAM chains together hold more than
+#: `RAM_KEEP_BYTES`. A live chain is never removed. A flood can so push earlier
+#: RAM lines off; a reboot clears them all anyway.
+RAM_ROTATE_AT_BYTES = 8 * 1024 * 1024
+RAM_KEEP_BYTES = 64 * 1024 * 1024
 
 ROTATE_SERVICE = "qmcp.audit-rotate"
+#: The new log's name while a rotation writes it, before it is renamed in.
+ROTATING_SUFFIX = ".rotating"
+#: The hourly rotation and removal by age; `qmcp check` fails while it does
+#: not run.
+AUDIT_TIMER = "qmcp-audit.timer"
 
 
 def _tail_state(f) -> tuple[int, str]:
@@ -117,7 +146,9 @@ def _locked_log(path: str):
         # file whoever creates it must stay group-writable (tmpfiles declares it).
         old = os.umask(0o007)
         try:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o660)
+            # O_NOFOLLOW: the RAM chains' directory is the services' group's to
+            # write, and root must never follow a link planted there.
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o660)
         finally:
             os.umask(old)
         if os.geteuid() == 0:
@@ -135,7 +166,16 @@ def _locked_log(path: str):
 
 def _write(f, record: dict) -> None:
     f.seek(0, os.SEEK_END)
-    f.write((json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+    line = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if f.tell():
+        # A write cut short (a kill, a full disk) leaves a last line with no
+        # newline: the next record starts a line of its own, so it is never
+        # glued onto the torn bytes and lost with them.
+        f.seek(-1, os.SEEK_END)
+        if f.read(1) != b"\n":
+            line = b"\n" + line
+        f.seek(0, os.SEEK_END)
+    f.write(line)
     f.flush()
     os.fsync(f.fileno())
 
@@ -158,19 +198,33 @@ def _append(record: dict, path: str) -> bool:
         f.close()
 
 
-def rotate(path: str | None = None) -> str:
-    """Rename the log aside and start a new one whose first record anchors on
+def rotate(path: str | None = None, caller: str = "operator") -> str:
+    """Keep the log aside and start a new one whose first record anchors on
     the old head, so the chain continues across files. Operator only (root).
-    Returns the name the old log now has."""
+    Returns the name the old log now has.
+
+    The new log is written in full under a temporary name, the old one is
+    linked to its new name, and the new one renamed over the log in one step:
+    there is no moment with no file at the log's name, in which a writer
+    would create a fresh log from GENESIS, unanchored. A writer waiting for
+    the old log's lock finds it is no longer the file at the name, and appends
+    to the new one (`_locked_log`)."""
     path = LOG_PATH if path is None else path
     f = _locked_log(path)
+    tmp = None
     try:
         seq, head = _tail_state(f)
         st = os.fstat(f.fileno())
         import datetime
         aside = path + "." + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        os.rename(path, aside)
-        nfd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o660)
+        tmp = path + ROTATING_SUFFIX
+        # One left by a rotation killed part-way (it was never renamed in) is
+        # taken over: this rotation holds the log's lock, so no other is running.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        nfd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o660)
         try:
             os.fchown(nfd, st.st_uid, st.st_gid)
         except PermissionError:
@@ -178,13 +232,21 @@ def rotate(path: str | None = None) -> str:
         os.fchmod(nfd, st.st_mode & 0o7777)
         with os.fdopen(nfd, "r+b") as nf:
             record = {"v": SCHEMA, "ts": _utc_now_iso(), "service": ROTATE_SERVICE,
-                      "caller": "operator", "args": {"continues": os.path.basename(aside),
+                      "caller": str(caller), "args": {"continues": os.path.basename(aside),
                                                "after_seq": seq},
                       "ok": True, "error": None, "seq": 1, "prev": head}
             record["hash"] = _body_hash(record)
             _write(nf, record)
+        os.link(path, aside)
+        os.rename(tmp, path)
+        tmp = None
         return aside
     finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         f.close()
 
 
@@ -221,6 +283,14 @@ REFUSED_SUFFIX = ".refused"
 AUDIT_LINES_PER_DAY = 20000
 
 
+def _counter(text: str):
+    """A counter's record: its first JSON value. A rewrite cut short between
+    its write and its truncate leaves the end of the older, longer text behind
+    the new record, which is ignored; an empty file is a fresh counter."""
+    text = text.lstrip()
+    return json.JSONDecoder().raw_decode(text)[0] if text else {}
+
+
 def _update(path: str, change):
     """Read-modify-write the caller's counter under its lock. `change(rec)`
     edits the dict and returns the answer. Raises when the counter cannot be
@@ -233,13 +303,17 @@ def _update(path: str, change):
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         text = fh.read(4096)
-        rec = json.loads(text) if text.strip() else {}
+        rec = _counter(text)
         if not isinstance(rec, dict):
             raise ValueError("counter is not an object")
         answer = change(rec)
+        # Written over the old text, then cut to length: a failure part-way
+        # leaves the old counts or the new, never an empty file that reads as
+        # a fresh day (the evidence gone, the budget restarted).
         fh.seek(0)
-        fh.truncate()
         fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        fh.flush()
+        fh.truncate()
         return answer
 
 
@@ -285,6 +359,31 @@ def budget_left(path: str, now: str | None = None) -> bool | None:
         return None
 
 
+#: The line a caller's first withheld call of an hour (the cap) or of a day
+#: (the budget) leaves on the chain: the counter that counts the rest is on
+#: tmpfs, which a reboot or an `rm` clears, so the chain keeps that they were.
+CAPPED_SERVICE = "qmcp.calls-capped"
+
+
+def first_capped(path: str, kind: str, now: str | None = None) -> str | None:
+    """The hour (`kind` "hour") or day ("day") just capped for this caller,
+    the first time it is asked in that period, else None: at most one line
+    per caller per period. None too when the counter cannot be kept."""
+    now = now or _utc_now_iso()
+    period = now[:13] if kind == "hour" else now[:10]
+
+    def change(rec):
+        key = f"noted_{kind}"
+        if rec.get(key) == period:
+            return None
+        rec[key] = period
+        return period
+    try:
+        return _update(path, change)
+    except Exception:
+        return None
+
+
 def budget_spent(path: str, now: str | None = None) -> bool:
     """Has this caller spent today's share? Read only, under the counter's
     lock; a counter that does not read counts as spent. For a kill, which acts
@@ -296,10 +395,10 @@ def budget_spent(path: str, now: str | None = None) -> bool:
             text = fh.read(4096)
     except FileNotFoundError:
         return False
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return True
     try:
-        rec = json.loads(text) if text.strip() else {}
+        rec = _counter(text)
         return rec.get("day") == now[:10] and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY
     except Exception:
         return True
@@ -337,7 +436,7 @@ def counters(calls_dir: str, now: str | None = None) -> list:
                 # it writes, and an unlocked read could catch the gap.
                 fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
                 text = fh.read(4096)
-            rec = json.loads(text) if text.strip() else {}
+            rec = _counter(text)
             if not isinstance(rec, dict):
                 raise ValueError
         except Exception:
@@ -375,14 +474,33 @@ def spent_budgets(calls_dir: str, now: str | None = None) -> list:
 
 
 def room(path: str | None = None) -> bool:
-    """True when the log's directory has `FLOOR_BYTES` free. False when it has
-    not, or when that cannot be read: a gate, so it fails toward refusing."""
+    """True when the directory of the chain `path` (default: the log) has
+    `FLOOR_BYTES` free: the log's disk, or for a RAM chain the tmpfs, which is
+    dom0's memory. False when it has not, or when that cannot be read: a gate,
+    so it fails toward refusing. A RAM chain's directory not made yet is
+    judged by its parent's filesystem, the same tmpfs."""
     path = LOG_PATH if path is None else path
+    d = os.path.dirname(path) or "."
+    if not os.path.isdir(d):
+        d = os.path.dirname(d) or "."
     try:
-        st = os.statvfs(os.path.dirname(path) or ".")
+        st = os.statvfs(d)
     except OSError:
         return False
     return st.f_bavail * st.f_frsize >= FLOOR_BYTES
+
+
+def install_room() -> bool:
+    """Room on every chain this install may write to: the log's disk in mode
+    disk, and the RAM chains' tmpfs in modes disk and ram (a project in RAM,
+    and a line whose project cannot be worked out, go there). Asked for every
+    line whatever its own place, so a refusal for room never says where a
+    line was going; mode none writes nothing and needs none."""
+    mode = install_mode()[0]
+    if mode == "none":
+        return True
+    ok = room(ram_path())
+    return ok and room(LOG_PATH) if mode == "disk" else ok
 
 
 def dropped(path: str | None = None):
@@ -390,7 +508,7 @@ def dropped(path: str | None = None):
     (None, None) for a marker that does not read."""
     try:
         with open(DROPPED_PATH if path is None else path, encoding="utf-8") as fh:
-            rec = json.loads(fh.read(4096))
+            rec = _counter(fh.read(4096))
         return int(rec["count"]), str(rec["first"])
     except FileNotFoundError:
         return None
@@ -409,25 +527,284 @@ def _note_dropped() -> None:
         with os.fdopen(fd, "r+", encoding="utf-8") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
-                rec = json.loads(fh.read(4096) or "{}")
+                rec = _counter(fh.read(4096))
                 count, first = int(rec.get("count", 0)), str(rec.get("first") or _utc_now_iso())
             except Exception:
                 count, first = 0, _utc_now_iso()
+            # Written over, then cut to length, as the callers' counters are:
+            # a failure part-way never leaves an empty marker that reads as none.
             fh.seek(0)
-            fh.truncate()
             fh.write(json.dumps({"count": count + 1, "first": first}) + "\n")
+            fh.flush()
+            fh.truncate()
     except Exception:
         pass
 
 
+# ------------------------------------------------------------------ where a line goes
+
+#: The install's mode: one word, `disk`, `ram` or `none` (`install.sh
+#: --audit-log`). Absent: `disk`, as every install before the option.
+MODE_PATH = "/etc/qmcp/audit-mode"
+#: Most private first: a line's mode is the first of these any of its parts asks for.
+MODES = ("none", "ram", "disk")
+#: A project's word for each mode (its record's `audit`; absent is disk).
+PROJECT_MODES = {"disk": "disk", "ram": "ram", "off": "none"}
+#: The RAM chains, under the runtime directory (tmpfs): one per project in
+#: RAM, and one for the install in RAM and for a line no single project's.
+RAM_SUBDIR = "audit"
+RAM_LOG = "qmcp-audit.log"
+#: Summary keys that hold a qube's name, a list of them, or a project's label
+#: or slot: what a line is about, for the project it belongs to.
+NAME_KEYS = ("name", "source", "template", "qube", "lead_clone", "lead_promote",
+             "model_qube", "subject")
+LIST_KEYS = ("qubes",)
+PROJECT_KEYS = ("project", "target", "subject")
+#: The request keys each state-changing service acts on, and so the qubes its
+#: line is about, read before the call acts. Only these: a key the service
+#: ignores is the caller's to choose, and would let it send its own line to a
+#: project kept in RAM or nowhere by naming one of that project's qubes.
+REQUEST_KEYS = {
+    "qmcp.SetPropertyAIManaged": ("name",),
+    "qmcp.SetFeatureAIManaged": ("name",),
+    "qmcp.LifecycleAIManaged": ("name",),
+    "qmcp.SpawnAIManagedQube": ("template",),
+    "qmcp.CloneAIManagedQube": ("source",),
+    "qmcp.SpawnDisposableAIManaged": ("template",),
+}
+
+
+def install_mode(path: str | None = None) -> tuple:
+    """(mode, problem). Absent: disk. A file that does not read or does not
+    hold one of the three words: ram, with the problem (`qmcp check` fails on
+    it). The operator may have asked for less than disk, so disk could leak
+    what was meant to stay off it, and none would lose the record: RAM is the
+    answer a line of an unknown project gets too."""
+    path = MODE_PATH if path is None else path
+    try:
+        with open(path, encoding="ascii") as fh:
+            word = fh.read(64).strip()
+    except FileNotFoundError:
+        return "disk", None
+    except (OSError, UnicodeDecodeError) as e:
+        return "ram", f"{path} does not read ({type(e).__name__})"
+    if word not in MODES:
+        return "ram", f"{path} holds neither disk, ram nor none"
+    return word, None
+
+
+def most_private(modes) -> str:
+    modes = list(modes)
+    return min(modes, key=MODES.index) if modes else "disk"
+
+
+def ram_dir() -> str:
+    from qmcp import core
+    return os.path.join(str(core.RUN_DIR), RAM_SUBDIR)
+
+
+def ram_path(slot: str | None = None) -> str:
+    """The RAM chain of project `slot`, or the install's (`slot` None)."""
+    return os.path.join(ram_dir(), RAM_LOG if slot is None else f"{slot}.log")
+
+
+class Where:
+    """The projects a line belongs to, each with its mode as read when the
+    line's qubes were read (`modes`: slot -> disk, ram or none), or
+    `unknown`: some part of it could not be worked out."""
+
+    __slots__ = ("modes", "unknown")
+
+    def __init__(self, modes=None, unknown=False):
+        self.modes, self.unknown = dict(modes or {}), bool(unknown)
+
+    def __or__(self, other: "Where") -> "Where":
+        modes = dict(self.modes)
+        for slot, mode in other.modes.items():
+            modes[slot] = most_private([mode, modes.get(slot, mode)])
+        return Where(modes, self.unknown or other.unknown)
+
+    def __repr__(self):
+        return f"<Where {'unknown' if self.unknown else sorted(self.modes.items())}>"
+
+
+def _names(summary: dict) -> list:
+    from qmcp import core
+    out = []
+    for key in NAME_KEYS:
+        if isinstance(summary.get(key), str):
+            out.append(summary[key])
+    for key in LIST_KEYS:
+        if isinstance(summary.get(key), list):
+            out += [v for v in summary[key] if isinstance(v, str)]
+    return [n for i, n in enumerate(out) if core.valid_qube_name(n) and n not in out[:i]]
+
+
+def place(app, summary=None, slots=()) -> Where:
+    """Where a line about `summary` belongs: the projects in `slots` (a
+    caller's own, or a `Where` worked out before), those whose slot badge a
+    named qube wears (one `admin.vm.tag.List` each, read through `app`; none
+    without one), and those it names by label or slot. A qube qubesd says is
+    missing belongs to none. Never raises: a read that fails is an unknown
+    place. Every named qube is read whatever came before, a missing one, an
+    unreadable one or an unknown place, so the number of reads is the same for
+    every name and never says what a name is (each read's time can: qubesd
+    answers a missing qube sooner than it reads an existing one's tags)."""
+    from qmcp import projects
+    if isinstance(slots, Where):
+        base, slots = slots, ()
+    else:
+        base = Where()
+    summary = summary if isinstance(summary, dict) else {}
+    found = {s for s in slots if s in projects.PROJECT_SLOTS}
+    unknown = base.unknown
+    if app is not None:
+        for name in _names(summary):
+            try:
+                raw = app.qubesd_call(name, "admin.vm.tag.List")
+                tags = raw.decode("ascii", "replace").split()
+            except KeyError:
+                continue                # QubesVMNotFoundError: no such qube, in no slot
+            except Exception:
+                unknown = True
+                continue
+            found |= {part[1] for part in map(projects.slot_badge_parts, tags)
+                      if part and part[1] in projects.PROJECT_SLOTS}
+    keys = [summary[k] for k in PROJECT_KEYS if isinstance(summary.get(k), str)]
+    if unknown:
+        return Where(base.modes, unknown=True)
+    # The records are read for every line, whatever its names wear: read only
+    # for a slot-badged name, the time it takes would tell such a name (a
+    # hidden project's qube) from one that does not exist.
+    try:
+        records = projects.load()
+        for key in keys:
+            if key in projects.PROJECT_SLOTS:
+                found.add(key)
+                continue
+            p = projects.by_label(records, key)
+            if p is not None and p.slot in projects.PROJECT_SLOTS:
+                found.add(p.slot)
+        # A slot whose record is gone (a delete part-way, badges left) has no
+        # mode to follow: an unknown place, RAM.
+        return base | Where({s: PROJECT_MODES[records[s].audit] for s in found if s in records},
+                            unknown=any(s not in records for s in found))
+    except Exception:
+        # Records that do not read leave unknown only a line that needs them:
+        # one of a project, or naming one. Another stays where it was going.
+        needed = found or any(k in projects.PROJECT_SLOTS or projects.LABEL_RE.match(k)
+                              for k in keys)
+        return Where(unknown=True) if needed else base
+
+
+def request_place(app, service: str, req, slot=None) -> Where:
+    """Where a service call's line belongs as the request stands, before it
+    acts: its caller's project, and the qubes the request names in the keys
+    the service acts on (`REQUEST_KEYS`), never any other."""
+    keys = REQUEST_KEYS.get(service, ())
+    names = {k: req.get(k) for k in keys} if isinstance(req, dict) else {}
+    return place(app, names, () if slot is None else (slot,))
+
+
+def destination(where: Where | None = None) -> tuple:
+    """(mode, path) for a line: path None for `none`. RAM goes to the
+    project's own chain when the line belongs to one project only and that
+    project asked for RAM, else to the install's RAM chain."""
+    where = Where() if where is None else where
+    install = install_mode()[0]
+    modes = [install] + (["ram"] if where.unknown else list(where.modes.values()))
+    mode = most_private(modes)
+    if mode == "none":
+        return "none", None
+    if mode == "disk":
+        return "disk", LOG_PATH
+    if not where.unknown and list(where.modes.values()) == ["ram"]:
+        return "ram", ram_path(next(iter(where.modes)))
+    return "ram", ram_path()
+
+
 def audit(service, caller, summary, ok, error=None, error_class=None,
-          path: str | None = None) -> bool:
-    """Record one state-changing call. Returns True if a line was written; a
-    line that was not is counted (`DROPPED_PATH`)."""
+          path: str | None = None, slots=(), app=None) -> bool:
+    """Record one state-changing call. Returns True if a line was written, or
+    if the line's mode is none (nothing is meant to be written); a line that
+    should have been and was not is counted (`DROPPED_PATH`). `slots`: the
+    projects the line belongs to that its summary does not show (a lead's
+    own), or a `Where` already worked out; `app`: read the badges of the
+    qubes the summary names. `path` writes to that file, whatever the modes."""
+    try:
+        if path is None:
+            # A place already worked out (a `Where`) is the caller's last word:
+            # the funnel reads the summary itself, and places a proposal's line
+            # by its caller alone. Otherwise it is worked out here.
+            where = slots if isinstance(slots, Where) else place(app, summary, slots)
+            mode, path = destination(where)
+            # A line kept more privately than the install's own costs what an
+            # install line costs: otherwise the time a refused call takes
+            # tells a principal that a name it cannot see belongs to a project
+            # logging to RAM or nowhere.
+            install = install_mode()[0]
+            if MODES.index(mode) < MODES.index(install):
+                _pay_like(install)
+            if mode == "none":
+                return True
+            if mode == "ram":
+                _ram_dir_ready()
+    except Exception:
+        _note_dropped()
+        return False
     written = _audit(service, caller, summary, ok, error, error_class, path)
     if not written:
         _note_dropped()
     return written
+
+
+#: What a line kept off the install's chain writes instead, to cost the same:
+#: zeros only, the same size each time, over the same bytes, so it never grows
+#: and holds nothing of any line.
+PAD_SUFFIX = ".pad"
+PAD_BYTES = 512
+
+
+def _pay_like(mode: str) -> None:
+    """The work an append to the install's chain does (its lock, its tail
+    read, a durable write on its filesystem), with nothing of the line in it.
+    Best-effort: a failure here never changes what the call does."""
+    path = LOG_PATH if mode == "disk" else ram_path()
+    pad = (LOG_PATH if mode == "disk" else ram_path()) + PAD_SUFFIX
+    if mode == "ram":
+        _ram_dir_ready()
+    try:
+        f = _locked_log(path)
+    except OSError:
+        return
+    try:
+        _tail_state(f)
+        old = os.umask(0o007)
+        try:
+            fd = os.open(pad, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        finally:
+            os.umask(old)
+        try:
+            os.pwrite(fd, b"\0" * PAD_BYTES, 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    finally:
+        f.close()
+
+
+def _ram_dir_ready() -> None:
+    """The RAM chains' directory, which tmpfiles declares; made here when a
+    boot or a test has not, setgid from /run/qmcp, so the group is `qubes`."""
+    d = ram_dir()
+    if not os.path.isdir(d):
+        old = os.umask(0o007)
+        try:
+            os.makedirs(d, 0o2770, exist_ok=True)
+        finally:
+            os.umask(old)
 
 
 def _audit(service, caller, summary, ok, error=None, error_class=None,
@@ -449,11 +826,310 @@ def _audit(service, caller, summary, ok, error=None, error_class=None,
         return False
 
 
+def ram_chains() -> list:
+    """[(name, bytes or None)] of the RAM chains there are now, and of their
+    rotated files (`<chain>.log.<UTC time>`), which hold memory too."""
+    d = ram_dir()
+    try:
+        names = sorted(n for n in os.listdir(d)
+                       if n.endswith(".log") or re.fullmatch(r".+\.log\.\d{8}T\d{6}Z", n))
+    except FileNotFoundError:
+        return []
+    out = []
+    for n in names:
+        try:
+            out.append((n, os.path.getsize(os.path.join(d, n))))
+        except OSError:
+            out.append((n, None))
+    return out
+
+
+def install_chain() -> str | None:
+    """The chain the install's own lines go to now: the log, the install's
+    RAM chain, or None in mode none."""
+    mode = install_mode()[0]
+    return None if mode == "none" else LOG_PATH if mode == "disk" else ram_path()
+
+
+# ------------------------------------------------------------------ rotation and retention
+
+#: How long a rotated log is kept, in days, or `off` (never removed). Absent:
+#: `KEEP_DAYS_DEFAULT`. `qmcp settings set --audit-keep-days`.
+KEEP_DAYS_PATH = "/etc/qmcp/audit-keep-days"
+KEEP_DAYS_DEFAULT = 90
+KEEP_DAYS_MAX = 36500
+#: What `qmcp check` reckons a line takes on disk, for the room a full budget
+#: needs: 352 bytes measured on the development box (2026-10-17), rounded up.
+LINE_BYTES = 400
+#: The service and caller of the line a removal leaves.
+REMOVE_SERVICE = "qmcp audit remove"
+ROTATE_CALLER = "rotate"
+_STAMP = "%Y%m%dT%H%M%SZ"
+_ROTATED_RE = re.compile(r"\A\d{8}T\d{6}Z\Z")
+
+
+def keep_days(path: str | None = None):
+    """The days a rotated log is kept: an int, "off", or None when the file
+    does not read or does not hold one of them. None removes nothing: removing
+    evidence is the direction that cannot be undone, so a setting that cannot
+    be read keeps everything, and `qmcp check` fails on it."""
+    path = KEEP_DAYS_PATH if path is None else path
+    try:
+        with open(path, encoding="ascii") as fh:
+            word = fh.read(64).strip()
+    except FileNotFoundError:
+        return KEEP_DAYS_DEFAULT
+    except (OSError, UnicodeDecodeError):
+        return None
+    return parse_keep_days(word)
+
+
+def parse_keep_days(word):
+    """An int 1..KEEP_DAYS_MAX or "off" from the operator's text, else None."""
+    if word == "off":
+        return "off"
+    if isinstance(word, str) and re.fullmatch(r"[0-9]{1,5}", word) \
+            and 1 <= int(word) <= KEEP_DAYS_MAX:
+        return int(word)
+    return None
+
+
+def rotated(path: str | None = None) -> list:
+    """[(file name, its time as a datetime)] of the logs rotated from `path`,
+    oldest first: exactly `rotate()`'s names, never a wider pattern."""
+    import datetime
+    path = LOG_PATH if path is None else path
+    d, base = os.path.dirname(path) or ".", os.path.basename(path) + "."
+    out = []
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return out
+    for n in names:
+        stamp = n[len(base):]
+        if n.startswith(base) and _ROTATED_RE.match(stamp):
+            try:
+                when = datetime.datetime.strptime(stamp, _STAMP).replace(
+                    tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+            out.append((n, when))
+    return sorted(out, key=lambda x: x[1])
+
+
+def _first_record(path: str):
+    """The log's first record, or None for an empty one. Raises OSError for
+    one that does not read, ValueError for a first line that does not parse."""
+    with open(path, "rb") as fh:
+        for line in fh:
+            if line.strip():
+                return json.loads(line.decode("utf-8"))
+    return None
+
+
+def _rotation_due(path: str, now) -> bool:
+    """Past `ROTATE_AT_BYTES`, or a first record of an earlier UTC day with
+    something after it besides a rotation's anchor. A first line that does not
+    parse is due too: the break stays in the file it is in."""
+    size = os.path.getsize(path)
+    if size > ROTATE_AT_BYTES:
+        return True
+    try:
+        first = _first_record(path)
+    except ValueError:
+        return size > 0
+    if first is None:
+        return False
+    with open(path, "rb") as fh:
+        lines = sum(1 for line in fh if line.strip())
+    if first.get("service") == ROTATE_SERVICE and lines == 1:
+        return False            # only the anchor of the last rotation
+    return str(first.get("ts", ""))[:10] < now.strftime("%Y-%m-%d")
+
+
+def auto_rotate(now=None) -> tuple:
+    """What the hourly timer does: rotate the log when it is due, then remove
+    the rotated logs older than the keep-days setting, judged by the time in
+    their names, never by their size: a flood must not be able to push the
+    record of anyone's earlier actions off the disk. Root only.
+
+    Under install mode ram or none nothing is appended to the log, and a
+    rotation's anchor would be a line on disk: no rotation then; the removal
+    runs in every mode. The RAM chains are bounded by size instead
+    (`_ram_retention`). Returns (lines, ok): a line per thing done, and False
+    when something could not be. A run that did nothing writes nothing; one
+    that removed files writes one line naming them, to the install's chain."""
+    import datetime
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    out, ok = [], True
+    mode, problem = install_mode()
+    if problem:
+        out.append(f"not rotated: {problem}")
+        ok = False
+    elif mode == "disk" and os.path.exists(LOG_PATH):
+        try:
+            if _rotation_due(LOG_PATH, now):
+                out.append(f"rotated: the old log is now {rotate(LOG_PATH, ROTATE_CALLER)}")
+        except OSError as e:
+            out.append(f"not rotated: {LOG_PATH} ({e.strerror or type(e).__name__})")
+            ok = False
+    lines, ram_ok = _ram_retention()
+    out += lines
+    ok = ok and ram_ok
+    keep = keep_days()
+    if keep is None:
+        out.append(f"nothing removed: {KEEP_DAYS_PATH} does not read")
+        return out, False
+    if keep == "off":
+        return out, ok
+    removed, failed = [], []
+    cutoff = now - datetime.timedelta(days=keep)
+    d = os.path.dirname(LOG_PATH) or "."
+    for name, when in rotated(LOG_PATH):
+        if when >= cutoff:
+            continue
+        try:
+            os.unlink(os.path.join(d, name))
+            removed.append(name)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            failed.append(f"{name} ({e.strerror or type(e).__name__})")
+    if removed or failed:
+        audit(REMOVE_SERVICE, ROTATE_CALLER,
+              {"removed": removed[:32] + ([f"and {len(removed) - 32} more"]
+                                          if len(removed) > 32 else []),
+               "keep_days": keep}, not failed,
+              None if not failed else "not removed: " + ", ".join(failed)[:512], slots=())
+    out += [f"removed {name}: older than {keep} days" for name in removed]
+    out += [f"NOT removed {f}" for f in failed]
+    return out, ok and not failed
+
+
+def _ram_retention() -> tuple:
+    """Rotate each RAM chain past `RAM_ROTATE_AT_BYTES`, then remove the
+    oldest rotated RAM files, by the time in their names, while every RAM file
+    together holds more than `RAM_KEEP_BYTES`. One line names what was
+    removed. Returns (lines, ok)."""
+    d = ram_dir()
+    try:
+        chains = sorted(n for n in os.listdir(d) if n.endswith(".log"))
+    except FileNotFoundError:
+        return [], True
+    out, ok = [], True
+    for n in chains:
+        path = os.path.join(d, n)
+        try:
+            st = os.lstat(path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > RAM_ROTATE_AT_BYTES:
+                out.append(f"rotated: the old RAM chain is now {rotate(path, ROTATE_CALLER)}")
+        except OSError as e:
+            out.append(f"not rotated: {path} ({e.strerror or type(e).__name__})")
+            ok = False
+    old = sorted(((when, name) for n in chains for name, when in rotated(os.path.join(d, n))))
+
+    def total():
+        # Regular files only, never followed: a link planted in the directory
+        # must neither count nor be read through.
+        size = 0
+        for n in os.listdir(d):
+            try:
+                st = os.lstat(os.path.join(d, n))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                size += st.st_size
+        return size
+    removed, failed = [], []
+    for _, name in old:
+        if total() <= RAM_KEEP_BYTES:
+            break
+        try:
+            os.unlink(os.path.join(d, name))
+            removed.append(name)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            # Said, and the next one tried: one that cannot go (a directory
+            # planted under its name) must not stop the sweep for good.
+            failed.append(f"{name} ({e.strerror or type(e).__name__})")
+    if removed or failed:
+        audit(REMOVE_SERVICE, ROTATE_CALLER,
+              {"removed": removed[:32] + ([f"and {len(removed) - 32} more"]
+                                          if len(removed) > 32 else []),
+               "ram_keep_bytes": RAM_KEEP_BYTES}, not failed,
+              None if not failed else "not removed: " + ", ".join(failed)[:512], slots=())
+    out += [f"removed {name}: the RAM chains held more than {RAM_KEEP_BYTES // 1024 ** 2} MiB"
+            for name in removed]
+    out += [f"NOT removed {f}" for f in failed]
+    return out, ok and not failed
+
+
+def free_bytes(path: str | None = None):
+    """The bytes free under `path`'s directory, or None when that cannot be read."""
+    path = LOG_PATH if path is None else path
+    try:
+        st = os.statvfs(os.path.dirname(path) or ".")
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+def room_needed(principals: int, keep) -> int | None:
+    """The disk a full budget of every principal for `keep` days takes, or
+    None when nothing is ever removed."""
+    if not isinstance(keep, int) or isinstance(keep, bool):
+        return None
+    return principals * AUDIT_LINES_PER_DAY * LINE_BYTES * keep
+
+
+def status(calls_dir: str, principals, now: str | None = None) -> dict:
+    """What `qmcp audit status --json` answers. A value that does not read
+    is None, never 0."""
+    now = now or _utc_now_iso()
+    mode, problem = install_mode()
+    keep = keep_days()
+
+    def size(p):
+        try:
+            return os.path.getsize(p)
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return None
+    d = os.path.dirname(LOG_PATH) or "."
+    budgets = []
+    for caller, rec in counters(calls_dir):
+        lines = None if rec is None else rec.get("lines", 0)
+        if rec is not None and rec.get("day") != now[:10]:
+            today = 0
+        elif isinstance(lines, int) and not isinstance(lines, bool) and lines >= 0:
+            today = lines
+        else:
+            today = None                    # a counter that does not read: never 0
+        budgets.append({"caller": caller, "lines_today": today, "budget": AUDIT_LINES_PER_DAY})
+    return {
+        "mode": mode if problem is None else None,
+        "keep_days": keep,
+        "log": LOG_PATH,
+        "log_bytes": size(LOG_PATH),
+        "rotated": [{"name": n, "bytes": size(os.path.join(d, n))} for n, _ in rotated(LOG_PATH)],
+        "ram": [{"name": n, "bytes": b} for n, b in ram_chains()],
+        "free_bytes": free_bytes(LOG_PATH),
+        "floor_bytes": FLOOR_BYTES,
+        "principals": principals,
+        "needed_bytes": None if principals is None else room_needed(principals, keep),
+        "budgets": budgets,
+    }
+
+
 def verify(path: str | None = None) -> tuple[bool, int, str | None]:
     """Walk the chain from GENESIS. Returns (ok, entries, first problem)."""
     path = LOG_PATH if path is None else path
     try:
-        with open(path, encoding="utf-8") as f:
+        # Bytes, decoded line by line: one byte that is not UTF-8 is a broken
+        # chain at its line, not an exception in the caller.
+        with open(path, "rb") as f:
             lines = [s for s in (ln.strip() for ln in f) if s]
     except FileNotFoundError:
         return True, 0, None
@@ -462,8 +1138,12 @@ def verify(path: str | None = None) -> tuple[bool, int, str | None]:
     expected_prev, expected_seq = GENESIS, 1
     for i, line in enumerate(lines):
         try:
-            obj = json.loads(line)
-        except ValueError:
+            obj = json.loads(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            return False, i + 1, f"line {i + 1} is not UTF-8"
+        except (ValueError, RecursionError):
+            return False, i + 1, f"unparseable line {i + 1}"
+        if not isinstance(obj, dict):
             return False, i + 1, f"unparseable line {i + 1}"
         if i == 0 and obj.get("service") == ROTATE_SERVICE:
             # A rotated log starts on the previous file's head hash.

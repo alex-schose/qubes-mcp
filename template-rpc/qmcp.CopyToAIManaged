@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""qmcp.CopyToAIManaged — copy a path from this qube to another ai-managed qube.
+"""qmcp.CopyToAIManaged — copy a path from this qube to another qube.
 
-Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. Runs as root in the
-source qube. Uses qvm-copy-to-vm, which invokes the standard qubes.Filecopy
-qrexec service from this qube. 30-mcp-control.policy lets it through at once
-inside one project slot or into that slot's dump sink, refuses it into a
-guarded qube, the hub or a lead, and answers anything else with the operator's
-confirmation dialog, so a copy may wait for a human (up to the timeout below).
+Installed at /etc/qubes-rpc/ by `qmcp template prepare`, in a template (its
+qubes inherit it) or a standalone; the hub and a project's lead call it. Runs
+as root in the source qube. Uses qvm-copy-to-vm, which invokes the standard
+qubes.Filecopy qrexec service from this qube. policy/30-mcp-control.policy
+decides where the copy may go: at once inside one project slot or into that
+slot's dump sink; refused into a guarded, held or hidden qube, the hub or a
+lead; anything else through the operator's confirmation dialog, so a copy may
+wait for a human, up to its timeout.
 
 Input  (stdin, JSON): {
-    "target": "<ai-managed qube name>",
-    "path":   "<absolute path on this qube>",
+    "target":  "<qube name>",
+    "path":    "<absolute path on this qube>",
+    "timeout": <seconds>          (optional, default 300, 1 to 86400)
 }
 Output (stdout, JSON):
     {"ok": true,  "target": "...", "path": "..."}
@@ -23,8 +26,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
+
+MAX_TIMEOUT = 86400
+QVM_COPY = "/usr/bin/qvm-copy-to-vm"
+# Qubes' own name shape; `dom0` is not a copy target. A name that is not one is
+# refused here, so it can never reach qvm-copy-to-vm's argv as an option.
+NAME_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_.-]{0,30}\Z")
 
 
 def emit(payload: dict) -> int:
@@ -44,18 +55,39 @@ def main() -> int:
         return emit({"ok": False, "error": "missing 'target' or 'path'"})
     if not isinstance(target, str) or not isinstance(path, str):
         return emit({"ok": False, "error": "'target' and 'path' must be strings"})
+    timeout = req.get("timeout", 300)
+    if not (isinstance(timeout, int) and not isinstance(timeout, bool)
+            and 1 <= timeout <= MAX_TIMEOUT):
+        return emit({"ok": False, "error": f"'timeout' must be a whole number of seconds, "
+                                           f"1 to {MAX_TIMEOUT}"})
+    if NAME_RE.match(target) is None or target.lower() == "dom0":
+        return emit({"ok": False, "error": "'target' is not a qube name"})
+    if not os.path.isabs(path):
+        return emit({"ok": False, "error": "'path' must be absolute"})
     if not os.path.exists(path):
         return emit({"ok": False, "error": f"path '{path}' does not exist on this qube"})
 
     try:
-        proc = subprocess.run(
-            ["/usr/bin/qvm-copy-to-vm", target, path],
-            capture_output=True,
-            timeout=300,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired:
-        return emit({"ok": False, "error": "copy timed out after 300s"})
+        # `--`: nothing after it is read as an option, the path included.
+        proc = subprocess.Popen([QVM_COPY, "--", target, path],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            _, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # A descendant outside the group holds the pipes: let it.
+                proc.wait()
+                for pipe in (proc.stdout, proc.stderr):
+                    pipe.close()
+            return emit({"ok": False, "error": f"copy timed out after {timeout}s; it was "
+                                               f"stopped"})
     except FileNotFoundError:
         return emit({"ok": False, "error": "qvm-copy-to-vm not installed in this qube"})
     except Exception as e:
@@ -64,7 +96,7 @@ def main() -> int:
     if proc.returncode != 0:
         return emit({
             "ok": False,
-            "error": f"copy failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}",
+            "error": f"copy failed (rc={proc.returncode}): {err.decode(errors='replace').strip()}",
         })
 
     return emit({"ok": True, "target": target, "path": path})

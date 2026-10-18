@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """qmcp.RunInAIManaged — execute a command in this qube.
 
-Installed in ai-managed TEMPLATES at /etc/qubes-rpc/. All AppVMs based on
-those templates inherit the service; AppVMs based on the operator's templates
-do not have it. Policy gates source=mcp-control → target=@tag:ai-managed
-(a guarded qube is refused)
-with user=root, so commands execute with root authority inside the sandbox.
+Installed at /etc/qubes-rpc/ by `qmcp template prepare`, in a template (its
+qubes inherit it) or a standalone. The callers are the hub, into the qubes it
+manages, and a project's lead, into its project's members; the rulebook,
+policy/30-mcp-control.policy, decides which call reaches which qube and refuses
+the rest (a guarded, held or hidden qube among them). It runs as root, so a
+command has root authority inside the qube.
 
 Input  (stdin, JSON): {
     "cmd":     ["bin", "arg", ...] | "shell string",
     "shell":   false | true                  (optional, default false)
-    "timeout": <seconds>                     (optional, default 60)
+    "timeout": <seconds>                     (optional, default 60, 1 to 86400)
     "stdin":   "<text>"                      (optional, default "")
 }
 Output (stdout, JSON):
@@ -20,13 +21,53 @@ Output (stdout, JSON):
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
+
+MAX_TIMEOUT = 86400
 
 
 def emit(payload: dict) -> int:
     print(json.dumps(payload))
     return 0 if payload.get("ok") else 1
+
+
+def valid_timeout(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_TIMEOUT
+
+
+def reap(proc) -> None:
+    """Wait for the killed process, and for its output pipes no longer than a
+    moment: a descendant that left the process group (setsid) survives the
+    kill and may hold them open for ever."""
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.wait()
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+
+
+def run(cmd, shell: bool, stdin: bytes, timeout: int):
+    """Run `cmd` in a session of its own. At the timeout the whole process
+    group is killed, so a shell's children and anything they started in the
+    foreground stop with it. Returns the CompletedProcess, or None on timeout."""
+    proc = subprocess.Popen(cmd, shell=shell, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        reap(proc)
+        return None
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def main() -> int:
@@ -42,6 +83,11 @@ def main() -> int:
 
     if cmd is None:
         return emit({"ok": False, "error": "missing 'cmd'"})
+    if not valid_timeout(timeout):
+        return emit({"ok": False, "error": f"'timeout' must be a whole number of seconds, "
+                                           f"1 to {MAX_TIMEOUT}"})
+    if not isinstance(stdin_input, str):
+        return emit({"ok": False, "error": "'stdin' must be a string"})
 
     if shell:
         if not isinstance(cmd, str):
@@ -51,15 +97,10 @@ def main() -> int:
             return emit({"ok": False, "error": "'cmd' must be a list of strings (or set shell=true)"})
 
     try:
-        proc = subprocess.run(
-            cmd,
-            input=stdin_input.encode() if isinstance(stdin_input, str) else stdin_input,
-            capture_output=True,
-            timeout=timeout,
-            shell=shell,
-        )
-    except subprocess.TimeoutExpired:
-        return emit({"ok": False, "error": f"timeout after {timeout}s"})
+        proc = run(cmd, shell, stdin_input.encode(errors="surrogateescape"), timeout)
+        if proc is None:
+            return emit({"ok": False, "error": f"timeout after {timeout}s; the command and "
+                                               f"its process group were killed"})
     except FileNotFoundError as e:
         return emit({"ok": False, "error": f"command not found: {e}"})
     except Exception as e:

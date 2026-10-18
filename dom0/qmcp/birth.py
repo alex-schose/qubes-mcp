@@ -105,7 +105,7 @@ def read_name_prefix(path: str | None = None) -> str:
     try:
         with open(NAME_PREFIX_PATH if path is None else path, encoding="utf-8") as fh:
             word = fh.read(256).split("#", 1)[0].strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return DEFAULT_NAME_PREFIX
     return word if _PREFIX_RE.match(word) else DEFAULT_NAME_PREFIX
 
@@ -284,6 +284,13 @@ def _add_order(tag: str) -> tuple:
     return (FIRST.index(tag), tag) if tag in FIRST else (len(FIRST), tag)
 
 
+def _remove_order(tag: str) -> tuple:
+    """Badges that route a caller in (a lead's, a slot's, a window's) come off
+    first and `qmcp-guarded` last, so a failure between two removals leaves
+    the child guarded with less, never unguarded with a routed badge."""
+    return (tag == GUARDED, tag)
+
+
 def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None,
           extra=()) -> set:
     """Make the child's controlled tags exactly `expected_tags`, or raise.
@@ -310,7 +317,8 @@ def stamp(io: TagIO, source_tags, principal: str, slot_badge: str | None = None,
         raise RuntimeError(f"the new qube arrived wearing {sorted(arrived)}")
     for tag in sorted(want - have, key=_add_order):
         io.add(tag)
-    for tag in sorted(t for t in have - want if controlled(t) and not is_restriction(t)):
+    for tag in sorted((t for t in have - want if controlled(t) and not is_restriction(t)),
+                      key=_remove_order):
         io.remove(tag)
     final = set(io.read())
     missing = want - final
@@ -370,5 +378,5 @@ def read_birth_egress(path: str | None = None) -> str:
     try:
         with open(BIRTH_EGRESS_PATH if path is None else path, encoding="utf-8") as fh:
             return fh.read(256).split("#", 1)[0].strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""

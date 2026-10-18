@@ -1,0 +1,16 @@
+# /etc/systemd/system/qmcp-audit.timer -- qubes-mcp
+#
+# Runs qmcp-audit.service every hour, and a run missed while dom0 was off
+# soon after boot (Persistent=): the log is rotated within an hour of a new
+# UTC day, and a rotated log is removed within an hour of its last day.
+
+[Unit]
+Description=qubes-mcp: audit log rotation and retention, hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

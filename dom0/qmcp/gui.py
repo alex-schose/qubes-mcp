@@ -18,7 +18,8 @@ copy is under Needs attention, held, with its row of `qmcp restored list`,
 until it is accepted or rejected (one at a time from its row, or all of them
 from the Check tab, which also prepares any template); a template in AI space
 takes packages by their exact names from its row; the Settings tab changes
-the caps and birth egress, and exports and imports the operator files.
+the caps, birth egress and the audit log's keep-days, and exports and imports
+the operator files.
 
 Every text a widget shows is set by one of the helpers between the two rules
 below, and they accept only `guimodel.Shown`, which only `esc()`,
@@ -85,6 +86,17 @@ def _set_lines(view, text) -> None:
 
 def _title(window, text) -> None:
     window.set_title(_need(text))
+
+
+def _level(fraction) -> Gtk.LevelBar:
+    """A bar filled to `fraction`, a number from 0 to 1: no text reaches it."""
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) \
+            or not 0 <= fraction <= 1:
+        raise TypeError("a level is a number from 0 to 1")
+    bar = Gtk.LevelBar()
+    bar.set_value(float(fraction))
+    bar.set_size_request(160, -1)
+    return bar
 
 
 def _named(widget, text) -> None:
@@ -822,6 +834,10 @@ class ProjectForm(Form, LeadFields, NetworkFields):
             for t in templates:
                 gm.not_managed(t, self._fleet, "the template")
         gm.anonymous_model_qube(qube, None, anonymous, self._fleet, self._projects)
+        why = gm.create_refusal(None if anonymous else label, self.prefix, self._projects,
+                                self._fleet, self.dump.get_active(), templates, source, origin)
+        if why:
+            raise gm.FormError(why)
         return gm.create_project(
             None if anonymous else label, source, origin, name, netvm, templates,
             gm.check_networks(self.network_values(), self._gateways), self.quota.get_text(),
@@ -865,6 +881,11 @@ class EditForm(Form, NetworkFields):
                 gm.not_managed(t, self._fleet, "the template")
             if not same_networks:
                 gm.anonymous_networks(networks, self._gateways)
+        if not same_networks:
+            gm.check_networks(networks, self._gateways)
+            why = gm.networks_in_use(rec, networks, self._fleet)
+            if why:
+                raise gm.FormError(why)
         return gm.edit_project(
             rec.get("label"), templates=templates,
             networks=None if same_networks else gm.check_networks(networks, self._gateways),
@@ -966,6 +987,10 @@ class LeadForm(Form, LeadFields):
         if keep and source != "promote" and not name and old == default and not anonymous:
             raise gm.FormError(f"the old lead keeps the name {default}: type a lead name "
                                "for the new one")
+        if source != "promote" and not anonymous:
+            why = gm.lead_name_refusal(name, self.space(), old, keep, self._fleet)
+            if why:
+                raise gm.FormError(why)
         if anonymous:
             gm.anonymous_lead(source, origin, netvm, self._fleet, self._gateways)
         if old:
@@ -983,16 +1008,25 @@ class LeadForm(Form, LeadFields):
 
 
 class DumpForm(Form):
-    def __init__(self, parent, key, default_name):
+    """A dump sink: refused before OK where the command refuses its name, in
+    its words (`gm.dump_refusal`), the default name included."""
+
+    def __init__(self, parent, key, default_name, prefix="ai-", fleet_rows=()):
         super().__init__(parent, f"Dump sink for {key}", "Create sink",
                          "A fresh qube with no network, outside AI space, that the members "
                          "copy into without a dialog.")
-        self.key = key
+        self.key, self.default_name, self.prefix = key, default_name, prefix
+        self._fleet = list(fleet_rows or ())
         self.sink_name = self.entry("Sink name", f"default: {default_name}")
         self.done_building()
 
     def build(self):
-        return gm.add_dump(self.key, self.sink_name.get_text().strip() or None)
+        typed = self.sink_name.get_text().strip() or None
+        argv = gm.add_dump(self.key, typed)                 # the name's shape first
+        why = gm.dump_refusal(typed or self.default_name, self.prefix, self._fleet)
+        if why:
+            raise gm.FormError(why)
+        return argv
 
 
 class MoveForm(Form):
@@ -1072,8 +1106,8 @@ class RevokeForm(Form):
                          "Takes it out of AI space: removes ai-managed and every other qmcp "
                          "badge, so the hub and every lead lose it and this window stops "
                          "listing it (Add a qube to AI space brings it back). Its default "
-                         "disposable is set to none, and it is killed if it runs, so nothing "
-                         "the hub started in it runs on, unless you leave it running. The "
+                         "disposable is set to none, and it is killed if it runs, which stops "
+                         "what the hub had running in it, unless you leave it running. The "
                          "qube itself is not removed." + (f" {note}" if note else ""))
         self.qube_name = name
         self.keep = _check(esc("leave it running"))
@@ -1110,12 +1144,18 @@ class OpenForm(Form):
 
 
 class AddForm(Form):
-    def __init__(self, parent, fleet_rows, hub, sinks):
+    """Manage or guard a qube outside AI space: refused before OK where the
+    command refuses it, as its `list` row shows (`gm.role_refusal`)."""
+
+    def __init__(self, parent, fleet_rows, hub, sinks, gw_rows=()):
         super().__init__(parent, "Add a qube to AI space", "Add",
                          "Managed: the hub may run commands in it as root and change it. "
                          "Guarded: listed and used as a reference, never operated. A qube "
                          "that provides network can only be guarded.")
         names = gm.outside_choices(fleet_rows, hub, sinks)
+        self._rows = {r["name"]: r for r in fleet_rows or () if isinstance(r, dict)
+                      and isinstance(r.get("name"), str)}
+        self._gateways = list(gw_rows or ())
         self.qube = self.combo("Qube", [(n, esc(n)) for n in names], preselect=False)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.guarded = _radio(None, esc("guarded"))           # the default: the lesser authority
@@ -1128,7 +1168,12 @@ class AddForm(Form):
 
     def build(self):
         name = self.qube.get_active_id()
-        return gm.role("manage" if self.managed.get_active() else "guard", name)
+        action = "manage" if self.managed.get_active() else "guard"
+        argv = gm.role(action, name)
+        why = gm.role_refusal(action, self._rows.get(name), self._gateways)
+        if why:
+            raise gm.FormError(why)
+        return argv
 
 
 class PrepareForm(Form):
@@ -1184,11 +1229,11 @@ class InstallForm(Form):
 
 
 class SettingsForm(Form):
-    """The pool cap, the private-volume cap and birth egress: only what
+    """The pool cap, the private-volume cap, birth egress and keep-days: only what
     changed is sent. A field left as it was read is unchanged, and birth
     egress starts on `unchanged`."""
 
-    def __init__(self, parent, settings, gw_rows):
+    def __init__(self, parent, settings, gw_rows, fleet_rows=()):
         super().__init__(parent, "Edit settings", "Apply", gm.SETTINGS_INTRO)
         self.values = dict(settings or {})
         v = self.values
@@ -1200,8 +1245,13 @@ class SettingsForm(Form):
                                       gm.quota_text(v.get("private_cap")))
         self.birth_egress = self.combo(
             "Birth egress", [(i, esc(t)) for i, t in gm.egress_choices(v.get("birth_egress"),
-                                                                       gw_rows)],
+                                                                       gw_rows, fleet_rows)],
             active="unchanged")
+        # As read; left so, it is not sent. One that did not read starts empty:
+        # typing a value is then a change, never a value the form guessed.
+        self.keep_read = gm.keep_days_field(v.get("audit_keep_days"))
+        self.keep_days = self.entry("Keep rotated audit logs", "days, e.g. 90, or off",
+                                    self.keep_read)
         self.done_building()
 
     def build(self):
@@ -1211,11 +1261,37 @@ class SettingsForm(Form):
         pool = None if pool == gm.quota_text(v.get("pool_cap")) else pool
         private = None if private == gm.quota_text(v.get("private_cap")) else private
         egress = self.birth_egress.get_active_id()
+        keep = self.keep_days.get_text().strip()
+        keep = None if keep == self.keep_read else keep
         if pool is not None:
             why = gm.pool_cap_refusal(pool, v.get("ai_space_bytes"))
             if why:
                 raise gm.FormError(why)
-        return gm.settings_set(pool, private, None if egress in (None, "unchanged") else egress)
+        return gm.settings_set(pool, private, None if egress in (None, "unchanged") else egress,
+                               keep)
+
+
+class AuditModeForm(Form):
+    """Where a project's audit lines go. Leaving disk says in red that the
+    old lines stay on dom0's disk, and that deleting a file is not erasing it."""
+
+    def __init__(self, parent, key, record):
+        super().__init__(parent, f"Audit log of {key}", "Apply", gm.AUDIT_FORM_INTRO)
+        self.key = key
+        self.old = record.get("audit") if record.get("audit") in gm.AUDIT_MODES else None
+        self.mode = self.combo("Its lines go to",
+                               [(m, esc(gm.PROJECT_AUDIT_TEXT[m])) for m in gm.AUDIT_MODES],
+                               active=self.old)
+        self.done_building()
+
+    def build(self):
+        mode = self.mode.get_active_id()
+        _set(self.warning, esc(gm.audit_form_warning(self.old, mode) or ""))
+        if self.old is None:
+            raise gm.FormError("the project's audit mode was not read: Refresh")
+        if mode == self.old:
+            raise gm.FormError(f"its lines go to {mode} already")
+        return gm.project_audit(self.key, mode)
 
 
 class ExportForm(Form):
@@ -1371,9 +1447,32 @@ class GatewayForm(Form):
         self.updates.set_active(row.get("updates") is True)
         self.updates.connect("toggled", self.update)
         self.row("Updates", self.updates)
-        self.label_entry = self.entry("Label", "up to 40 characters; empty: no label",
-                                      row.get("label") or "")
+        # A label the field would show escaped is not put in it: an edit
+        # would send the escapes as typed. It is shown beside, and changes
+        # only by typing a new one or ticking it clear.
+        label = row.get("label") or ""
+        self.clear_label = None
+        if gm.esc(label) == label:
+            self.label_entry = self.entry("Label", "up to 40 characters; empty: no label", label)
+        else:
+            self.row("Label now", _label(esc(label), wrap=True, selectable=True))
+            self.label_entry = self.entry("New label", "up to 40 characters; empty: keep the "
+                                                       "label shown above")
+            self.clear_label = _check(esc("clear the label"))
+            self.clear_label.connect("toggled", self.update)
+            self.row("Clear it", self.clear_label)
         self.done_building()
+
+    def label_value(self):
+        """The label to send: None leaves it, "" clears it."""
+        typed = self.label_entry.get_text()
+        if self.clear_label is None:
+            return None if typed == (self.row_data.get("label") or "") else typed
+        if self.clear_label.get_active():
+            if typed:
+                raise gm.FormError("type a new label, or tick to clear it, not both")
+            return ""
+        return typed or None
 
     def build(self):
         row = self.row_data
@@ -1385,11 +1484,15 @@ class GatewayForm(Form):
         if not (was and anonymising) and self.remark.get_active():
             self.remark.set_active(False)
         mark = anonymising and (not was or self.remark.get_active())
-        label = self.label_entry.get_text()
+        label = self.label_value()
         self.updates.set_sensitive(anonymising)
         if not anonymising and self.updates.get_active():
             self.updates.set_active(False)
         ticked = self.updates.get_active()
+        if gm.held_row(name, self._fleet):
+            # The command refuses a held gateway any change, as it does there.
+            raise gm.FormError(f"'{name}' is held for your review: accept or reject it first "
+                               f"(qmcp restored)")
         if mark:
             why = gm.anonymising_refusal(name, row.get("upstream"))
             if why:
@@ -1404,10 +1507,8 @@ class GatewayForm(Form):
         moved = mark and was and row.get("upstream") != row.get("recorded_upstream")
         updates = None if (ticked == (row.get("updates") is True) and not (moved and ticked)) \
             else ticked
-        # The field shows the label escaped: left as shown, it is unchanged.
         return gm.change_gateway(
-            name, True if mark else (None if anonymising == was else anonymising),
-            None if label == gm.esc(row.get("label") or "") else label,
+            name, True if mark else (None if anonymising == was else anonymising), label,
             None if not anonymising and not was else updates)
 
 
@@ -1562,7 +1663,7 @@ class Window(Gtk.Window):
         ("revoke", "Revoke..."), ("add_to_ai_space", "Add a qube to AI space..."),
         ("set_model", "Set lead model..."), ("set_rules", "Set lead rules..."),
         ("accept_rules", "Accept current rules..."), ("set_model_qube", "Set model qube..."),
-        ("unblock", "Unblock..."), ("prepare", "Prepare..."),
+        ("unblock", "Unblock..."), ("prepare", "Prepare..."), ("audit_mode", "Audit log..."),
         ("packages", "Install packages..."),
         ("accept_restored", "Accept restored..."), ("reject_restored", "Reject restored..."),
     )
@@ -1604,6 +1705,9 @@ class Window(Gtk.Window):
         #: OK when the window has read the fleet again since it opened.
         self.view_gen = 0
         self.records_read = False
+        #: Whether `list` and `settings` have ever read: before, their empty
+        #: values are no state, and the window says "not read".
+        self.fleet_read = self.settings_read = False
         #: When the qubes, records, audit lines and settings on show were read,
         #: in one complete refresh; None before the first.
         self.view_time = None
@@ -1615,6 +1719,10 @@ class Window(Gtk.Window):
         self.settings: dict = {}
         self.check_doc = None
         self.audit_rows: list = []
+        #: `audit status --json` of the last complete refresh; never shown
+        #: before one has read it.
+        self.audit_status: dict = {}
+        self.audit_status_read = False
         self.proposal_rows: list = []
         self.proposals_read = False
         self.gateways: list = []
@@ -1876,6 +1984,11 @@ class Window(Gtk.Window):
         _named(self.verify_label, esc("verify result"))
         bar.pack_start(self.verify_label, True, True, 0)
         box.pack_start(bar, False, False, 0)
+        # The gauge: the log and its files, the free space against the floor
+        # and each principal's budget today (`audit status --json`).
+        self.audit_gauge = Gtk.Grid(column_spacing=12, row_spacing=4)
+        _named(self.audit_gauge, esc("audit gauge"))
+        box.pack_start(self.audit_gauge, False, False, 0)
         self.audit_store = Gtk.ListStore(*([str] * (1 + len(gm.AUDIT_FIELDS))))
         view = Gtk.TreeView(model=self.audit_store)
         for i, (key, heading) in enumerate(gm.AUDIT_FIELDS):
@@ -1988,6 +2101,7 @@ class Window(Gtk.Window):
         settings = parsed("settings", gm.parse_json, dict)
         check = parsed("check", gm.parse_json, dict)
         audit_rows = parsed("audit", gm.parse_audit, list)
+        audit_status = parsed("audit_status", gm.parse_json, dict)
         proposal_rows = parsed("proposals", gm.parse_json, list)
         gateways = parsed("gateways", gm.parse_json, list)
         gate = parsed("gate", gm.parse_gate, list)
@@ -1998,6 +2112,7 @@ class Window(Gtk.Window):
             return                        # keep the last complete view, whole
         if fleet is not None:
             self.fleet = fleet
+            self.fleet_read = True
         if rows is not None:
             self.project_rows = rows
             self.records_read = True
@@ -2005,8 +2120,12 @@ class Window(Gtk.Window):
                             if isinstance(r, dict) and isinstance(r.get("slot"), str)}
         if settings is not None:
             self.settings = settings
+            self.settings_read = True
         if audit_rows is not None:
             self.audit_rows = audit_rows
+        if audit_status is not None:
+            self.audit_status = audit_status
+            self.audit_status_read = True
         if proposal_rows is not None:
             self.proposal_rows = proposal_rows
             self.proposals_read = True
@@ -2032,8 +2151,10 @@ class Window(Gtk.Window):
         try:
             self.store.clear()
             self.nodes = {}
-            tree = gm.build_tree(self.fleet, self.project_rows if self.records_read else None,
-                                 self.settings, self.gate_view(), self.restored_view())
+            tree = gm.build_tree(self.fleet if self.fleet_read else None,
+                                 self.project_rows if self.records_read else None,
+                                 self.settings if self.settings_read else None,
+                                 self.gate_view(), self.restored_view())
 
             def add(parent, nodes):
                 for node in nodes:
@@ -2069,9 +2190,22 @@ class Window(Gtk.Window):
         for i, rec in reversed(list(enumerate(self.audit_rows))):
             _list_append(self.audit_store, str(i), gm.audit_cells(rec))
         _set_lines(self.audit_detail, esc_lines(gm.audit_hint(self.audit_rows)))
+        _clear(self.audit_gauge)
+        for i, (heading, text, fraction) in enumerate(gm.audit_gauge(
+                self.audit_status if self.audit_status_read else None)):
+            self.audit_gauge.attach(_label(esc(heading)), 0, i, 1, 1)
+            if fraction is not None:
+                level = _level(fraction)
+                _named(level, esc(heading))
+                self.audit_gauge.attach(level, 1, i, 1, 1)
+            value = _label(esc(text), wrap=True, selectable=True)
+            value.set_hexpand(True)
+            self.audit_gauge.attach(value, 2, i, 1, 1)
+        self.audit_gauge.show_all()
 
         _clear(self.settings_grid)
-        for i, (heading, text) in enumerate(gm.settings_rows(self.settings)):
+        for i, (heading, text) in enumerate(gm.settings_rows(self.settings if self.settings_read
+                                                             else None)):
             self.settings_grid.attach(_label(esc(heading)), 0, i, 1, 1)
             value = _label(text, wrap=True, selectable=True)
             value.set_hexpand(True)
@@ -2341,7 +2475,7 @@ class Window(Gtk.Window):
     def _sync(self):
         writable = self.changes_on()
         available = (gm.actions(self.node(), self.records, self.fw_pane, self.fleet,
-                                self.settings.get("hub"))
+                                self.settings.get("hub"), self.settings.get("mode"))
                      if not self.busy else set())
         if not writable:
             # A failed or running refresh turns off what grants or moves
@@ -2474,7 +2608,8 @@ class Window(Gtk.Window):
             return self._open(form, "Create project", check=lambda: form.red_changed(self.fleet))
         if ident == "add_to_ai_space":
             sinks = [r.get("dump") for r in self.records.values() if r.get("dump")]
-            return self._open(AddForm(self, self.fleet, hub, sinks), "Add to AI space")
+            return self._open(AddForm(self, self.fleet, hub, sinks, self.gateways),
+                              "Add to AI space")
         if ident == "rotate":
             return self._open(ConfirmForm(
                 self, "Rotate the audit log", "Rotate",
@@ -2491,7 +2626,8 @@ class Window(Gtk.Window):
         if ident in dict(self.CHECK_ACTIONS):
             return self.check_action(ident)
         if ident == "edit_settings":
-            return self._open(SettingsForm(self, self.settings, self.gateways), "Edit settings")
+            return self._open(SettingsForm(self, self.settings, self.gateways, self.fleet),
+                              "Edit settings")
         if ident == "export":
             return self._open(ExportForm(self), "Export")
         if ident == "import":
@@ -2511,18 +2647,18 @@ class Window(Gtk.Window):
             lead = node.data.get("lead")
             return self._open(ConfirmForm(
                 self, f"Remove the lead of {key}", "Remove lead",
-                f"Removes {lead}: its badges, then the record, then the qube. The project keeps "
-                "its workers; only the hub reaches them until it has a new lead.",
-                gm.remove_lead(key),
+                gm.remove_lead_intro(node.data), gm.remove_lead(key),
                 warning=f"{lead} will be removed, with everything in it. This cannot be undone."),
                 "Remove lead")
         if ident == "add_dump":
             slot = gm.slot_of(node) or "p00"
             label = node.data.get("label")
-            return self._open(DumpForm(self, key or slot, f"{label}-dump" if label else "hub-dump"),
-                              "Dump sink")
+            return self._open(DumpForm(self, key or slot, f"{label}-dump" if label else "hub-dump",
+                                       prefix, self.fleet), "Dump sink")
         if ident in ("delete_project", "finish_delete"):
             return self.delete(key)
+        if ident == "audit_mode":
+            return self._open(AuditModeForm(self, key, node.data), "Audit log")
         if node.kind != "qube":
             return None
         name = node.data.get("name")
@@ -2534,10 +2670,13 @@ class Window(Gtk.Window):
         if ident in ("manage", "guard"):
             return self._open(ConfirmForm(self, f"{ident.capitalize()} {name}", ident.capitalize(),
                                           gm.role_intro(ident, node.data, self.records),
-                                          gm.role(ident, name),
+                                          gm.guard_qube(name) if ident == "guard"
+                                          else gm.role(ident, name),
                                           warning=(gm.manage_red(node.data, self.records)
-                                                   if ident == "manage" else None)),
-                              ident.capitalize())
+                                                   if ident == "manage" else None),
+                                          refusal=gm.role_refusal(ident, node.data,
+                                                                  self.gateways)),
+                              ident.capitalize(), lowers=ident == "guard")
         if ident == "open":
             return self._open(OpenForm(self, node.data), "Open")
         if ident == "prepare":
@@ -2667,9 +2806,19 @@ class Window(Gtk.Window):
         else:
             if not self.changes_on():
                 return None
-            rec = gm.blocked_project(self.node(), self.records)
+            rec = (gm.blocked_project(self.node(), self.records)
+                   or gm.leftover_block(self.node(), self.records, self.settings.get("mode"),
+                                        self.fleet))
         if rec is None:
             return None
+        if rec.get("leftover"):
+            # No verdict: asked again at OK, against the mode as the latest
+            # refresh read it.
+            return self._open(ConfirmForm(self, "Unblock p00", "Unblock", gm.unblock_intro(rec),
+                                          gm.unblock_project(rec["label"])), "Unblock p00",
+                              check=lambda: None if self.settings.get("mode") == "normal" else
+                              "the mode is not normal as the latest refresh read it: open "
+                              "Unblock again")
         verdict = gm.verdict_for(rec.get("slot"), self.gate_view())
         slot = rec.get("slot")
         # Asked again at OK, against the gate's verdict as the latest refresh read

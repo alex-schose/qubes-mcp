@@ -5,15 +5,18 @@
 # writes it at runtime. The installer renders the hub's name into it (default
 # `mcp-control`).
 #
-# Three kinds of source appear below.
+# Four kinds of source appear below.
 #   mcp-control      the hub. It is NOT ai-managed. It reaches AI space only
 #                    through section E.
 #   @tag:qmcp-lead   a project's lead, one per slot p01-p15 (qmcp-lead-pNN).
 #                    It is ai-managed, so every AI-space deny applies to it
 #                    unless a line in A6, B or C sorts above that deny.
+#   @tag:qmcp-proj-pNN  a slot's members, in that slot's copy lines (B).
 #   @tag:ai-managed  AI space: every qube the hub or a lead manages or
 #                    references.
-# A few denies also name @anyvm (any source) or @tag:ai-dump (the drop boxes).
+# A few denies also name @anyvm (any source), @tag:ai-dump (the drop boxes),
+# or a stopped, held or anonymous qube (@tag:qmcp-blocked,
+# @tag:qmcp-quarantine, @tag:qmcp-anon).
 # A qube in AI space is MANAGED (ai-managed) or GUARDED (ai-managed plus
 # qmcp-guarded). Guarded qubes are listed, read and spawned from, and never
 # operated. Gateways are always guarded.
@@ -124,6 +127,14 @@ qubes.ConnectTCP           +11434  @tag:qmcp-lead-p13  @tag:qmcp-model-p13  allo
 qubes.ConnectTCP           +11434  @tag:qmcp-lead-p14  @tag:qmcp-model-p14  allow
 qubes.ConnectTCP           +11434  @tag:qmcp-lead-p15  @tag:qmcp-model-p15  allow
 
+# A8. A lead's firewall is the operator's. dom0 writes it when the lead is
+# created, and again only when the operator changes it, directly or by
+# accepting the hub's proposal. The hub may still read it. These lines sit
+# above A6b, so a qube that wears a lead badge and an open window's firewall
+# badge, which only a mistake in dom0 makes, keeps its firewall the operator's.
+admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-lead           deny
+admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-lead           deny
+
 # A6b. The operator's open window (M5). A guarded qube is sealed, and A7 just
 # below refuses everything into it. `qmcp open QUBE --for D` adds qmcp-open,
 # and these lines ARE the window: the hub runs commands in the qube, copies a
@@ -160,12 +171,6 @@ admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-guarded        deny
 admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-guarded        deny
 qubes.Filecopy             *  mcp-control      @tag:qmcp-guarded        deny
 *                          *  @tag:ai-managed  @tag:qmcp-guarded        deny
-
-# A8. A lead's firewall is the operator's. dom0 writes it when the lead is
-# created, and again only when the operator changes it, directly or by
-# accepting the hub's proposal. The hub may still read it.
-admin.vm.firewall.Set      *  mcp-control      @tag:qmcp-lead           deny
-admin.vm.firewall.Reload   *  mcp-control      @tag:qmcp-lead           deny
 
 # =========================================================================
 # B. PROJECT SLOTS
@@ -526,6 +531,14 @@ policy.EvalGUI                                *  @tag:ai-managed  @anyvm  deny
 # refusal ours. @anyvm also matches @default.
 qubes.ConnectTCP           *  @tag:ai-managed  @anyvm                   deny
 
+# D5. Nor does it start an application in another qube, or read an image from
+# one, dialog or not: nothing in AI space needs either, and an allowed
+# GetImageRGBA hands over any image the target can read. Qubes' own default
+# file asks for both. OpenInVM and OpenURL keep that dialog. @anyvm also
+# matches @default.
+qubes.StartApp             *  @tag:ai-managed  @anyvm                   deny
+qubes.GetImageRGBA         *  @tag:ai-managed  @anyvm                   deny
+
 # =========================================================================
 # E. THE HUB
 # =========================================================================
@@ -568,8 +581,10 @@ admin.vm.firewall.Reload   *  mcp-control  @tag:ai-managed  allow  target=@admin
 # refusal here tells only what the hub's own refused call (A0) already does.
 *                          *  @tag:ai-managed  @tag:qmcp-hubblind       deny
 
-# Every qubes.Filecopy from AI space that A did not refuse (into a guarded
-# qube, the hub or a lead), B did not allow (inside one slot, or into its
+# Every qubes.Filecopy from AI space that A did not refuse (into a guarded,
+# stopped or held qube, the hub, a lead, @dispvm or a new disposable of an
+# AI-space template; out of a stopped or held qube), D2 did not refuse (into
+# dom0), B did not allow (inside one slot, or into its
 # dump sink) and the line above did not refuse (into a hidden project) gets
 # the normal Qubes dialog, where the operator picks or confirms the
 # destination (since v0.9.15). That covers every other copy across projects.

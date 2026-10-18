@@ -40,8 +40,10 @@ class _UsageError(Exception):
 
 
 def _write_out(text: str) -> None:
-    # UTF-8 whatever the locale says, so a result can always be printed.
-    sys.stdout.buffer.write(text.encode("utf-8"))
+    # UTF-8 whatever the locale says, so a result can always be printed. A lone
+    # surrogate (a qube's output can hold one) is written as its escape: the
+    # call has already run, so its result must not end in a traceback.
+    sys.stdout.buffer.write(text.encode("utf-8", errors="backslashreplace"))
     sys.stdout.flush()
 
 
