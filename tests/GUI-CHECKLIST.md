@@ -799,7 +799,8 @@ qube, first; its timer does the same every 15 seconds.
     greyed out, `the file to write: give the full path, starting with /`.
     Empty the field, OK. Expect a report `wrote` and a path under your dom0
     home, `qmcp-export-<time>.json`, then what to do with it after a
-    reinstall. In dom0, `ls -l` on that file shows it yours, `-rw-------`.
+    reinstall, and, when a qube is held for review, a line naming it and
+    saying to accept or reject it first (exit status 0 either way). In dom0, `ls -l` on that file shows it yours, `-rw-------`.
     *Export...* again with that path typed in full, OK: the report FAILED,
     `... exists; nothing was written`.
 62. **Import refuses on this install.** *Import...*. Expect the red paragraph

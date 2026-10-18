@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.34 — what the audit round's last gates and the development box left.** Besides the hub, up to 15
+**Status: 0.9.35 — what the reinstall rehearsal left.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -236,7 +236,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.34.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.35.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -289,6 +289,18 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 0.9.34? Install over it. `qmcp export` names every qube held for
+review, or about to be, and says to accept or reject it before you back up: after
+a restore every AI qube is held alike, and `restored accept --all` would take it
+with the rest. The gate's timer now also removes the in-qube services' lock of a
+qube removed by hand, and a removed lead's call locks under `/run/qmcp/calls`
+(never its `.refused` counter). An in-qube lock 0.9.34 made is root's and
+0600, so the gate's user cannot open it: it stays until the next boot. `qmcp
+check` says "another version" of the in-qube services, not "an older version",
+since after a rollback it is newer. To
+roll back to 0.9.34, run this release's `uninstall.sh` before 0.9.34's installer
+(not drilled for this release; the uninstaller is unchanged since 0.9.33).
 
 Coming from 0.9.33? Install over it. If you created `/etc/qmcp/audit-keep-days`
 with the `tee` line of the note for upgrading from 0.9.32, `qmcp check` as your
@@ -450,8 +462,9 @@ sudo qmcp settings set --birth-egress sys-ai-net     # where the hub's template-
 halted one, writes the two services in as root, labels it with their version,
 and shuts it down again. dom0 keeps its own copy of the services, so this works
 at any time, not only while a fetched release is unpacked; `qmcp check` warns
-on a template it runs commands in that was never prepared, or carries an older
-version. After an update, a running prepared qube's own disk is brought up to
+on a template it runs commands in that was never prepared, or carries another
+version than the installed one (an older one after an update, a newer one after
+a rollback). After an update, a running prepared qube's own disk is brought up to
 date within a minute, and a halted one's the next time it runs (none is started
 for it); the qubes built on a template get the new services once it has shut
 down and they restart.
@@ -670,7 +683,10 @@ hub (`qvm-tags mcp-control del qmcp-anon`), or `qmcp check` fails on it.
 
 Fetch the new release exactly as in step 2, into a fresh
 `/tmp/qubes-mcp`, and run the installer again: it is idempotent, backs up what
-it replaces and ends with `qmcp check`. Then:
+it replaces and ends with `qmcp check`. Before it installs the new policy it
+seals every open window (`qmcp seal --all`, which kills an open qube that runs),
+so an install never leaves one open: if you still want one, open it again
+afterwards (`sudo qmcp open QUBE --for 2h`). Then:
 
 - **Prepare what the check names.** A release that changes the in-qube services
   marks every prepared template and standalone as behind. A running one's own
@@ -701,7 +717,10 @@ before it needs.
 
 A Qubes backup takes dom0 in as your home directory and nothing else, so it
 never holds qmcp's own settings. Export them into your home first, then back up
-with dom0 ticked:
+with dom0 ticked. Accept or reject every qube held for review before you export
+(`qmcp restored list`): after a restore every AI qube is held alike, and
+`restored accept --all` takes one held before the backup with the rest. The
+export names any it finds, and is written all the same:
 
 ```sh
 # in dom0
@@ -718,6 +737,10 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh --hub mcp-control   # the same hub
 sudo qmcp import ~/home-restore-<time>/dom0-home/<you>/qmcp-export-<time>.json
 sudo qmcp restored accept --all   # the restored AI qubes, back into their projects
 ```
+
+Pending proposals are not in the export: they expire in 7 days, and would ask
+for changes to a fleet that has moved on. The hub may submit again what it
+still needs.
 
 The installer's closing check is FAILED until the import and the accept: no
 gateway is enrolled yet, and the restored AI qubes are held. That is expected

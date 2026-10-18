@@ -4269,7 +4269,10 @@ EXPORT_INTRO = (
     "you can read. A Qubes backup takes dom0 in as your home directory only, so keep the file "
     "there and back up with dom0 ticked. Left empty, the file is "
     "qmcp-export-<UTC time>.json in your dom0 home. The command never writes over a file that "
-    "exists. Not in it: the proposals and the audit chain, which a new install starts afresh.")
+    "exists. Not in it: the proposals and the audit chain, which a new install starts afresh. "
+    "Accept or reject every qube held for review first: after a restore every AI qube is held "
+    "alike, and Accept all held... takes one held before the backup with the rest. The command "
+    "names any it finds, and writes the export all the same.")
 IMPORT_INTRO = (
     "Puts an export's operator files back under /etc/qmcp: the caps, birth egress, the name "
     "prefix, the audit log's keep-days, the gateway registry and the project records (the "

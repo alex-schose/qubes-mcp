@@ -2,7 +2,7 @@
 #
 # Brings qmcp's two in-qube services up to the installed version in every
 # RUNNING template and standalone that was prepared before
-# (`qmcp template prepare`) and carries an older version. It never starts a
+# (`qmcp template prepare`) and carries another version. It never starts a
 # qube: a halted one is brought up to date the next time it runs. It skips a
 # qube the anonymity gate stopped and one held for the operator's review, and
 # one never prepared. One audit line per qube it wrote into, as caller

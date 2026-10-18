@@ -419,6 +419,37 @@ def review(app, records) -> list:
     return sorted(rows, key=lambda r: r["name"])
 
 
+def before_export(app) -> list:
+    """What `qmcp export` warns about: [] when no qube waits for review. A
+    restore gives every qube a new identity, so after one every AI qube is
+    held alike, and `restored accept --all` takes a qube held now (a hand
+    `qvm-clone`, say) with the rest: its review would be skipped. So the
+    export names each qube waiting for review now, held or about to be, and
+    each whose state cannot be read; a list that cannot be read at all is
+    said so too, never "nothing waits". The export is written either way: it
+    is a backup step, not a gate."""
+    try:
+        rows = review(app, None)
+    except Exception as e:
+        return [f"whether any qube is held for review could not be read "
+                f"({type(e).__name__}): run qmcp restored list before you back up"]
+    waiting = [r["name"] for r in rows if "unreadable" not in r]
+    unread = [r["name"] for r in rows if "unreadable" in r]
+    out = []
+    if waiting:
+        out.append(f"held for review, or about to be: {', '.join(waiting)}. Accept or reject "
+                   f"each before you back up (sudo qmcp restored accept QUBE, or reject QUBE): "
+                   f"after a restore every AI qube is held alike, and restored accept --all "
+                   f"takes these with the rest")
+    if unread:
+        one = len(unread) == 1
+        out.append(f"whether {', '.join(unread)} {'is' if one else 'are'} held for review is "
+                   f"not known, since {'it' if one else 'they'} cannot be read now: qmcp "
+                   f"restored list, then accept or reject {'it' if one else 'each'} before "
+                   f"you back up")
+    return out
+
+
 class ReviewError(Exception):
     pass
 

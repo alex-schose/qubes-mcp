@@ -764,6 +764,173 @@ class Writes(Base):
         self.assertIn("ExecStart=/usr/local/bin/qmcp gate",
                       (pathlib.Path(__file__).parent.parent / "deploy" / "qmcp-gate.service").read_text())
 
+    def test_the_sweep_takes_a_gone_qubes_inqube_lock_and_never_a_live_or_held_one(self):
+        """A template removed by hand left `inqube-<name>.lock` until boot (the
+        box, 2026-10-18). The pass removes it once qubesd no longer lists the
+        name, and leaves a live qube's, one a prepare holds, and a FIFO."""
+        import fcntl
+        run = pathlib.Path(core.RUN_DIR)
+        for f in ("inqube-gone-tpl.lock", "inqube-ai-work.lock", "inqube-gone-held.lock",
+                  "inqube-not a name.lock", "inqube-gone-tpl.other"):
+            (run / f).touch()
+        os.mkfifo(run / "inqube-gone-fifo.lock")
+        held = os.open(run / "inqube-gone-held.lock", os.O_RDWR)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.assertEqual(core.sweep_qube_locks(self.app), 1)
+        left = sorted(f for f in os.listdir(run) if f.startswith("inqube-"))
+        self.assertEqual(left, ["inqube-ai-work.lock", "inqube-gone-fifo.lock",
+                                "inqube-gone-held.lock", "inqube-gone-tpl.other",
+                                "inqube-not a name.lock"])
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(core.sweep_qube_locks(self.app), 1)
+        self.assertNotIn("inqube-gone-held.lock", os.listdir(run))
+        # A prepare in progress on a name qubesd does not list keeps its lock.
+        with inqube._OneWriter("gone-tpl2") as w:
+            self.assertEqual(core.sweep_qube_locks(self.app), 0)
+            self.assertTrue(os.path.exists(w.path))
+        self.assertEqual(core.sweep_qube_locks(self.app), 1)
+        self.assertFalse(os.path.exists(w.path))
+        # A list that cannot be read, or one without dom0 (not qubesd's list),
+        # removes nothing.
+        (run / "inqube-gone-tpl3.lock").touch()
+        self.app.fail_reads("admin.vm.List", "fail")
+        self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        with mock.patch.object(self.app, "qubesd_call", return_value=b"ai-work class=AppVM"):
+            self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        self.assertIn("inqube-gone-tpl3.lock", os.listdir(run))
+
+    def test_the_inqube_lock_is_the_gates_to_open_and_a_writer_retakes_a_removed_file(self):
+        """The gate's user opens the lock root made to remove it, so it is
+        0640 under any umask; and a writer left holding the lock on a file the
+        pass removed after its open (the pass takes the lock, unlinks, lets go,
+        and the writer's flock then lands on the removed file) opens the path
+        again, never keeping a lock on a lost file. The mock unlinks once the
+        lock is had, which leaves the writer in that same state."""
+        old = os.umask(0o077)
+        try:
+            with inqube._OneWriter("ai-tpl-x") as w:
+                self.assertEqual(os.stat(w.path).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+        real, calls = inqube._OneWriter._open, []
+
+        def open_then_swept(self_w):
+            fd = real(self_w)
+            if not calls:
+                os.unlink(self_w.path)          # the pass, after the open
+            calls.append(fd)
+            return fd
+        with mock.patch.object(inqube._OneWriter, "_open", open_then_swept):
+            with inqube._OneWriter("ai-tpl-y") as w:
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(os.fstat(w.fd).st_ino, os.stat(w.path).st_ino)
+                # So a second writer finds it held.
+                with self.assertRaises(inqube.InQubeError):
+                    inqube._OneWriter("ai-tpl-y").__enter__()
+
+    def test_a_writer_tries_a_lock_held_for_a_moment_again_before_calling_it_busy(self):
+        """The sweep holds a writer lock for a moment to remove a gone qube's
+        file: a prepare that meets that moment tries again, and only a lock
+        held through every try is another writer's."""
+        import fcntl
+        import threading
+        path = pathlib.Path(core.RUN_DIR) / "inqube-ai-tpl-z.lock"
+        path.touch(mode=0o640)
+        fd = os.open(path, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        t = threading.Timer(0.15, fcntl.flock, (fd, fcntl.LOCK_UN))
+        t.start()
+        self.addCleanup(t.cancel)
+        with inqube._OneWriter("ai-tpl-z") as w:          # had on a later try
+            self.assertEqual(os.fstat(w.fd).st_ino, os.stat(path).st_ino)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        sleeps = []
+        with mock.patch.object(inqube.time, "sleep", sleeps.append):
+            with self.assertRaises(inqube.InQubeError) as cm:
+                inqube._OneWriter("ai-tpl-z").__enter__()
+        self.assertIn("another prepare or install", str(cm.exception))
+        self.assertEqual(sleeps, [inqube.LOCK_RETRY_S] * (inqube.LOCK_TRIES - 1))
+
+    def test_a_call_slot_is_made_for_the_gate_to_open_whatever_the_umask(self):
+        """A `--gate-user` other than the services' user removes a gone
+        caller's slots: a slot file is 0660 under the service's umask, and
+        never made through a link."""
+        old = os.umask(0o077)
+        try:
+            fd = core.acquire_call_slot("ai-umask-lead", limit=1)
+        finally:
+            os.umask(old)
+        self.addCleanup(os.close, fd)
+        path = pathlib.Path(core.RUN_DIR) / "calls" / "ai-umask-lead.0"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o660)
+        target = self.tmp / "elsewhere"
+        target.write_text("")
+        os.symlink(target, pathlib.Path(core.RUN_DIR) / "calls" / "ai-link-lead.0")
+        with self.assertRaises(core.Refusal) as cm:
+            core.acquire_call_slot("ai-link-lead", limit=1)
+        self.assertEqual(cm.exception.payload["error"], "qmcp runtime directory unavailable")
+
+    def test_the_sweep_takes_a_gone_callers_call_locks_and_never_a_counter(self):
+        """A lead removed by hand, then its project deleted, left
+        `calls/<lead>.0` until boot (the box, 2026-10-18). The pass removes a
+        gone caller's call slots and acting lock with its turnstile; it never
+        removes a counter (`.refused`, the caller's day of the audit budget), a
+        live qube's file, the hub's, the leads' pool or a file a call holds,
+        and nothing at all while the hub file or qubesd's list does not read."""
+        import fcntl
+        calls = pathlib.Path(core.RUN_DIR) / "calls"
+        self.app.vm("ai-x.0", netvm=None, tags={"ai-managed"})
+        counter = '{"day": "2026-10-18", "lines": 19999}\n'
+        gone = ["ai-gone-lead.0", "ai-gone-lead.3", "ai-gone-lead.acting",
+                "ai-gone-lead.acting.queue", "ai-x.0"]
+        kept = ["ai-gone-lead.refused", "ai-work.0", "ai-work.refused", "ai-x.0.0",
+                "@leads.0", "ai-held.0", "ai-gone-lead.99", "ghost-hub.0", "ghost-hub.acting"]
+        for f in gone + kept:
+            (calls / f).write_text(counter if f.endswith(".refused") else "")
+        held = os.open(calls / "ai-held.0", os.O_RDWR)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        # The hub, as /etc/qmcp/hub names it, even while qubesd does not list it.
+        pathlib.Path(core.HUB_PATH).write_text("ghost-hub\n")
+        # Unreadable first: no hub file, then no list, then a list without dom0.
+        os.unlink(core.HUB_PATH)
+        self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        pathlib.Path(core.HUB_PATH).write_text("ghost-hub\n")
+        self.app.fail_reads("admin.vm.List", "fail")
+        self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        with mock.patch.object(self.app, "qubesd_call", return_value=b"ai-work class=AppVM"):
+            self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        self.assertEqual(sorted(os.listdir(calls)), sorted(gone + kept))
+        # Readable: ai-gone-lead and ai-x go (two callers), the rest stay.
+        self.assertEqual(core.sweep_qube_locks(self.app), 2)
+        self.assertEqual(sorted(os.listdir(calls)), sorted(kept))
+        self.assertEqual((calls / "ai-gone-lead.refused").read_text(), counter)
+        # The held slot goes once it is free; the counter still stays.
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(core.sweep_qube_locks(self.app), 1)
+        self.assertNotIn("ai-held.0", os.listdir(calls))
+        self.assertIn("ai-gone-lead.refused", os.listdir(calls))
+
+    def test_the_sweep_leaves_an_acting_lock_held_shared_or_exclusive(self):
+        """A call still holds its caller's acting lock shared, and a drain
+        holds it exclusively: either way the pass leaves it, and removes it
+        once it is let go."""
+        acting = core.acting_lock_path("ai-gone-actor")
+        for take in (lambda: core.hold_acting("ai-gone-actor", 1),
+                     lambda: core.drain_caller("ai-gone-actor", 1)):
+            fd = take()
+            self.assertIsNotNone(fd)
+            try:
+                self.assertEqual(core.sweep_qube_locks(self.app), 0)
+                self.assertTrue(os.path.exists(acting))
+            finally:
+                os.close(fd)
+            self.assertEqual(core.sweep_qube_locks(self.app), 1)
+            self.assertFalse(os.path.exists(acting))
+            self.assertFalse(os.path.exists(core.queue_path(acting)))
+
     def test_a_removed_qubes_lock_files_go_with_it(self):
         # The lock itself goes under the one the call holds; another qube's stay.
         self.seed_qube_locks("ai-work2")

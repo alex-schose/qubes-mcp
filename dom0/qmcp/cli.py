@@ -554,6 +554,14 @@ def cmd_export(args) -> int:
           f"back under ~/home-restore-<time>/dom0-home/), then sudo qmcp restored accept --all. "
           f"With anonymous projects, send the templates' updates through the anonymiser again "
           f"(the README's Setup, step 7) before the import")
+    # A warning, never a refusal: the export is written, and it is a backup step.
+    try:
+        notes = restored.before_export(_app())
+    except Exception as e:
+        notes = [f"whether any qube is held for review could not be read "
+                 f"({type(e).__name__}): run qmcp restored list before you back up"]
+    for note in notes:
+        print(f"qmcp export: {note}", file=sys.stderr)
     return 0
 
 
@@ -587,7 +595,9 @@ def cmd_gate(args) -> int:
     held the gate so nothing was."""
     held = None
     # The lock files of names that are gone (a disposable qubesd removed after
-    # a kill): best-effort, silent, and never the gate's verdict.
+    # a kill, a qube or a lead removed by hand): the qube locks, the in-qube
+    # writer locks and a gone caller's call locks, never its counter.
+    # Best-effort, and never the gate's verdict.
     core.sweep_qube_locks(_app())
     try:
         held = restored.hold(_app())

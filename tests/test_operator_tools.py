@@ -314,7 +314,10 @@ class InQube(ToolsBase):
             inqube.prepare(self.app, root)
         self.assertEqual([f[0] for f in self.findings()], ["pass"])
         self.app.domains["ai-debian-13"].features[inqube.LABEL] = "sha256:old"
-        self.assertIn("older version", self.findings()[0][2])
+        self.assertIn("another version of them than the installed one in ai-debian-13",
+                      self.findings()[0][2])
+        # Never "older": after a rollback the label names a newer version.
+        self.assertNotIn("older", self.findings()[0][2])
 
     def test_the_check_covers_a_managed_standalone_and_follows_a_template_chain(self):
         for root in ROOTS:
@@ -949,6 +952,70 @@ class Review(ToolsBase):
         rc, out, _ = self.cli("restored", "accept", "--all")
         self.assertEqual((rc, out.strip()), (0, "nothing is held"))
         self.assertEqual(self.audit_lines()[-1]["args"], {"qubes": [], "all": True})
+
+    def test_export_names_every_qube_waiting_for_review_and_still_writes(self):
+        """After a restore every AI qube is held alike and `accept --all`
+        takes them all, so a qube held before the backup (a hand qvm-clone)
+        would skip its review: the export says so, and is written all the same,
+        byte for byte the file it writes with nothing waiting."""
+        stamp = mock.patch.object(opfiles, "_now", return_value="20261018T120000Z")
+        clean = self.tmp / "e0.json"
+        with stamp:
+            rc, out, err = self.cli("export", str(clean))
+        self.assertEqual((rc, err), (0, ""), err)       # nothing waits: no warning
+        self.back("ai-a", {"qmcp-proj-p00"})
+        restored.hold(self.app)
+        self.back("ai-b", {"qmcp-proj-p00"})            # not held yet: the next pass holds it
+        path = self.tmp / "e1.json"
+        with stamp:
+            rc, out, err = self.cli("export", str(path))
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"wrote {path}", out)
+        self.assertEqual(path.read_bytes(), clean.read_bytes())
+        self.assertIn("qmcp export: held for review, or about to be: ai-a, ai-b. Accept or "
+                      "reject each before you back up", err)
+        self.assertIn("restored accept --all takes these with the rest", err)
+        # The warning names the qubes it found, and only those.
+        restored.accept(self.app, "ai-a")
+        rc, _, err = self.cli("export", str(self.tmp / "e2.json"))
+        self.assertEqual(rc, 0)
+        self.assertIn("about to be: ai-b.", err)
+        self.assertNotIn("ai-a", err)
+
+    def test_export_says_when_whether_a_qube_is_held_cannot_be_read(self):
+        """A qube whose tags do not read may be held: never left out, and a
+        review that cannot run at all is never "nothing waits". The file is
+        the one written with nothing waiting, byte for byte."""
+        stamp = mock.patch.object(opfiles, "_now", return_value="20261018T120000Z")
+        with stamp:
+            self.assertEqual(self.cli("export", str(self.tmp / "e0.json"))[0], 0)
+        clean = (self.tmp / "e0.json").read_bytes()
+        for n in ("ai-a", "ai-b"):
+            self.back(n, {"qmcp-proj-p00"})
+        restored.hold(self.app)
+        self.app.fail.add("tag.List:ai-b")
+        with stamp:
+            rc, _, err = self.cli("export", str(self.tmp / "e1.json"))
+        self.app.fail.clear()
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((self.tmp / "e1.json").exists())
+        self.assertIn("about to be: ai-a.", err)
+        self.assertIn("whether ai-b is held for review is not known, since it cannot be read "
+                      "now", err)
+        with stamp, mock.patch.object(restored, "review", side_effect=RuntimeError("boom")):
+            rc, _, err = self.cli("export", str(self.tmp / "e2.json"))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((self.tmp / "e2.json").exists())
+        self.assertIn("whether any qube is held for review could not be read (RuntimeError)", err)
+        self.assertNotIn("boom", err)
+        # And when the Admin API client cannot even be made: still written, still said.
+        with stamp, mock.patch.object(restored, "before_export",
+                                      side_effect=ImportError("qubesadmin")):
+            rc, _, err = self.cli("export", str(self.tmp / "e3.json"))
+        self.assertEqual(rc, 0, err)
+        for f in ("e1.json", "e2.json", "e3.json"):
+            self.assertEqual((self.tmp / f).read_bytes(), clean, f)
+        self.assertIn("whether any qube is held for review could not be read (ImportError)", err)
 
     def test_accept_all_never_says_nothing_is_held_over_a_qube_it_cannot_read(self):
         for n in ("ai-a", "ai-b"):
@@ -1913,7 +1980,8 @@ class Packages(ToolsBase):
 
     def test_one_writer_at_a_time_in_a_qube(self):
         # An install or a prepare that started a qube shuts it down at the end,
-        # which would stop another's write part-way: the second refuses at once.
+        # which would stop another's write part-way: the second refuses, after
+        # trying the lock again for half a second (the gate's sweep holds it briefly).
         with inqube._OneWriter(self.TPL):
             with self.assertRaises(inqube.InQubeError) as cm:
                 inqube.install(self.app, self.TPL, ["curl"])

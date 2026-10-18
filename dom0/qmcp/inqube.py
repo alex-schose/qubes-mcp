@@ -80,6 +80,12 @@ SKIP_BADGES = frozenset({projects.BLOCKED, projects.STOPPED, core.QUARANTINE})
 UNKNOWN = "unknown: copied from a running qube"
 
 
+#: A writer's lock found held is tried this many times, this far apart, before
+#: it is another writer's: the gate's sweep holds it for a moment only.
+LOCK_TRIES = 5
+LOCK_RETRY_S = 0.1
+
+
 class InQubeError(Exception):
     """A prepare or a refresh that did not happen; the message names why, in
     fixed words, never the qube's own output."""
@@ -88,38 +94,60 @@ class InQubeError(Exception):
 class _OneWriter:
     """One prepare or install in a qube at a time. Either may start a halted
     qube and shut it down when it is done, which would stop the other one's
-    write part-way (a dpkg run, say), so the second refuses at once rather
-    than waiting. An flock on a file in /run/qmcp, released with the process.
-    The refresh never starts or stops a qube, so it takes none."""
+    write part-way (a dpkg run, say), so the second refuses within half a
+    second rather than waiting for it. An flock on a file in /run/qmcp, released with the process.
+    The refresh never starts or stops a qube, so it takes none.
+
+    The file is 0640, in the `qubes` group of the setgid directory, so the
+    gate's timer (the dom0 user) can open it to remove it once its qube is
+    gone (`core.sweep_qube_locks`), under its lock; it holds nothing. That
+    removal is why a writer checks, once it has the lock, that its file is
+    still the one at the path, and opens the path again when it is not: two
+    writers never hold the lock on two files."""
 
     def __init__(self, name: str) -> None:
-        self.path = os.path.join(core.RUN_DIR, f"inqube-{name}.lock")
+        self.path = os.path.join(core.RUN_DIR, f"{core.INQUBE_LOCK_PREFIX}{name}"
+                                               f"{core.INQUBE_LOCK_SUFFIX}")
         self.fd = None
 
     def __enter__(self):
+        for _ in range(3):
+            self.fd = self._open()
+            if core._is_current(self.fd, self.path):
+                return self
+            os.close(self.fd)
+        raise InQubeError("its lock was removed while it was taken: try again")
+
+    def _open(self) -> int:
         import fcntl
         import stat
-        old = os.umask(0o077)
+        old = os.umask(0o027)
         try:
             # Never through a link, and only a regular file of this process's
             # owner: /run/qmcp is the services group's to write in.
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-                              0o600)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o640)
         except OSError as e:
             raise InQubeError(f"its lock cannot be opened ({type(e).__name__})") from None
         finally:
             os.umask(old)
-        st = os.fstat(self.fd)
+        st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            os.close(self.fd)
+            os.close(fd)
             raise InQubeError(f"{self.path} is not a lock this command made: remove it")
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(self.fd)
-            raise InQubeError("another prepare or install is running in it: try again when it "
-                              "has finished") from None
-        return self
+        # The gate's sweep takes the lock for a moment to remove a gone
+        # qube's file, so a lock held now is tried again a few times before
+        # it is called another writer's.
+        for attempt in range(LOCK_TRIES):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                if attempt + 1 < LOCK_TRIES:
+                    time.sleep(LOCK_RETRY_S)
+        os.close(fd)
+        raise InQubeError("another prepare or install is running in it: try again when it "
+                          "has finished")
 
     def __exit__(self, *exc):
         os.close(self.fd)
@@ -418,9 +446,10 @@ def findings(vms, records: dict, tags_by: dict, add, directory: str | None = Non
         if missing:
             parts.append(f"no record that qmcp's services were written into {', '.join(missing)}")
         if behind:
-            parts.append(f"an older version of them in {', '.join(behind)} (a running one's own "
-                         f"disk is brought up to date within a minute; the qubes built on a "
-                         f"template get it once the template has shut down and they restart)")
+            parts.append(f"another version of them than the installed one in "
+                         f"{', '.join(behind)} (a running one's own disk is brought to the "
+                         f"installed one within a minute; the qubes built on a template get it "
+                         f"once the template has shut down and they restart)")
         add("warn", "in-qube services",
             "; ".join(parts) + ": sudo qmcp template prepare QUBE (this reads dom0's record, "
             "not the qube's disk)")

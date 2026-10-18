@@ -35,6 +35,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import time
 
@@ -295,11 +296,15 @@ def acquire_call_slot(caller_name: str, run_dir: str | None = None,
     base = os.path.join(RUN_DIR if run_dir is None else run_dir, "calls")
     for i in range(MAX_CONCURRENT_CALLS if limit is None else limit):
         path = os.path.join(base, f"{caller_name}.{i}")
-        # A slot file removed while this call held it open (`retire_caller`)
-        # is a slot no other call can see: opened again, the one at the path.
+        # A slot file removed while this call held it open (`retire_caller`,
+        # the gate's sweep) is a slot no other call can see: opened again, the
+        # one at the path. Made as every shared lock file is (`_open_lock_file`:
+        # group-readable and -writable whatever the service's umask, never
+        # through a link), so the gate's user can remove it once its caller is
+        # gone.
         for _ in range(3):
             try:
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+                fd = _open_lock_file(path)
             except OSError:
                 raise refuse("qmcp runtime directory unavailable") from None
             try:
@@ -499,14 +504,19 @@ def drain_caller(caller: str, timeout: float | None = None) -> int | None:
 def _remove_if_free(path: str) -> str | None:
     """Remove the lock file at `path` under its own lock, exclusive, taken
     without waiting: None when it is gone, or the reason it was left. Never
-    made where it is missing."""
+    made where it is missing. Opened read-only, which is all a lock needs, so
+    the gate's user can remove an in-qube lock root made 0640; and without
+    blocking, so a FIFO planted under a lock's name never holds the pass up
+    (it is left: only a regular file is a lock file)."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         return None
     except OSError as e:
         return f"not opened ({type(e).__name__})"
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "not a lock file"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -572,7 +582,8 @@ def retire_qube_locks(name: str, held=()) -> list:
     a file in use is left (a reboot clears it): every taker checks its file
     is still the one at the path (`_take_current`), and a service checks the
     qube again under the lock and finds it gone, so a file left or removed
-    grants nothing. A qube removed outside qmcp keeps its files. Never
+    grants nothing. A qube removed outside qmcp keeps its files until the
+    gate's next pass (`sweep_qube_locks`). Never
     raises: a remove that landed is never reported as failed for this."""
     if not valid_qube_name(name):
         return []
@@ -595,33 +606,123 @@ def retire_qube_locks(name: str, held=()) -> list:
     return left
 
 
-def sweep_qube_locks(app) -> int:
-    """Remove the lock files of names that are no longer qubes: a disposable
-    qubesd removed itself after a kill, a qube removed outside qmcp. Run by
-    every pass of the gate's timer; the number of names swept. A file a call
-    holds is left for the next pass, and one whose name is a qube is never
-    touched; the list is read from qubesd itself (`admin.vm.List`), not from
-    the client's cache, which lags a new disposable. Safe against a qube
-    created under the name meanwhile for the same reason as
-    `retire_qube_locks`: every taker checks its file is still the one at the
-    path. Never raises, and writes no audit line: it changes nothing a
-    principal or the operator did."""
+#: The in-qube services' writer lock of a qube (`inqube._OneWriter`): one
+#: prepare or install at a time, `<RUN_DIR>/inqube-<name>.lock`.
+INQUBE_LOCK_PREFIX = "inqube-"
+INQUBE_LOCK_SUFFIX = ".lock"
+_SLOT_RE = re.compile(r"\A(.+)\.([0-9]{1,2})\Z")
+
+
+def _listed_names(app) -> set | None:
+    """Every name qubesd lists, read from qubesd itself (`admin.vm.List`),
+    not from the client's cache, which lags a new disposable. None when the
+    list cannot be read, or reads without dom0: qubesd's list always holds
+    dom0, so a reply without it is not that list. This catches no reply cut
+    short after dom0 (qubesd sorts the names, so dom0 sits mid-list); a wrong
+    list costs nothing, since only a free file is removed and every taker
+    checks its file is still the one at the path."""
     try:
         raw = app.qubesd_call("dom0", "admin.vm.List").decode(errors="replace")
-        live = {line.split(" ", 1)[0] for line in raw.splitlines() if line.strip()}
-        files = os.listdir(os.path.join(RUN_DIR, QUBE_LOCK_SUBDIR))
     except Exception:
+        return None
+    live = {line.split(" ", 1)[0] for line in raw.splitlines() if line.strip()}
+    return live if "dom0" in live else None
+
+
+def _caller_of_call_file(f: str) -> str | None:
+    """The caller a lock file under `calls/` belongs to: a call slot
+    (`<caller>.<i>`), its acting lock (`<caller>.acting`) or that lock's
+    turnstile (`<caller>.acting.queue`). None for anything else, the counter
+    (`<caller>.refused`) and the leads' pool (`@leads.<i>`, no qube name)
+    included. Only the one suffix each writer adds is taken off, so a qube
+    whose name holds a dot (`ai-x.0`) never reads as another (`ai-x`)."""
+    for suffix in (".acting.queue", ".acting"):
+        if f.endswith(suffix):
+            name = f[:-len(suffix)]
+            return name if valid_qube_name(name) else None
+    m = _SLOT_RE.match(f)
+    if m and int(m.group(2)) < max(MAX_CONCURRENT_CALLS, LEAD_CALLS) \
+            and valid_qube_name(m.group(1)):
+        return m.group(1)
+    return None
+
+
+def sweep_qube_locks(app) -> int:
+    """Remove the runtime lock files of names that are no longer qubes: a
+    disposable qubesd removed itself after a kill, a qube removed outside
+    qmcp (`qvm-remove`). Run by every pass of the gate's timer; the number of
+    names whose files it removed, counted once per kind of file. Three kinds:
+    a qube's lock and turnstile under `qubes/`; its in-qube writer lock
+    (`inqube-<name>.lock`); and, under `calls/`, the call slots, acting lock
+    and acting turnstile of a caller that is no qube any more (a lead
+    removed by hand). Never a caller's counter (`<caller>.refused`): it is
+    that principal's day of the audit budget and the evidence `qmcp check`
+    warns on, and removing it would give the name a new day's share, so it
+    stays until the operator removes it or a reboot does (as
+    `retire_caller` keeps it). Nothing under `calls/` while `/etc/qmcp/hub`
+    does not read, and never the hub's files.
+
+    A name is gone only when qubesd's own list reads and does not hold it: a
+    list that cannot be read, or reads without dom0 (then it is not qubesd's
+    list), removes nothing. A list that is wrong some other way costs
+    nothing: only a free file is removed, and every taker re-checks it. A file
+    a call or a prepare holds is left for the next pass, and one whose name
+    is a qube is never touched. Each file goes only under its own lock,
+    taken without waiting (`_remove_if_free`), and every taker checks, once
+    it has a lock, that its file is still the one at the path, so a qube or
+    a caller of that name made meanwhile takes a new file and nothing is
+    held on two. Never raises, and writes no audit line: it changes nothing a
+    principal or the operator did."""
+    try:
+        live = _listed_names(app)
+        if live is None:
+            return 0
+        swept = 0
+        names = set()
+        try:
+            files = os.listdir(os.path.join(RUN_DIR, QUBE_LOCK_SUBDIR))
+        except OSError:
+            files = []
+        for f in files:
+            for suffix in (".lock", ".queue"):
+                if f.endswith(suffix) and valid_qube_name(f[:-len(suffix)]):
+                    names.add(f[:-len(suffix)])
+        for name in sorted(names - live):
+            if not retire_qube_locks(name):
+                swept += 1
+        try:
+            files = os.listdir(RUN_DIR)
+        except OSError:
+            files = []
+        for f in sorted(files):
+            if not (f.startswith(INQUBE_LOCK_PREFIX) and f.endswith(INQUBE_LOCK_SUFFIX)):
+                continue
+            name = f[len(INQUBE_LOCK_PREFIX):-len(INQUBE_LOCK_SUFFIX)]
+            if valid_qube_name(name) and name not in live \
+                    and _remove_if_free(os.path.join(RUN_DIR, f)) is None:
+                swept += 1
+        hub = read_hub()
+        if hub is None:
+            return swept
+        calls = os.path.join(RUN_DIR, "calls")
+        try:
+            files = os.listdir(calls)
+        except OSError:
+            files = []
+        by_caller: dict = {}
+        for f in files:
+            caller = _caller_of_call_file(f)
+            if caller is not None and caller != hub and caller not in live:
+                by_caller.setdefault(caller, []).append(os.path.join(calls, f))
+        for caller in sorted(by_caller):
+            left = [why for why in (_remove_if_free(p) for p in sorted(by_caller[caller])) if why]
+            if not left:
+                swept += 1
+        return swept
+    except Exception as e:
+        print(f"qmcp: the sweep of runtime lock files stopped ({type(e).__name__})",
+              file=sys.stderr)
         return 0
-    names = set()
-    for f in files:
-        for suffix in (".lock", ".queue"):
-            if f.endswith(suffix) and valid_qube_name(f[:-len(suffix)]):
-                names.add(f[:-len(suffix)])
-    swept = 0
-    for name in sorted(names - live):
-        if not retire_qube_locks(name):
-            swept += 1
-    return swept
 
 
 class qube_lock:

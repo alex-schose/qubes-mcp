@@ -26,6 +26,51 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.35] — 2026-10-18
+
+**What the reinstall rehearsal left.** An export says which qubes wait for review, the gate's
+timer removes the in-qube and call lock files of a qube removed by hand, the in-qube services
+item no longer calls a newer version older, and the README says what an update and a restore do
+to windows and proposals.
+
+### Changed
+
+- `qmcp export` names on standard error every qube waiting for review (held, or not yet held)
+  and says to accept or reject it before backing up: after a restore every AI qube is held
+  alike, and `restored accept --all` takes a qube held before the backup (a hand `qvm-clone`)
+  with the rest. A qube whose tags or label cannot be read is named as not known, and a review
+  that cannot be read at all is said so, never "nothing waits". The export is written either
+  way and exits 0. The window's Export form says the same.
+- Each pass of the gate's timer also removes, for a name qubesd no longer lists, its in-qube
+  writer lock (`/run/qmcp/inqube-<name>.lock`) and its call slots, acting lock and acting
+  turnstile under `/run/qmcp/calls`, each under its own lock taken without waiting. It never
+  removes a counter (`<caller>.refused`, the caller's day of the audit budget), the hub's
+  call files, or anything under `/run/qmcp/calls` while `/etc/qmcp/hub` does not read; a list that
+  does not read, or reads without dom0 (then it is not qubesd's list), removes nothing, and a
+  list wrong some other way costs nothing, since only a free file is removed and every taker
+  checks its file is still the one at the path. A FIFO or another file that is not a
+  regular file is left, never opened in a way that waits.
+- The in-qube writer lock is made 0640 in the `qubes` group, so the gate's user can open it
+  to remove it; a prepare or install that finds its file removed once it has the lock opens the
+  path again, and one that finds the lock held tries it 5 times, 0.1 s apart (about 0.4 s),
+  before it says another prepare or install is running, since the sweep holds it for a
+  moment. A lock an earlier version made (root's, 0600) stays until boot: the gate's user
+  cannot open it.
+- A call's concurrency slot files under `/run/qmcp/calls` are made as every other shared lock
+  file: 0660 whatever the service's umask, and never through a link, so a `--gate-user` other
+  than the services' user can open them to remove them. A slot an earlier version made 0600
+  may stay until boot when the gate's user is not the services' user, which cannot open it.
+- The README's "Updating" says the installer seals every open window before it installs the
+  policy, so `qmcp open` it again afterwards; its backup section says to accept or reject held
+  qubes before exporting, and that pending proposals are not exported (the hub submits again
+  what it still needs).
+
+### Fixed
+
+- `qmcp check`'s in-qube services item said "an older version" for any label that is not the
+  installed version, which after a rollback names a newer one; it says "another version of
+  them than the installed one", and the README and the refresh unit say the same.
+
 ## [0.9.34] — 2026-10-18
 
 **What the audit round's last gates and the development box left.** The installer and
