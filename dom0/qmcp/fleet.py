@@ -319,6 +319,11 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     def T(vm) -> set:
         return tags_by[vm.name]
 
+    # 0. the operator files: judged by their mode, not by whether this user
+    # can open them, so a check run as root fails on a file the services and
+    # the operator's own check cannot read.
+    _operator_files(add)
+
     # 1. the hub
     hub = core.read_hub()
     if hub is None:
@@ -3275,6 +3280,40 @@ def _audit_modes(add, records, mode, problem) -> None:
             + JOURNAL_VOLATILE)
 
 
+def _operator_files(add) -> None:
+    """Every operator file under /etc/qmcp that is there must be a plain file
+    every user can read and not every user can write: the services run as the
+    dom0 user and read them on every call, and so does `qmcp check` run as
+    that user. A file written with `tee` under sudo inherits dom0's umask
+    (0077) and comes out 0600, which root reads and nobody else does."""
+    from qmcp import opfiles
+    bad, cannot = [], []
+    for path in sorted(opfiles._paths().values()):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            cannot.append(path)
+            continue
+        mode = stat.S_IMODE(st.st_mode)
+        if not stat.S_ISREG(st.st_mode):
+            bad.append(f"{path} is not a plain file")
+        elif not mode & 0o004:
+            bad.append(f"{path} is {mode:04o}, which the services and the dom0 user cannot "
+                       f"read (sudo chmod 0644 {path})")
+        elif mode & 0o002:
+            bad.append(f"{path} is {mode:04o}, which every user can write "
+                       f"(sudo chmod 0644 {path})")
+    if bad:
+        add("fail", "operator files", "; ".join(bad)
+            + (f"; cannot read the mode of {', '.join(cannot)}" if cannot else ""))
+    elif cannot:
+        add("error", "operator files", f"cannot read the mode of {', '.join(cannot)}")
+    else:
+        add("pass", "operator files", "plain files every user can read")
+
+
 def _audit_retention(add, records, mode) -> None:
     """Rotated logs are removed by age: the setting must read, the timer that
     removes them must run, and the budgets of every principal for that many
@@ -3913,9 +3952,15 @@ def _remove_qube(app, name) -> str:
     except Exception as e:
         return f"{name}: {type(e).__name__}"
     try:
-        return "" if _vm(app, name) is None else f"{name}: still present"
+        gone = _vm(app, name) is None
     except core.Unreadable:
         return f"{name}: cannot be looked up, so not known to be removed"
+    if not gone:
+        return f"{name}: still present"
+    # Removed: its lock files go too, each under its own lock, never waited
+    # for (`core.retire_qube_locks`); one in use is left until a reboot.
+    core.retire_qube_locks(name)
+    return ""
 
 
 def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
@@ -4184,6 +4229,15 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
                           f"({type(e).__name__}), so its calls in flight were not waited for")
         try:
             _demote_and_kill(vm, p, report, removing)
+            # Its badges are off, so it is no principal: its lock files go,
+            # under the acting lock still held (`core.retire_caller`). Never
+            # a failure of the command: a file left grants nothing.
+            left = None
+            if drained is not None:
+                try:
+                    left = core.retire_caller(p.lead, drained)
+                except Exception as e:
+                    left = [(os.path.join(core.RUN_DIR, "calls", p.lead), type(e).__name__)]
         finally:
             if drained is not None:
                 os.close(drained)
@@ -4191,6 +4245,13 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
             report.append(f"{p.slot}: a call {p.lead} had started was still running after "
                           f"{core.OPERATOR_WAIT_S:.0f} s; it was checked while {p.lead} was the "
                           f"lead, and may finish after this command")
+        if drained is None or left:
+            report.append(f"{p.slot}: {p.lead}'s lock files under "
+                          f"{os.path.join(core.RUN_DIR, 'calls')} were "
+                          + ("left, since its acting lock was not had" if drained is None else
+                             "not all removed: " + ", ".join(f"{os.path.basename(f)} ({why})"
+                                                             for f, why in left))
+                          + "; they grant nothing, and a reboot clears them")
     finally:
         lock.__exit__(None, None, None)
     if not held:

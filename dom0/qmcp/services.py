@@ -418,6 +418,43 @@ def _project_rows(app):
 
 # ------------------------------------------------------------------ writes
 
+def _reach(call, name, judge, *args):
+    """`judge(*args)`, the check that lets the call act on or build from the
+    qube `name`, with what it found kept on `call.reached`: the qubes a
+    refused call's line may be placed by and may name (`audit.refused_place`).
+    Not reached until the check passes, again each time it runs, so a qube a
+    later check refuses (one hidden or moved while the call waited) is not."""
+    call.reached.discard(name)
+    try:
+        vm = judge(*args)
+    except core.Refusal as r:
+        if r.payload in _VISIBLE_REFUSALS:
+            _name_if_in_no_slot(call, name, args[0])
+        raise
+    call.reached.add(name)
+    return vm
+
+
+#: Refusals of a qube the caller can see, for a state it is in (guarded,
+#: stopped by the gate, held): it resolved, and the reply already says so.
+_VISIBLE_REFUSALS = (core.GUARDED_REFUSAL, core.BLOCKED_REFUSAL, core.QUARANTINE_REFUSAL)
+
+
+def _name_if_in_no_slot(call, name, app):
+    """A qube refused for its state is named on the line, never placing it,
+    when it wears no slot badge (a template, a gateway, another guarded
+    qube): what was refused is worth keeping, and no project's mode covers
+    that name. A project's qube stays `<out-of-reach>`, so a project logging
+    to RAM or nowhere never has its qubes' names on another chain. A tag
+    read that fails keeps it masked."""
+    try:
+        tags = core.tags_of(core.lookup(app, name))
+    except Exception:
+        return
+    if not any(projects.is_slot_tag(t) for t in tags):
+        call.proposed.add(name)
+
+
 def _operate(app, call, name):
     """The qube a call operates, under its lock: resolved as `core.operand`
     resolves it, then its lock is taken, then the caller and the qube are checked again, so a guard, revoke, move or
@@ -426,13 +463,13 @@ def _operate(app, call, name):
     The lock is taken only once the qube resolves, so a name the caller cannot
     see never waits on a lock and contention is no oracle; it is held until
     the reply (`call.fds`)."""
-    core.operand(app, name, call.principal)
+    _reach(call, name, core.operand, app, name, call.principal)
     fd = core.acquire_qube_lock(name, core.QUBE_WAIT_S)
     if fd is None:
         raise core.Refusal(core.BUSY_REFUSAL)
     call.fds.append(fd)
     _recheck(app, call)
-    return core.operand(app, name, call.principal)
+    return _reach(call, name, core.operand, app, name, call.principal)
 
 
 
@@ -532,9 +569,12 @@ def svc_set_feature(app, call, req):
 def svc_lifecycle(app, call, req):
     name, action = _string(req, "name"), _string(req, "action")
     call.summary.update({"name": _clip(name), "action": _clip(action)})
+    # The qube first: a refused call's line is placed by a qube only once the
+    # call has judged it in reach, so an action refused before that would
+    # lose the line's place for a qube the caller may act on.
+    vm = _operate(app, call, name)
     if action not in LIFECYCLE_ACTIONS:
         raise refuse(f"action must be one of: {sorted(LIFECYCLE_ACTIONS)}")
-    vm = _operate(app, call, name)
     # A lead is a project's identity: removing one takes the operator's approval.
     if action == "remove" and projects.LEAD in core.tags_of(vm):
         raise refuse("removing a lead takes the operator's approval")
@@ -550,6 +590,10 @@ def svc_lifecycle(app, call, req):
     except Exception as e:
         call.error_class = type(e).__name__
         raise refuse("action failed") from None
+    if action == "remove":
+        # Its lock files go, the lock itself under the one this call holds;
+        # never a wait, and never a failure of the remove.
+        core.retire_qube_locks(name, call.fds)
     return {"ok": True}
 
 
@@ -584,7 +628,10 @@ def _remove(app, name) -> bool:
         del app.domains[name]
     except Exception:
         pass
-    return _exists(app, name) is False
+    if _exists(app, name) is not False:
+        return False
+    core.retire_qube_locks(name)
+    return True
 
 
 def _rollback(app, call, name, step, exc) -> core.Refusal:
@@ -604,6 +651,7 @@ def _create_failed(app, call, name, what, exc) -> core.Refusal:
     exists = _exists(app, name)
     if exists is not False:
         call.landed = True          # it may be this call's: its line is never withheld
+        call.reached.add(name)
     if exists:
         return refuse(f"{what} failed; a qube named '{name}' exists and was left alone")
     return refuse(f"{what} failed")
@@ -757,10 +805,10 @@ def _private_size(req):
     return size
 
 
-def _spawn_template(app, template, klass, who):
+def _spawn_template(app, call, template, klass):
     """The template a spawn builds on, judged: in reach, not stopped by the
     gate, not held, of the class `klass` needs, and providing no network."""
-    tpl = core.reference(app, template, "template", who)
+    tpl = _reach(call, template, core.reference, app, template, "template", call.principal)
     if klass in ("AppVM", "StandaloneVM", "DispVMTemplate"):
         if core.klass_of(tpl) != "TemplateVM":
             raise refuse(f"template '{template}' must be a TemplateVM for klass={klass}")
@@ -784,6 +832,7 @@ def svc_spawn(app, call, req):
     err = _create_name_refusal(name, who)
     if err:
         raise refuse(err)
+    call.proposed.add(name)             # inside the caller's own space
     klasses = SPAWN_KLASSES if who.is_hub() else LEAD_SPAWN_KLASSES
     # Shape first: a list is unhashable, and `in` on a frozenset would raise.
     if not isinstance(klass, str) or klass not in klasses:
@@ -791,7 +840,7 @@ def svc_spawn(app, call, req):
     if not isinstance(label, str) or label not in LABELS:
         raise refuse(f"label must be one of: {sorted(LABELS)}")
     private_size = _private_size(req)
-    tpl = _spawn_template(app, template, klass, who)
+    tpl = _spawn_template(app, call, template, klass)
     _claim_name(app, call, name)
     netvm = _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM"))
 
@@ -804,7 +853,7 @@ def svc_spawn(app, call, req):
     # source is: a stop, a revoke, a hold or a hidden project's approval that
     # landed while this call waited must not be built on. Its tags below come
     # from this read.
-    tpl = _spawn_template(app, template, klass, who)
+    tpl = _spawn_template(app, call, template, klass)
     _same_network(netvm, _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM")),
                   "template")
     budget.check_private_size(private_size)
@@ -836,6 +885,7 @@ def svc_spawn(app, call, req):
     except Exception as e:
         raise _create_failed(app, call, name, "create", e)
     call.landed = True
+    call.reached.add(name)
     step = "copy"
     try:
         if klass == "StandaloneVM":
@@ -966,13 +1016,15 @@ def svc_clone(app, call, req):
         else birth.name_refusal(name, birth.read_name_prefix())
     if err:
         raise refuse(err)
+    if not who.is_hub():
+        call.proposed.add(name)         # inside the lead's own space
     if not isinstance(source, str):
         raise core.Refusal(core.NOT_FOUND)
     # The source must be managed: a clone is a managed, editable copy of
     # everything in it, which a guarded qube must never become. A guarded
     # qube may still be spawned FROM; see the residuals in CLAUDE.md for what a
     # spawn carries over. The hub may clone a template it manages.
-    src = core.operand(app, source, who)
+    src = _reach(call, source, core.operand, app, source, who)
     src_is_template = core.is_template(src)
     if src_is_template and not who.is_hub():
         # Templates and disposable templates are never project members.
@@ -981,6 +1033,7 @@ def svc_clone(app, call, req):
     err = _clone_name_refusal(name, who, project)
     if err:
         raise refuse(err)
+    call.proposed.add(name)             # inside the space the clone lands in
     _claim_name(app, call, name)
     # A clone is the same kind of qube as its source, so the source always
     # answers for its own network — a cloned template stays off the network.
@@ -1021,6 +1074,7 @@ def svc_clone(app, call, req):
     except Exception as e:
         raise _create_failed(app, call, name, "clone", e)
     call.landed = True
+    call.reached.add(name)
     # Filled before it is in AI space: the stamp is its first badge of ours.
     step = "copy"
     try:
@@ -1072,16 +1126,21 @@ def _dispose(app, name) -> bool:
         pass
     for _ in range(DISPOSE_TRIES):
         if not _exists_direct(app, name):
-            return True
+            break
         try:
             app.qubesd_call(name, "admin.vm.Remove")
         except Exception:
             time.sleep(DISPOSE_WAIT_S)
-    return not _exists_direct(app, name)
+    else:
+        if _exists_direct(app, name):
+            return False
+    # Gone, here or by qubesd's own cleanup of a killed disposable.
+    core.retire_qube_locks(name)
+    return True
 
 
-def _disposable_template(app, template, who):
-    dvmt = core.reference(app, template, "template", who)
+def _disposable_template(app, call, template):
+    dvmt = _reach(call, template, core.reference, app, template, "template", call.principal)
     if not core.is_dvmt(dvmt):
         raise refuse(f"template '{template}' must be a disposable template")
     _not_a_gateway(dvmt, "disposable template")
@@ -1092,7 +1151,7 @@ def svc_spawn_disposable(app, call, req):
     template = req.get("template")
     call.summary.update({"template": _clip(template)})
     who = call.principal
-    dvmt = _disposable_template(app, template, who)
+    dvmt = _disposable_template(app, call, template)
     netvm = _birth_netvm(app, call, {}, dvmt, authoritative=True)
 
     call.fds.append(budget.acquire_create_lock())
@@ -1100,7 +1159,7 @@ def svc_spawn_disposable(app, call, req):
     who = call.principal
     # Judged again under the lock, as a spawn's template is; the tags below
     # come from this read.
-    dvmt = _disposable_template(app, template, who)
+    dvmt = _disposable_template(app, call, template)
     _same_network(netvm, _birth_netvm(app, call, {}, dvmt, authoritative=True),
                   "disposable template")
     _check_budget(app, call, budget.estimate_new_private(_estimate(budget._vol_size, dvmt, "private")))
@@ -1120,6 +1179,7 @@ def svc_spawn_disposable(app, call, req):
     if not core.valid_qube_name(disp):
         raise refuse("disposable creation failed")
     call.summary["name"] = disp
+    call.reached.add(disp)              # this call's own disposable
     # Direct admin calls from here on: qubesadmin's domain cache lags
     # CreateDisposable by seconds, so `app.domains[disp]` would raise. A
     # preloaded disposable arrives already running on its template's network,
@@ -1483,7 +1543,19 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
         # A proposal's subject is the hub's own words about what it asks for,
         # never a qube it acts on: its line goes where the hub's own lines go.
         if service != "qmcp.SubmitProposal":
-            call.where = audit_mod.place(app, call.summary, call.where)
+            placing = call.summary
+            if not ok:
+                # A refused call is placed by what the service reached, never
+                # by what the request names: a qube it did not judge in its
+                # caller's reach would let the caller choose where its own
+                # line goes, and its name is not the line's to keep. The
+                # uniform not-found answer is out of reach for every name.
+                if payload == core.NOT_FOUND:
+                    call.reached.clear()
+                call.summary, placing, call.where = audit_mod.refused_place(
+                    call.summary, call.where, audit_mod.request_names(service, req),
+                    call.reached, call.proposed, call.principal.slot)
+            call.where = audit_mod.place(app, placing, call.where)
     changed = ok and not call.noop or call.landed
     if log and counter is None:
         pass                            # install mode none: nothing is counted

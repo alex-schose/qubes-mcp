@@ -105,6 +105,10 @@
 #   /etc/qmcp/mode                   with --anonymous: the word anonymous, written after the
 #                                    policy, once qmcp-anon is on the hub and on every qube
 #                                    under the hub's check; then they are stamped once more
+#   the operator files' mode         every operator file under /etc/qmcp that is there and
+#                                    is a plain file is set to 0644, whoever wrote it: the services and the dom0
+#                                    user read them, and one written with tee under sudo
+#                                    comes out 0600 under dom0's umask
 # It takes every open window off (seal --all, which kills an open qube that runs), and
 # anonymous mode puts qmcp-anon on the hub and on every
 # qube in AI space that is not an anonymous project's lead, member or model qube,
@@ -116,8 +120,10 @@
 # Every preflight check runs before anything changes: the source tree, the hub,
 # the values for /etc/qmcp, the fleet's shape, and the policy, which is checked
 # with qrexec's own parser against this box's real policy directory, with ours
-# swapped in, before the live file is replaced. The last step is `qmcp check`;
-# this script exits with its status (0 GREEN, 1 FAILED, 3 INCOMPLETE — not green).
+# swapped in, before the live file is replaced. The last step is `qmcp check`, run
+# as the gate's user (the dom0 user, as the README runs it), not as root, which reads
+# files that user cannot; this script exits with its status (0 GREEN, 1 FAILED,
+# 3 INCOMPLETE — not green).
 
 set -euo pipefail
 # Staged code is imported as root from a world-writable /tmp: never leave
@@ -799,6 +805,23 @@ elif [ -e "$ETC_QMCP/mode" ]; then
     stamp_mode > /dev/null || die "could not put qmcp-anon on every qube of the mode; run the install again"
 fi
 
+# --- the operator files: every one the services and the dom0 user read is
+# 0644, whoever wrote it. A file written with `tee` under sudo inherits dom0's
+# umask (0077) and comes out 0600, which root reads and the services and the
+# operator's own `qmcp check` do not. The list is the library's own. Before the
+# gate's first run: as its user it would block every anonymous qube on records
+# it cannot read.
+OPFILES="$(PYTHONPATH="$LIB" python3 -c 'from qmcp import opfiles; print("\n".join(sorted(opfiles._paths().values())))')" \
+    || die "could not list the operator files"
+while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && [ ! -L "$f" ] || continue
+    was="$(stat -c %a "$f")"
+    if [ "$was" != 644 ]; then
+        chmod 0644 "$f"
+        say "set $f to 0644 (it was $was)"
+    fi
+done <<< "$OPFILES"
+
 # --- the gate's timer, and one run now, so its heartbeat is this release's
 systemctl start qmcp-gate.timer
 systemctl start qmcp-gate.service || true
@@ -809,14 +832,17 @@ say "the anonymity gate runs every 15 seconds as $GATE_USER (qmcp-gate.timer)"
 say "the audit log is rotated daily and rotated logs removed by age, hourly (qmcp-audit.timer)"
 
 # ===================================================================== verify
+# As the dom0 user, as the README runs it: a check as root reads files the
+# services and the operator cannot.
 echo
 CHECK_STATUS=0
-/usr/local/bin/qmcp check || CHECK_STATUS=$?
+say "qmcp check, as $GATE_USER:"
+runuser -u "$GATE_USER" -- /usr/local/bin/qmcp check || CHECK_STATUS=$?
 echo
 if [ "$CHECK_STATUS" -eq 0 ]; then
     say "qubes-mcp $VERSION installed. Hub: $HUB."
 else
-    say "qubes-mcp $VERSION installed, but qmcp check is not GREEN (status $CHECK_STATUS)."
+    say "qubes-mcp $VERSION installed, but qmcp check, as $GATE_USER, is not GREEN (status $CHECK_STATUS)."
 fi
 # The registry starts empty, on a fresh install and on an upgrade from 0.9.20:
 # no AI qube can be given a network until the operator enrolls one.

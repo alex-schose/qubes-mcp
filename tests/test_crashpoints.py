@@ -47,6 +47,7 @@ sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
 import racefixture as rf  # noqa: E402
+import scratch  # noqa: E402
 from racefixture import LEAD, cmd, svc  # noqa: E402
 from qmcp import audit  # noqa: E402
 
@@ -217,37 +218,24 @@ def run(name, mode=None, target=0, scenarios=SCENARIOS) -> dict:
     except rf.Hung as e:
         t.probe.disarm()
         t.probe.dead = False
-        t.doCleanups()
+        rf.close_fixture(t)
         return {"error": f"HUNG: {e}"}
     except BaseException:
         t.probe.disarm()
         t.probe.dead = False
-        t.doCleanups()
+        rf.close_fixture(t)
         raise
 
 
 def finish(res):
-    """Close a run's fixture once the judge is done with it, and every file a
-    simulated death left open in it: a call that "died" never closed its
-    locks, and a sweep of every death point would otherwise hold thousands
-    (past dom0's default limit of open files)."""
+    """Close a run's fixture once the judge is done with it. A call that
+    "died" never closed its locks, so they stay held while the run is judged;
+    the fixture's cleanup closes them, as the kernel would a killed
+    process's, or a sweep of every death point would hold thousands (past
+    dom0's default limit of open files)."""
     t = res.pop("t", None)
     if t is not None:
-        _close_left_open(str(t.tmp))
-        t.doCleanups()
-
-
-def _close_left_open(root: str) -> None:
-    for fd in os.listdir("/proc/self/fd"):
-        try:
-            target = os.readlink(f"/proc/self/fd/{fd}")
-        except OSError:
-            continue
-        if target.startswith(root + os.sep):
-            try:
-                os.close(int(fd))
-            except OSError:
-                pass
+        rf.close_fixture(t)
 
 
 def _check(res):
@@ -330,7 +318,7 @@ def clean_run(name, scenarios=SCENARIOS) -> dict:
             setup(t)
             res["CB"] = rf.check_items(t)
         finally:
-            t.doCleanups()
+            rf.close_fixture(t)
         _CLEAN[key] = res
     return _CLEAN[key]
 
@@ -471,6 +459,33 @@ class Controls(unittest.TestCase):
     def test_the_fail_mode_covers_a_write_that_lands_and_raises(self):
         keys = clean_run("guard")["keys"]
         self.assertTrue(any(k.startswith("tag.add.landed:") for k in keys), keys)
+
+
+# ======================================================================= what a run leaves behind
+
+class Hygiene(unittest.TestCase):
+    """A simulated death keeps the dead operation's locks held while its run
+    is judged, as a dead process's would be until the kernel closed them, and
+    closing the run leaves nothing: no descriptor, no temp dir, no snapshot."""
+
+    def test_a_death_holds_its_locks_until_the_run_is_closed(self):
+        name = "svc-spawn-appvm"
+        n = clean_run(name)["count"]
+        open_before = len(os.listdir("/proc/self/fd"))
+        held_somewhere = False
+        for i in range(1, n + 1):
+            res = run(name, "death", i)
+            t, snap = res["t"], res["t"].probe.snap
+            self.assertTrue(res["died"], i)
+            held = scratch.fds_under(t.tmp)
+            held_somewhere = held_somewhere or bool(held)
+            finish(res)
+            self.assertEqual(scratch.fds_under(t.tmp), [], i)
+            self.assertFalse(t.tmp.exists(), i)
+            self.assertFalse(snap is not None and snap.exists(), i)
+            self.assertLessEqual(len(os.listdir("/proc/self/fd")), open_before, i)
+        # Teeth: some death point does leave a lock held during the judge.
+        self.assertTrue(held_somewhere, f"no death point of {name} left a lock held")
 
 
 # ======================================================================= a torn audit line

@@ -34,7 +34,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, cli, fleet, projects, services  # noqa: E402
+from qmcp import audit, cli, core, fleet, projects, services  # noqa: E402
 from test_dom0 import HUB, Base  # noqa: E402
 from test_projects import LEAD  # noqa: E402
 from test_proposals import PBase  # noqa: E402
@@ -274,6 +274,194 @@ class ServiceLines(ModeBase):
         self.assertEqual(self.disk(), [])
 
 
+# ======================================================================= refused out of reach
+
+class RefusedOutOfReach(ModeBase):
+    """A refused call's line is placed by what its service reached: a qube the
+    caller may not see or act on, or one the call never judged, sends the line
+    nowhere but where the caller's own lines go, and is recorded as
+    `audit.OUT_OF_REACH`."""
+
+    def setUp(self):
+        super().setUp()
+        # A hidden anonymous project that logs nowhere, with one qube that
+        # wears its badges and one that lost its hidden badge.
+        doc = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        doc["slots"]["p05"] = {"label": "hid", "lead": None, "templates": ["ai-hid-tpl"],
+                               "networks": [None], "quota": 2 ** 30, "dump": None,
+                               "anonymous": True, "hidden": True, "audit": "off"}
+        pathlib.Path(projects.PROJECTS_PATH).write_text(json.dumps(doc))
+        self.app.vm("ai-hid-w1", tags={"ai-managed", "qmcp-proj-p05", "qmcp-anon",
+                                       "qmcp-hubblind"})
+        self.app.vm("ai-hid-w2", tags={"ai-managed", "qmcp-proj-p05", "qmcp-anon"})
+
+    def one_disk_line(self, n):
+        lines = self.disk()
+        self.assertEqual(len(lines), n + 1, lines)
+        return lines[-1]
+
+    def test_the_hubs_refused_call_on_a_hidden_projects_qube_stays_on_its_own_log(self):
+        cases = [
+            ("qmcp.SetPropertyAIManaged", {"name": "ai-hid-w1", "property": "memory",
+                                           "value": 900}, "name"),
+            ("qmcp.SetFeatureAIManaged", {"name": "ai-hid-w1", "feature": "service.x",
+                                          "value": 1}, "name"),
+            ("qmcp.LifecycleAIManaged", {"name": "ai-hid-w1", "action": "start"}, "name"),
+            ("qmcp.CloneAIManagedQube", {"source": "ai-hid-w1", "name": "ai-hub-c1"},
+             "source"),
+            ("qmcp.SpawnDisposableAIManaged", {"template": "ai-hid-w1"}, "template"),
+            ("qmcp.SpawnAIManagedQube", {"name": "ai-hub-s1", "template": "ai-hid-w1"},
+             "template"),
+        ]
+        for svc, req, key in cases:
+            with self.subTest(svc):
+                n = len(self.disk())
+                r = self.call(svc, req)
+                self.assertFalse(r["ok"], r)
+                line = self.one_disk_line(n)
+                self.assertEqual(line["service"], svc)
+                self.assertEqual(line["args"][key], audit.OUT_OF_REACH)
+        self.assertEqual(audit.ram_chains(), [])
+        self.assertNotIn(b"ai-hid-w1", pathlib.Path(audit.LOG_PATH).read_bytes())
+
+    def test_a_missing_name_and_an_out_of_reach_one_leave_the_same_line(self):
+        for name in ("no-such-qube", "ai-hid-w1", "personal"):
+            self.call("qmcp.SetPropertyAIManaged", {"name": name, "property": "memory",
+                                                    "value": 900})
+        lines = self.disk()
+        self.assertEqual(len(lines), 3, lines)
+        shown = {json.dumps({k: l[k] for k in ("service", "caller", "args", "ok", "error")})
+                 for l in lines}
+        self.assertEqual(len(shown), 1, shown)
+        self.assertEqual(lines[0]["args"]["name"], audit.OUT_OF_REACH)
+
+    def test_a_leads_refused_call_on_another_projects_qube_goes_where_its_own_lines_go(self):
+        self.set_project("p01", "ram")
+        self.set_project("p02", "off")
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-other-w1", "action": "start"},
+                      caller=LEAD)
+        self.assertFalse(r["ok"], r)
+        lines = self.ram("p01")
+        self.assertEqual(self.services_of(lines), ["qmcp.LifecycleAIManaged"])
+        self.assertEqual(lines[0]["args"]["name"], audit.OUT_OF_REACH)
+        self.assertEqual(self.disk(), [])
+
+    def test_a_guarded_qube_refused_is_out_of_reach(self):
+        self.set_project("p01", "ram")
+        self.app.domains["ai-osint-w1"].tags.add("qmcp-guarded")
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1", "action": "start"})
+        self.assertFalse(r["ok"], r)
+        self.assertEqual(self.ram("p01"), [])
+        self.assertEqual(self.one_disk_line(0)["args"]["name"], audit.OUT_OF_REACH)
+
+    def test_a_guarded_qube_in_no_slot_refused_is_named_but_places_nothing(self):
+        # A guarded template wears no slot badge: the line names it, and goes
+        # where the hub's own lines go. A project's guarded qube stays masked
+        # (above).
+        self.set_install("ram")
+        r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-tpl-g", "action": "start"})
+        self.assertEqual(r, core.GUARDED_REFUSAL)
+        self.assertEqual(self.ram()[-1]["args"]["name"], "ai-tpl-g")
+
+    def test_a_not_found_after_the_qube_resolved_is_out_of_reach(self):
+        # The hub reaches a qube that lost its hidden badge, and is then told
+        # it does not exist: its project is hidden.
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-hid-w2", "name": "ai-hub-c2"})
+        self.assertEqual(r, {"ok": False, "error": "not found"})
+        self.assertEqual(self.one_disk_line(0)["args"]["source"], audit.OUT_OF_REACH)
+
+    def test_a_refusal_before_the_qube_is_judged_follows_no_qube_it_names(self):
+        self.set_project("p02", "off")
+        # A name outside the lead's space, refused on its shape alone, that is
+        # another project's qube; an action that is not one; a request
+        # refused before its name reached the summary.
+        for svc, req in (("qmcp.SpawnAIManagedQube", {"name": "ai-other-w1",
+                                                      "template": "ai-debian-13"}),
+                         ("qmcp.LifecycleAIManaged", {"name": "ai-other-w1",
+                                                      "action": "bogus"}),
+                         ("qmcp.SetPropertyAIManaged", {"name": "ai-other-w1"})):
+            with self.subTest(svc):
+                n = len(self.disk())
+                self.assertFalse(self.call(svc, req, caller=LEAD)["ok"])
+                line = self.one_disk_line(n)
+                self.assertNotEqual(line["args"].get("name"), "ai-other-w1")
+        self.assertNotIn(b"ai-other-w1", pathlib.Path(audit.LOG_PATH).read_bytes())
+
+    def test_a_proposed_name_in_the_callers_space_is_kept(self):
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-osint-new", "template": "ai-tpl-g"},
+                      caller=LEAD)
+        self.assertFalse(r["ok"], r)
+        args = self.one_disk_line(0)["args"]
+        self.assertEqual((args["name"], args["template"]), ("ai-osint-new", audit.OUT_OF_REACH))
+
+    def test_a_qube_the_check_under_its_lock_refuses_is_out_of_reach(self):
+        # Reached when the call first judged it, guarded while the call waited
+        # for its lock: refused by the second check, and no longer in reach.
+        self.set_project("p01", "ram")
+        real = services._recheck
+
+        def guarded_meanwhile(app, call, *a, **k):
+            app.domains["ai-osint-w1"].tags.add("qmcp-guarded")
+            return real(app, call, *a, **k)
+        services._recheck = guarded_meanwhile
+        self.addCleanup(setattr, services, "_recheck", real)
+        r = self.call("qmcp.SetPropertyAIManaged", {"name": "ai-osint-w1", "property": "memory",
+                                                    "value": 900})
+        self.assertFalse(r["ok"], r)
+        self.assertEqual(self.ram("p01"), [])
+        self.assertEqual(self.one_disk_line(0)["args"]["name"], audit.OUT_OF_REACH)
+
+    # ------------------------------------------------------------ what stays as it was
+
+    def test_a_template_the_call_reached_stays_named_on_its_refused_line(self):
+        # Judged in reach, then refused for its class.
+        r = self.call("qmcp.SpawnAIManagedQube", {"name": "ai-hub-x9", "template": "ai-debian-13",
+                                                  "klass": "DispVM"})
+        self.assertFalse(r["ok"], r)
+        args = self.one_disk_line(0)["args"]
+        self.assertEqual((args["name"], args["template"]), ("ai-hub-x9", "ai-debian-13"))
+
+    def test_a_refusal_of_a_qube_in_reach_keeps_its_place_and_its_name(self):
+        self.set_project("p01", "ram")
+        for svc, req in (("qmcp.SetPropertyAIManaged", {"name": "ai-osint-w1",
+                                                        "property": "no-such", "value": 1}),
+                         ("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1",
+                                                      "action": "bogus"})):
+            with self.subTest(svc):
+                self.assertFalse(self.call(svc, req)["ok"])
+        lines = self.ram("p01")
+        self.assertEqual(self.services_of(lines),
+                         ["qmcp.SetPropertyAIManaged", "qmcp.LifecycleAIManaged"])
+        self.assertEqual({l["args"]["name"] for l in lines}, {"ai-osint-w1"})
+        self.assertEqual(self.disk(), [])
+
+    def test_a_successful_call_keeps_its_place(self):
+        self.set_project("p01", "ram")
+        r = self.call("qmcp.SetPropertyAIManaged", {"name": "ai-osint-w1", "property": "memory",
+                                                    "value": 900})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.ram("p01")[0]["args"]["name"], "ai-osint-w1")
+        self.assertEqual(self.disk(), [])
+
+    def test_the_operators_own_lines_still_follow_what_they_name(self):
+        # Not a principal's service call: placed by the qubes it names.
+        self.assertEqual(audit.destination(audit.place(self.app, {"name": "ai-hid-w1"}))[0],
+                         "none")
+
+    def test_refused_place_on_its_own(self):
+        logged, placing, where = audit.refused_place(
+            {"name": "ai-x", "source": "ai-y", "qubes": ["ai-y", "ai-z"], "action": "start"},
+            audit.Where({"p05": "none"}), ["ai-x"], {"ai-y"}, set(), "p01")
+        self.assertEqual(logged, {"name": audit.OUT_OF_REACH, "source": "ai-y",
+                                  "qubes": ["ai-y", audit.OUT_OF_REACH], "action": "start"})
+        self.assertEqual(placing, {"source": "ai-y", "qubes": ["ai-y"], "action": "start"})
+        self.assertEqual(where, ("p01",))
+        # Every name the request's keys hold was reached: the place read before stays.
+        before = audit.Where({"p02": "ram"})
+        self.assertIs(audit.refused_place({"name": "ai-x"}, before, ["ai-x"], {"ai-x"},
+                                          set(), None)[2], before)
+
+
 # ======================================================================= placement itself
 
 class Placement(ModeBase):
@@ -328,11 +516,14 @@ class Placement(ModeBase):
         self.app.calls.clear()
         where = audit.place(self.app, {"qubes": ["ai-osint-w1", "ai-other-w1", "no-such-qube"]})
         self.assertTrue(where.unknown)
+        # Each read is balanced by one of the other kind: a missing qube after a
+        # read that found its qube, dom0 after one that did not.
         self.assertEqual([c[0] for c in self.app.calls],
-                         ["ai-osint-w1", "ai-other-w1", "no-such-qube"])
+                         ["ai-osint-w1", core.BALANCE_PRESENT, "ai-other-w1",
+                          core.BALANCE_MISSING, "no-such-qube", core.BALANCE_PRESENT])
         self.app.calls.clear()
         audit.place(self.app, {"name": "ai-work2"}, audit.Where(unknown=True))
-        self.assertEqual([c[0] for c in self.app.calls], ["ai-work2"])
+        self.assertEqual([c[0] for c in self.app.calls], ["ai-work2", core.BALANCE_MISSING])
 
     def test_records_that_do_not_read_are_an_unknown_place(self):
         pathlib.Path(projects.PROJECTS_PATH).write_text("{not json")
@@ -734,6 +925,45 @@ class SettingsStatusCheck(ModeBase):
         pathlib.Path(audit.KEEP_DAYS_PATH).write_text("nope\n")
         self.assertEqual(self.finding("audit retention").status, "fail")
 
+    def test_check_fails_on_an_operator_file_the_services_cannot_read(self):
+        """The 0.9.33 README's `echo off | sudo tee` made the keep-days file
+        0600 under dom0's umask: root's check read it, the user's did not.
+        The item judges the mode, so a check run as root fails on it too."""
+        from qmcp import opfiles
+        self.assertEqual(self.finding("operator files").status, "pass")
+        keep = pathlib.Path(audit.KEEP_DAYS_PATH)
+        keep.write_text("off\n")
+        os.chmod(keep, 0o600)
+        f = self.finding("operator files")
+        self.assertEqual(f.status, "fail")
+        self.assertIn(f"{keep} is 0600", f.detail)
+        self.assertIn(f"sudo chmod 0644 {keep}", f.detail)
+        os.chmod(keep, 0o646)
+        f = self.finding("operator files")
+        self.assertEqual(f.status, "fail")
+        self.assertIn("every user can write", f.detail)
+        os.chmod(keep, 0o644)
+        self.assertEqual(self.finding("operator files").status, "pass")
+        # Every operator file is judged, not only keep-days: the list is the
+        # one export and import use.
+        for path in opfiles._paths().values():
+            p = pathlib.Path(path)
+            existed = p.exists()
+            if not existed:
+                p.write_text("x\n")
+            saved = p.stat().st_mode & 0o7777
+            os.chmod(p, 0o600)
+            self.assertEqual(self.finding("operator files").status, "fail", path)
+            os.chmod(p, saved)
+            if not existed:
+                p.unlink()
+        keep.unlink()
+        os.symlink(self.tmp / "hub", keep)
+        f = self.finding("operator files")
+        self.assertEqual(f.status, "fail")
+        self.assertIn("not a plain file", f.detail)
+        keep.unlink()
+
     def test_check_verifies_the_ram_chains(self):
         self.set_project("p01", "ram")
         self.lcall("qmcp.SetPropertyAIManaged", {"name": "ai-osint-w1", "property": "memory",
@@ -778,6 +1008,27 @@ class Wiring(unittest.TestCase):
                 if line.strip() and not line.startswith("#")}
         self.assertIn(("d", "/run/qmcp/audit", "2770", "root", "qubes"), rows)
         self.assertEqual(audit.RAM_SUBDIR, "audit")
+
+    def test_the_installer_sets_the_operator_files_and_checks_as_the_user(self):
+        """It sets every operator file to 0644 from the library's own list,
+        and its closing check runs as the gate's user, not as root."""
+        install = (DEPLOY / "install.sh").read_text()
+        self.assertIn("opfiles._paths().values()", install)
+        self.assertIn('chmod 0644 "$f"', install)
+        self.assertIn('runuser -u "$GATE_USER" -- /usr/local/bin/qmcp check', install)
+        verify = install.split("# ===================================================================== verify", 1)[1]
+        self.assertNotIn("\n/usr/local/bin/qmcp check", verify)
+        # The mode is set after every write to /etc/qmcp, and before the gate's
+        # first run, which as its user would block every anonymous qube on
+        # records it cannot read.
+        self.assertLess(install.index('QMCP_WRITE_MODE=1 stamp_mode'), install.index('chmod 0644 "$f"'))
+        self.assertLess(install.index('chmod 0644 "$f"'), install.index("systemctl start qmcp-gate.service"))
+        self.assertLess(install.index('chmod 0644 "$f"'), install.index("\nsystemctl start qmcp-gate.timer\n"))
+
+    def test_the_balancing_reads_missing_name_cannot_be_created(self):
+        from qmcp import birth
+        self.assertIsNotNone(birth.name_refusal(core.BALANCE_MISSING, "qmcp-"))
+        self.assertIsNone(birth.name_refusal("qmcp-no-such-qube2", "qmcp-"))
 
     def test_the_installer_takes_the_audit_log_option(self):
         install = (DEPLOY / "install.sh").read_text()

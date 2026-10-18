@@ -8,6 +8,7 @@ open, the test shows the fake reproduces the platform first.
 """
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -60,7 +61,9 @@ class ProjectBase(Base):
         self.write_records(RECORDS)
 
     def write_records(self, doc):
-        pathlib.Path(projects.PROJECTS_PATH).write_text(json.dumps(doc))
+        path = pathlib.Path(projects.PROJECTS_PATH)
+        path.write_text(json.dumps(doc))
+        os.chmod(path, 0o644)           # as `projects.save` leaves it, whatever the umask
 
     def records(self):
         return projects.load()
@@ -213,11 +216,14 @@ class LeadReads(ProjectBase):
             # The first call is the lead's own badges, the same for every request.
             traces[name] = ([c[1:] for c in self.app.calls[1:]], self.app.domains.lookups)
         self.assertEqual(len(set(map(repr, traces.values()))), 1, traces)
-        # Around it, the audit's read of the named qube's badges, before the
-        # call acts and after: the same for every name.
+        # Before it, the audit's read of the named qube's badges, the same for
+        # every name. None after: a qube out of the caller's reach never
+        # places its refused line. Each read by name is followed by its
+        # balance (`core.tag_read_by_name`).
         self.assertEqual(traces["no-such-qube"][0], [("admin.vm.tag.List", None),
+                                                     ("admin.vm.tag.List", None),
                                                      ("admin.vm.tag.Get", "qmcp-proj-p01"),
-                                                     ("admin.vm.tag.List", None)])
+                                                     ("admin.vm.tag.Get", "qmcp-proj-p01")])
 
     def test_references_are_scoped_to_the_project(self):
         r = self.lcall("qmcp.GetPropertyAIManaged", {"name": "ai-osint-w1", "property": "netvm"})
@@ -295,11 +301,12 @@ class LeadCreates(ProjectBase):
             r = self.spawn(name=name)
             self.assertFalse(r["ok"], name)
             self.assertEqual(self.app.domains.lookups, 0, name)
-            # The lead's own badges, and the audit's reads of the badges: of the
-            # template before the call (the key a spawn acts on), and of the name
-            # and the template its line records after: the same for every name,
-            # and none is a lookup.
-            self.assertEqual([c[1] for c in self.app.calls], ["admin.vm.tag.List"] * 4, name)
+            # The lead's own badges, and the audit's read of the template's
+            # badges before the call (the key a spawn acts on), balanced by a
+            # second read. After it, the line is placed by its caller alone:
+            # refused before the template was judged, its line follows no qube
+            # it names. The same for every name, and none is a lookup.
+            self.assertEqual([c[1] for c in self.app.calls], ["admin.vm.tag.List"] * 3, name)
 
     def test_spawn_joins_the_project_on_its_default_network(self):
         r = self.spawn()
@@ -1808,6 +1815,9 @@ class LeadChangesWaitForCalls(ProjectBase):
         self.assertLess(waited, 1.0)
 
     def test_a_lead_call_reaching_its_check_meanwhile_is_refused(self):
+        # The call must still be waiting when the drain is let go: a wait as
+        # long as the sleep below made the outcome a coin-flip under load.
+        core.QUBE_WAIT_S = 5.0
         drain = core.drain_caller(LEAD, 1)                # the removal holds it
         req = {"name": "ai-osint-w1", "property": "memory", "value": 600}
         t, out = self.in_thread(lambda: self.lcall("qmcp.SetPropertyAIManaged", req))
@@ -1877,6 +1887,201 @@ class LeadChangesWaitForCalls(ProjectBase):
         self.assertEqual(self.app.domains[LEAD].get_power_state(), "Halted")
         self.assertTrue(any("killed again" in line for line in report), report)
         self.assertIn("qmcp-proj-p01", self.tags(LEAD))
+
+
+class RetiredLeadsLockFiles(ProjectBase):
+    """A command that ends a lead (delete, remove, change) removes the lock
+    files the lead's calls made under /run/qmcp/calls: its acting lock and
+    that lock's turnstile, and its call slots, each under its own lock. Its
+    counter stays, and so does every other caller's file. A taker holding a
+    file open when it goes opens the path again, so no lock is ever held on
+    two files at once."""
+
+    def setUp(self):
+        super().setUp()
+        core.OPERATOR_WAIT_S = 5.0
+        self.calls = pathlib.Path(core.RUN_DIR) / "calls"
+
+    def seed(self, caller):
+        """The files a caller's calls leave behind: its slots, its acting lock
+        and that lock's turnstile, and its counter."""
+        for fd in [core.acquire_call_slot(caller, limit=core.LEAD_CALLS)
+                   for _ in range(core.LEAD_CALLS)]:
+            os.close(fd)
+        os.close(core.hold_acting(caller))
+        audit.spend(str(self.calls / f"{caller}{audit.REFUSED_SUFFIX}"))
+
+    def lock_files(self, caller):
+        own = {"acting"} | {str(i) for i in range(core.MAX_CONCURRENT_CALLS)}
+        return sorted(f.name for f in self.calls.iterdir()
+                      if f.name.startswith(caller + ".")
+                      and f.name[len(caller) + 1:].split(".")[0] in own)
+
+    def ends_the_lead(self, run):
+        self.seed(LEAD)
+        self.seed(OTHER_LEAD)
+        os.close(core.acquire_call_slot(core.LEADS_POOL_KEY, limit=core.LEADS_POOL))
+        self.assertEqual(len(self.lock_files(LEAD)), core.LEAD_CALLS + 2)
+        report = run()
+        self.assertEqual(self.lock_files(LEAD), [], report)
+        self.assertFalse(any("lock files" in line for line in report), report)
+        # Its counter is evidence; the other callers' files are theirs.
+        self.assertTrue((self.calls / f"{LEAD}{audit.REFUSED_SUFFIX}").exists())
+        self.assertEqual(len(self.lock_files(OTHER_LEAD)), core.LEAD_CALLS + 2)
+        self.assertTrue((self.calls / f"{core.LEADS_POOL_KEY}.0").exists())
+        return report
+
+    def test_a_project_delete_removes_the_leads_lock_files(self):
+        self.ends_the_lead(lambda: fleet.delete_project(self.app, "osint"))
+        self.assertIsNone(projects.find(self.records(), "osint"))
+
+    def test_removing_the_lead_removes_its_lock_files(self):
+        self.ends_the_lead(lambda: fleet.remove_lead(self.app, "osint"))
+
+    def test_a_new_lead_under_the_old_name_starts_with_none_of_its_files(self):
+        # The old lead removed, the new one takes the name it freed.
+        self.ends_the_lead(lambda: fleet.set_lead(self.app, "osint", "template", "ai-debian-13",
+                                                  lead_netvm="none"))
+        self.assertEqual(projects.find(self.records(), "osint").lead, LEAD)
+
+    def test_an_old_lead_kept_as_a_worker_loses_its_lock_files(self):
+        self.ends_the_lead(lambda: fleet.set_lead(self.app, "osint", "template", "ai-debian-13",
+                                                  lead_netvm="none", keep_old=True,
+                                                  lead_name="ai-osint-lead2"))
+        self.assertIn("qmcp-proj-p01", self.tags(LEAD))
+
+    def test_a_slot_a_call_still_holds_is_left_and_said_and_the_delete_completes(self):
+        self.seed(LEAD)
+        held = core.acquire_call_slot(LEAD, limit=core.LEAD_CALLS)
+        self.addCleanup(os.close, held)
+        drain = core.drain_caller(LEAD, 1)
+        t0 = time.monotonic()
+        left = core.retire_caller(LEAD, drain)
+        # Never a wait: the command holds the acting and create locks, which
+        # the call holding the slot may be waiting for.
+        self.assertLess(time.monotonic() - t0, 0.2)
+        os.close(drain)
+        self.assertEqual([os.path.basename(f) for f, _ in left], [f"{LEAD}.0"])
+        os.close(core.hold_acting(LEAD))
+        report = fleet.delete_project(self.app, "osint")
+        self.assertEqual(self.lock_files(LEAD), [f"{LEAD}.0"])
+        self.assertTrue(any("not all removed" in l and f"{LEAD}.0 (a call still held it)" in l
+                            for l in report), report)
+        self.assertIsNone(projects.find(self.records(), "osint"))
+
+    def test_a_drain_that_ran_out_leaves_the_files_and_says_so(self):
+        core.OPERATOR_WAIT_S = 0.3
+        self.seed(LEAD)
+        call = core.hold_acting(LEAD)
+        self.addCleanup(os.close, call)
+        report = fleet.remove_lead(self.app, "osint")
+        self.assertIn(f"{LEAD}.acting", self.lock_files(LEAD))
+        self.assertTrue(any("lock files" in l and "were left" in l for l in report), report)
+        self.assertIsNone(projects.find(self.records(), "osint").lead)
+
+    def test_a_call_waiting_on_the_removed_acting_lock_takes_the_new_one(self):
+        # A call of the lead's waits for the acting lock while the command
+        # holds it and removes the file. Once it has a lock it must be on the
+        # file at the path, or a later drain would not wait for it.
+        drain = core.drain_caller(LEAD, 1)
+        got = {}
+        t = threading.Thread(target=lambda: got.setdefault("fd", core.hold_acting(LEAD, 5)),
+                             daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        time.sleep(0.3)                                    # it waits on the old file
+        self.assertEqual(core.retire_caller(LEAD, drain), [])
+        os.close(drain)
+        t.join(5)
+        fd = got["fd"]
+        self.addCleanup(os.close, fd)
+        self.assertEqual(os.fstat(fd).st_ino, os.stat(core.acting_lock_path(LEAD)).st_ino)
+        self.assertIsNone(core.drain_caller(LEAD, 0.3))   # the call still holds it
+
+    def test_a_command_waiting_in_the_removed_turnstile_takes_the_new_lock(self):
+        drain = core.drain_caller(LEAD, 1)
+        other = {}
+        t = threading.Thread(target=lambda: other.setdefault("fd", core.drain_caller(LEAD, 5)),
+                             daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        time.sleep(0.3)                                    # in the turnstile, waiting
+        left = core.retire_caller(LEAD, drain)
+        os.close(drain)
+        t.join(5)
+        fd = other["fd"]
+        self.assertIsNotNone(fd)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(os.fstat(fd).st_ino, os.stat(core.acting_lock_path(LEAD)).st_ino)
+        # The waiter held the turnstile, so it was left, and named.
+        self.assertEqual([os.path.basename(f) for f, _ in left], [f"{LEAD}.acting.queue"])
+
+    def test_a_slot_removed_between_its_open_and_its_lock_is_opened_again(self):
+        # A call opens slot 0, and the file is removed before it locks it.
+        # The call must not hold a slot no other call can see: with one slot,
+        # a second call is then refused.
+        real, slot = fcntl.flock, os.path.join(self.calls, f"{LEAD}.0")
+        removed = []
+
+        def flock(fd, op):
+            if not removed and os.path.exists(slot) \
+                    and os.fstat(fd).st_ino == os.stat(slot).st_ino:
+                removed.append(True)
+                os.unlink(slot)
+            return real(fd, op)
+        os.close(core.acquire_call_slot(LEAD, limit=1))
+        with mock.patch.object(core.fcntl, "flock", flock):
+            fd = core.acquire_call_slot(LEAD, limit=1)
+        self.addCleanup(os.close, fd)
+        self.assertTrue(removed)
+        self.assertEqual(os.fstat(fd).st_ino, os.stat(slot).st_ino)
+        with self.assertRaises(core.Refusal):
+            os.close(core.acquire_call_slot(LEAD, limit=1))
+
+    def qube_lock_files(self, name):
+        path = core.qube_lock_path(name)
+        return [p for p in (path, core.queue_path(path)) if os.path.exists(p)]
+
+    def test_a_delete_removes_the_lock_files_of_every_qube_it_removes(self):
+        names = (LEAD, "ai-osint-w1", "ai-osint-w2", "osint-dump", OTHER_LEAD)
+        for name in names:
+            os.close(core.acquire_qube_lock(name, 1))
+        fleet.delete_project(self.app, "osint")
+        for name in names[:3]:
+            self.assertNotIn(name, self.app.domains)
+            self.assertEqual(self.qube_lock_files(name), [], name)
+        # A kept sink and another project's lead keep theirs.
+        for name in names[3:]:
+            self.assertEqual(len(self.qube_lock_files(name)), 2, name)
+
+    def test_removing_or_replacing_a_lead_removes_its_qube_lock_files(self):
+        os.close(core.acquire_qube_lock(LEAD, 1))
+        fleet.remove_lead(self.app, "osint")
+        self.assertEqual(self.qube_lock_files(LEAD), [])
+        os.close(core.acquire_qube_lock(OTHER_LEAD, 1))
+        fleet.set_lead(self.app, "other", "template", "ai-debian-13", lead_netvm="none",
+                       lead_name="ai-other-lead2")
+        self.assertNotIn(OTHER_LEAD, self.app.domains)
+        self.assertEqual(self.qube_lock_files(OTHER_LEAD), [])
+
+    def test_a_qube_lock_held_elsewhere_is_left_and_the_remove_still_lands(self):
+        held = core.acquire_qube_lock("ai-osint-w1", 1)     # a call of the hub's, say
+        self.addCleanup(os.close, held)
+        fleet.delete_project(self.app, "osint")
+        self.assertNotIn("ai-osint-w1", self.app.domains)
+        # The lock in use is left; its free turnstile goes.
+        self.assertEqual(self.qube_lock_files("ai-osint-w1"), [core.qube_lock_path("ai-osint-w1")])
+
+    def test_a_retired_leads_leftover_files_grant_nothing(self):
+        # Files left behind (a call held one) are only locks: the lead is no
+        # principal whatever is under /run/qmcp/calls.
+        self.seed(LEAD)
+        held = core.acquire_call_slot(LEAD, limit=core.LEAD_CALLS)
+        self.addCleanup(os.close, held)
+        fleet.remove_lead(self.app, "osint")
+        self.assertTrue(self.lock_files(LEAD))
+        self.assertEqual(self.lcall("qmcp.ListAIManagedQubes"), core.NOT_AUTHORIZED)
+
 
 if __name__ == "__main__":
     unittest.main()

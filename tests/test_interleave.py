@@ -173,7 +173,7 @@ def run(pairs, name, plan, k=0) -> dict:
         return {"error": f"HUNG: {e}"}
     finally:
         t.probe.disarm()
-        t.doCleanups()
+        rf.close_fixture(t)
 
 
 def _view(S) -> dict:

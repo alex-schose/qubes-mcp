@@ -120,6 +120,11 @@ def name_refusal(name, prefix: str) -> str | None:
         return f"name must start with '{prefix}': that namespace is reserved for AI-created qubes"
     if len(name) <= len(prefix):
         return f"name must have something after the reserved '{prefix}' prefix"
+    from qmcp import core
+    if name == core.BALANCE_MISSING:
+        # The name the balancing tag reads take to cost a missing qube: a qube
+        # of that name would bring back the gap they close.
+        return f"'{name}' is reserved"
     return None
 
 

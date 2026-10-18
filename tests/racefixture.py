@@ -44,6 +44,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
+import scratch  # noqa: E402
 import test_projects  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from qmcp import anon, budget, cli as qcli, core, fleet, gateways, projects, proposals, restored, services  # noqa: E402
@@ -146,6 +147,8 @@ class Probe:
         if self.count == self.target:
             if self.mode == "death":
                 self.snap = snapshot_files(self.fixture.tmp)
+                # restore_files removes it; this removes it when a run ends first.
+                self.fixture.addCleanup(scratch.remove, self.snap)
                 self.dead = True
                 raise Death(key)
             if self.mode == "fail":
@@ -297,6 +300,13 @@ class Fixture(test_projects.ProjectBase):
 
     def setUp(self):
         super().setUp()
+        # A simulated death leaves the locks of the "dead" operation held: its
+        # call slots, its acting lock, its qubes' and the create lock. That is
+        # the state the judge must see, so they stay open for the whole run. A
+        # killed process's descriptors are closed by the kernel; the harness
+        # closes them here, when the fixture ends (before its temp dir goes),
+        # or a sweep of every death point holds thousands of them.
+        self.addCleanup(self._close_left_open)
         for mod, attr, value in SHORT_WAITS:
             self.addCleanup(setattr, mod, attr, getattr(mod, attr))
             setattr(mod, attr, value)
@@ -306,6 +316,15 @@ class Fixture(test_projects.ProjectBase):
         projects.Locked.__init__.__defaults__ = (None, 0.0)
         self.probe = Probe(self)
         self._per_thread_process_state()
+
+    def _close_left_open(self):
+        probe = getattr(self, "probe", None)
+        if probe is not None and probe.thread is not None and probe.thread.is_alive():
+            # A second operation still running (a deadlock the run reported)
+            # owns its descriptors, as a live process would: closing them
+            # under it could hand their numbers to the next fixture's files.
+            return
+        scratch.close_fds_under(self.tmp)
 
     def _per_thread_process_state(self):
         """What an operation reads from the process, kept per thread, so a
@@ -372,8 +391,22 @@ class _PerThreadStream:
 
 def new_fixture() -> Fixture:
     t = Fixture()
-    t.setUp()
+    try:
+        t.setUp()
+    except BaseException:
+        t.doCleanups()          # what setUp made so far; its own error is the one to see
+        raise
     return t
+
+
+def close_fixture(t) -> None:
+    """Run a fixture's cleanups: the patched paths and waits restored, the
+    descriptors a simulated death left open closed, the temp dir and any
+    snapshot removed. A fixture is used as an object, never run as a test, so
+    a cleanup that fails would otherwise be dropped without a word."""
+    if not t.doCleanups():
+        raise AssertionError(f"a cleanup of the fixture in {getattr(t, 'tmp', '?')} failed; "
+                             f"it may be left behind")
 
 
 def run_cli(t, *argv) -> dict:

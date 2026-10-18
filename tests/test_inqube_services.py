@@ -16,11 +16,14 @@ import os
 import pathlib
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import scratch  # noqa: E402
 
 SOURCES = pathlib.Path(__file__).resolve().parent.parent / "template-rpc"
 RUN = SOURCES / "qmcp.RunInAIManaged"
@@ -39,8 +42,7 @@ def _load(path: pathlib.Path):
 class RunTests(unittest.TestCase):
 
     def setUp(self) -> None:
-        self.dir = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.dir)]))
+        self.dir = scratch.tempdir(self, "qmcp-inqube-")
         self.marker = self.dir / "marker"
 
     def run_service(self, request: dict) -> dict:
@@ -95,8 +97,7 @@ class RunTests(unittest.TestCase):
 class CopyTests(unittest.TestCase):
 
     def setUp(self) -> None:
-        self.dir = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.dir)]))
+        self.dir = scratch.tempdir(self, "qmcp-inqube-")
         self.log = self.dir / "argv"
         self.fake = self.dir / "qvm-copy-to-vm"
         self.sleep = 0

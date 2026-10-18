@@ -586,6 +586,9 @@ def cmd_gate(args) -> int:
     Exit 0 all sound, 1 one is not, 3 one could not be judged, or another run
     held the gate so nothing was."""
     held = None
+    # The lock files of names that are gone (a disposable qubesd removed after
+    # a kill): best-effort, silent, and never the gate's verdict.
+    core.sweep_qube_locks(_app())
     try:
         held = restored.hold(_app())
         restored.notify(held)

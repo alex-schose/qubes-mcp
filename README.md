@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.33 — the audit round's low findings, and the docs checked against the code.** Besides the hub, up to 15
+**Status: 0.9.34 — what the audit round's last gates and the development box left.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -236,7 +236,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.33.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.34.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -290,10 +290,22 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.32? **Breaking:** within the hour after the install, the new
+Coming from 0.9.33? Install over it. If you created `/etc/qmcp/audit-keep-days`
+with the `tee` line of the note for upgrading from 0.9.32, `qmcp check` as your
+user failed on it (dom0's umask makes such a file 0600): the installer now sets
+every operator file under `/etc/qmcp` that is a plain file to 0644, and `qmcp check` fails on one that not every user can
+read, as root too. A refused call's audit line no longer names, or follows, a
+qube out of the caller's reach: it records `<out-of-reach>` and goes where the
+caller's own lines go (a qube refused as guarded, stopped or held that is in no
+project is still named). A lifecycle call with an action that is not one (a
+non-empty string) checks its qube first, so for a qube out of reach it answers `not found`. To roll
+back to 0.9.33, run this release's `uninstall.sh` before 0.9.33's installer (not
+drilled for this release; the uninstaller is unchanged since 0.9.33).
+
+Coming from 0.9.32? Read the 0.9.33 note too. **Breaking:** within the hour after the install, the new
 `qmcp-audit.timer` removes rotated audit logs (`qmcp-audit.log.<UTC time>`)
 older than 90 days, the new default. 0.9.32's `qmcp settings set` has no option
-for it, and the installer leaves the setting's file alone, so to keep them, write
+for it, and the installer leaves the setting's value alone, so to keep them, write
 the file before installing: `echo off | sudo tee /etc/qmcp/audit-keep-days` (or a
 number of days instead of `off`). Then install over it. The two in-qube services change (a
 timeout of at most a day that kills the command's whole process group, and a
@@ -431,7 +443,7 @@ qvm-create --class AppVM --template "$(qubes-prefs default_template)" --label re
 qvm-prefs sys-ai-net provides_network True
 qvm-prefs sys-ai-net netvm sys-firewall
 sudo qmcp gateway enroll sys-ai-net --label clearnet   # AI qubes may sit on it
-echo sys-ai-net | sudo tee /etc/qmcp/birth-egress      # where the hub's template-based qubes go online
+sudo qmcp settings set --birth-egress sys-ai-net     # where the hub's template-based qubes go online
 ```
 
 `qmcp template prepare` takes a TemplateVM or a StandaloneVM: it starts a

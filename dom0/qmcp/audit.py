@@ -42,7 +42,10 @@ effective mode is the most private of the install's and of every project it
 belongs to (none, then ram, then disk). A line whose project cannot be worked
 out (a badge read that failed, records that do not read, a slot badge with no
 record) goes to RAM (nowhere only in install mode none), never to disk.
-Every caller says where its line belongs (`slots=`, `app=`, or a `Where` it worked out
+A principal's REFUSED call is placed only by the qubes its service judged
+within the caller's reach (or created): a name it did not (out of reach,
+missing, or refused before it was judged) places nothing, and the line
+records it as `OUT_OF_REACH` (`refused_place`). Every caller says where its line belongs (`slots=`, `app=`, or a `Where` it worked out
 before, which `audit()` takes as final), and a test refuses one that does not.
 """
 from __future__ import annotations
@@ -648,8 +651,9 @@ def place(app, summary=None, slots=()) -> Where:
     missing belongs to none. Never raises: a read that fails is an unknown
     place. Every named qube is read whatever came before, a missing one, an
     unreadable one or an unknown place, so the number of reads is the same for
-    every name and never says what a name is (each read's time can: qubesd
-    answers a missing qube sooner than it reads an existing one's tags)."""
+    every name and never says what a name is; each read is balanced
+    (`core.tag_read_by_name`), since qubesd answers a missing qube sooner
+    than it reads an existing one's tags."""
     from qmcp import projects
     if isinstance(slots, Where):
         base, slots = slots, ()
@@ -661,7 +665,8 @@ def place(app, summary=None, slots=()) -> Where:
     if app is not None:
         for name in _names(summary):
             try:
-                raw = app.qubesd_call(name, "admin.vm.tag.List")
+                from qmcp import core
+                raw = core.tag_read_by_name(app, name, "admin.vm.tag.List")
                 tags = raw.decode("ascii", "replace").split()
             except KeyError:
                 continue                # QubesVMNotFoundError: no such qube, in no slot
@@ -704,6 +709,52 @@ def request_place(app, service: str, req, slot=None) -> Where:
     keys = REQUEST_KEYS.get(service, ())
     names = {k: req.get(k) for k in keys} if isinstance(req, dict) else {}
     return place(app, names, () if slot is None else (slot,))
+
+
+def request_names(service: str, req) -> list:
+    """The qube names `request_place` reads: those in the keys the service
+    acts on, that could be a qube's name."""
+    keys = REQUEST_KEYS.get(service, ())
+    return _names({k: req.get(k) for k in keys}) if isinstance(req, dict) else []
+
+
+#: What a refused call's line records in place of a name its service did not
+#: judge within the caller's reach: one the caller may not see or act on, one
+#: that does not exist, or one the call was refused before it judged. The
+#: three are recorded alike, so the line never says which a name was.
+OUT_OF_REACH = "<out-of-reach>"
+
+
+def refused_place(summary, where, before, reached, proposed, slot=None) -> tuple:
+    """A refused call's line, placed by what its service reached rather than
+    by what the request names: (the summary to record, the summary to place
+    it by, the place worked out before the call acted, or its caller's alone).
+
+    A named qube the service did not judge within its caller's reach
+    (`reached`: by the check that lets it act, or a qube this call created)
+    places nothing and is recorded as `OUT_OF_REACH`; a create's proposed
+    name inside the caller's own name space (`proposed`) is kept as given but
+    places nothing either. When a name the request's own keys hold (`before`,
+    which `request_place` read before the call acted) was not reached, that
+    place is dropped for the caller's own: its project for a lead (`slot`),
+    the install's mode for the hub. So a principal cannot send its own
+    refused line after a qube it may not reach, and the line never records
+    that qube's name. Neither depends on whether the name exists: a missing
+    name and an out-of-reach one take the same path."""
+    summary = summary if isinstance(summary, dict) else {}
+    out = set(_names(summary)) - set(reached)
+    logged, placing = {}, {}
+    for key, value in summary.items():
+        if key in NAME_KEYS and value in out:
+            logged[key] = value if value in proposed else OUT_OF_REACH
+        elif key in LIST_KEYS and isinstance(value, list):
+            logged[key] = [OUT_OF_REACH if v in out and v not in proposed else v for v in value]
+            placing[key] = [v for v in value if v not in out]
+        else:
+            logged[key] = placing[key] = value
+    if any(name not in reached for name in before):
+        where = () if slot is None else (slot,)
+    return logged, placing, where
 
 
 def destination(where: Where | None = None) -> tuple:

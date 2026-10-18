@@ -295,14 +295,20 @@ def acquire_call_slot(caller_name: str, run_dir: str | None = None,
     base = os.path.join(RUN_DIR if run_dir is None else run_dir, "calls")
     for i in range(MAX_CONCURRENT_CALLS if limit is None else limit):
         path = os.path.join(base, f"{caller_name}.{i}")
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
-        except OSError:
-            raise refuse("qmcp runtime directory unavailable") from None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except OSError:
+        # A slot file removed while this call held it open (`retire_caller`)
+        # is a slot no other call can see: opened again, the one at the path.
+        for _ in range(3):
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+            except OSError:
+                raise refuse("qmcp runtime directory unavailable") from None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                break
+            if _is_current(fd, path):
+                return fd
             os.close(fd)
     raise refuse("too many concurrent calls")
 
@@ -359,6 +365,34 @@ def _wait_flock(fd: int, deadline: float, step: float, mode: int = fcntl.LOCK_EX
             time.sleep(step)
 
 
+def _is_current(fd: int, path: str) -> bool:
+    """Whether the open file `fd` is still the one at `path`. A lock file may
+    be removed (`retire_caller`, under its lock): a taker that locked the
+    removed file holds a lock no later taker can see, so it opens the path
+    again. Removal and this check are both made under the lock, so a taker
+    that found its file current keeps it until it lets go."""
+    try:
+        a, b = os.fstat(fd), os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _take_current(path: str, deadline: float, step: float, mode: int) -> int | None:
+    """The lock on the file at `path` as it is once had: its descriptor, or
+    None past `deadline`. Raises OSError when it cannot be opened."""
+    while True:
+        fd = _open_lock_file(path)
+        if not _wait_flock(fd, deadline, step, mode):
+            os.close(fd)
+            return None
+        if _is_current(fd, path):
+            return fd
+        os.close(fd)
+        if time.monotonic() >= deadline:
+            return None
+
+
 def take_queued_lock(path: str, timeout: float, step: float, queue: bool,
                      mode: int = fcntl.LOCK_EX) -> int | None:
     """A lock taken through its turnstile (`queue_path`): its descriptor, or
@@ -374,20 +408,17 @@ def take_queued_lock(path: str, timeout: float, step: float, queue: bool,
     callers that reach the qube have slots. A service passes straight through: it never holds the
     turnstile while it waits, so services never queue behind each other.
     `mode`: the lock itself is taken shared (`fcntl.LOCK_SH`) by the calls
-    that hold a caller's acting lock, and exclusively by everyone else."""
+    that hold a caller's acting lock, and exclusively by everyone else. A
+    file removed while it was waited on is opened again (`_take_current`)."""
     deadline = time.monotonic() + timeout
-    qfd = _open_lock_file(queue_path(path))
+    qfd = _take_current(queue_path(path), deadline, step, fcntl.LOCK_EX)
+    if qfd is None:
+        return None
     try:
-        if not _wait_flock(qfd, deadline, step):
-            return None
         if not queue:
             os.close(qfd)
             qfd = None
-        fd = _open_lock_file(path)
-        if _wait_flock(fd, deadline, step, mode):
-            return fd
-        os.close(fd)
-        return None
+        return _take_current(path, deadline, step, mode)
     finally:
         if qfd is not None:
             os.close(qfd)
@@ -463,6 +494,134 @@ def drain_caller(caller: str, timeout: float | None = None) -> int | None:
     when the lock cannot be opened."""
     return take_queued_lock(acting_lock_path(caller),
                             OPERATOR_WAIT_S if timeout is None else timeout, 0.05, True)
+
+
+def _remove_if_free(path: str) -> str | None:
+    """Remove the lock file at `path` under its own lock, exclusive, taken
+    without waiting: None when it is gone, or the reason it was left. Never
+    made where it is missing."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"not opened ({type(e).__name__})"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "a call still held it"
+        if not _is_current(fd, path):
+            return None                 # removed meanwhile
+        os.unlink(path)
+        return None
+    except OSError as e:
+        return f"not removed ({type(e).__name__})"
+    finally:
+        os.close(fd)
+
+
+def retire_caller(caller: str, acting_fd: int, run_dir: str | None = None) -> list:
+    """Remove the lock files of a caller that is no principal any more: its
+    acting lock and the acting lock's turnstile, and its call slots. Called by
+    a command that ended its authority while it still holds `acting_fd`, the
+    caller's acting lock taken exclusively (`drain_caller`). [(path, why)] for
+    each file left, and nothing it leaves grants anything: every file is only
+    a lock, and a caller's authority is its record and badges (`principal`).
+
+    It never waits. The command holds the acting lock (and the create lock),
+    and a call holding a slot or passing the turnstile may be waiting for
+    either, so a wait here would take locks in the other order; a file in use
+    is left, and a reboot clears it.
+
+    Safe against the taker that has the file open meanwhile: each file is
+    removed only while this process holds its lock exclusively, and every
+    taker checks, once it has a lock, that its file is still the one at the
+    path (`_is_current`), and opens the path again when it is not. So no two
+    takers ever hold one lock on two files. A call of the caller's that then
+    gets the acting lock is checked again against its record and badges
+    (`services._recheck`), which the command has already taken away.
+
+    Its counter (`<caller>.refused`) is kept: what it counted is the evidence
+    `qmcp check` warns on, and removing it would also give the name a new
+    day's share of the audit log."""
+    if not valid_qube_name(caller):
+        return []
+    base = os.path.join(RUN_DIR if run_dir is None else run_dir, "calls")
+    left = []
+    acting = acting_lock_path(caller, run_dir)
+    try:
+        if _is_current(acting_fd, acting):
+            os.unlink(acting)
+    except OSError as e:
+        left.append((acting, f"not removed ({type(e).__name__})"))
+    for path in [queue_path(acting)] + [os.path.join(base, f"{caller}.{i}")
+                                       for i in range(max(MAX_CONCURRENT_CALLS, LEAD_CALLS))]:
+        why = _remove_if_free(path)
+        if why:
+            left.append((path, why))
+    return left
+
+
+def retire_qube_locks(name: str, held=()) -> list:
+    """Remove the lock file of a qube qmcp has just removed, and its
+    turnstile: [(path, why)] for each file left. `held`: descriptors this
+    process may hold the qube's lock on (a service's `call.fds`); the lock
+    file goes under that lock when one of them is it, else under its own,
+    taken without waiting. It never waits, so it never delays a remove, and
+    a file in use is left (a reboot clears it): every taker checks its file
+    is still the one at the path (`_take_current`), and a service checks the
+    qube again under the lock and finds it gone, so a file left or removed
+    grants nothing. A qube removed outside qmcp keeps its files. Never
+    raises: a remove that landed is never reported as failed for this."""
+    if not valid_qube_name(name):
+        return []
+    path, left = qube_lock_path(name), []
+    try:
+        mine = next((fd for fd in held if _is_current(fd, path)), None)
+        if mine is not None:
+            try:
+                os.unlink(path)
+            except OSError as e:
+                left.append((path, f"not removed ({type(e).__name__})"))
+        elif (why := _remove_if_free(path)):
+            left.append((path, why))
+        if (why := _remove_if_free(queue_path(path))):
+            left.append((queue_path(path), why))
+    except Exception as e:
+        left.append((path, type(e).__name__))
+        print(f"qmcp: the lock files of the removed qube {name} were left "
+              f"({type(e).__name__})", file=sys.stderr)
+    return left
+
+
+def sweep_qube_locks(app) -> int:
+    """Remove the lock files of names that are no longer qubes: a disposable
+    qubesd removed itself after a kill, a qube removed outside qmcp. Run by
+    every pass of the gate's timer; the number of names swept. A file a call
+    holds is left for the next pass, and one whose name is a qube is never
+    touched; the list is read from qubesd itself (`admin.vm.List`), not from
+    the client's cache, which lags a new disposable. Safe against a qube
+    created under the name meanwhile for the same reason as
+    `retire_qube_locks`: every taker checks its file is still the one at the
+    path. Never raises, and writes no audit line: it changes nothing a
+    principal or the operator did."""
+    try:
+        raw = app.qubesd_call("dom0", "admin.vm.List").decode(errors="replace")
+        live = {line.split(" ", 1)[0] for line in raw.splitlines() if line.strip()}
+        files = os.listdir(os.path.join(RUN_DIR, QUBE_LOCK_SUBDIR))
+    except Exception:
+        return 0
+    names = set()
+    for f in files:
+        for suffix in (".lock", ".queue"):
+            if f.endswith(suffix) and valid_qube_name(f[:-len(suffix)]):
+                names.add(f[:-len(suffix)])
+    swept = 0
+    for name in sorted(names - live):
+        if not retire_qube_locks(name):
+            swept += 1
+    return swept
 
 
 class qube_lock:
@@ -625,6 +784,38 @@ def lookup(app, name):
         return None
 
 
+#: A valid qube name no qube carries: the balancing read of `tag_read_by_name`
+#: after a read of a qube that exists. Should a qube ever be given this name,
+#: the balance degrades to the gap it closes, never to a new one.
+BALANCE_MISSING = "qmcp-no-such-qube"
+#: The qube the balancing read goes to after a read that failed: it always exists.
+BALANCE_PRESENT = "dom0"
+
+
+def tag_read_by_name(app, name, method: str, *args) -> bytes:
+    """A tag read of the qube called `name` (`admin.vm.tag.List` or `.Get`),
+    which costs the same whether or not that qube exists. Raises what the read
+    raised.
+
+    qubesd answers a missing qube sooner than it reads an existing one's tags:
+    measured on the development box (Qubes 4.3.1, 2026-10-18), about 0.22 ms a
+    read, for `tag.List` and `tag.Get` alike. So every read by name is followed
+    by one more of the same method: on a qube that does not exist when the read
+    found its qube, on dom0 when it did not. Each name then costs one read of
+    an existing qube and one of a missing one (measured: -0.003 ms apart, 600
+    pairs). The second read's answer is never used."""
+    ok = False
+    try:
+        out = app.qubesd_call(name, method, *args)
+        ok = True
+        return out
+    finally:
+        try:
+            app.qubesd_call(BALANCE_MISSING if ok else BALANCE_PRESENT, method, *args)
+        except Exception:
+            pass
+
+
 def in_ai_space_by_name(app, name, hub: bool = False) -> bool:
     """Is the qube called `name` in AI space (and, for the hub, not hidden
     from it)? One qubesd round trip either way.
@@ -635,19 +826,19 @@ def in_ai_space_by_name(app, name, hub: bool = False) -> bool:
     on 2026-10-01 at ~0.7 ms apart. `admin.vm.tag.Get` answers "1"/"0" for a
     qube and fails for a missing one, after the same single call. For the hub
     the one call is `admin.vm.tag.List`, so a qube of a hidden anonymous project
-    (`qmcp-hubblind`) takes the same calls as a missing one, but not the same
-    time: qubesd answers a missing qube about 0.25 ms sooner, and a service
-    call reads tags several times, so from the hub such a call took about 1 ms
-    longer (measured on the development box, 2026-10-18). Its names come from
-    a random label, so this confirms a name rather than finding one.
+    (`qmcp-hubblind`) takes the same calls as a missing one. qubesd answers a
+    missing qube sooner, which made such a service call about 1 ms slower
+    than one naming a missing qube (measured on the development box,
+    2026-10-18), so each read is balanced (`tag_read_by_name`).
     """
     if not valid_qube_name(name):
         return False
     try:
         if hub:
-            tags = set(app.qubesd_call(name, "admin.vm.tag.List").decode(errors="replace").split())
+            tags = set(tag_read_by_name(app, name, "admin.vm.tag.List")
+                       .decode(errors="replace").split())
             return UMBRELLA in tags and projects.HUBBLIND not in tags
-        return app.qubesd_call(name, "admin.vm.tag.Get", UMBRELLA).strip() == b"1"
+        return tag_read_by_name(app, name, "admin.vm.tag.Get", UMBRELLA).strip() == b"1"
     except Exception:
         return False
 
@@ -689,8 +880,8 @@ def member_by_name(app, name, slot: str) -> bool:
     if not valid_qube_name(name):
         return False
     try:
-        return app.qubesd_call(name, "admin.vm.tag.Get",
-                               projects.member_badge(slot)).strip() == b"1"
+        return tag_read_by_name(app, name, "admin.vm.tag.Get",
+                                projects.member_badge(slot)).strip() == b"1"
     except Exception:
         return False
 
@@ -805,7 +996,7 @@ class Call:
     """One invocation: what the audit line will say about it."""
 
     __slots__ = ("service", "caller", "principal", "summary", "error_class", "fds", "acting",
-                 "landed", "noop", "where")
+                 "landed", "noop", "where", "reached", "proposed")
 
     def __init__(self, service: str) -> None:
         self.service = service
@@ -833,6 +1024,15 @@ class Call:
         #: The projects its line belongs to (`audit.place`), worked out before
         #: the call acts and again after; () until then: no project.
         self.where = ()
+        #: The qubes the service judged within its caller's reach, by the same
+        #: check that lets it act on them (`operand`, `reference`), or that
+        #: this call created. A refused call's line is placed, and names a
+        #: qube, only by these (`audit.OUT_OF_REACH` for any other).
+        self.reached: set = set()
+        #: A create's proposed name, judged inside its caller's own name
+        #: space: kept on a refused call's line as given, though it places
+        #: nothing until the call creates it.
+        self.proposed: set = set()
 
 
 def emit(call: Call, payload: dict, audit: bool, out=None) -> int:

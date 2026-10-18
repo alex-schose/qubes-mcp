@@ -26,6 +26,69 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.34] — 2026-10-18
+
+**What the audit round's last gates and the development box left.** The installer and
+`qmcp check` judge the operator files as the dom0 user reads them, a name that does not exist
+costs what a hidden project's qube costs, a refused call's audit line no longer follows a qube
+out of the caller's reach, and a retired lead's lock files go with it.
+
+### Changed
+
+- `qmcp check` has an "operator files" item: it fails on a file under `/etc/qmcp` that is not
+  a plain file, that not every user can read, or that every user can write, and names
+  `sudo chmod 0644 FILE`. It judges the mode, so a check run as root fails on it too.
+- The installer sets every operator file under `/etc/qmcp` that is a plain file (the ten the
+  library lists) to 0644, and its closing
+  `qmcp check` runs as the gate's user (the dom0 user), not as root.
+- A refused call's audit line is placed by its caller and by the qubes its service judged
+  within the caller's reach (or created), and records `<out-of-reach>` for every other qube name
+  in the keys the line is about: a qube out of reach, a name that does not exist, a name refused
+  before it was judged (a create's proposed name inside the caller's space and a spawn's `netvm`
+  are kept as given). A qube refused for its state (guarded, stopped, held) that wears no slot badge, such as
+  a template or a gateway, is still named, and places nothing. Successful calls, refusals of
+  qubes in reach and the operator's commands are placed as before.
+- A lifecycle call judges its qube before the action's value: an action that is not one, on a
+  qube out of reach, now answers `not found` instead of listing the valid actions (an action that
+  is missing, empty or not a string is still refused first).
+- Each tag read of a name the caller chose (the scope checks and the audit's placement reads) is
+  followed by one more read of the same method, on a qube
+  that does not exist after a read that found its qube, on dom0 after one that did not, so a
+  missing name costs what an existing one costs. One more qubesd round trip per such read. qmcp
+  refuses to create a qube under the name the second read takes for a missing one,
+  `qmcp-no-such-qube`.
+- Removing a lead (`project delete`, `project lead --remove`, a new lead with the old one
+  removed or kept) removes its lock files under `/run/qmcp/calls`, but one a call holds then,
+  and all of them when its calls outlast the wait, which the report says; every taker of a qube's or a caller's lock checks that its file is
+  still the one at the path. Its `.refused` counter stays.
+
+### Fixed
+
+- The `tee` line of the note for upgrading from 0.9.32, `echo off | sudo tee
+  /etc/qmcp/audit-keep-days`, made the file 0600 when it created it
+  under dom0's umask 0077: root's check and the timer read it, `qmcp check` as the dom0 user
+  failed on it and `qmcp settings` showed `-`. This install sets it to 0644; on 0.9.33,
+  `sudo chmod 0644 /etc/qmcp/audit-keep-days`.
+- The README's setup wrote `/etc/qmcp/birth-egress` the same way; it now uses
+  `sudo qmcp settings set --birth-egress`.
+- From the hub, a refused call naming a hidden project's qube took about 1 ms longer than one
+  naming a qube that does not exist; qubesd answers a tag read of a missing qube about 0.2 ms
+  sooner, `tag.Get` (a lead's scope checks) as `tag.List` (the hub's, and every placement read). With the balanced reads the hub's two
+  were not told apart on the development box, pooled: -0.11 ms under the hourly cap and -0.07 ms
+  past it (195 and 480 pairs; the two runs past the cap were each told apart, by about 0.3 ms in
+  opposite directions). A hub call measured about 1.5-3.5 ms slower than in 0.9.33 (passes hours
+  apart, not interleaved).
+- The offline suites remove every temp directory they make, after a failure too, and the
+  crash-point harness closes a simulated death's lock files on every path out of a run. The test
+  fixtures leave the operator files 0644 under any umask, as the installer does.
+- A test of a lead call refused after its lead was removed waited exactly as long as it slept,
+  and failed in 2 of 47 full runs under load (the intermittent failure); it now waits 5 s.
+- Removing a qube (the lifecycle service, a create rolled back, a disposable qmcp disposes of,
+  `project delete` and lead changes) removes its lock files under `/run/qmcp/qubes`, never
+  waiting for one; every pass of the gate's timer removes the free ones of names qubesd no
+  longer lists (a disposable Qubes removed after a kill, a qube removed by hand), which the box
+  showed left behind by the hub's disposables (three in one pass).
+
 ## [0.9.33] — 2026-10-18
 
 **The audit round's low findings, audit-log rotation and retention, and audit-log modes.** The

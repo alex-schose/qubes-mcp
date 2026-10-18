@@ -15,7 +15,6 @@ import os
 import pathlib
 import shutil
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -27,6 +26,7 @@ sys.path.insert(0, str(HERE))
 
 from qmcp import anon, audit, birth, budget, core, firewall, fleet, gateways, inqube, projects, proposals, services  # noqa: E402
 import fakequbes  # noqa: E402
+import scratch  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
 
 HUB = "mcp-control"
@@ -34,8 +34,7 @@ HUB = "mcp-control"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="qmcp-dom0-"))
-        self.addCleanup(shutil.rmtree, self.tmp)
+        self.tmp = scratch.tempdir(self, "qmcp-dom0-")
         self._saved = []
         for mod, attr, value in [
             (core, "HUB_PATH", self.tmp / "hub"),
@@ -96,6 +95,10 @@ class Base(unittest.TestCase):
         (self.tmp / "hub").write_text(HUB + "\n")
         (self.tmp / "pool-cap").write_text(str(1000 * GiB) + "\n")
         (self.tmp / "private-cap").write_text(str(20 * GiB) + "\n")
+        # As the installer leaves every operator file, whatever the umask
+        # (dom0's is 0077): `qmcp check` fails on one not every user can read.
+        for f in ("hub", "pool-cap", "private-cap"):
+            os.chmod(self.tmp / f, 0o644)
         self.app = standard_fleet()
         # As after the operator enrolled the fleet's AI router: the registry
         # starts empty on install, and the fixtures assume a working fleet.
@@ -138,6 +141,60 @@ class Base(unittest.TestCase):
     def tags(self, name):
         self.app.domains.clear_cache()
         return set(self.app.domains[name].tags)
+
+
+class TempDirs(unittest.TestCase):
+    """Every suite built on Base leaves nothing in the temp dir, whatever the
+    outcome of its test."""
+
+    def _outcome_of(self, body):
+        seen = {}
+
+        class Inner(Base):
+            def runTest(inner):
+                seen["tmp"] = inner.tmp
+                body(inner)
+
+        result = unittest.TestResult()
+        Inner().run(result)
+        return seen["tmp"], result
+
+    def test_a_failed_test_leaves_no_temp_dir(self):
+        def body(t):
+            t.fail("on purpose")
+        tmp, result = self._outcome_of(body)
+        self.assertEqual((len(result.failures), result.errors), (1, []))
+        self.assertFalse(tmp.exists())
+
+    def test_an_errored_test_leaves_no_temp_dir(self):
+        def body(t):
+            raise RuntimeError("on purpose")
+        tmp, result = self._outcome_of(body)
+        self.assertEqual((result.failures, len(result.errors)), ([], 1))
+        self.assertFalse(tmp.exists())
+
+    def test_a_tree_left_unwritable_is_still_removed(self):
+        def body(t):
+            os.chmod(t.tmp / "run" / "qubes", 0o000)
+            os.chmod(t.tmp / "run", 0o500)
+        tmp, result = self._outcome_of(body)
+        self.assertTrue(result.wasSuccessful(), result.errors)
+        self.assertFalse(tmp.exists())
+
+    def test_a_link_out_of_the_tree_is_not_followed(self):
+        outside = scratch.tempdir(self, "qmcp-outside-")
+        (outside / "keep").write_text("x")
+        os.chmod(outside, 0o500)
+        self.addCleanup(os.chmod, outside, 0o700)
+
+        def body(t):
+            os.symlink(outside, t.tmp / "out")
+            os.chmod(t.tmp, 0o500)               # forces the second pass
+        tmp, result = self._outcome_of(body)
+        self.assertTrue(result.wasSuccessful(), result.errors)
+        self.assertFalse(tmp.exists())
+        self.assertEqual(((outside / "keep").read_text(), oct(os.stat(outside).st_mode & 0o777)),
+                         ("x", "0o500"))
 
 
 # ======================================================================= funnel
@@ -669,6 +726,83 @@ class Writes(Base):
         self.assertEqual(self.life("ai-work", "remove")["error"], "action failed")   # running
         self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
         self.assertNotIn("ai-work2", self.app.domains)
+
+    def qube_lock_files(self, name):
+        path = core.qube_lock_path(name)
+        return [p for p in (path, core.queue_path(path)) if os.path.exists(p)]
+
+    def seed_qube_locks(self, name):
+        os.close(core.acquire_qube_lock(name, 1))
+        self.assertEqual(len(self.qube_lock_files(name)), 2)
+
+    def test_the_gates_pass_sweeps_the_lock_files_of_names_that_are_gone(self):
+        """A disposable that qubesd removes itself after a kill never passes
+        through qmcp's own remove: the gate's pass sweeps its files, leaves a
+        file a call holds, and never touches a qube's that exists."""
+        import fcntl
+        from qmcp import cli
+        d = pathlib.Path(core.RUN_DIR) / core.QUBE_LOCK_SUBDIR
+        for f in ("disp9.lock", "disp9.queue", "ai-work.lock", "ai-work.queue",
+                  "disp10.lock", "disp11.queue", "not a name.lock"):
+            (d / f).touch()
+        held = os.open(d / "disp10.lock", os.O_RDWR)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.assertEqual(core.sweep_qube_locks(self.app), 2)       # disp9, disp11
+        self.assertEqual(sorted(os.listdir(d)),
+                         ["ai-work.lock", "ai-work.queue", "disp10.lock", "not a name.lock"])
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(core.sweep_qube_locks(self.app), 1)       # disp10, now free
+        self.assertNotIn("disp10.lock", os.listdir(d))
+        # A list that cannot be read sweeps nothing.
+        (d / "disp12.lock").touch()
+        self.app.fail_reads("admin.vm.List", "fail")
+        self.assertEqual(core.sweep_qube_locks(self.app), 0)
+        self.assertIn("disp12.lock", os.listdir(d))
+        # The gate's timer runs `qmcp gate`, which sweeps first.
+        self.assertIn("core.sweep_qube_locks(_app())", pathlib.Path(cli.__file__).read_text())
+        self.assertIn("ExecStart=/usr/local/bin/qmcp gate",
+                      (pathlib.Path(__file__).parent.parent / "deploy" / "qmcp-gate.service").read_text())
+
+    def test_a_removed_qubes_lock_files_go_with_it(self):
+        # The lock itself goes under the one the call holds; another qube's stay.
+        self.seed_qube_locks("ai-work2")
+        self.seed_qube_locks("ai-work")
+        self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
+        self.assertEqual(self.qube_lock_files("ai-work2"), [])
+        self.assertEqual(len(self.qube_lock_files("ai-work")), 2)
+
+    def test_a_failed_remove_keeps_the_qubes_lock_files(self):
+        self.seed_qube_locks("ai-work")
+        self.assertEqual(self.life("ai-work", "remove")["error"], "action failed")   # running
+        self.assertEqual(len(self.qube_lock_files("ai-work")), 2)
+
+    def test_a_turnstile_in_use_is_left_and_the_remove_still_succeeds(self):
+        self.seed_qube_locks("ai-work2")
+        queue = core.queue_path(core.qube_lock_path("ai-work2"))
+        fd = os.open(queue, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        r = {}
+        # Held by "another process" only once the call is past it.
+        real = core.retire_qube_locks
+
+        def retire(name, held=()):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r["left"] = real(name, held)
+            return r["left"]
+        with mock.patch.object(core, "retire_qube_locks", retire):
+            self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
+        self.assertEqual(self.qube_lock_files("ai-work2"), [queue])
+        self.assertEqual([p for p, _ in r["left"]], [queue])
+
+    def test_a_rolled_back_create_and_a_disposable_remove_their_lock_files(self):
+        for remove in (services._remove, services._dispose):
+            with self.subTest(remove.__name__):
+                self.app.vm("ai-hub-gone", template=self.app.domains["ai-debian-13"],
+                            netvm=None, tags={"ai-managed"})
+                self.seed_qube_locks("ai-hub-gone")
+                self.assertTrue(remove(self.app, "ai-hub-gone"))
+                self.assertEqual(self.qube_lock_files("ai-hub-gone"), [])
 
 
 # ======================================================================= creates
@@ -1405,14 +1539,44 @@ class AuditFindings(Base):
             # of each qube its request names, before it acts and after, for the
             # project its audit line belongs to: the same for every name too.
             # Before: the keys the service acts on; after: the names its line
-            # records. Both the same for every name, as asserted above.
+            # records that the call judged in reach, which none of these is, so
+            # after a refusal none of them is read. Both the same for every
+            # name, as asserted above. Every read by name is balanced by a
+            # second one (`core.tag_read_by_name`).
             reads = missing[1]
             self.assertEqual(set(reads), {"admin.vm.tag.List"}, svc)
             if services.SERVICES[svc][1]:
-                self.assertGreaterEqual(len(reads), 2 + 2 * len(audit.REQUEST_KEYS[svc]), svc)
+                self.assertGreaterEqual(len(reads), 3 + 2 * len(audit.REQUEST_KEYS[svc]), svc)
             else:
-                self.assertEqual(len(reads), 2, svc)
+                self.assertEqual(len(reads), 3, svc)
             self.assertEqual(missing[2], 0, svc)
+
+    def test_a_read_by_name_is_balanced_by_one_of_the_other_kind(self):
+        """qubesd answers a missing qube sooner than it reads an existing
+        one's tags, so a read by name is followed by one more of the same
+        method on the other kind: a missing qube after a read that found its
+        qube, dom0 after one that did not. Its answer and its failure are
+        never used."""
+        self.app.calls.clear()
+        out = core.tag_read_by_name(self.app, "ai-work", "admin.vm.tag.Get", "ai-managed")
+        self.assertEqual(out, b"1")
+        self.assertEqual(self.app.calls, [("ai-work", "admin.vm.tag.Get", "ai-managed"),
+                                          (core.BALANCE_MISSING, "admin.vm.tag.Get", "ai-managed")])
+        self.app.calls.clear()
+        with self.assertRaises(KeyError):
+            core.tag_read_by_name(self.app, "no-such-qube", "admin.vm.tag.List")
+        self.assertEqual([c[0] for c in self.app.calls], ["no-such-qube", core.BALANCE_PRESENT])
+        # A read that fails (not a missing qube) raises its own error, after
+        # its balance; a balance that fails changes nothing.
+        self.app.fail_reads("admin.vm.tag.List", "fail fail")
+        self.app.calls.clear()
+        with self.assertRaises(Exception) as e:
+            core.tag_read_by_name(self.app, "ai-work", "admin.vm.tag.List")
+        self.assertNotIsInstance(e.exception, KeyError)
+        self.assertEqual([c[0] for c in self.app.calls], ["ai-work", core.BALANCE_PRESENT])
+        self.assertIn("ai-managed", core.tag_read_by_name(self.app, "ai-work",
+                                                          "admin.vm.tag.List").decode())
+        self.assertNotIn(core.BALANCE_MISSING, self.app.domains)
 
     def test_explicit_netvm_is_checked_by_name(self):
         self.egress("ai-net-router")
