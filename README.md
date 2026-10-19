@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.37 — a hand copy loses its owner badge.** Besides the hub, up to 15
+**Status: 0.9.38 — a hidden project's disposable templates stay its own.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -237,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.37.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.38.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -291,7 +291,15 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.36? Install over it. **Breaking:** a hand copy of a qube qmcp
+Coming from 0.9.37? Install over it. `qmcp project create` and `edit` now refuse
+to share a disposable template between a hidden project and one the hub sees,
+either way round: each disposable the project the hub sees tried to make from
+it was rolled back at birth, with no word of why. `qmcp check` warns of a share
+made before; give that project a disposable template of its own (`sudo qmcp
+project edit NAME --template ...`, listing every template it keeps and leaving
+out the shared one). To roll back, install 0.9.37 over this one.
+
+Coming from 0.9.36? See the note above too. **Breaking:** a hand copy of a qube qmcp
 made (`qvm-clone`) carried its `qmcp-owner_*` badge, so the hub could remove
 your copy. Now the hub cannot remove a qube waiting for review, and the gate
 takes the owner badge off a copy right after it holds it; a qube restored from
@@ -685,7 +693,11 @@ alone. `qmcp project list` shows each anonymous project, its kind and whether
 it is stopped; `qmcp gate` and the window's Anonymity tab show what the gate
 found; `sudo qmcp project unblock NAME` clears a
 stop once the gate finds the project sound again. `--hub-sees` makes one the
-hub may see and operate (hidden from the network, not from the hub). A model
+hub may see and operate (hidden from the network, not from the hub). `qmcp
+project create` and `qmcp project edit --template` refuse to share a hidden
+project's disposable template with a project the hub sees, and `qmcp check` warns
+of one shared before: that project's
+disposables would be born hidden and refused at birth. A model
 qube or a template the hub operated before you guarded it can harm a hidden
 project, since guarding removes nothing the hub left; projects behind one
 router share its exit. Mark no anonymous qube to start at boot: the gate's

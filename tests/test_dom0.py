@@ -2570,6 +2570,15 @@ class Windows(Base):
         fleet.write_window(self.TPL, -1, False)
         self.assertEqual(self.findings()["open windows"].status, "fail")
 
+    def test_a_window_under_a_minute_reads_in_seconds_not_zero_minutes(self):
+        msg = fleet.open_window(self.app, self.TPL, 30)
+        self.assertIn("(30 s)", msg)
+        self.assertNotIn("0 min", msg)
+        detail = self.findings()["open windows"].detail
+        self.assertRegex(detail, rf"{self.TPL} \(\d+ s left\)")
+        fleet.seal(self.app, self.TPL)
+        self.assertIn("(10 min)", fleet.open_window(self.app, self.TPL, 600))
+
     def test_check_fails_on_the_firewall_half_alone(self):
         self.app.domains[self.TPL].tags.add(core.OPEN_FW)
         f = self.findings()["open windows"]

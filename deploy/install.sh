@@ -750,7 +750,9 @@ hub = os.environ["QMCP_HUB"]
 app = qubesadmin.app.QubesLocal()
 
 
-def stamp() -> int:
+def stamp(again: bool = False) -> int:
+    """Puts qmcp-anon on the mode's qubes and reads it back. The first pass names
+    each qube; the second (`again`) names only the ones it stamped itself."""
     records, registry = projects.load(), gateways.load()
     by_name, tags_by = anon._snapshot(app, strict=True)
     # The hub's subjects, and the anonymous projects' model qubes, which join
@@ -771,9 +773,13 @@ def stamp() -> int:
                 restored.label_if_missing(vm)
             vm.tags.add(projects.ANON)
             added += 1
+            stamped = True
+        else:
+            stamped = False
         if projects.ANON not in core.tags_of(vm):
             sys.exit(f"    {name} does not read back wearing {projects.ANON}")
-        print(f"==> {name} wears {projects.ANON}")
+        if stamped or not again:
+            print(f"==> {name} wears {projects.ANON}")
     return added
 
 
@@ -790,7 +796,7 @@ with anon._GateLock(wait=120) as got:
         os.replace(path + ".new", path)
         # A qube the hub made between the first pass and the mode file was born
         # without it (the services stamp only in the mode): a second pass.
-        added += stamp()
+        added += stamp(again=True)
     if wrote or added:
         audit.audit("qmcp install", "operator",
                     {"mode": "anonymous", "turned_on": wrote, "stamped": added}, True, slots=())

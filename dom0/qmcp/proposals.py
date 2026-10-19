@@ -1420,7 +1420,7 @@ def _refuse_hidden(app, p: dict, records: dict) -> None:
     if "project" in p and _hidden(records, p["project"]):
         raise fleet.ProjectError(f"no project '{p['project']}'")
     if t.startswith("project-"):
-        _refuse_hidden_names(app, p)
+        _refuse_hidden_names(app, p, records)
     if t in ("qube-manage", "qube-revoke", "template-install"):
         _refuse_hidden_qube(app, p)
 
@@ -1558,13 +1558,17 @@ def _hidden_names(p: dict) -> list:
     return out
 
 
-def _refuse_hidden_names(app, p: dict) -> None:
+def _refuse_hidden_names(app, p: dict, records: dict) -> None:
     """A project proposal that names a hidden project's qube (a disposable
     template, a model qube, a lead's source) fails as one naming a qube that
     does not exist, in the command's own words for that, before the command
     reads anything else about it. A qube that cannot be looked up, or whose
-    tags cannot be read, is `_Unsure`, since it may be one."""
+    tags cannot be read, is `_Unsure`, since it may be one. A disposable
+    template a hidden project's record names counts as hidden even without
+    its badge, so this layer and the command's share refusal decide on the
+    same facts and the hub learns nothing from which of them refused."""
     from qmcp import fleet
+    by_hidden = {t for r in records.values() if r.hidden for t in r.templates}
     for name, missing in _hidden_names(p):
         if not core.valid_qube_name(name):
             continue                        # the command refuses it in its own words
@@ -1582,6 +1586,13 @@ def _refuse_hidden_names(app, p: dict) -> None:
             raise _Unsure(f"'{name}''s badges cannot be read") from None
         if projects.HUBBLIND in tags:
             raise fleet.ProjectError(missing)
+        if name in by_hidden:
+            try:
+                dvmt = core.is_dvmt(app.domains[name])
+            except core.Unreadable:
+                raise _Unsure(f"whether '{name}' is a disposable template cannot be read") from None
+            if dvmt:
+                raise fleet.ProjectError(missing)
 
 
 def _refuse_hidden_qube(app, p: dict) -> None:

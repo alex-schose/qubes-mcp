@@ -440,7 +440,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         if left <= 0:
             open_bad.append(f"{name}'s window ran out {-left}s ago and its badge is still on")
             continue
-        open_now.append(f"{name} ({left // 60} min left"
+        open_now.append(f"{name} ({_span(left)} left"
                         + (", firewall too" if core.OPEN_FW in tags else "") + ")")
     # A seal whose kill was never read back: what the hub started there may
     # still run, though no badge is left for the items above to see.
@@ -1094,6 +1094,43 @@ def anonymity_findings(app, vms, records: dict, tags_by: dict, registry=None, hu
         add("fail", "hidden templates", f"the hub can reach qubes made from a hidden project's "
                                         f"disposable template: {', '.join(sorted(reachable))} "
                                         f"(remove them, or qmcp revoke them)")
+    # A disposable template that is hidden from the hub, or that a hidden
+    # project's record names, approved by a project the hub sees: that
+    # project's disposables arrive hidden and are refused at birth. Judged on
+    # the badge as well as the records, since `qmcp-hubblind` stays on a
+    # template after its hidden project lets it go or is deleted. `project
+    # create` and `edit` refuse the share since 0.9.38; one made before stays
+    # until the operator gives that project another template.
+    by_name = {vm.name: vm for vm in vms}
+    by_hidden = {}
+    for p in records.values():
+        if p.hidden:
+            for t in p.templates:
+                by_hidden.setdefault(t, []).append(p.label or p.slot)
+    shared = []
+    for q in sorted(records.values(), key=lambda q: q.slot):
+        if q.hidden:
+            continue
+        for t in q.templates:
+            if t not in by_name or (t not in by_hidden
+                                    and projects.HUBBLIND not in tags_by.get(t, ())):
+                continue
+            try:
+                dvmt = core.is_dvmt(by_name[t])
+            except core.Unreadable as e:
+                add("error", "hidden templates", f"{e}: whether {q.label or q.slot} can make "
+                                                 f"disposables from it is not known")
+                continue
+            if dvmt:
+                why = (f"approved by the hidden project {', '.join(sorted(by_hidden[t]))}"
+                       if t in by_hidden else f"wears {projects.HUBBLIND}")
+                shared.append(f"{t} ({why}, and by {q.label or q.slot})")
+    if shared:
+        add("warn", "hidden templates", f"a disposable template hidden from the hub is approved "
+                                        f"by a project the hub sees, whose disposables from it "
+                                        f"are refused at birth: {', '.join(shared)}; give that "
+                                        f"project a disposable template of its own (qmcp "
+                                        f"project edit)")
     if not anonymous and mode is False:
         # The timer also ends open windows and holds restored qubes, in every
         # mode: its item stands without an anonymous project.
@@ -2843,6 +2880,12 @@ def pending_kills(dir_: str | None = None) -> list:
     return sorted(n for n in names if core.valid_qube_name(n) and kill_pending(n, dir_))
 
 
+def _span(seconds: int) -> str:
+    """A window's length or what is left of it, as a person reads it: whole
+    minutes from one minute up, seconds below (a 30 s window is not "0 min")."""
+    return f"{seconds // 60} min" if seconds >= 60 else f"{seconds} s"
+
+
 def _open_refusal(vm, name, tags) -> str | None:
     """Why this qube is never opened, or None. Read before any write."""
     if core.UMBRELLA not in tags:
@@ -2932,7 +2975,7 @@ def _open_window(app, name, seconds: int, firewall: bool = False,
         clear_window(name, dir_)
         raise RoleError(f"'{name}' was not opened ({failed}); nothing is left on it") from None
     ends = time.strftime("%H:%M:%S", time.localtime(rec["expires"]))
-    return (f"{name}: open until {ends} ({seconds // 60} min)"
+    return (f"{name}: open until {ends} ({_span(seconds)})"
             + (", firewall rules too" if firewall else "")
             + f"; qmcp seal {name} closes it at once"
             + (f"; WARNING: {warning}" if warning else ""))
@@ -3764,7 +3807,7 @@ def _not_managed(app, name, what: str) -> None:
     guarded, so the hub cannot change it."""
     vm = _vm(app, name)
     if vm is None:
-        raise ProjectError(f"no {what} '{name}'")
+        raise ProjectError(f"{what} '{name}' does not exist")
     tags = _read_tags(vm)
     if core.UMBRELLA in tags and core.GUARDED not in tags:
         raise ProjectError(f"{what} '{name}' is managed, so the hub can change it: guard it "
@@ -3808,6 +3851,37 @@ def _anonymous_lead(app, source: str, origin: str, lead_netvm) -> None:
     _lead_template(app, origin)
     _not_managed(app, origin, "the lead's template")
     _anonymous_networks(app, [lead_netvm])
+
+
+def _dvmt_share_refusal(app, records: dict, p, names) -> None:
+    """A hidden project's disposable templates are approved by hidden projects
+    only. A disposable is born with its template's tags, and the birth stamp
+    refuses a child that arrives wearing `qmcp-hubblind` unasked, so a project
+    the hub sees, sharing one, could make no disposable from it: each would be
+    rolled back, with nothing to say why. Refused when the project is made or
+    edited, either way round, naming the other project; `names` are the
+    entries to check (`_apply_edit`'s convention)."""
+    for t in names:
+        vm = _vm(app, t)
+        if vm is None or not core.is_dvmt(vm):
+            continue
+        others = [q for s, q in records.items() if s != p.slot and t in q.templates]
+        if p.hidden:
+            seen = sorted(q.label or q.slot for q in others if not q.hidden)
+            if seen:
+                raise ProjectError(f"the disposable template {t} is approved by {', '.join(seen)}, "
+                                   f"which the hub sees: a hidden project's disposable templates "
+                                   f"are hidden from the hub, and that project's disposables "
+                                   f"would then be refused at birth; give this project a "
+                                   f"disposable template of its own")
+            continue
+        hiding = sorted(q.label or q.slot for q in others if q.hidden)
+        if hiding or projects.HUBBLIND in _read_tags(vm):
+            whose = (f"the hidden project {', '.join(hiding)}'s" if hiding
+                     else f"hidden from the hub ({projects.HUBBLIND}), a hidden project's")
+            raise ProjectError(f"the disposable template {t} is {whose}: a disposable made from "
+                               f"it is born hidden from the hub and refused for a project the "
+                               f"hub sees; give this project a disposable template of its own")
 
 
 def _hide_disposable_templates(report, app, p) -> None:
@@ -4519,6 +4593,7 @@ def _create_project(report, app, label, lead_source, lead_origin, templates, net
         if lead_source == "promote" and model_qube == lead_origin:
             raise ProjectError(f"'{model_qube}' cannot be both the lead and its model qube")
         _plan_model_qube(app, slot, model_qube, records, new)
+    _dvmt_share_refusal(app, records, new, tpls)
     if new.hidden:
         _hide_disposable_templates(report, app, new)
     lead, fresh, before, stored, old_rules, old_net = _make_lead(app, slot, lead_source,
@@ -4851,6 +4926,7 @@ def _apply_edit(report, app, records, p, templates, networks, quota, added=None)
             if added[0]:
                 _check_templates(app, added[0])
             p.templates = tuple(templates)
+        _dvmt_share_refusal(app, records, p, p.templates if added is None else added[0])
     if networks is not None:
         if added is None:
             new = tuple(_check_networks(app, networks))

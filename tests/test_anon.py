@@ -1488,6 +1488,181 @@ class HiddenTemplates(AnonBase):
         self.assertTrue(found and found[0].status == "fail", found)
         self.assertIn(child, found[0].detail)
 
+    # -- a hidden project's disposable templates are approved by hidden projects only
+    def test_a_project_the_hub_sees_cannot_take_a_hidden_projects_disposable_template(self):
+        hidden = self.make(templates=["ai-dvm-g"])
+        before = set(self.records())
+        for kw in (dict(hub_sees=True), dict(anonymous=False)):
+            label = None if kw.get("anonymous", True) else "plain"
+            with self.assertRaises(fleet.ProjectError) as cm:
+                fleet.create_project(self.app, label, "template", "ai-tpl-g",
+                                     templates=["ai-dvm-g"], networks=["ai-net-tor"],
+                                     quota="10G", lead_netvm="ai-net-tor",
+                                     model="api.example.org:443", **{"anonymous": True, **kw})
+            self.assertIn(hidden.label, str(cm.exception))
+            self.assertIn("a disposable template of its own", str(cm.exception))
+            self.assertEqual(set(self.records()), before)
+        # Two hidden projects may share one: their disposables are born hidden anyway.
+        self.assertTrue(self.make(templates=["ai-dvm-g"]).hidden)
+
+    def test_a_hidden_project_cannot_take_a_disposable_template_one_the_hub_sees_uses(self):
+        seen = self.make(hub_sees=True, templates=["ai-dvm-g"])
+        with self.assertRaises(fleet.ProjectError) as cm:
+            self.make(templates=["ai-dvm-g"])
+        self.assertIn(seen.label, str(cm.exception))
+        self.assertNotIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+        self.assertEqual([p.slot for p in self.records().values() if p.anonymous], [seen.slot])
+
+    def test_an_edit_cannot_make_the_share_either_way(self):
+        hidden = self.make()
+        seen = self.make(hub_sees=True, templates=["ai-dvm-g"])
+        for key, args in ((hidden.label, dict(templates=["ai-tpl-g", "ai-dvm-g"])),):
+            with self.assertRaisesRegex(fleet.ProjectError, seen.label):
+                fleet.edit_project(self.app, key, **args)
+        with self.assertRaisesRegex(fleet.ProjectError, seen.label):
+            fleet.edit_project_changes(self.app, hidden.label, add_templates=["ai-dvm-g"])
+        self.assertNotIn("ai-dvm-g", projects.find(self.records(), hidden.slot).templates)
+        self.assertNotIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+        # The other way: the hidden project holds it, the seen one asks for it.
+        fleet.edit_project_changes(self.app, seen.label, remove_templates=["ai-dvm-g"])
+        fleet.edit_project_changes(self.app, hidden.label, add_templates=["ai-dvm-g"])
+        with self.assertRaisesRegex(fleet.ProjectError, hidden.label):
+            fleet.edit_project_changes(self.app, seen.label, add_templates=["ai-dvm-g"])
+        self.assertNotIn("ai-dvm-g", projects.find(self.records(), seen.slot).templates)
+
+    def test_a_disposable_template_left_hidden_is_refused_with_no_hidden_project_named(self):
+        self.app.domains["ai-dvm-g"].tags.add("qmcp-hubblind")      # its hidden project gone
+        with self.assertRaises(fleet.ProjectError) as cm:
+            self.make(hub_sees=True, templates=["ai-dvm-g"])
+        self.assertIn("qmcp-hubblind", str(cm.exception))
+
+    def share_made_before_the_refusal(self):
+        """The share a release before this one let through, written into the
+        records directly."""
+        hidden = self.make(templates=["ai-dvm-g"])
+        seen = self.make(hub_sees=True)
+        records = self.records()
+        rec = records[seen.slot]
+        rec.templates = tuple(rec.templates) + ("ai-dvm-g",)
+        projects.save(records)
+        return hidden, projects.find(self.records(), seen.slot)
+
+    def test_a_share_made_before_is_what_breaks_and_the_check_warns_of_it(self):
+        hidden, seen = self.share_made_before_the_refusal()
+        # Teeth: the symptom the refusal prevents. The seen project's disposable
+        # arrives hidden and the birth stamp rolls it back.
+        self.app.domains[seen.lead].__dict__["_power"] = "Running"
+        r = self.lcall("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm-g"}, lead=seen.lead)
+        self.assertEqual(r.get("error"), "birth stamp failed (rolled back)", r)
+        found = [f for f in fleet.check(self.app, policy_dir=str(self.tmp))
+                 if f.check == "hidden templates"]
+        self.assertEqual([f.status for f in found], ["warn"], found)
+        self.assertIn(f"ai-dvm-g (approved by the hidden project {hidden.label}, and by "
+                      f"{seen.label})", found[0].detail)
+        # An edit naming what it adds is not refused for the share it does not name.
+        self.app.vm("ai-dvm-h", template=self.app.domains["ai-debian-13"],
+                    template_for_dispvms=True, netvm=None, tags={"ai-managed", "qmcp-guarded"})
+        fleet.edit_project_changes(self.app, seen.label, add_templates=["ai-dvm-h"])
+        self.assertIn("ai-dvm-h", projects.find(self.records(), seen.slot).templates)
+
+    def hidden_template_findings(self):
+        return [f for f in fleet.check(self.app, policy_dir=str(self.tmp))
+                if f.check == "hidden templates"]
+
+    def test_no_share_no_warning_and_the_share_then_warns(self):
+        self.make(templates=["ai-dvm-g"])
+        seen = self.make(hub_sees=True)
+        self.assertFalse(self.hidden_template_findings())
+        # Positive control on the same fixture: the share, written in, warns.
+        records = self.records()
+        records[seen.slot].templates = tuple(records[seen.slot].templates) + ("ai-dvm-g",)
+        projects.save(records)
+        self.assertEqual([f.status for f in self.hidden_template_findings()], ["warn"])
+
+    def test_a_share_ended_from_the_hidden_side_still_warns_on_the_badge(self):
+        hidden, seen = self.share_made_before_the_refusal()
+        fleet.edit_project_changes(self.app, hidden.label, remove_templates=["ai-dvm-g"])
+        self.assertIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+        found = self.hidden_template_findings()
+        self.assertEqual([f.status for f in found], ["warn"], found)
+        self.assertIn(f"ai-dvm-g (wears qmcp-hubblind, and by {seen.label})", found[0].detail)
+
+    def test_a_share_left_by_a_deleted_hidden_project_still_warns(self):
+        hidden, seen = self.share_made_before_the_refusal()
+        fleet.delete_project(self.app, hidden.label)
+        found = self.hidden_template_findings()
+        self.assertEqual([f.status for f in found], ["warn"], found)
+        self.assertIn(seen.label, found[0].detail)
+
+    def test_a_hidden_record_without_the_badge_still_warns(self):
+        hidden, seen = self.share_made_before_the_refusal()
+        self.app.domains["ai-dvm-g"].tags.discard("qmcp-hubblind")
+        found = self.hidden_template_findings()
+        self.assertEqual([f.status for f in found], ["warn"], found)
+        self.assertIn(f"approved by the hidden project {hidden.label}", found[0].detail)
+
+    def test_a_template_that_does_not_exist_is_named_so(self):
+        with self.assertRaises(fleet.ProjectError) as cm:
+            self.make(templates=["ai-no-such-dvm"])
+        self.assertEqual(str(cm.exception), "the template 'ai-no-such-dvm' does not exist")
+
+    def test_the_check_reports_a_disposable_flag_it_cannot_read(self):
+        self.share_made_before_the_refusal()
+        self.app.fail_reads("get.template_for_dispvms:ai-dvm-g", "fail fail fail fail")
+        found = self.hidden_template_findings()
+        self.assertIn("error", [f.status for f in found], found)
+
+    def test_an_edit_is_refused_on_the_badge_alone(self):
+        seen = self.make(hub_sees=True)
+        self.app.domains["ai-dvm-g"].tags.add("qmcp-hubblind")
+        with self.assertRaisesRegex(fleet.ProjectError, "qmcp-hubblind"):
+            fleet.edit_project_changes(self.app, seen.label, add_templates=["ai-dvm-g"])
+        self.assertNotIn("ai-dvm-g", projects.find(self.records(), seen.slot).templates)
+
+    def test_a_read_that_fails_refuses_and_changes_nothing(self):
+        self.make(templates=["ai-dvm-g"])
+        seen = self.make(hub_sees=True)
+        before = projects.find(self.records(), seen.slot).templates
+        # The second tag read is the share refusal's own (the first is
+        # _check_templates'); then the disposable flag.
+        for key, pattern in (("tag.List:ai-dvm-g", "ok fail"),
+                             ("get.template_for_dispvms:ai-dvm-g", "ok ok fail")):
+            self.app.fail_plan.clear()
+            self.app.fail_reads(key, pattern)
+            with self.assertRaises(fleet.RoleError):
+                fleet.edit_project_changes(self.app, seen.label, add_templates=["ai-dvm-g"])
+            self.assertEqual(projects.find(self.records(), seen.slot).templates, before)
+        self.app.fail_plan.clear()
+
+    def test_an_accepted_proposal_meets_the_refusal(self):
+        seen = self.make(hub_sees=True, templates=["ai-dvm-g"])
+        r = self.submit(anon_create(templates=["ai-dvm-g"]))
+        self.assertTrue(r["ok"], r)
+        ok, report = self.accept(r["id"], yes=True)
+        self.assertFalse(ok, report)
+        self.assertTrue(any(seen.label in l for l in report), report)
+        self.assertNotIn("qmcp-hubblind", self.app.domains["ai-dvm-g"].tags.raw())
+
+    def test_a_hidden_record_names_it_so_the_hub_sees_a_missing_name(self):
+        # Degraded: the hidden project's record names the template but the
+        # badge is gone. The hub's proposal fails exactly as for a name that
+        # does not exist, not with the share refusal.
+        hidden = self.make(templates=["ai-dvm-g"])
+        seen = self.make(hub_sees=True)
+        self.app.domains["ai-dvm-g"].tags.discard("qmcp-hubblind")
+        outcomes = []
+        for name in ("ai-dvm-g", "ai-no-such-dvm"):
+            r = self.submit({"type": "project-edit", "title": "t", "project": seen.label,
+                             "add_templates": [name]})
+            self.assertTrue(r["ok"], r)
+            ok, report = self.accept(r["id"], yes=True)
+            self.assertFalse(ok, report)
+            # What the hub reads of an accept is its state; the report is the
+            # operator's. It must not be the share refusal either.
+            self.assertFalse([l for l in report if hidden.label in l], report)
+            outcomes.append(self.status({"id": r["id"]})["state"])
+        self.assertEqual(outcomes, ["failed", "failed"])
+
     def project_edit(self, template):
         return self.submit({"type": "project-edit", "title": "t", "project": "osint",
                             "add_templates": [template]})

@@ -26,6 +26,49 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.38] — 2026-10-19
+
+**A hidden project's disposable templates stay its own.** Found while reinstalling the test machine: qmcp let one
+disposable template be approved by a hidden project and by a project the hub sees. The hidden
+project's hide puts `qmcp-hubblind` on the template, a disposable is born with its template's
+tags, and the birth stamp refuses a child that arrives hidden for a project the hub sees: every
+disposable that project made from the template was rolled back ("birth stamp failed (rolled
+back)"), while `qmcp check` and the anonymity gate stayed GREEN. Nothing leaked; the stamp's
+refusal was the safe one.
+
+### Fixed
+
+- `qmcp project create` and `qmcp project edit` refuse to share a disposable template between a
+  hidden project and one the hub sees, either way round, naming the other project; an accepted
+  hub proposal to create a hidden project meets the same refusal. A disposable template that
+  wears `qmcp-hubblind` with no hidden project naming it is refused for a project the hub sees
+  too. Two hidden projects may still share one through these commands. `qmcp project edit
+  --template` and the window's edit form replace the whole list and check every template on it,
+  so they refuse while the list keeps a share made before this release; an edit of networks or
+  quota only is not checked, and an accepted `project-edit` proposal checks only the templates
+  it adds.
+- `qmcp check` warns ("hidden templates") when a project the hub sees approves a disposable
+  template that wears `qmcp-hubblind` or that a hidden project's record names: a share made
+  before this release, or one whose hidden project has let the template go or been deleted,
+  since the badge stays on the template. It names the template and the project; give that
+  project a disposable template of its own.
+- A hub proposal that names a disposable template a hidden project's record names fails as one
+  naming a qube that does not exist even when the template has lost its badge, so the proposal
+  layer and the command decide on the same facts and the hub learns nothing from which refused.
+- An anonymous project's command that named a template that does not exist said "no the
+  template 'NAME'"; it now says "the template 'NAME' does not exist" (and "the lead's template").
+- `qmcp open` said "(0 min)" for a window under a minute, and the check's open-window line "0 min
+  left": both now say seconds below a minute, as the window already did for the time left.
+- `install.sh --anonymous`, on the install that turned the mode on, named every qube of the mode
+  twice: its second stamping pass, which catches a qube the hub made meanwhile, now names only
+  the ones it stamps.
+
+### Upgrading
+
+Install over 0.9.37. A share made before stays until you change it: `qmcp check` names it. The
+window's project forms still list every template and show the command's refusal at OK. To roll
+back, install 0.9.37 over this one.
+
 ## [0.9.37] — 2026-10-19
 
 **A hand copy loses its owner badge.** A `qvm-clone` of a qube qmcp made copied its
