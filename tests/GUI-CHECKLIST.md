@@ -929,8 +929,8 @@ button is greyed out and the window waits for the report; that is not a hang.
     Refresh, select it. Expect *Qube to manage* `ai-t12` (never *Guarded
     qube to open*), *Equivalent command* `qmcp manage ai-t12`, and in red
     `MANAGES ai-t12: the hub may then run commands in it as root, copy files
-    out of it, write its firewall rules, clone it and remove it, with no time
-    limit` and `brings ai-t12 into AI space: today the hub cannot see it`.
+    out of it, write its firewall rules and clone it, with no time limit (it
+    removes it only if qmcp made it; otherwise only by a proposal you accept)` and `brings ai-t12 into AI space: today the hub cannot see it`.
     Tick the box, *Accept...*, OK. Expect a report `ai-t12: managed`, then
     `proposal N: accepted`, and `ai-t12` under the hub's "no slot".
 70. **The hub proposes revoking it.** `qvm-start ai-t12`. In the hub:

@@ -1108,15 +1108,24 @@ class RevokeForm(Form):
                          "listing it (Add a qube to AI space brings it back). Its default "
                          "disposable is set to none, and it is killed if it runs, which stops "
                          "what the hub had running in it, unless you leave it running. The "
-                         "qube itself is not removed." + (f" {note}" if note else ""))
+                         "qube itself is not removed, unless you tick Remove: then it is "
+                         "killed and removed with its storage, which cannot be undone."
+                         + (f" {note}" if note else ""))
         self.qube_name = name
         self.keep = _check(esc("leave it running"))
         self.keep.connect("toggled", self.update)
         self.row("Power", self.keep)
+        self.remove = _check(esc("then remove it and its storage (cannot be undone)"))
+        self.remove.connect("toggled", self.update)
+        self.row("Remove", self.remove)
         self.done_building()
 
     def build(self):
-        return gm.role("revoke", self.qube_name, keep_running=self.keep.get_active())
+        remove = self.remove.get_active()
+        _set(self.warning, esc(f"Removes {self.qube_name} and its storage after the revoke: "
+                               f"this cannot be undone." if remove else ""))
+        return gm.role("revoke", self.qube_name, keep_running=self.keep.get_active(),
+                       remove=remove)
 
 
 class OpenForm(Form):
@@ -2531,8 +2540,10 @@ class Window(Gtk.Window):
         one without a `check` refuses once the window has read another view
         than the one it opened on."""
         opened = self.view_gen
+        lowering = lowers
 
         def response(dialog, resp):
+            lowers = lowering() if callable(lowering) else lowering
             if resp != Gtk.ResponseType.OK:
                 dialog.destroy()
                 return
@@ -2665,8 +2676,10 @@ class Window(Gtk.Window):
         if ident == "move":
             return self._open(MoveForm(self, node.data, self.records), "Move")
         if ident == "revoke":
-            return self._open(RevokeForm(self, name, gm.revoke_note(node.data)), "Revoke",
-                              lowers=True)
+            form = RevokeForm(self, name, gm.revoke_note(node.data))
+            # A revoke only takes authority away and runs on any view; one that
+            # removes the qube cannot be undone, so it waits for a fresh one.
+            return self._open(form, "Revoke", lowers=lambda: not form.remove.get_active())
         if ident in ("manage", "guard"):
             return self._open(ConfirmForm(self, f"{ident.capitalize()} {name}", ident.capitalize(),
                                           gm.role_intro(ident, node.data, self.records),

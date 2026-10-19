@@ -167,6 +167,7 @@ class ServiceLines(ModeBase):
 
     def test_a_qube_the_call_removes_still_counts_by_the_badges_read_before(self):
         self.set_project("p01", "ram")
+        self.app.domains["ai-osint-w1"].tags.add("qmcp-owner_mcp-control")   # qmcp made it
         r = self.call("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1", "action": "remove"})
         self.assertTrue(r["ok"], r)
         self.assertIsNone(self.app.domains._any("ai-osint-w1"))

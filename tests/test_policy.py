@@ -189,12 +189,14 @@ def _permissive_text() -> str:
     return "\n".join(lines) + "\n"
 
 
-def _load(extra: dict[str, str] | None = None) -> FilePolicy:
+def _load(extra: dict[str, str] | None = None, ours: bool = True) -> FilePolicy:
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="qmcp-policy-"))
     try:
         shutil.copytree(UPSTREAM, tmp, dirs_exist_ok=True, symlinks=True)
         (tmp / "README.md").unlink(missing_ok=True)
-        shutil.copy(OURS, tmp / OURS.name)
+        (tmp / OURS.name).unlink(missing_ok=True)
+        if ours:
+            shutil.copy(OURS, tmp / OURS.name)
         for name, text in (extra or {}).items():
             (tmp / name).write_text(text)
         return FilePolicy(policy_path=tmp)
@@ -225,6 +227,13 @@ def _first_rule(policy, rules, service, source, target):
         if tgt:
             act += f" target={tgt}"
     return act, rule
+
+
+#: An expectation that is whatever the baseline says without our file. For a
+#: request our file leaves to upstream whose answer an install-time choice sets:
+#: where templates' updates go is sys-net or sys-whonix by the installer's
+#: "updates over Tor" box, so a fixed target would test the box, not our file.
+UPSTREAM_SAYS = "upstream's answer"
 
 
 def _base(outcome: str) -> str:
@@ -502,7 +511,7 @@ def _cases() -> list[Case]:
 
     # --- upstream behaviour this file leaves alone
     add("ai clock sync", "qubes.GetDate", "ai-work", "@default", "allow target=dom0", "allow")
-    add("RESIDUAL managed template updates", "qubes.UpdatesProxy", "ai-tpl", "@default", "allow target=sys-net", "allow")
+    add("RESIDUAL managed template updates", "qubes.UpdatesProxy", "ai-tpl", "@default", UPSTREAM_SAYS, "allow")
     add("appvm update proxy", "qubes.UpdatesProxy", "ai-work", "@default", "deny", "allow")
     add("operator qube untouched", "qubes.OpenInVM", "personal", "@dispvm", "allow", "allow")
 
@@ -607,6 +616,7 @@ class PolicyMatrix(unittest.TestCase):
         logging.getLogger().setLevel(logging.ERROR)
         cls.stock = _load()
         cls.permissive = _load({"40-test-permissive.policy": _permissive_text()})
+        cls.bare = _load(ours=False)
         cls.ours = {
             "stock": [r for r in cls.stock.rules if pathlib.Path(r.filepath).name == OURS.name],
             "permissive": [r for r in cls.permissive.rules if pathlib.Path(r.filepath).name == OURS.name],
@@ -615,8 +625,13 @@ class PolicyMatrix(unittest.TestCase):
     def _run(self, policy, field):
         bad = []
         for case in CASES:
-            got, _ = _first_rule(policy, policy.rules, case.service, case.source, case.target)
+            got, first = _first_rule(policy, policy.rules, case.service, case.source, case.target)
             want = getattr(case, field)
+            if want == UPSTREAM_SAYS:
+                if first is not None and pathlib.Path(first.filepath).name == OURS.name:
+                    bad.append(f"{case!r}: decided by our file, line {first.lineno}")
+                    continue
+                want, _ = _first_rule(self.bare, self.bare.rules, case.service, case.source, case.target)
             if got != want:
                 bad.append(f"{case!r}: got {got!r}, want {want!r}")
         return bad

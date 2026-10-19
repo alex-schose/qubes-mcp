@@ -126,6 +126,8 @@ PROPOSALS = {
                "qube": "personal"},
     "revoke": {"type": "qube-revoke", "title": "done with ai-work2", "qube": "ai-work2",
                "shutdown": False},
+    "remove": {"type": "qube-revoke", "title": "remove the qube I adopted", "qube": "ai-work2",
+               "remove": True},
     "install": {"type": "template-install", "title": "curl and jq for the reference template",
                 "template": "ai-tpl-g", "packages": ["curl", "jq"]},
 }
@@ -331,7 +333,7 @@ class GuiBase(ProjectBase):
     #: The fixtures `submit_every_proposal` decides as it goes: `dump` is
     #: accepted, the rest rejected, so a decision with a report is read as well
     #: and the pending ones stay under `proposals.MAX_PENDING`.
-    DECIDED = ("dump", "lead", "anon", "qfw", "qnone", "openfw", "manage", "revoke")
+    DECIDED = ("dump", "lead", "anon", "qfw", "qnone", "openfw", "manage", "revoke", "remove")
 
     def submit_every_proposal(self):
         """One proposal of every shape in PROPOSALS, through the real service:
@@ -339,7 +341,7 @@ class GuiBase(ProjectBase):
         so a decision with a report is read as well and the pending ones stay
         within the cap (`proposals.MAX_PENDING`). The cap is checked at submit,
         and PROPOSALS is longer than the cap, so the rejections are what keeps
-        room for the next shape added here (with 18 shapes and 8 decided, the
+        room for the next shape added here (with 19 shapes and 9 decided, the
         last one fills it). `open` and `install` stay PENDING: only a pending
         proposal shows its second-tick reasons, which is what the tests below
         read."""
@@ -564,7 +566,8 @@ SAMPLES = {
     gm.delete_project: [dict(key="osint")],
     gm.guard_qube: [dict(qube="x1")],
     gm.role: [dict(action="manage", qube="x1"), dict(action="guard", qube="x1"),
-              dict(action="revoke", qube="x1", keep_running=True)],
+              dict(action="revoke", qube="x1", keep_running=True),
+              dict(action="revoke", qube="x1", remove=True)],
     gm.open_qube: [dict(qube="x1", duration="2h"),
                    dict(qube="x1", duration="30m", firewall=True)],
     gm.seal_qube: [dict(qube="x1")],
@@ -800,6 +803,16 @@ class Model(GuiBase):
         names = {n.data.get("name") for n in gm.walk(tree) if n.kind == "qube"}
         self.assertNotIn("personal", names)                 # outside AI space: not in the tree
         self.assertNotIn(HUB, names)
+
+    def test_revoke_with_remove_is_the_commands_flag(self):
+        self.assertEqual(gm.role("revoke", "ai-work2", remove=True)[-1], "--remove")
+        self.assertNotIn("--remove", gm.role("revoke", "ai-work2"))
+        for bad in ({"keep_running": True, "remove": True},):
+            with self.assertRaises(gm.FormError):
+                gm.role("revoke", "ai-work2", **bad)
+        for action in ("manage", "guard"):
+            with self.assertRaises(gm.FormError):
+                gm.role(action, "ai-work2", remove=True)
 
     def test_roles_come_from_badges_and_records_never_the_label(self):
         before = [(n.key, n.cells) for n in gm.walk(self.tree())]
@@ -4147,7 +4160,8 @@ class Widgets(GuiBase):
             gm.move: (self.gui.MoveForm(self.win, row, self.win.records), {
                 "qube": "row_data", "target": "target", "confirm": "confirm"}),
             gm.role: (self.gui.RevokeForm(self.win, "ai-work2"), {
-                "action": "build", "qube": "qube_name", "keep_running": "keep"}),
+                "action": "build", "qube": "qube_name", "keep_running": "keep",
+                "remove": "remove"}),
             gm.open_qube: (self.gui.OpenForm(self.win, {"name": "ai-tpl-g"}), {
                 "qube": "qube_name", "duration": "duration", "firewall": "firewall"}),
             # The Settings tab's: what was read, and the gateways it may name.
@@ -4654,6 +4668,32 @@ class Widgets(GuiBase):
         self.release_all()
         self.runner.hold = False
 
+    def test_a_revoke_that_removes_says_so_and_waits_for_a_fresh_view(self):
+        # Revoke runs on any view; with Remove ticked it cannot be undone, so it
+        # says so in red and refuses while a refresh runs, as a grant does.
+        self.select("qube:ai-osint-w1")
+        form = self.win.act("revoke")
+        form.remove.set_active(True)
+        form.argv()
+        self.assertIn("cannot be undone", form.warning.get_text())
+        self.runner.hold = True
+        self.select("qube:ai-gw-unbadged")
+        self.win.act("guard").response(Gtk.ResponseType.OK)
+        self.runner.release()                                   # the change; its refresh starts
+        self.assertFalse(self.win.fresh)
+        writes = lambda: [c for c in self.runner.calls if c[:2] == list(gm.SUDO)]  # noqa: E731
+        before = writes()
+        form.response(Gtk.ResponseType.OK)
+        self.assertIn("a refresh is running", form.error.get_text())
+        self.assertEqual(writes(), before)
+        form.remove.set_active(False)                           # a plain revoke runs on it
+        form.argv()
+        self.assertEqual(form.warning.get_text(), "")
+        form.response(Gtk.ResponseType.OK)
+        self.assertEqual(len(writes()), len(before) + 1)
+        self.release_all()
+        self.runner.hold = False
+
     def test_while_a_refresh_runs_the_old_view_grants_nothing(self):
         # A view goes stale when its refresh starts: after a change, until the
         # refresh lands, only what takes authority away is on, and a form
@@ -4882,6 +4922,9 @@ class Widgets(GuiBase):
         forms.append(f)
         f = self.gui.RevokeForm(self.win, "ai-work")
         f.keep.set_active(True)
+        forms.append(f)
+        f = self.gui.RevokeForm(self.win, "ai-work")
+        f.remove.set_active(True)
         forms.append(f)
         for kind in ("managed", "guarded"):
             f = self.gui.AddForm(self.win, rows, HUB, [], gws)

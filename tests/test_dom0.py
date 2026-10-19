@@ -722,8 +722,13 @@ class Writes(Base):
         self.assertEqual(self.life("ai-tpl-g", "start"), core.GUARDED_REFUSAL)
         self.assertEqual(self.life("personal", "kill"), core.NOT_FOUND)
 
+    def created(self, name="ai-work2"):
+        # What every qmcp create stamps: the hub may remove only such a qube.
+        self.app.domains[name].tags.add("qmcp-owner_mcp-control")
+
     def test_remove_is_a_real_remove(self):
         self.assertEqual(self.life("ai-work", "remove")["error"], "action failed")   # running
+        self.created()
         self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
         self.assertNotIn("ai-work2", self.app.domains)
 
@@ -935,6 +940,7 @@ class Writes(Base):
         # The lock itself goes under the one the call holds; another qube's stay.
         self.seed_qube_locks("ai-work2")
         self.seed_qube_locks("ai-work")
+        self.created()
         self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
         self.assertEqual(self.qube_lock_files("ai-work2"), [])
         self.assertEqual(len(self.qube_lock_files("ai-work")), 2)
@@ -957,6 +963,7 @@ class Writes(Base):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             r["left"] = real(name, held)
             return r["left"]
+        self.created()
         with mock.patch.object(core, "retire_qube_locks", retire):
             self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
         self.assertEqual(self.qube_lock_files("ai-work2"), [queue])
@@ -2652,6 +2659,134 @@ class Windows(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================================================= removing what qmcp did not create
+
+class RemovingAQubeQmcpDidNotCreate(Base):
+    """The services remove only a qube wearing an owner badge (one qmcp
+    created); any other leaves AI space removed only by `qmcp revoke --remove`,
+    the operator's command or an accepted qube-revoke with remove."""
+
+    REFUSED = {"ok": False,
+               "error": "removing a qube qmcp did not create takes the operator's approval"}
+
+    def life(self, name, action):
+        return self.call("qmcp.LifecycleAIManaged", {"name": name, "action": action})
+
+    def tags(self, name):
+        return set(self.app.domains[name].tags.raw())
+
+    def test_the_hub_does_not_remove_a_qube_qmcp_did_not_create(self):
+        self.assertNotIn("qmcp-owner_mcp-control", self.tags("ai-work2"))
+        self.assertEqual(self.life("ai-work2", "remove"), self.REFUSED)
+        self.assertIn("ai-work2", self.app.domains)
+
+    def test_any_owner_badge_lets_the_hub_remove_it(self):
+        # A lead's worker, or a qube the hub created: provenance, whoever it was.
+        self.app.domains["ai-work2"].tags.add("qmcp-owner_ai-osint-lead")
+        self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
+        self.assertNotIn("ai-work2", self.app.domains)
+
+    def test_the_other_actions_still_work_on_it(self):
+        self.assertEqual(self.life("ai-work2", "start"), {"ok": True})
+        self.assertEqual(self.life("ai-work2", "kill"), {"ok": True})
+
+    def test_the_decision_read_failing_refuses_the_remove(self):
+        # The lead and owner checks rest on one strict read; when it fails,
+        # nothing is removed (core.tags_of raises, never answers "no badges").
+        self.app.domains["ai-work2"].tags.add("qmcp-owner_mcp-control")
+        real = core.tags_of
+
+        def failing(vm):
+            if sys._getframe(1).f_code.co_name == "svc_lifecycle":
+                raise core.Unreadable("injected")
+            return real(vm)
+        with mock.patch.object(core, "tags_of", failing):
+            r = self.life("ai-work2", "remove")
+        self.assertFalse(r.get("ok"), r)
+        self.assertIn("ai-work2", self.app.domains)
+        # The same read, answering, removes it: the failure above was the cause.
+        self.assertEqual(self.life("ai-work2", "remove"), {"ok": True})
+
+    # ------------------------------------------------ the operator's command
+    def test_revoke_remove_removes_it(self):
+        msg = fleet.revoke(self.app, "ai-work2", remove=True)
+        self.assertTrue(msg.endswith(", removed"), msg)
+        self.assertNotIn("ai-work2", self.app.domains)
+
+    def test_revoke_remove_kills_a_running_qube_first(self):
+        self.assertEqual(self.app.domains["ai-work"].get_power_state(), "Running")
+        self.app.vm("ai-leaf", template=self.app.domains["ai-debian-13"], netvm=None,
+                    tags={"ai-managed"}, power="Running")
+        msg = fleet.revoke(self.app, "ai-leaf", remove=True)
+        self.assertIn("killed", msg)
+        self.assertNotIn("ai-leaf", self.app.domains)
+
+    def refused(self, name, words, **kw):
+        before = self.tags(name)
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, name, remove=True, **kw)
+        self.assertIn(words, str(cm.exception))
+        self.assertIn("nothing was changed", str(cm.exception))
+        self.assertIn(name, self.app.domains)
+        self.assertEqual(self.tags(name), before)
+        return str(cm.exception)
+
+    def test_revoke_remove_refuses_a_guarded_qube(self):
+        self.refused("ai-tpl-g", "guarded")
+
+    def test_revoke_remove_refuses_a_gateway(self):
+        self.refused("ai-net-router", "guarded")
+
+    def test_revoke_remove_refuses_a_qube_others_are_built_on(self):
+        msg = self.refused("ai-debian-13", "in use by")
+        self.assertIn("ai-work", msg)
+
+    def test_revoke_remove_refuses_a_qube_another_starts_disposables_from(self):
+        dvm = self.app.vm("ai-ddvm", template=self.app.domains["ai-debian-13"], netvm=None,
+                          template_for_dispvms=True, tags={"ai-managed"})
+        self.app.domains["ai-work2"]._props["default_dispvm"] = dvm
+        self.refused("ai-ddvm", "in use by")
+
+    def test_revoke_remove_refuses_a_qube_outside_ai_space(self):
+        # The operator's own command too: one mistyped name is no remove.
+        self.refused("personal", "not in AI space")
+
+    def test_revoke_remove_refuses_a_qube_a_global_setting_names(self):
+        for prop in ("default_dispvm", "updatevm", "management_dispvm"):
+            with self.subTest(prop=prop):
+                setattr(self.app, prop, self.app.domains["ai-work2"])
+                msg = self.refused("ai-work2", "in use by")
+                self.assertIn(f"the global {prop}", msg)
+                setattr(self.app, prop, None)
+
+    def test_revoke_remove_refuses_dom0s_default_disposable_template(self):
+        dvm = self.app.vm("ai-ddvm0", template=self.app.domains["ai-debian-13"], netvm=None,
+                          template_for_dispvms=True, tags={"ai-managed"})
+        self.app.domains["dom0"]._props["default_dispvm"] = dvm
+        msg = self.refused("ai-ddvm0", "in use by")
+        self.assertIn("dom0", msg)
+
+    def test_revoke_remove_never_leaves_it_running(self):
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-work2", shutdown=False, remove=True)
+        self.assertIn("cannot be left running", str(cm.exception))
+        self.assertIn("ai-managed", self.tags("ai-work2"))
+
+    def test_revoke_remove_refuses_when_what_uses_it_cannot_be_read(self):
+        self.app.fail_reads("get.template:ai-work", "fail")
+        self.refused("ai-work2", "could not be read")
+        self.assertGreater(sum(self.app.failed.values()), 0)
+
+    def test_a_remove_that_fails_after_the_revoke_says_so(self):
+        self.app.fail.add("remove")
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-work2", remove=True)
+        self.assertIn("NOT removed", str(cm.exception))
+        self.assertIn("qvm-remove ai-work2", str(cm.exception))
+        self.assertIn("ai-work2", self.app.domains)
+        self.assertNotIn("ai-managed", self.tags("ai-work2"))     # out of AI space all the same
 
 
 # ======================================================================= taking authority away

@@ -568,8 +568,12 @@ def _qubes_shutdown(args: dict) -> dict:
 @_register("qubes_remove", """
     Remove a managed qube and its storage. It must be shut down first.
 
-    This cannot be undone. A guarded qube is refused; one that is out of scope
-    or does not exist is reported as "not found".
+    This cannot be undone. Only a qube qubes-mcp created (by any of its
+    creates, the operator's included) can be removed this way: one the operator brought into AI space
+    is refused ("removing a qube qmcp did not create takes the operator's
+    approval"), and the hub may ask for it with qubes_propose_revoke and
+    remove true (or by deleting a project it is a member of). A lead and a guarded qube are refused too; one that is out
+    of scope or does not exist is reported as "not found".
 
     Returns {"ok": true} or {"ok": false, "error": "<reason>"}.
     """, {
@@ -1614,8 +1618,15 @@ def _qubes_propose_manage(args: dict) -> dict:
     qubes_propose_manage. It is killed if it runs, unless shutdown is false,
     so what this hub had running in it is stopped; killing a gateway cuts the
     network of every qube on it. Nothing is removed but a disposable, which
-    Qubes removes when it stops: the qube and its files stay, outside AI
-    space.
+    Qubes removes when it stops, unless remove is true: the qube and its
+    files stay, outside AI space. With remove true, accepting also removes
+    the qube and its storage, which cannot be undone: the way to have a qube
+    qubes-mcp did not create removed (qubes_remove refuses one), besides
+    deleting a project it is a member of. The command
+    then refuses, with nothing changed, a guarded qube, a project's model
+    qube, a qube a project lists (its lead, dump sink, an approved template
+    or a worker network), a qube others use as their template, default
+    disposable template or network, and one a global setting names.
 
     The command refuses a project's lead (removed or replaced with
     qubes_propose_lead) and a qube held for review, and accepting fails for a
@@ -1624,6 +1635,9 @@ def _qubes_propose_manage(args: dict) -> dict:
     tick, and those words are what they read.
 
     - qube: the qube to revoke.
+    - remove: true to remove the qube after revoking it; it is killed first,
+      so shutdown false with it is refused at submit. Omitted, null or false,
+      nothing is removed.
     - shutdown: false to leave it running, which only a guarded qube that is
       not open may be: one this hub could run commands in is always killed,
       so what this hub started in it does not run on outside AI space, and
@@ -1637,6 +1651,8 @@ def _qubes_propose_manage(args: dict) -> dict:
         "qube": _prop("string", "The qube to revoke."),
         "shutdown": _prop(["boolean", "null"], "false leaves the qube running. Omitted or null, "
                                                "it is killed if it runs (true)."),
+        "remove": _prop(["boolean", "null"], "true also removes the qube and its storage, "
+                                             "after the revoke. Omitted or null: false."),
     }, required=("title", "qube"))
 def _qubes_propose_revoke(args: dict) -> dict:
     return _submit("qube-revoke", args)

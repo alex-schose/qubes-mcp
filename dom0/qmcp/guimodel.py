@@ -462,16 +462,23 @@ def delete_project(key) -> list:
     return write_cmd("project", "delete", _key(key), "--yes")
 
 
-def role(action, qube, keep_running=False) -> list:
+def role(action, qube, keep_running=False, remove=False) -> list:
     """Manage, guard or revoke; Add to AI space guards a qube outside it with
-    this. The Guard button on a row is `guard_qube`."""
+    this. The Guard button on a row is `guard_qube`. `remove`: revoke, then
+    remove it (`--remove`), which kills it first."""
     if action not in ("manage", "guard", "revoke"):
         raise FormError(f"unknown action {action}")
     argv = write_cmd(action, _qube(qube, "the qube"))
     if keep_running:
         if action != "revoke":
             raise FormError("only revoke shuts a qube down")
+        if remove:
+            raise FormError("a removed qube is killed first: it cannot be left running")
         argv.append("--no-shutdown")
+    if remove:
+        if action != "revoke":
+            raise FormError("only revoke removes a qube")
+        argv.append("--remove")
     return argv
 
 
@@ -1786,6 +1793,7 @@ PROPOSAL_OPTION_HEADINGS = {
     ("qube-open", "qube"): "Guarded qube to open",
     ("qube-manage", "qube"): "Qube to manage",
     ("qube-revoke", "qube"): "Qube to revoke",
+    ("qube-revoke", "remove"): "Then remove the qube and its storage",
 }
 
 

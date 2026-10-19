@@ -17,6 +17,10 @@ Every probe is expected to be REFUSED and to be refused WITHOUT a dialog: an
 `ask` here would wait for a human, so each probe runs under a timeout and a
 probe that hangs is reported as a failure, not a pass. Exits 0 GREEN, 2 FAILED,
 3 INCOMPLETE.
+
+The probes on `QMCP_SEAT_GUARDED` (default `ai-net-router`) run only when the
+hub's list shows it guarded: a qube outside AI space is refused anyway, so a
+refusal there would test no guard. Otherwise they are NOT-RUN.
 """
 from __future__ import annotations
 
@@ -134,8 +138,17 @@ def from_hub(inside, lead=None, model=None):
     refused_raw("admin.vm.tag.Set on an AI qube", inside, "admin.vm.tag.Set+ai-full")
     refused_raw("admin.vm.property.Set on an AI qube", inside, "admin.vm.property.Set+template")
     refused_raw("policy.Get", "@adminvm", "policy.Get")
-    refused_raw("exec into a guarded qube", GUARDED_QUBE, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
-    refused_raw("firewall write on a guarded qube", GUARDED_QUBE, "admin.vm.firewall.Set", b"action=accept\n")
+    # A refusal of a qube outside AI space proves nothing about the guard:
+    # the probes run only on a qube the hub's own list shows guarded.
+    listed = {q["name"]: q for q in call("qubes_list").get("qubes", [])}
+    if listed.get(GUARDED_QUBE, {}).get("guarded") is True:
+        refused_raw("exec into a guarded qube", GUARDED_QUBE, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
+        refused_raw("firewall write on a guarded qube", GUARDED_QUBE, "admin.vm.firewall.Set",
+                    b"action=accept\n")
+    else:
+        for name in ("exec into a guarded qube", "firewall write on a guarded qube"):
+            not_run(name, f"{GUARDED_QUBE} is not listed guarded: set QMCP_SEAT_GUARDED to a "
+                          f"guarded qube in AI space")
     refused_raw("exec outside AI space", OUTSIDE_QUBE, "qmcp.RunInAIManaged", b'{"cmd":["true"]}')
     refused_raw("raw @dispvm shell from the hub", "@dispvm", "qubes.VMShell", b"true\n")
     rc, out = raw("@adminvm", "qmcp.SetPropertyAIManaged", b'{"name":"' + b"x" * 70000 + b'"}')

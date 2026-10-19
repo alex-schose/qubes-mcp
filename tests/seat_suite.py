@@ -16,6 +16,12 @@ box and its fixture names; this never touches theirs.
 Reports PASS / FAIL / NOT-RUN per check and exits 0 GREEN, 2 FAILED,
 3 INCOMPLETE. INCOMPLETE is not green.
 
+`QMCP_SEAT_GUARDED` (default `ai-net-router`) names a guarded qube in AI space;
+its checks are NOT-RUN while the hub's list shows no guarded qube of that name
+(the README's setup guards no router), and the redaction of its network is
+tested only when that network is neither none nor an enrolled gateway: a router guarded in
+AI space on `sys-firewall` is the fixture that runs them all.
+
 Copies between the hub's own qubes (p00) need no dialog, and the suite copies
 between two of them. Other copies out of AI space need the operator's dialog,
 so the suite asserts only the dialog-free paths: a copy into a guarded qube is
@@ -71,9 +77,22 @@ def spawn(suffix, **kw):
 
 #: The gateways the operator enrolled, read from the hub's pool stats.
 ENROLLED: set = set()
+#: Why the checks on QMCP_SEAT_GUARDED cannot run, or None. The README's setup
+#: guards no router, so a box set up by it has no guarded qube under the
+#: default name: its checks are NOT-RUN (INCOMPLETE, not green), never FAIL.
+GUARD_WHY: str | None = None
+
+
+def gcheck(name, ok, detail=""):
+    """A check on the guarded qube, NOT-RUN while the box holds none."""
+    if GUARD_WHY:
+        not_run(name, GUARD_WHY)
+        return False
+    return check(name, ok, detail)
 
 
 def main() -> int:
+    global GUARD_WHY
     keep = "--keep" in sys.argv
     t0 = time.monotonic()
 
@@ -86,7 +105,11 @@ def main() -> int:
         check("fixture names are free", False, f"something already uses {PREFIX}-*; aborting")
         return report(t0)
     check("template is listed managed", by.get(TEMPLATE, {}).get("guarded") is False, str(by.get(TEMPLATE)))
-    check("gateway is listed guarded", by.get(GUARDED_QUBE, {}).get("guarded") is True, str(by.get(GUARDED_QUBE)))
+    if by.get(GUARDED_QUBE, {}).get("guarded") is not True:
+        GUARD_WHY = (f"{GUARDED_QUBE} is not listed guarded ({by.get(GUARDED_QUBE)}): set "
+                     f"QMCP_SEAT_GUARDED to a guarded qube in AI space, ideally a router on a "
+                     f"network outside it")
+    gcheck("the guarded qube is listed guarded", True)
     check("hub and operator qubes are not listed",
           "mcp-control" not in by and OUTSIDE_QUBE not in by and "dom0" not in by)
 
@@ -109,9 +132,18 @@ def main() -> int:
     b = call("qubes_props_get", name="no-such-qube-zz", properties=["memory"])
     check("out of scope reads like nonexistent", a == b and a.get("ok") is False, f"{a} vs {b}")
     r = call("qubes_props_get", name=GUARDED_QUBE, properties=["netvm", "tags"])
-    check("a guarded qube is readable, outside names redacted",
-          r.get("ok") and r["values"].get("netvm") == "<out-of-scope>"
-          and r["values"].get("tags") == ["ai-managed", "qmcp-guarded"], json.dumps(r))
+    v = r.get("values", {}) if r.get("ok") else {}
+    gcheck("a guarded qube is readable, its badges filtered",
+           r.get("ok") is True and v.get("tags") == ["ai-managed", "qmcp-guarded"], json.dumps(r))
+    # The hub may see an enrolled gateway's name wherever it sits, so the
+    # redaction is tested only on a network that is neither one nor none.
+    if not GUARD_WHY and (v.get("netvm") is None or v.get("netvm") in ENROLLED):
+        not_run("a guarded qube's network outside AI space is redacted",
+                f"{GUARDED_QUBE}'s network is {v.get('netvm')!r}, which the hub may see; set "
+                f"QMCP_SEAT_GUARDED to a guarded qube on a network outside AI space")
+    else:
+        gcheck("a guarded qube's network outside AI space is redacted",
+               v.get("netvm") == "<out-of-scope>", json.dumps(r))
 
     # ---------------------------------------------------------------- creates
     r = call("qubes_spawn", name="not-in-prefix-zz", template=TEMPLATE)
@@ -142,12 +174,12 @@ def main() -> int:
 
     # ---------------------------------------------------------------- guarded
     r = call("qubes_start", name=GUARDED_QUBE)
-    check("lifecycle on a guarded qube refused", r.get("error") == "guarded: reference only", json.dumps(r))
+    gcheck("lifecycle on a guarded qube refused", r.get("error") == "guarded: reference only", json.dumps(r))
     r = call("qubes_run", name=GUARDED_QUBE, cmd=["true"])
-    check("exec into a guarded qube refused by policy", r == {"ok": False, "error": "not found or refused"},
+    gcheck("exec into a guarded qube refused by policy", r == {"ok": False, "error": "not found or refused"},
           json.dumps(r))
     r = call("qubes_firewall_set", name=GUARDED_QUBE, rules="action=accept\n")
-    check("firewall write on a guarded qube refused", r.get("ok") is False, json.dumps(r))
+    gcheck("firewall write on a guarded qube refused", r.get("ok") is False, json.dumps(r))
 
     # ---------------------------------------------------------------- run, events
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
@@ -169,7 +201,7 @@ def main() -> int:
     src = "/home/user/qmcp-seat-copy.txt"
     call("qubes_run", name=w, cmd=f"echo seat-{RUN} > {src}", shell=True, timeout=30)
     r = call("qubes_copy", source=w, target=GUARDED_QUBE, path=src, timeout=60)
-    check("copy into a guarded qube refused, no dialog",
+    gcheck("copy into a guarded qube refused, no dialog",
           r.get("ok") is False and "does not exist" not in str(r.get("error")), json.dumps(r))
 
     # ---------------------------------------------------------------- clone, and templates the hub builds
@@ -185,7 +217,7 @@ def main() -> int:
         r = call("qubes_props_get", name=c, properties=["tags"])
         check("the clone is managed", r.get("values", {}).get("tags") == ["ai-managed"], json.dumps(r))
     r = call("qubes_clone", source=GUARDED_QUBE, name=f"{PREFIX}-gc")
-    check("clone of a guarded qube refused", r.get("error") == "guarded: reference only", json.dumps(r))
+    gcheck("clone of a guarded qube refused", r.get("error") == "guarded: reference only", json.dumps(r))
     # The hub's own AppVMs share p00: a copy between them needs no dialog.
     if c in created:
         call("qubes_start", name=w)

@@ -307,7 +307,8 @@ def _model_qube(value, allow_none: bool) -> str:
 OPTIONAL = {"project-create": frozenset({"model", "model_qube", "anonymous", "hub_sees",
                                          "lead_class"}),
             "project-lead": frozenset({"model", "add_old_network", "model_qube", "lead_class"}),
-            "project-firewall": frozenset({"model", "rules", "model_qube"})}
+            "project-firewall": frozenset({"model", "rules", "model_qube"}),
+            "qube-revoke": frozenset({"remove"})}
 
 
 def _optional(out: dict, req: dict, model_qube_none: bool = False) -> dict:
@@ -483,12 +484,21 @@ def _manage(req: dict, prefix) -> dict:
 
 
 def _revoke(req: dict, prefix) -> dict:
-    """`qmcp revoke QUBE [--no-shutdown]`. The normal form carries `shutdown`
-    whether or not it was sent, so it reads back as itself."""
-    _fields(req, {"qube"}, {"shutdown"})
+    """`qmcp revoke QUBE [--no-shutdown] [--remove]`. The normal form carries
+    `shutdown` whether or not it was sent, so it reads back as itself, and
+    `remove` only when it is true, so a proposal stored before it existed
+    reads back as itself too. A remove kills first, so it never keeps the
+    qube running."""
+    _fields(req, {"qube"}, {"shutdown", "remove"})
     shutdown = req.get("shutdown")
-    return {"qube": _qube(req["qube"], "qube"),
-            "shutdown": True if shutdown is None else _bool(shutdown, "shutdown")}
+    out = {"qube": _qube(req["qube"], "qube"),
+           "shutdown": True if shutdown is None else _bool(shutdown, "shutdown")}
+    remove = req.get("remove")
+    if remove is not None and _bool(remove, "remove"):
+        if not out["shutdown"]:
+            raise Invalid("remove: a removed qube is killed first, so shutdown cannot be false")
+        out["remove"] = True
+    return out
 
 
 def _install(req: dict, prefix) -> dict:
@@ -980,7 +990,8 @@ def command(p: dict) -> str | None:
     elif t == "qube-manage":
         argv = ["qmcp", "manage", p["qube"]]
     elif t == "qube-revoke":
-        argv = ["qmcp", "revoke", p["qube"]] + ([] if p["shutdown"] else ["--no-shutdown"])
+        argv = ["qmcp", "revoke", p["qube"]] + ([] if p["shutdown"] else ["--no-shutdown"]) \
+            + (["--remove"] if p.get("remove") else [])
     elif t == "template-install":
         argv = ["qmcp", "template", "install", p["template"]] + list(p["packages"])
     return None if argv is None else shlex.join(argv)
@@ -1146,14 +1157,20 @@ def _qube_reasons(app, p: dict, records: dict) -> list:
     out = []
     if t == "qube-manage":
         out.append(f"MANAGES {q}: the hub may then run commands in it as root, copy files out of "
-                   f"it, write its firewall rules, clone it and remove it, with no time limit "
+                   f"it, write its firewall rules and clone it, with no time limit (it removes it "
+                   f"only if qmcp made it; otherwise only by a proposal you accept) "
                    f"(an open window is the bounded way into a guarded qube)")
     elif t == "qube-revoke":
         out.append(f"REVOKES {q}: every qmcp badge comes off, so it leaves AI space and any slot "
-                   f"it is in; after that the hub reaches it only through your dialogs, and "
-                   f"what it left on its disk stays"
+                   f"it is in; after that the hub reaches it only through your dialogs"
+                   + ("" if p.get("remove") else ", and what it left on its disk stays")
                    + ("; it is killed if it runs, and what the hub had running in it is stopped"
                       if p["shutdown"] else "; it keeps running"))
+        if p.get("remove"):
+            out.append(f"REMOVES {q} after that, with its storage: this cannot be undone, and "
+                       f"what is on its disk is gone (refused, with nothing changed, if it is "
+                       f"guarded, a model qube, listed by a project, or used by other qubes or a "
+                       f"global setting)")
     else:
         out.append(f"INSTALLS {len(p['packages'])} package(s) into the template {q} as root, "
                    f"with its own package manager, from the repositories it already trusts, "
@@ -1449,7 +1466,8 @@ def _execute(app, p: dict) -> list:
         return report
     if t == "qube-revoke":
         report = fleet.Report()
-        report.append(fleet.revoke(app, p["qube"], shutdown=p["shutdown"], from_hub=True))
+        report.append(fleet.revoke(app, p["qube"], shutdown=p["shutdown"], from_hub=True,
+                                   remove=bool(p.get("remove"))))
         return report
     if t == "template-install":
         return install_report(app, p["template"], p["packages"])
@@ -1514,6 +1532,10 @@ def _refusal_seen(app, p: dict, vm, tags):
                 core.GUARDED not in tags or tags & {core.OPEN, core.OPEN_FW}):
             return (f"the hub could run commands in {name}, so a hub's proposal to revoke it "
                     f"kills it")
+        if p["type"] == "qube-revoke" and p.get("remove"):
+            why = fleet._remove_refusal(app, vm, name, tags, plan=True)
+            if why:
+                return why.replace(f"'{name}'", name)
     except (core.Unreadable, fleet.RoleError):
         return None
     return None

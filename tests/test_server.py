@@ -2006,6 +2006,12 @@ PAYLOAD_CASES = [
         # null is "not given", as everywhere: stored as leaving it out is.
         ("qubes_propose_revoke", "qube-revoke", {
             "title": "Hand it back", "qube": "ai-osint-w2", "shutdown": None}),
+        # remove true joins the normal form; false and null are left out, so
+        # a proposal stored before 0.9.36 reads back as itself.
+        ("qubes_propose_revoke", "qube-revoke", {
+            "title": "Remove the qube I adopted", "qube": "ai-osint-w2", "remove": True}),
+        ("qubes_propose_revoke", "qube-revoke", {
+            "title": "Hand it back", "qube": "ai-osint-w2", "remove": False}),
         ("qubes_propose_packages", "template-install",
          MINIMAL_PROPOSALS["qubes_propose_packages"]),
         ("qubes_propose_packages", "template-install", {

@@ -575,9 +575,20 @@ def svc_lifecycle(app, call, req):
     vm = _operate(app, call, name)
     if action not in LIFECYCLE_ACTIONS:
         raise refuse(f"action must be one of: {sorted(LIFECYCLE_ACTIONS)}")
-    # A lead is a project's identity: removing one takes the operator's approval.
-    if action == "remove" and projects.LEAD in core.tags_of(vm):
-        raise refuse("removing a lead takes the operator's approval")
+    if action == "remove":
+        # One strict read for both: a read that fails raises, so neither
+        # refusal is skipped on it.
+        tags = core.tags_of(vm)
+        # A lead is a project's identity: removing one takes the operator's approval.
+        if projects.LEAD in tags:
+            raise refuse("removing a lead takes the operator's approval")
+        # A qube with no owner badge (brought in with qmcp manage, say) is
+        # removed only by the operator: their own command, or a proposal they
+        # accept (a qube-revoke with remove, a project-delete). The badge gates
+        # here in one direction only: lacking it takes authority away, and only
+        # dom0 writes tags, so AI space cannot add one.
+        if not any(t.startswith(birth.OWNER_PREFIX) for t in tags):
+            raise refuse("removing a qube qmcp did not create takes the operator's approval")
     # The gate may stop the qube between the check above and the start: read
     # again right before waking it.
     if action in ("start", "unpause") and projects.BLOCKED in core.tags_of(vm):

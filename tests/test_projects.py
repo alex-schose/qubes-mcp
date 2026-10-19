@@ -278,9 +278,35 @@ class LeadWrites(ProjectBase):
         self.assertIn("operator-only", r["error"])
 
     def test_a_lead_removes_its_workers(self):
+        self.app.domains["ai-osint-w1"].tags.add(f"qmcp-owner_{LEAD}")     # it made it
         self.assertEqual(self.lcall("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1", "action": "remove"}),
                          {"ok": True})
         self.assertNotIn("ai-osint-w1", self.app.domains)
+
+    def test_revoke_remove_refuses_a_projects_approved_template(self):
+        before = set(self.app.domains["ai-debian-13"].tags.raw())
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, "ai-debian-13", remove=True)
+        self.assertIn("approved template or worker network of osint", str(cm.exception))
+        self.assertEqual(set(self.app.domains["ai-debian-13"].tags.raw()), before)
+
+    def test_revoke_remove_refuses_a_recorded_lead_stripped_of_its_badges(self):
+        # Hand-tampered tags: the record still names it, so it is not removed.
+        vm = self.app.domains[LEAD]
+        for t in ("qmcp-lead", "qmcp-lead-p01"):
+            vm.tags.discard(t)
+        vm.kill() if vm.get_power_state() != "Halted" else None
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, LEAD, remove=True)
+        self.assertIn("lead or dump sink a project's record names", str(cm.exception))
+        self.assertIn(LEAD, self.app.domains)
+        self.assertIn("ai-managed", set(vm.tags.raw()))
+
+    def test_a_lead_does_not_remove_a_member_qmcp_did_not_create(self):
+        # Brought in by the operator (qmcp manage, then project move): no owner badge.
+        r = self.lcall("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1", "action": "remove"})
+        self.assertEqual(r["error"], "removing a qube qmcp did not create takes the operator's approval")
+        self.assertIn("ai-osint-w1", self.app.domains)
 
     def test_a_guarded_member_is_still_guarded(self):
         self.app.domains["ai-osint-w1"].tags.add("qmcp-guarded")
@@ -429,6 +455,11 @@ class HubWithProjects(ProjectBase):
         self.assertEqual(r["error"], "removing a lead takes the operator's approval")
         self.assertIn(LEAD, self.app.domains)
         self.assertEqual(self.call("qmcp.LifecycleAIManaged", {"name": LEAD, "action": "kill"}), {"ok": True})
+        # The lead's refusal comes first, whatever its owner badge.
+        self.app.domains[LEAD].tags.add("qmcp-owner_dom0")
+        r = self.call("qmcp.LifecycleAIManaged", {"name": LEAD, "action": "remove"})
+        self.assertEqual(r["error"], "removing a lead takes the operator's approval")
+        self.app.domains["ai-osint-w1"].tags.add(f"qmcp-owner_{LEAD}")
         self.assertEqual(self.call("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1", "action": "remove"}),
                          {"ok": True})
         r = self.call("qmcp.SetPropertyAIManaged", {"name": LEAD, "property": "netvm", "value": None})

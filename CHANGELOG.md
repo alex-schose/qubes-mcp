@@ -26,6 +26,59 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.36] — 2026-10-19
+
+**AI removes only what qmcp created.** The hub and a lead can no longer remove a qube qmcp did
+not create, such as one brought into AI space with `qmcp manage`; the hub asks with a revoke
+proposal that also removes it, and the operator accepts.
+
+### Changed
+
+- **BREAKING:** `qmcp.LifecycleAIManaged` (`qubes_remove`) refuses `remove` from the hub or a
+  lead for a qube that wears no `qmcp-owner_*` badge: "removing a qube qmcp did not create takes
+  the operator's approval". Every qmcp create stamps that badge, a revoke takes it off, and only
+  dom0 writes tags, so what it refuses is a qube the operator brought into AI space with none
+  (`qmcp manage`, an accepted `qube-manage`), a qube revoked and brought back, and a qube from a
+  release before owner badges; a hand `qvm-clone` of a qube that wears one copies it. The tag
+  read is strict: a read that fails refuses. The hub has such a qube removed by a proposal the
+  operator accepts: a `qube-revoke` with `remove` (below), or a `project-delete` it is a member
+  of. The operator's own commands are unchanged.
+
+### Added
+
+- `qmcp revoke QUBE --remove`: revoke, kill, then remove the qube with its storage. Before it
+  changes anything it refuses a qube outside AI space, a guarded qube (a gateway is one), a qube
+  a project's record names as its model qube, lead, dump sink, approved template or worker
+  network, a qube a model badge marks, a qube
+  another qube (dom0 included) uses as its template, default disposable template or network, a
+  qube a global setting (`qubes-prefs`) names, and a read of those that fails; `--no-shutdown`
+  with it is refused. A remove that fails after the revoke (Qubes refuses more than this sees,
+  such as a qube another qube's management disposable or GUI qube names) leaves the qube revoked
+  and killed, and says it was not removed.
+- `qube-revoke` proposals take `remove` (`qubes_propose_revoke`'s `remove: true`): accepting runs
+  `qmcp revoke QUBE --remove`. The second tick says it removes the qube, and `show`'s plan names
+  the refusals it can see (a read that fails there is no refusal). `remove` with `shutdown`
+  false is refused at submit; a proposal stored before 0.9.36 reads back as itself.
+- A `qube-manage`'s second tick no longer says the hub may remove the qube: it removes it only
+  if qmcp made it.
+- The window's Revoke form has a Remove tick, which says in red that the remove cannot be
+  undone; with it ticked, OK refuses unless the window's last refresh read everything and none
+  has run since the form opened, as for a form that grants (a plain revoke still runs on any
+  view). The proposal pane names the option.
+
+### Fixed
+
+- The policy matrix's row for templates' updates no longer pins where they go: it asks the
+  baseline without our file, so `QMCP_POLICY_BASELINE=/etc/qubes/policy.d` passes on a box
+  installed with updates over Tor, and the row still fails when our file decides it (found on the
+  reinstalled development box).
+- `tests/seat_suite.py` and `tests/redteam_suite.py` report the checks on `QMCP_SEAT_GUARDED` as
+  NOT-RUN when no guarded qube of that name is listed, as on a box set up by the README, which
+  guards no router; before, the seat suite failed them and the red-team suite passed its two
+  without testing a guard. The seat suite tests the redaction of a guarded qube's network only
+  on a network that is neither none nor an enrolled gateway.
+- README: the qubes-devel thread reviewed the May 2026 design, which has changed since.
+
 ## [0.9.35] — 2026-10-18
 
 **What the reinstall rehearsal left.** An export says which qubes wait for review, the gate's

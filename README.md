@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.35 — what the reinstall rehearsal left.** Besides the hub, up to 15
+**Status: 0.9.36 — AI removes only what qmcp created.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -121,7 +121,8 @@ Next: 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced th
 - **Proposals.** The hub cannot create a project, change or remove a lead,
   delete a project, change a project's templates, networks or quota, change
   a lead's firewall, open a guarded qube, bring a qube into AI space or take
-  one out, or install packages into a guarded template. It
+  one out, remove a qube qmcp did not create (one you brought into AI space),
+  or install packages into a guarded template. It
   may propose each of those, as the options of one `qmcp` command,
   and the operator accepts or rejects it in dom0, in the window or with
   `qmcp proposal accept` or `reject`: accepting runs that command's own
@@ -183,7 +184,7 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | Tool | |
 |---|---|
 | `qubes_list`, `qubes_state`, `qubes_props_get` | what is in scope, and its properties |
-| `qubes_spawn`, `qubes_clone`, `qubes_remove` | create (AppVM, standalone, disposable template, named disposable) and remove |
+| `qubes_spawn`, `qubes_clone`, `qubes_remove` | create (AppVM, standalone, disposable template, named disposable), and remove a qube qmcp created |
 | `qubes_start`, `qubes_shutdown` | lifecycle |
 | `qubes_props_set`, `qubes_feature_set` | label/memory/maxmem/vcpus, netvm only to none; features on an allowlist |
 | `qubes_run`, `qubes_copy` | run a command as root in a managed qube; copy a file out of one (by your dialog, but inside a slot) |
@@ -192,7 +193,7 @@ The full design, and the risks it accepts, are in [CLAUDE.md](CLAUDE.md).
 | `qubes_events` | a window of events for qubes in scope |
 | `qubes_get_pool_stats` | the caller's disk budget: AI space, every project's record but a hidden one's, and the enrolled gateways for the hub, the project for a lead, with the names, templates and networks a lead may use and its model (an endpoint, or a model qube and its port) |
 | `qubes_propose_project`, `qubes_propose_project_edit`, `qubes_propose_dump`, `qubes_propose_lead`, `qubes_propose_lead_firewall`, `qubes_propose_project_delete` | the hub asks the operator for a project, a change to one, a dump sink, a new lead or none, a lead's new firewall, a deletion |
-| `qubes_propose_open`, `qubes_propose_manage`, `qubes_propose_revoke`, `qubes_propose_packages` | the hub asks for a window on a guarded qube, a qube brought into AI space or out of the guarded state, a qube taken out of AI space, or exact packages installed into a template in AI space |
+| `qubes_propose_open`, `qubes_propose_manage`, `qubes_propose_revoke`, `qubes_propose_packages` | the hub asks for a window on a guarded qube, a qube brought into AI space or out of the guarded state, a qube taken out of AI space (and removed, with `remove`), or exact packages installed into a template in AI space |
 | `qubes_proposals` | what became of the hub's proposals: pending, accepted, rejected, expired or failed |
 
 The hub and a lead run the same server and see the same tools; dom0 scopes
@@ -236,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.35.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.36.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -289,6 +290,24 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 0.9.35? Install over it. **Breaking:** the hub and a lead can no
+longer remove a qube qmcp did not create, such as one you brought into AI
+space with `qmcp manage`: `qubes_remove` refuses it ("removing a qube qmcp did
+not create takes the operator's approval"). The hub asks with
+`qubes_propose_revoke` and `remove` true, and accepting revokes, kills and
+removes it; `sudo qmcp revoke QUBE --remove` does the same by hand. It refuses
+a qube outside AI space, a guarded qube, a model qube, a qube a project lists
+(its lead, dump sink, an approved template or a worker network), and a qube
+other qubes or a global setting use,
+before it changes anything (a qube Qubes refuses to remove for another reason
+is revoked and killed, and the command says it was not removed). Qubes qmcp created
+(the hub's `ai-hub-*`, a lead's workers, their clones and disposables) are
+removed as before. Anything you bring into AI space should still have a
+backup: root in a managed qube can destroy its data without removing it. To
+roll back to 0.9.35, run this release's `uninstall.sh` before 0.9.35's
+installer; a revoke proposal with `remove` that is not yet decided (pending or
+expired) then reads as unreadable, and `qmcp proposal reject N` closes it.
 
 Coming from 0.9.34? Install over it. `qmcp export` names every qube held for
 review, or about to be, and says to accept or reject it before you back up: after
@@ -818,8 +837,9 @@ wanted. The specific questions are in
 
 Where this has been discussed:
 
-- **qubes-devel design review**, answered point by point by the Qubes project
-  lead: <https://groups.google.com/g/qubes-devel/c/4NuSqL64DVE>
+- **qubes-devel design review** of the May 2026 design, answered by the Qubes
+  project lead (the design has changed since):
+  <https://groups.google.com/g/qubes-devel/c/4NuSqL64DVE>
 - **Qubes forum thread**: <https://forum.qubes-os.org/t/41387>
 - **Background**, the case for putting MCP trust boundaries below the protocol:
   <https://alexschose.com/writing/mcp-trust-boundaries-belong-below-the-protocol.html>

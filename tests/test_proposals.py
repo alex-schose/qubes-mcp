@@ -113,7 +113,7 @@ class Shape(unittest.TestCase):
             "project-delete": ({"project"}, set()),
             "qube-open": ({"qube", "for", "firewall"}, set()),
             "qube-manage": ({"qube"}, set()),
-            "qube-revoke": ({"qube", "shutdown"}, set()),
+            "qube-revoke": ({"qube", "shutdown"}, {"remove"}),
             "template-install": ({"template", "packages"}, set()),
         }
         samples = [
@@ -142,6 +142,9 @@ class Shape(unittest.TestCase):
             {"type": "qube-manage", "title": "t", "qube": "work-outside"},
             {"type": "qube-revoke", "title": "t", "qube": "ai-work"},
             {"type": "qube-revoke", "title": "t", "qube": "ai-work", "shutdown": False},
+            {"type": "qube-revoke", "title": "t", "qube": "ai-work", "remove": True},
+            {"type": "qube-revoke", "title": "t", "qube": "ai-work", "remove": False},
+            {"type": "qube-revoke", "title": "t", "qube": "ai-work", "remove": None},
             {"type": "template-install", "title": "t", "template": "ai-tpl-g",
              "packages": ["curl", "gir1.2-gtk-3.0", "g++"]},
         ]
@@ -1593,6 +1596,8 @@ class QubeProposals(PBase):
                 ({"type": "qube-revoke", "qube": "ai-work2"}, "qmcp revoke ai-work2"),
                 ({"type": "qube-revoke", "qube": "ai-work2", "shutdown": False},
                  "qmcp revoke ai-work2 --no-shutdown"),
+                ({"type": "qube-revoke", "qube": "ai-work2", "remove": True},
+                 "qmcp revoke ai-work2 --remove"),
                 ({"type": "template-install", "template": "ai-tpl-g", "packages": ["curl", "g++"]},
                  "qmcp template install ai-tpl-g curl g++")):
             p = proposals.normalise(dict(fields, title="t"), "ai-")
@@ -1687,6 +1692,60 @@ class QubeProposals(PBase):
         self.assertFalse(ok)
         self.assertIn("is the lead of osint", " ".join(report))
         self.assertIn("qmcp-lead-p01", self.app.domains[LEAD].tags)
+
+    def test_the_plan_names_no_refusal_for_a_read_that_failed(self):
+        # A failed read proves nothing in `show`: the command checks again at accept.
+        pid = self.ask("qube-revoke", qube="ai-work2", remove=True)
+        self.app.fail_reads("get.template:ai-work", "fail fail fail fail")
+        plan = proposals.show(self.app, pid)["plan"] or ""
+        self.assertNotIn("could not be read", plan)
+        self.assertNotIn("will fail", plan)
+
+    def test_the_plan_names_no_refusal_when_the_records_stop_reading(self):
+        # `show` read the records; the remove's own read of them then failed.
+        pid = self.ask("qube-revoke", qube="ai-work2", remove=True)
+        real = projects.load
+
+        def load(*a, **kw):
+            if sys._getframe(1).f_code.co_name == "_remove_refusal":
+                raise projects.ProjectsUnreadable("injected")
+            return real(*a, **kw)
+        with mock.patch.object(projects, "load", load):
+            plan = proposals.show(self.app, pid)["plan"] or ""
+        self.assertNotIn("do not read", plan)
+        self.assertNotIn("will fail", plan)
+
+    def test_a_revoke_with_remove_removes_a_qube_qmcp_did_not_create(self):
+        self.assertNotIn("qmcp-owner_mcp-control", set(self.app.domains["ai-work2"].tags))
+        pid = self.ask("qube-revoke", qube="ai-work2", remove=True)
+        doc = proposals.show(self.app, pid)
+        self.assertIn("REMOVES ai-work2", " ".join(doc["second_tick"]))
+        with self.assertRaises(proposals.Refused):                  # one click changes nothing
+            self.accept(pid)
+        self.assertIn("ai-work2", self.app.domains)
+        self.assertIn("ai-managed", set(self.app.domains["ai-work2"].tags))
+        ok, report = self.accept(pid, yes=True)
+        self.assertTrue(ok, report)
+        self.assertIn("removed", " ".join(report))
+        self.assertNotIn("ai-work2", self.app.domains)
+
+    def test_a_remove_the_command_refuses_changes_nothing(self):
+        for qube, words in (("ai-debian-13", "approved template"), ("ai-tpl-g", "guarded")):
+            with self.subTest(qube=qube):
+                before = set(self.app.domains[qube].tags)
+                pid = self.ask("qube-revoke", qube=qube, remove=True)
+                self.assertIn(words, proposals.show(self.app, pid)["plan"] or "")
+                ok, report = self.accept(pid, yes=True)
+                self.assertFalse(ok)
+                self.assertIn(words, " ".join(report))
+                self.assertEqual(proposals.show(self.app, pid)["state"], "failed")
+                self.assertEqual(set(self.app.domains[qube].tags), before)
+
+    def test_remove_with_shutdown_false_is_refused_at_submit(self):
+        reply = self.submit({"type": "qube-revoke", "title": "t", "qube": "ai-work2",
+                             "remove": True, "shutdown": False})
+        self.assertFalse(reply["ok"])
+        self.assertIn("remove", reply["error"])
 
     def test_revoking_takes_a_member_out_of_its_slot_and_shuts_it_down(self):
         w2 = self.app.domains["ai-osint-w2"]

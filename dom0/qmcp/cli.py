@@ -137,7 +137,8 @@ def cmd_role(args) -> int:
     action = {"manage": fleet.manage, "guard": fleet.guard}.get(args.cmd)
     try:
         if args.cmd == "revoke":
-            print(fleet.revoke(_app(), args.qube, shutdown=not args.no_shutdown))
+            print(fleet.revoke(_app(), args.qube, shutdown=not args.no_shutdown,
+                               remove=args.remove))
         else:
             print(fleet.guard(_app(), args.qube, in_ai_space_only=args.only_in_ai_space)
                   if args.cmd == "guard" else action(_app(), args.qube))
@@ -931,6 +932,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "revoke":
             p.add_argument("--no-shutdown", action="store_true",
                            help="leave it running")
+            p.add_argument("--remove", action="store_true",
+                           help="then remove it, with its storage (it is killed first); refuses "
+                                "a qube outside AI space, a guarded or model qube, one a project "
+                                "lists, and one other qubes or a global setting use")
         if name == "guard":
             p.add_argument("--only-in-ai-space", action="store_true",
                            help="refuse a qube outside AI space instead of adding it, guarded "
@@ -1144,6 +1149,8 @@ def operator_line(args):
         summary = {"qube": str(args.qube)[:128]}
         if c == "revoke":
             summary["no_shutdown"] = bool(args.no_shutdown)
+            if args.remove:
+                summary["remove"] = True
         if c == "guard" and args.only_in_ai_space:
             summary["only_in_ai_space"] = True
         return f"qmcp {c}", summary

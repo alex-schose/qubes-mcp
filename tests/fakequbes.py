@@ -638,6 +638,12 @@ class FakeApp:
         self.default_netvm = None
         self.default_dispvm = None
         self.default_template = None
+        # The other global settings that name a qube (`qubes-prefs`).
+        self.management_dispvm = None
+        self.updatevm = None
+        self.clockvm = None
+        self.default_guivm = None
+        self.default_audiovm = None
         self._disp_counter = 1000
         self.calls: list = []
         #: `run_service` per qube: "ok" (the default), "timeout" or "exit1"

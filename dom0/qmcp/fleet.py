@@ -2501,9 +2501,13 @@ def _kill_model_qube(report, slot, vm, name, managed: bool, guard_failed: str = 
                            f"run the command again")
 
 
-def revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
-    """`qmcp revoke`, under the qube's lock (`_revoke`)."""
-    return _with_qube_lock(name, False, lambda held: _revoke(app, name, shutdown, from_hub),
+def revoke(app, name, shutdown: bool = True, from_hub: bool = False, remove: bool = False) -> str:
+    """`qmcp revoke`, under the qube's lock (`_revoke`). `remove`: then remove
+    it (`--remove`, or an accepted `qube-revoke` with `remove`): the hub's way
+    to have a qube without an owner badge removed, besides deleting a project
+    it is a member of (the services refuse such a remove)."""
+    return _with_qube_lock(name, False,
+                           lambda held: _revoke(app, name, shutdown, from_hub, remove),
                            settle=lambda: _settle_kill(app, name) if shutdown else "")
 
 
@@ -2523,9 +2527,92 @@ def _settle_kill(app, name) -> str:
                     f"NOT be killed ({done}): kill it by hand (qvm-kill {name})")
 
 
-def _revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
+def _remove_refusal(app, vm, name, tags, plan: bool = False) -> str | None:
+    """Why `revoke --remove` will not remove this qube, read before anything
+    changes; None when it may. A guarded qube (a gateway is one), a model qube
+    (by record or badge), a project's recorded lead, dump sink, approved
+    template or worker network, a qube others are built on, start disposables
+    from or reach the network through, and one a global setting names. A lead
+    by its badges and the drop box are refused before this (`_not_in_a_slot`,
+    `_target`). A read that fails refuses: a remove cannot be undone. Qubes
+    refuses more than this sees (another qube's management disposable, GUI or
+    audio qube): such a remove fails after the revoke, which says so. `plan`: for `proposal show`, where a
+    read that failed proves nothing, so it gives no reason (`_refusal_seen`)."""
+    if plan:
+        try:
+            if core.GUARDED in tags or core.is_gateway(vm):
+                return f"'{name}' is guarded: qmcp removes no guarded qube or gateway"
+        except core.Unreadable:
+            return None
+    elif core.is_guarded(vm, tags):
+        return (f"'{name}' is guarded: qmcp removes no guarded qube or gateway; qvm-remove it "
+                f"by hand if you mean to")
+    try:
+        records = projects.load()
+    except projects.ProjectsUnreadable as e:
+        if plan:
+            return None
+        return f"the project records do not read ({e}), so whether '{name}' serves one is not known"
+    serves = sorted(r.label or r.slot for r in records.values() if r.model_qube == name)
+    if serves or projects.model_slots(tags):
+        return (f"'{name}' is the model qube of {', '.join(serves) or 'a project'}: take it off "
+                f"first (qmcp project firewall PROJECT --model-qube none)")
+    named = sorted(r.label or r.slot for r in records.values() if name in (r.lead, r.dump))
+    if named:
+        return f"'{name}' is the lead or dump sink a project's record names ({', '.join(named)})"
+    listing = sorted(r.label or r.slot for r in records.values()
+                     if name in r.templates or name in r.networks)
+    if listing:
+        return (f"'{name}' is an approved template or worker network of {', '.join(listing)}: "
+                f"take it off the list first (qmcp project edit)")
+    users = []
+    try:
+        for other in list(app.domains):
+            try:
+                oname = core.name_of(other)
+                if oname == name:
+                    continue
+                refs = (core.template_of(other), core.default_dispvm_of(other))
+                if any(r is not None and _ref_name(r) == name for r in refs) \
+                        or core.netvm_of(other) == name:
+                    users.append(oname)
+            except core.Gone:
+                continue                # removed while it was read: it uses nothing
+        for prop in _GLOBAL_QUBE_PREFS:
+            if _ref_name(getattr(app, prop)) == name:
+                users.append(f"the global {prop}")
+    except Exception:
+        if plan:
+            return None
+        return f"which qubes use '{name}' could not be read, so it is not removed"
+    if users:
+        shown = ", ".join(sorted(users)[:5]) + (", ..." if len(users) > 5 else "")
+        return (f"'{name}' is in use by {len(users)} qube(s) (their template, default "
+                f"disposable template or network): {shown}; qubesd would refuse the remove")
+    return None
+
+
+#: Qubes' global settings that name a qube (`qubes-prefs`): qubesd refuses to
+#: remove a qube one of them names, so `--remove` refuses it first.
+_GLOBAL_QUBE_PREFS = ("default_dispvm", "default_netvm", "default_template",
+                      "management_dispvm", "updatevm", "clockvm", "default_guivm",
+                      "default_audiovm")
+
+
+def _ref_name(ref):
+    """The name a qube-valued property holds, None for none."""
+    if ref is None or ref == "":
+        return None
+    return ref if isinstance(ref, str) else core.name_of(ref)
+
+
+def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
+            remove: bool = False) -> str:
     """Strip every AI-space badge, pin default_dispvm, and kill the qube if it
-    runs, unless `shutdown` is false.
+    runs, unless `shutdown` is false. `remove`: then remove it; every refusal
+    of it is read first (`_remove_refusal`), so a refused remove changes
+    nothing, and a remove that fails after the revoke leaves the qube revoked
+    and killed, which is the safe end, and says so.
     Restrictions such as an egress lock go too: revoke is yours. `from_hub`:
     the command an accepted `qube-revoke` runs, which also refuses a hidden
     project's qube (as a name that does not exist), a qube outside AI space
@@ -2545,6 +2632,15 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
             raise RoleError(f"the hub could run commands in '{name}', so a hub's proposal to "
                             f"revoke it kills it: propose it without shutdown false")
     _not_in_a_slot(vm, name, "revoke")
+    if remove:
+        if not shutdown:
+            raise RoleError("--remove kills the qube first: it cannot be left running")
+        if core.UMBRELLA not in before:
+            raise RoleError(f"'{name}' is not in AI space: --remove removes only a qube in AI "
+                            f"space (qvm-remove it if you mean to); nothing was changed")
+        why = _remove_refusal(app, vm, name, before)
+        if why:
+            raise RoleError(f"{why}; nothing was changed")
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
     try:
@@ -2572,8 +2668,14 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False) -> str:
                             f"the hub started in it may still run, outside AI space; kill it by "
                             f"hand (qvm-kill {name})")
         if done == "killed":
-            msg += (", killed: what the hub had running in it was stopped; what it wrote to "
-                    "disk stays")
+            msg += (", killed: what the hub had running in it was stopped"
+                    + ("" if remove else "; what it wrote to disk stays"))
+    if remove:
+        err = _remove_qube(app, name)
+        if err:
+            raise RoleError(f"'{name}' is revoked, but it was NOT removed ({err}): qvm-remove "
+                            f"{name} by hand once Qubes allows it")
+        msg += ", removed"
     return msg
 
 

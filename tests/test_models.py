@@ -546,6 +546,17 @@ class NoOtherRole(ModelBase):
                 fleet.move(self.app, MODEL, target)
         self.assertEqual(self.raw(MODEL) & {"qmcp-proj-p00", "qmcp-proj-p01", "qmcp-proj-p02"}, set())
 
+    def test_revoke_remove_refuses_a_model_qube_even_managed(self):
+        # Un-guarded for maintenance it is still the model qube its record names.
+        fleet.manage(self.app, MODEL)
+        before = self.raw(MODEL)
+        with self.assertRaises(fleet.RoleError) as cm:
+            fleet.revoke(self.app, MODEL, remove=True)
+        self.assertIn("is the model qube of osint", str(cm.exception))
+        self.assertIn("nothing was changed", str(cm.exception))
+        self.assertEqual(self.raw(MODEL), before)
+        self.assertIn(MODEL, self.app.domains)
+
     def test_guard_after_maintenance_kills_it_if_it_runs(self):
         # The maintenance window closes: no process the hub started runs on.
         fleet.manage(self.app, MODEL)

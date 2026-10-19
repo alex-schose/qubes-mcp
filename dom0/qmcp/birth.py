@@ -158,8 +158,12 @@ class TagIO:
 
 
 def owner_tag(principal: str) -> str:
-    """Provenance only, never a gate. Never `created-by-*`, which
-    qubesd stamps with the CALLING domain — dom0 for every qmcp create."""
+    """Provenance, and one gate in one direction: the services remove only a
+    qube that wears an owner badge (`svc_lifecycle`), so lacking it only takes
+    authority away; every qmcp create stamps one, a revoke takes it off, and
+    only dom0 writes tags. Never
+    `created-by-*`, which qubesd stamps with the CALLING domain — dom0 for
+    every qmcp create."""
     safe = "".join(c for c in str(principal) if c.isalnum() or c in "-_")
     return f"{OWNER_PREFIX}{safe or 'unknown'}"
 
