@@ -610,6 +610,16 @@ def cmd_gate(args) -> int:
         for name in held.held:
             print(f"{name}: held for review (it came back from a backup or a copy)",
                   file=sys.stderr)
+        for name in held.unowned:
+            print(f"{name}: its owner badge came off (a copy, or not proven a restore), so "
+                  f"only you remove it", file=sys.stderr)
+        for name in held.owner_kept:
+            print(f"{name}: keeps its owner badge (a restore whose original is gone)",
+                  file=sys.stderr)
+        for name, err in held.owner_failed:
+            print(f"{name}: its owner badge was NOT decided ({err}); the next run tries again, "
+                  f"and accepting it takes off a badge the check did not record as kept",
+                  file=sys.stderr)
         for name, err in held.failed:
             print(f"{name}: NOT held ({err}); tried again next run", file=sys.stderr)
         for name in held.gone:
@@ -648,7 +658,7 @@ def cmd_gate(args) -> int:
     if any(v.status == anon.RED for v in verdicts):
         return 1
     unjudged = held is None or not held.judged or bool(held.failed or held.unread
-                                                         or held.unsettled)
+                                                         or held.unsettled or held.owner_failed)
     return 3 if unjudged or any(v.status == anon.UNREADABLE for v in verdicts) else 0
 
 

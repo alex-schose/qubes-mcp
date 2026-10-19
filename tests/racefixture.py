@@ -47,7 +47,7 @@ sys.path.insert(0, str(HERE))
 import scratch  # noqa: E402
 import test_projects  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
-from qmcp import anon, budget, cli as qcli, core, fleet, gateways, projects, proposals, restored, services  # noqa: E402
+from qmcp import anon, birth, budget, cli as qcli, core, fleet, gateways, projects, proposals, restored, services  # noqa: E402
 
 LEAD, OTHER_LEAD = test_projects.LEAD, test_projects.OTHER_LEAD
 
@@ -533,10 +533,19 @@ def expired(t):
 
 
 def unheld_restored(t):
-    """A qube restored from a backup: it wears a project's badges and no
-    label of this dom0's, and the restore check has not seen it yet."""
+    """A qube restored from a backup: it wears a project's badges, the hub's
+    owner badge and no label of this dom0's, and the restore check has not
+    seen it yet (with no label it is not proven a restore: the badge comes off)."""
     t.app.vm("ai-back", labelled=False, template=t.app.domains["ai-debian-13"], netvm=None,
-             tags={"ai-managed", "qmcp-proj-p01"})
+             tags={"ai-managed", "qmcp-proj-p01", birth.owner_tag(HUB)})
+
+
+def hand_copy(t):
+    """A hand qvm-clone of a qube the hub made: it carries the hub's owner
+    badge and its source's label, and the restore check has not seen it yet."""
+    src = t.app.vm("ai-hub-src", template=t.app.domains["ai-debian-13"], netvm=None,
+                   tags={"ai-managed", "qmcp-proj-p00", birth.owner_tag(HUB)})
+    t.app.clone_vm(src, "ai-hub-src-copy")
 
 
 def held_restored(t):

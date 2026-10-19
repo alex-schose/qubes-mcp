@@ -26,6 +26,64 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.37] — 2026-10-19
+
+**A hand copy loses its owner badge.** A `qvm-clone` of a qube qmcp made copied its
+`qmcp-owner_*` badge, so the hub could remove the operator's copy (often a backup): before the
+gate held it, and after the operator accepted it. Now the hub can do neither to a copy made from
+now on, unless its source is removed before the gate decides it; a qube restored from a backup
+whose original is gone keeps its badge. A copy accepted before 0.9.37 keeps the badge it was
+copied with: see below.
+
+### Changed
+
+- **BREAKING:** `qmcp.LifecycleAIManaged` (`qubes_remove`) refuses `remove` for a qube waiting
+  for review (in AI space, with no `qmcp-id` label or one that is not its own UUID, other than a
+  disposable Qubes made itself from a labelled disposable template) before the gate's pass
+  holds it, as every create already refuses to build on one, on a strict read: "held for the
+  operator's review".
+- **BREAKING:** the gate's restore check decides the `qmcp-owner_*` badges of every qube waiting
+  for review that wears one, once, right after it holds it (and on its next pass for one held
+  already, such as a copy of a held qube, or one 0.9.36 held). It keeps them only for a proven
+  restore: every qube's UUID and label read, the label names a UUID no qube has now, and no other
+  qube carries that label. It records that in a dom0 feature, `qmcp-owner-kept`, set to the
+  qube's own UUID, which a copy of it never shares. Any other qube (a copy names a qube that
+  exists, or shares its source's label; a qube with no label; a failed read of its label or of
+  another qube's, but one qubesd says is gone) loses them, and from then on only the operator
+  removes it. A failed read of the qube's own tags, UUID or record leaves it undecided. A copy
+  made while its source exists is held and decided within the gate's interval, normally about 15
+  seconds; once it is decided, removing the source changes nothing, but a source removed before
+  then (or before a failed decision is tried again) makes the copy read as a restore. A decision
+  that fails is said on standard error (`qmcp gate` exits 3, or 1 when an anonymous project, or
+  in anonymous mode the hub, is unsound), the hold stays on, and the next pass tries again. The
+  gate leaves one audit line, caller `gate`, for each decision and each failed one (none for a
+  qube removed meanwhile).
+- **BREAKING:** `qmcp restored accept` takes off any owner badge the restore check did not record
+  as kept for that qube, before it labels the qube, and says so in its output (its audit line is
+  unchanged). `accept` and `reject` refuse a disposable that Qubes made itself from a labelled
+  disposable template, unless it is held: it is not waiting for review. The window's Accept and
+  Accept all texts say which badges stay.
+- **Upgrading:** a copy 0.9.36 held is decided on the first pass after the install (if its
+  source was removed meanwhile, it reads as a restore and keeps the badge). A copy accepted
+  before 0.9.37 is labelled as its own qube and is never looked at again: it keeps the owner
+  badge it was copied with, and the hub may remove it. Take that badge off by hand (`qvm-tags
+  QUBE del qmcp-owner_...`); the audit log's `qmcp restored accept` lines name the qubes you
+  accepted, except a `restored accept --all` run on 0.9.32 or earlier, whose one line names none.
+
+### Fixed
+
+- `tests/project_suite.py` started the lead seat with a line whose backgrounded shell, under
+  bash (`/bin/sh` on Fedora and Arch), held the in-qube service's reply until the seat ended, so
+  the start timed out after 60 s and the service's process-group kill took the status writer
+  with it; under dash (Debian's) it returned at once. The seat now runs in a session of its own
+  with no descriptor of the service's, its paths quoted (found on the reinstalled development box,
+  on Fedora 44 leads).
+- `tests/lead_seat.py`'s "the lead has no network" read QubesDB's `/qubes-ip`, which Qubes keeps
+  when a running qube's netvm is cleared, so a lead that lost its network while running (as
+  `qmcp project firewall --model-qube` leaves it) failed the check with no interface and no
+  route. It now asks the kernel: no global address and no default route; its control probes a
+  worker the same way.
+
 ## [0.9.36] — 2026-10-19
 
 **AI removes only what qmcp created.** The hub and a lead can no longer remove a qube qmcp did

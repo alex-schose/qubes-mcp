@@ -124,6 +124,9 @@ PAIRS = {
     # The restore check and the gate.
     "restored-accept-x-gate": (rf.held_restored, cmd("restored", "accept", "ai-back"), cmd("gate")),
     "manage-x-gate": (rf.outsider, cmd("manage", "op-x"), cmd("gate")),
+    "copy-remove-x-gate": (rf.hand_copy, svc("qmcp.LifecycleAIManaged", {"name": "ai-hub-src-copy",
+                                                                       "action": "remove"}),
+                           cmd("gate")),
     "lead-new-x-lead-spawn": (rf.nothing, cmd("project", "lead", "osint", "--lead-template", "ai-debian-13"),
                               LEAD_SPAWN),
 }

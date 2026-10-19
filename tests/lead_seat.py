@@ -398,14 +398,22 @@ def http(method, path, body=None, timeout=60):
         return json.loads(r.read().decode())
 
 
+GLOBAL_ADDRESSES = ["ip", "-o", "addr", "show", "scope", "global"]
+
+
 def no_network_here():
-    """(no network, detail): no address in QubesDB and no default route. A
-    connection that times out would also read as offline behind a firewall."""
-    ip = subprocess.run(["qubesdb-read", "/qubes-ip"], capture_output=True, text=True)
+    """(no network, detail): no global address on any interface and no
+    default route, as the kernel has them. Not QubesDB's /qubes-ip: Qubes keeps
+    that key when a running qube's netvm is cleared (measured on 4.3.2), so a
+    lead that lost its network while running still shows its old address there.
+    A connection that times out would also read as offline behind a firewall."""
+    addr = subprocess.run(GLOBAL_ADDRESSES, capture_output=True, text=True)
     route = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True)
-    return (ip.returncode != 0 and not ip.stdout.strip() and route.returncode == 0
+    db = subprocess.run(["qubesdb-read", "/qubes-ip"], capture_output=True, text=True)
+    return (addr.returncode == 0 and not addr.stdout.strip() and route.returncode == 0
             and not route.stdout.strip(),
-            f"qubes-ip rc={ip.returncode} {ip.stdout.strip()!r}, default route {route.stdout.strip()!r}")
+            f"global addresses {addr.stdout.strip()[:120]!r}, default route "
+            f"{route.stdout.strip()!r}, QubesDB /qubes-ip {db.stdout.strip()!r}")
 
 
 def model_section(args, stats, worker):
@@ -420,8 +428,8 @@ def model_section(args, stats, worker):
           json.dumps({k: stats.get(k) for k in ("model", "model_qube", "model_port")}))
     # Control first: the probe sees a network where there is one, in a worker
     # born on the project's first network.
-    r = call("qubes_run", name=worker, cmd=["qubesdb-read", "/qubes-ip"], timeout=30)
-    check("CONTROL: a worker on a network shows its address in QubesDB",
+    r = call("qubes_run", name=worker, cmd=GLOBAL_ADDRESSES, timeout=30)
+    check("CONTROL: a worker on a network shows a global address",
           r.get("ok") is True and r.get("rc") == 0 and r.get("stdout", "").strip(), json.dumps(r)[:200])
     offline, detail = no_network_here()
     check("the lead has no network (a lead whose model is a qube has none)", offline, detail)

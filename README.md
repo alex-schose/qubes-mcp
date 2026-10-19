@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.36 — AI removes only what qmcp created.** Besides the hub, up to 15
+**Status: 0.9.37 — a hand copy loses its owner badge.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -237,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.36.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.37.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -291,7 +291,25 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.35? Install over it. **Breaking:** the hub and a lead can no
+Coming from 0.9.36? Install over it. **Breaking:** a hand copy of a qube qmcp
+made (`qvm-clone`) carried its `qmcp-owner_*` badge, so the hub could remove
+your copy. Now the hub cannot remove a qube waiting for review, and the gate
+takes the owner badge off a copy right after it holds it; a qube restored from
+a backup, with its label, whose original is gone keeps its badge, so the hub may
+still remove what qmcp made. `restored accept` takes off any owner badge the
+gate did not record as kept. A copy 0.9.36 held is decided on the first pass
+after the install: if its source was removed while 0.9.36 ran, it reads as a
+restore and keeps the badge, so check `qmcp restored list` for such a copy and
+reject it, or take the badge off by hand (`qvm-tags QUBE del qmcp-owner_...`). A
+copy you accepted before 0.9.37 is labelled as its own and is never looked at
+again: it keeps its badge until you take it off the same way (the audit log's
+`qmcp restored accept` lines name the qubes you accepted, except a `restored accept --all` run on 0.9.32 or earlier, whose one line names none).
+To roll back to 0.9.36, run this release's `uninstall.sh` before 0.9.36's
+installer (not drilled for this release; the uninstaller is unchanged since
+0.9.33): a copy whose badge 0.9.37 took off stays without it, and a new copy carries its source's
+badge again, as before.
+
+Coming from 0.9.35? See the note above too. **Breaking:** the hub and a lead can no
 longer remove a qube qmcp did not create, such as one you brought into AI
 space with `qmcp manage`: `qubes_remove` refuses it ("removing a qube qmcp did
 not create takes the operator's approval"). The hub asks with

@@ -25,11 +25,18 @@ and a project's record keeps no list of its members.
 - `hold(app)`, run by the gate's pass, puts `qmcp-quarantine` on every qube in
   scope whose label does not match. The rulebook's A0 refuses every call into
   it and out of it, and the services refuse to operate it or create from it. It
-  keeps the badges it came back with, so the review can show them.
+  keeps the badges it came back with, so the review can show them, but for an
+  owner badge: once a qube waiting for review is held, the same pass decides
+  its `qmcp-owner_*` badges once (`decide_owner`): a proven restore keeps them
+  and is recorded by its own UUID in `qmcp-owner-kept`, which no copy of it
+  shares; any other qube loses them, so the hub cannot remove a copy decided
+  while its source exists. The lifecycle service refuses to remove a qube waiting for
+  review even before the pass holds it.
 - `review(app, records)` lists every such qube, with the role its badges name
   and whether that agrees with the records today.
-- `accept(app, name)` labels the qube first and only then lifts the hold, so a
-  failure leaves it held. `reject(app, name)` takes every qmcp badge off, the
+- `accept(app, name)` takes off an owner badge the pass did not record as
+  kept, then labels the qube, and only then lifts the hold, so a failure
+  leaves it held. `reject(app, name)` takes every qmcp badge off, the
   routed ones first and the hold last.
 
 A qube is in scope when it wears `ai-managed`, `ai-dump` or any `qmcp-` badge.
@@ -45,8 +52,12 @@ from __future__ import annotations
 import os
 
 from qmcp import audit, budget, core, projects
+from qmcp.birth import OWNER_PREFIX
 
 ID = core.ID_FEATURE
+#: dom0's record that the restore check proved a qube a restore, so it keeps
+#: its owner badge: that qube's own UUID, which no copy of it shares.
+KEPT = "qmcp-owner-kept"
 HOLD = core.QUARANTINE
 SERVICE = "qmcp gate"
 CALLER = "gate"
@@ -172,13 +183,107 @@ class Held:
     """What one pass did: qubes newly held, holds that failed, reads it could
     not make; `gone`, qubes removed by a call that was already running when
     they were held; `unsettled`, qubes held while a call kept their lock past
-    both waits. `judged` is False when the pass could not run at all."""
+    both waits; `unowned`, qubes waiting for review whose owner badge it took
+    off (a copy, or not proven a restore), `owner_kept`, those it proved a
+    restore, and `owner_failed`, those whose decision failed (the next pass
+    tries again, and accept strips the badge without a record). `judged` is
+    False when the pass could not run at all."""
 
-    __slots__ = ("held", "failed", "unread", "judged", "gone", "unsettled")
+    __slots__ = ("held", "failed", "unread", "judged", "gone", "unsettled", "unowned",
+                 "owner_kept", "owner_failed")
 
     def __init__(self):
         self.held, self.failed, self.unread, self.judged = [], [], [], True
-        self.gone, self.unsettled = [], []
+        self.gone, self.unsettled, self.unowned, self.owner_failed = [], [], [], []
+        self.owner_kept = []
+
+
+def _owner_badges(vm) -> list:
+    return sorted(t for t in core.tags_of(vm) if t.startswith(OWNER_PREFIX))
+
+
+def kept_of(vm):
+    """The `qmcp-owner-kept` record: the UUID of the qube the restore check
+    proved a restore, or None. Raises core.Unreadable."""
+    try:
+        value = vm.features.get(KEPT, None)
+    except Exception as e:
+        raise core.Unreadable(f"cannot read the {KEPT} feature of {core.name_of(vm)}") from e
+    return None if value is None else str(value).strip().lower()
+
+
+class Origins:
+    """Every qube's UUID and `qmcp-id` label, read once per pass. `complete`
+    is False when any read failed but that of a qube qubesd says is gone."""
+
+    __slots__ = ("uuids", "labels", "complete")
+
+    def __init__(self, app):
+        self.uuids, self.labels, self.complete = set(), {}, True
+        try:
+            domains = list(app.domains)
+        except Exception:
+            self.complete = False
+            return
+        for vm in domains:
+            try:
+                name = core.name_of(vm)
+                self.uuids.add(_uuid(vm))
+                lab = label_of(vm)
+            except Exception:
+                try:
+                    gone = _is_gone(app, core.name_of(vm))
+                except Exception:
+                    gone = False
+                if not gone:
+                    self.complete = False
+                continue
+            if lab is not None:
+                self.labels[lab] = self.labels.get(lab, 0) + 1
+
+
+def proven_restore(vm, origins) -> bool:
+    """True only when every read succeeded and the qube's label names a UUID
+    that no qube has now, and no other qube carries that label: a restore
+    whose original is gone. A copy names a qube that exists, or shares its
+    label with the qube it was copied from (a copy of a held restore, a second
+    restore of one backup); a qube with no label, or its own, is not proven."""
+    if origins is None or not origins.complete:
+        return False
+    try:
+        lab, own = label_of(vm), _uuid(vm)
+    except core.Unreadable:
+        return False
+    return (lab is not None and lab != own and lab not in origins.uuids
+            and origins.labels.get(lab, 0) == 1)
+
+
+def decide_owner(vm, origins):
+    """For a qube waiting for review that wears an owner badge: decide once,
+    and record it. A proven restore keeps the badge, and `qmcp-owner-kept`
+    is set to its own UUID, so a copy of it (a new UUID) never inherits the
+    decision; anything else loses every `qmcp-owner_*` badge: AI removes only
+    what qmcp created, and a copy the operator made is not that. Returns
+    "kept", "removed", or None when there was nothing to decide (no badge, or
+    the record already names this qube). Raises when a badge did not come
+    off or the record did not read back, and core.Unreadable or core.Gone
+    from its own reads."""
+    owners = _owner_badges(vm)
+    if not owners:
+        return None
+    own = _uuid(vm)
+    if kept_of(vm) == own:
+        return None
+    if proven_restore(vm, origins):
+        vm.features[KEPT] = own
+        if kept_of(vm) != own:
+            raise RuntimeError(f"the {KEPT} record did not read back")
+        return "kept"
+    for t in owners:
+        vm.tags.discard(t)
+    if _owner_badges(vm):
+        raise RuntimeError("the owner badge did not come off")
+    return "removed"
 
 
 def hold(app, lock_wait: float | None = None) -> Held:
@@ -187,6 +292,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
     create and its label. Best-effort per qube: a qube it cannot read or hold
     is reported and tried again next run."""
     out = Held()
+    origins = None                  # read once, on the first qube that needs it
     try:
         fd = budget.acquire_create_lock(timeout=LOCK_WAIT_S if lock_wait is None else lock_wait,
                                         queue=True)
@@ -204,7 +310,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
             except core.Unreadable as e:
                 out.unread.append(str(e))
                 continue
-            if not in_scope(tags) or HOLD in tags:
+            if not in_scope(tags):
                 continue
             try:
                 if known(vm):
@@ -213,6 +319,11 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 out.unread.append(str(e))
                 continue
             name = core.name_of(vm)
+            if HOLD in tags:
+                # Already held (a copy of a held qube copies the hold, and
+                # 0.9.36 held without deciding): its owner badge is decided here.
+                origins = _decide(app, vm, name, out, origins)
+                continue
             # The qube's own lock, briefly: a service already past its check
             # (a remove, a start) lands before the hold, and none after it. A
             # hold only takes authority away, so it goes on without the lock
@@ -255,12 +366,49 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 continue
             out.held.append(name)
             _audit(name, True, app=app)
+            # Held first, then its owner badge decided: the hold is the larger
+            # restriction, and a held qube's badge grants nothing until accept.
+            origins = _decide(app, vm, name, out, origins)
     finally:
         try:
             os.close(fd)
         except Exception:
             pass
     return out
+
+
+def _decide(app, vm, name: str, out: Held, origins):
+    """The pass's owner-badge decision for one qube waiting for review (see
+    `decide_owner`). Returns the pass's Origins, read on first need."""
+    try:
+        if not _owner_badges(vm) or kept_of(vm) == _uuid(vm):
+            return origins
+        if origins is None:
+            origins = Origins(app)
+        what = decide_owner(vm, origins)
+    except core.Gone:
+        return origins
+    except Exception as e:
+        if _is_gone(app, name):
+            return origins
+        out.owner_failed.append((name, type(e).__name__))
+        _audit_owner(name, False, "not decided", f"{type(e).__name__}", app=app)
+        return origins
+    if what == "removed":
+        out.unowned.append(name)
+        _audit_owner(name, True, "removed: a copy, or not proven a restore", app=app)
+    elif what == "kept":
+        out.owner_kept.append(name)
+        _audit_owner(name, True, "kept: a restore whose original is gone", app=app)
+    return origins
+
+
+def _audit_owner(name: str, ok: bool, what: str, error: str | None = None, app=None) -> None:
+    try:
+        audit.audit(SERVICE, CALLER, {"qube": name[:128], "owner badge": what}, ok, error,
+                    app=app)
+    except Exception:
+        pass
 
 
 def _is_gone(app, name: str) -> bool:
@@ -461,7 +609,7 @@ def _subject(app, name: str):
     tags = core.tags_of(vm)
     if not in_scope(tags):
         raise ReviewError(f"'{name}' carries no qmcp badge")
-    if labelled(vm) and HOLD not in tags:
+    if HOLD not in tags and (labelled(vm) or born_of_its_template(vm, label_of(vm))):
         raise ReviewError(f"'{name}' is not waiting for review")
     return vm, tags
 
@@ -490,18 +638,34 @@ def _locked(name: str, must: bool, fn):
 
 
 def accept(app, name: str) -> str:
-    """Label the qube, then lift its hold, under its lock. Its badges stay as
-    they came back: `qmcp check` judges them against the records from here on."""
+    """Take off an owner badge the pass did not record as kept, label the
+    qube, then lift its hold, under its lock. Its other badges stay as they
+    came back: `qmcp check` judges them against the records from here on."""
     return _locked(name, True, lambda: _accept(app, name))
 
 
 def _accept(app, name: str) -> str:
     vm, tags = _subject(app, name)
+    # An owner badge stays only where the pass recorded this qube a proven
+    # restore; any other (not decided yet, or its decision failed) comes off
+    # here, before the label makes the qube known.
+    unowned = False
+    owners = _owner_badges(vm)
+    if owners and kept_of(vm) != _uuid(vm):
+        for t in owners:
+            vm.tags.discard(t)
+        if _owner_badges(vm):
+            raise RuntimeError("the owner badge did not come off")
+        unowned = True
     label(vm)
     if HOLD in tags:
         vm.tags.discard(HOLD)
         if HOLD in core.tags_of(vm):
             raise RuntimeError("the hold did not come off")
+    if unowned:
+        return (f"{name}: accepted; its owner badge came off (the restore check had not "
+                f"recorded it a restore: only you remove it), its other badges stay as they "
+                f"came back")
     return f"{name}: accepted; its badges stay as they came back"
 
 

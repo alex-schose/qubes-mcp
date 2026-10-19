@@ -3892,15 +3892,30 @@ def accept_restored_intro(name, rec) -> str:
     """What accepting one qube does, for the form that asks."""
     if not isinstance(rec, dict):
         return (f"{name} wears the hold, though its qmcp-id label is its own. Accepting lifts "
-                f"the hold, and it keeps its badges, which the rulebook then acts on.")
+                f"the hold, and it keeps its badges, which the rulebook then acts on, but an "
+                f"owner badge the restore check did not record as a restore's comes off.")
     text = (f"{name} came back from a backup or was copied by hand: its qmcp-id label is not "
             f"its own UUID. Accepting labels it with its own UUID and lifts the hold, if it is "
-            f"held. It keeps the badges it came back with")
-    if "unreadable" not in rec:
-        text += (f" ({', '.join(str(b) for b in rec.get('badges') or ()) or 'none'}), which "
-                 f"make it {rec.get('role')}")
-    return text + (": from then on the rulebook acts on them, and qmcp check judges them "
-                   "against the project records.")
+            f"held.")
+    owners = []
+    if "unreadable" in rec:
+        text += " It keeps the badges it came back with"
+    else:
+        badges = [str(b) for b in rec.get("badges") or ()]
+        owners = [b for b in badges if b.startswith(birth.OWNER_PREFIX)]
+        rest = [b for b in badges if b not in owners]
+        text += (f" It keeps {'its other badges' if owners else 'the badges it came back with'} "
+                 f"({', '.join(rest) or 'none'}), which make it {rec.get('role')}")
+    text += (": from then on the rulebook acts on them, and qmcp check judges them against "
+             "the project records.")
+    if owners:
+        text += (f" Its owner badge ({', '.join(owners)}) stays only if the restore check "
+                 f"recorded it a restore whose original is gone; otherwise accepting takes it "
+                 f"off, and only you can remove the qube.")
+    elif "unreadable" in rec:
+        text += (" An owner badge it wears stays only if the restore check recorded it a "
+                 "restore whose original is gone; otherwise accepting takes it off.")
+    return text
 
 
 def accept_restored_red(rec) -> str:
@@ -3934,7 +3949,8 @@ def accept_all_intro(rows) -> str:
     lines (the form shows it through `esc_lines`)."""
     lines = ["Accepts exactly the qubes below, by name (qmcp restored accept QUBE...): each is "
              "labelled with its own UUID, its hold comes off, and it keeps the badges it came "
-             "back with, which the rulebook then acts on. It is the last step after a "
+             "back with, which the rulebook then acts on; an owner badge the restore check did "
+             "not record as a restore's comes off. It is the last step after a "
              "reinstall (restore everything, install qubes-mcp, qmcp import, then this; in "
              "anonymous mode, install.sh --anonymous after it). A "
              "qube the gate holds after this window last read is not in the list and stays held "

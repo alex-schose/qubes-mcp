@@ -589,6 +589,10 @@ def svc_lifecycle(app, call, req):
         # dom0 writes tags, so AI space cannot add one.
         if not any(t.startswith(birth.OWNER_PREFIX) for t in tags):
             raise refuse("removing a qube qmcp did not create takes the operator's approval")
+        # A qube the restore check would hold on its next pass (a hand copy
+        # carries its source's owner badge until then) is the operator's to
+        # review first: refused as a held one is, on a strict read.
+        _reviewed(vm)
     # The gate may stop the qube between the check above and the start: read
     # again right before waking it.
     if action in ("start", "unpause") and projects.BLOCKED in core.tags_of(vm):

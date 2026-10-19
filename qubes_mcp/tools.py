@@ -572,7 +572,10 @@ def _qubes_shutdown(args: dict) -> dict:
     creates, the operator's included) can be removed this way: one the operator brought into AI space
     is refused ("removing a qube qmcp did not create takes the operator's
     approval"), and the hub may ask for it with qubes_propose_revoke and
-    remove true (or by deleting a project it is a member of). A lead and a guarded qube are refused too; one that is out
+    remove true (or by deleting a project it is a member of). A copy the
+    operator made by hand is refused while it waits for review ("held for
+    the operator's review"), and once the gate decides it, it carries no
+    owner badge unless its source was removed first. A lead and a guarded qube are refused too; one that is out
     of scope or does not exist is reported as "not found".
 
     Returns {"ok": true} or {"ok": false, "error": "<reason>"}.

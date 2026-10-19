@@ -27,7 +27,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import (audit, budget, cli, core, fleet, gateways, inqube, opfiles,  # noqa: E402
+from qmcp import (audit, birth, budget, cli, core, fleet, gateways, inqube, opfiles,  # noqa: E402
                   projects, proposals, restored, services)
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
@@ -536,6 +536,164 @@ class Hold(ToolsBase):
         held = restored.hold(self.app)
         self.assertEqual(sorted(held.held), ["ai-hubq-copy", "ai-tagged-by-hand"])
         self.assertNotIn(core.QUARANTINE, self.tags("ai-hubq"))
+
+    # A hand copy of a qube qmcp made carries its owner badge, which would let
+    # the hub remove the operator's copy (often a backup). The pass decides once
+    # per qube waiting for review, after the hold: a proven restore keeps the
+    # badge and is recorded by its own UUID (qmcp-owner-kept), anything else
+    # loses it. Accept keeps a badge only where that record names the qube.
+
+    GONE_UUID = "6a0b0b5e-0000-4000-8000-000000000000"
+
+    def hub_made(self, name="ai-hub-src"):
+        return self.app.vm(name, template=self.app.domains["ai-debian-13"], netvm=None,
+                           tags={"ai-managed", "qmcp-proj-p00", birth.owner_tag(HUB)})
+
+    def restore_of_gone(self, name="ai-hub-back"):
+        vm = self.hub_made(name)
+        vm.features[core.ID_FEATURE] = self.GONE_UUID
+        return vm
+
+    def hub_remove(self, name):
+        return self.call("qmcp.LifecycleAIManaged", {"name": name, "action": "remove"})
+
+    def owned(self, name):
+        return birth.owner_tag(HUB) in self.tags(name)
+
+    def kept(self, name):
+        return dict.get(self.app.domains[name].features, restored.KEPT)
+
+    def test_a_hand_copy_loses_its_owner_badge_at_the_hold_and_the_hub_cannot_remove_it(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.assertTrue(self.owned("ai-hub-src-copy"))           # the platform copied it
+        held = restored.hold(self.app)
+        self.assertEqual((held.held, held.unowned), (["ai-hub-src-copy"], ["ai-hub-src-copy"]))
+        self.assertFalse(self.owned("ai-hub-src-copy"))
+        self.assertTrue(self.owned("ai-hub-src"))                 # the source keeps its own
+        lines = [l for l in self.audit_lines() if l["args"].get("qube") == "ai-hub-src-copy"]
+        self.assertEqual([("owner badge" in l["args"], l["ok"]) for l in lines],
+                         [(False, True), (True, True)])            # held first, then decided
+        self.assertNotIn("held", lines[1]["args"])
+        # Removing the source afterwards changes nothing: the decision was made.
+        del self.app.domains["ai-hub-src"]
+        self.assertIn("its badges stay", restored.accept(self.app, "ai-hub-src-copy"))
+        self.assertFalse(self.owned("ai-hub-src-copy"))
+        r = self.hub_remove("ai-hub-src-copy")
+        self.assertIn("qmcp did not create", r["error"])
+        self.assertIn("ai-hub-src-copy", self.app.domains)
+
+    def test_the_hub_cannot_remove_a_hand_copy_before_the_pass_holds_it(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.assertNotIn(core.QUARANTINE, self.tags("ai-hub-src-copy"))
+        self.assertEqual(self.hub_remove("ai-hub-src-copy"), core.QUARANTINE_REFUSAL)
+        self.assertIn("ai-hub-src-copy", self.app.domains)
+        self.assertTrue(self.hub_remove("ai-hub-src")["ok"])     # the positive: its own qube
+
+    def test_a_restore_whose_original_is_gone_keeps_its_owner_badge(self):
+        self.restore_of_gone()
+        held = restored.hold(self.app)
+        self.assertEqual((held.held, held.unowned, held.owner_kept),
+                         (["ai-hub-back"], [], ["ai-hub-back"]))
+        self.assertTrue(self.owned("ai-hub-back"))
+        self.assertEqual(self.kept("ai-hub-back"), self.uuid("ai-hub-back"))
+        self.assertIn("its badges stay", restored.accept(self.app, "ai-hub-back"))
+        self.assertTrue(self.hub_remove("ai-hub-back")["ok"])
+        self.assertNotIn("ai-hub-back", self.app.domains)
+
+    def test_a_copy_of_a_held_restore_loses_it_and_the_restore_keeps_its_own(self):
+        self.restore_of_gone("ai-hub-back")
+        restored.hold(self.app)
+        # The copy carries the hold, the label and the record, under a new UUID.
+        self.app.clone_vm(self.app.domains["ai-hub-back"], "ai-hub-back-copy")
+        self.assertIn(core.QUARANTINE, self.tags("ai-hub-back-copy"))
+        self.assertEqual(self.kept("ai-hub-back-copy"), self.uuid("ai-hub-back"))
+        held = restored.hold(self.app)
+        self.assertEqual((held.unowned, held.owner_kept), (["ai-hub-back-copy"], []))
+        self.assertFalse(self.owned("ai-hub-back-copy"))
+        self.assertTrue(self.owned("ai-hub-back"))
+        for n in ("ai-hub-back", "ai-hub-back-copy"):
+            restored.accept(self.app, n)
+        self.assertIn("qmcp did not create", self.hub_remove("ai-hub-back-copy")["error"])
+        self.assertTrue(self.hub_remove("ai-hub-back")["ok"])
+
+    def test_two_qubes_with_one_label_before_any_pass_both_lose_it(self):
+        # A restore copied before the pass ran, or one backup restored twice:
+        # neither is proven, since another qube carries the same label.
+        self.restore_of_gone("ai-hub-back")
+        self.app.clone_vm(self.app.domains["ai-hub-back"], "ai-hub-back-copy")
+        held = restored.hold(self.app)
+        self.assertEqual(sorted(held.unowned), ["ai-hub-back", "ai-hub-back-copy"])
+        self.assertFalse(self.owned("ai-hub-back") or self.owned("ai-hub-back-copy"))
+
+    def test_a_copy_held_before_this_release_is_decided_by_the_next_pass(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.domains["ai-hub-src-copy"].tags.add(core.QUARANTINE)  # as 0.9.36 held it
+        held = restored.hold(self.app)
+        self.assertEqual((held.held, held.unowned), ([], ["ai-hub-src-copy"]))
+        self.assertFalse(self.owned("ai-hub-src-copy"))
+        del self.app.domains["ai-hub-src"]
+        restored.accept(self.app, "ai-hub-src-copy")
+        self.assertFalse(self.owned("ai-hub-src-copy"))
+
+    def test_no_label_or_a_uuid_read_that_fails_is_not_proven_a_restore(self):
+        vm = self.hub_made("ai-hub-nolabel")
+        dict.pop(vm.features, core.ID_FEATURE, None)
+        self.restore_of_gone("ai-hub-back")
+        self.app.fail.add("get.uuid:ai-hubq")                    # another qube's UUID
+        held = restored.hold(self.app)
+        self.assertEqual(sorted(held.unowned), ["ai-hub-back", "ai-hub-nolabel"])
+        self.assertFalse(self.owned("ai-hub-back") or self.owned("ai-hub-nolabel"))
+
+    def test_a_qube_qubesd_says_is_gone_does_not_spoil_the_reading(self):
+        self.restore_of_gone("ai-hub-back")
+        self.app.fail.add("get.uuid:ai-hubq")
+        with mock.patch.object(restored, "_is_gone", lambda app, name: name == "ai-hubq"):
+            held = restored.hold(self.app)
+        self.assertEqual(held.owner_kept, ["ai-hub-back"])
+        self.assertTrue(self.owned("ai-hub-back"))
+
+    def test_a_decision_that_fails_still_holds_and_the_next_pass_decides(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        owner = birth.owner_tag(HUB)
+        self.app.fail.add(f"tag.discard:{owner}")
+        rc, _, err = self.cli("gate", root=False)
+        self.assertEqual(rc, 3)
+        self.assertIn("ai-hub-src-copy: held for review", err)
+        self.assertIn("ai-hub-src-copy: its owner badge was NOT decided", err)
+        self.assertIn(core.QUARANTINE, self.tags("ai-hub-src-copy"))
+        self.assertTrue(self.owned("ai-hub-src-copy"))
+        line = [l for l in self.audit_lines() if l["args"].get("owner badge")][-1]
+        self.assertEqual((line["args"]["qube"], line["ok"]), ("ai-hub-src-copy", False))
+        self.app.fail.discard(f"tag.discard:{owner}")
+        held = restored.hold(self.app)
+        self.assertEqual(held.unowned, ["ai-hub-src-copy"])
+        self.assertFalse(self.owned("ai-hub-src-copy"))
+
+    def test_a_discard_that_does_not_land_is_a_failed_decision(self):
+        src = self.hub_made()
+        copy = self.app.clone_vm(src, "ai-hub-src-copy") or self.app.domains["ai-hub-src-copy"]
+        copy.tags.discard = lambda tag: None
+        held = restored.hold(self.app)
+        self.assertEqual([n for n, _ in held.owner_failed], ["ai-hub-src-copy"])
+        self.assertEqual(held.unowned, [])
+
+    def test_accept_takes_off_a_badge_the_pass_did_not_record(self):
+        # A qube held with no decision yet (accepted within a pass, or every
+        # decision failed): fail-safe, even where the label would read as a restore.
+        vm = self.restore_of_gone("ai-hub-back")
+        vm.tags.add(core.QUARANTINE)
+        self.assertIn("owner badge came off", restored.accept(self.app, "ai-hub-back"))
+        self.assertFalse(self.owned("ai-hub-back"))
+
+    def test_accept_refuses_a_disposable_born_of_its_template(self):
+        name = self.app.qubesd_call("ai-dvm", "admin.vm.CreateDisposable").decode()
+        self.app.domains.clear_cache()
+        with self.assertRaises(restored.ReviewError):
+            restored.accept(self.app, name)
 
     def test_a_qube_out_of_scope_is_never_held(self):
         self.app.vm("operator-thing", labelled=False)

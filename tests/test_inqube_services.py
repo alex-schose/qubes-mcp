@@ -14,6 +14,8 @@ import io
 import json
 import os
 import pathlib
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -92,6 +94,58 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(reply, {"ok": False, "error": "'timeout' must be a whole "
                                                                "number of seconds, 1 to 86400"})
                 self.assertFalse(self.marker.exists())
+
+
+class ProjectSuiteStart(unittest.TestCase):
+    """tests/project_suite.py starts the lead seat through this service, and
+    the reply must come back while the seat runs on and writes its status,
+    under every /bin/sh a lead may have. (0.9.36's start line backgrounded an
+    AND-list whose shell, under bash, the /bin/sh of Fedora and Arch, kept the
+    reply's pipe open until the seat ended; dash, Debian's, did not. On the
+    box the service's timeout then killed the status writer.)"""
+
+    SHELLS = [sh for sh in ("bash", "dash") if shutil.which(sh)]
+    run_service = RunTests.run_service
+
+    def setUp(self) -> None:
+        self.dir = scratch.tempdir(self, "qmcp-seat start-")   # a space: the paths are quoted
+        (self.dir / "tests").mkdir()
+        (self.dir / "tests" / "lead_seat.py").write_text(
+            "import sys, time\nprint(sys.argv[1:], flush=True)\ntime.sleep(5)\nsys.exit(7)\n")
+        self.out, self.rc = self.dir / "seat.out", self.dir / "seat.rc"
+
+    def wait_for(self, path, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not path.exists():
+            time.sleep(0.1)
+        return path.exists()
+
+    def test_the_start_answers_at_once_and_the_seat_writes_its_status(self):
+        import project_suite
+        self.assertIn("bash", self.SHELLS)                  # the shell that hung must be tested
+        cmd = project_suite.start_command(str(self.dir), ["--other", "a b"], str(self.out),
+                                          str(self.rc))
+        for sh in self.SHELLS:
+            with self.subTest(shell=sh):
+                for f in (self.out, self.rc):
+                    f.unlink(missing_ok=True)
+                start = time.monotonic()
+                reply = self.run_service({"cmd": [sh, "-c", cmd], "timeout": 10})
+                self.assertEqual((reply["ok"], reply["stdout"]), (True, "started\n"), reply)
+                self.assertLess(time.monotonic() - start, 3)            # the seat sleeps 5 s
+                self.assertTrue(self.wait_for(self.rc, 15))
+                time.sleep(0.2)
+                self.assertEqual(self.rc.read_text().strip(), "7")
+                self.assertIn("['--other', 'a b']", self.out.read_text())
+
+    def test_teeth_under_bash_the_old_start_line_held_the_reply_and_lost_the_status(self):
+        d, out, rc = (shlex.quote(str(x)) for x in (self.dir, self.out, self.rc))
+        old = (f"cd {d} && rm -f {rc} {out} && (PYTHONPATH=. setsid nohup python3 "
+               f"tests/lead_seat.py > {out} 2>&1; echo $? > {rc}) > /dev/null 2>&1 & echo started")
+        reply = self.run_service({"cmd": ["bash", "-c", old], "timeout": 1})
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("timeout", reply["error"])
+        self.assertFalse(self.wait_for(self.rc, 7))       # the seat would have ended at 5 s
 
 
 class CopyTests(unittest.TestCase):

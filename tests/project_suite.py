@@ -47,6 +47,18 @@ def bundle() -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def start_command(seat_dir, seat_args, out="/tmp/lead_seat.out", rc="/tmp/lead_seat.rc") -> str:
+    """The shell line that starts the seat and returns at once. The in-qube
+    service waits until nothing holds its output pipe and kills the command's
+    process group at the timeout, so the seat runs in a session of its own
+    with no descriptor of the service's, and its status is written there."""
+    q = shlex.quote
+    seat = (f"PYTHONPATH=. python3 tests/lead_seat.py {' '.join(q(a) for a in seat_args)}"
+            f" > {q(out)} 2>&1; echo $? > {q(rc)}")
+    return (f"cd {q(seat_dir)} && rm -f {q(rc)} {q(out)} || exit 1; "
+            f"setsid sh -c {shlex.quote(seat)} > /dev/null 2>&1 < /dev/null & echo started")
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--lead" not in argv:
@@ -60,10 +72,7 @@ def main() -> int:
     if not (r.get("ok") and "shipped" in r.get("stdout", "")):
         print(f"FAIL    could not ship the lead seat into {lead}: {r}")
         return 2
-    args = " ".join(shlex.quote(a) for a in seat_args)
-    r = run(lead, f"cd {SEAT_DIR} && rm -f /tmp/lead_seat.rc /tmp/lead_seat.out && "
-                  f"(PYTHONPATH=. setsid nohup python3 tests/lead_seat.py {args} > /tmp/lead_seat.out 2>&1; "
-                  f"echo $? > /tmp/lead_seat.rc) > /dev/null 2>&1 & echo started")
+    r = run(lead, start_command(SEAT_DIR, seat_args))
     if not (r.get("ok") and "started" in r.get("stdout", "")):
         print(f"FAIL    could not start the lead seat in {lead}: {r}")
         return 2

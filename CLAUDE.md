@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (0.9.36). Read it first in any
+**This file describes the code at this version (0.9.37). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -109,8 +109,9 @@ These are load-bearing. Do not change them without the operator's sign-off.
   tags qmcp writes on its own are the stamp a create puts on the qube it just
   made, and those of dom0's own passes, which its timers, the boot unit, a
   check and each changing command run: the anonymity gate's `qmcp-blocked` and
-  `qmcp-stopped`, the restore check's `qmcp-quarantine`, and the open badges
-  taken off when a window ends.
+  `qmcp-stopped`, the restore check's `qmcp-quarantine` and the owner badges it
+  takes off a qube waiting for review, and the open badges taken off when a
+  window ends.
 - **A qube back from a backup waits for review.** dom0 labels every qube it
   brings into AI space, and every qube before one of its commands gives it a
   badge, with the feature `qmcp-id`, set to the qube's own UUID; neither the hub
@@ -125,7 +126,21 @@ These are load-bearing. Do not change them without the operator's sign-off.
   into and out of it, and the services refuse to operate it, create from it or
   take it as a principal (a create also refuses to copy or build on a qube in
 AI space whose label is not its own, before the pass holds it, since its copy
-would get a label of its own), until the operator accepts it (`qmcp restored
+would get a label of its own, and the lifecycle service refuses to remove
+  one). Right after the hold, and on its next pass for a qube held already, the
+  pass decides, once, the `qmcp-owner_*` badges of a qube waiting for review
+  that wears them: they stay only on a proven restore (every qube's UUID and
+  label read, its label names a UUID no qube has now, and no other qube
+  carries that label), which it records in the dom0 feature `qmcp-owner-kept`
+  as the qube's own UUID, a value no copy of it shares; any other qube loses
+  them. So a hand copy whose source still exists at that pass, a copy of a held
+  qube still present then, and two restores of one backup present at the same
+  pass lose the badge, and from then on only the
+  operator removes them; a restore whose original is gone keeps it. A decision
+  that fails (a failed read of the qube's own tags, UUID or record, or a write
+  that does not read back) leaves the qube held, and the next pass tries again;
+  a failed read of its label or of another qube's strips it. The qube
+  stays held until the operator accepts it (`qmcp restored
   accept`, which labels it) or rejects it. Meanwhile the operator's commands
   refuse to manage, guard, revoke, open, move or prepare it, to take it as a
   template (a cloned or promoted lead's included), a lead's source, a model
@@ -189,7 +204,10 @@ would get a label of its own), until the operator accepts it (`qmcp restored
   `qube-manage`), a qube revoked and brought back, and a qube from a release
   before owner badges are refused ("removing a qube qmcp did not create takes
   the operator's approval"), on a strict tag read, so a read that fails
-  refuses. (A hand `qvm-clone` of a qube that wears one copies it.) Such a
+  refuses. (A hand `qvm-clone` of a qube that wears one copies it; the
+  service refuses to remove the copy while it waits for review, and the
+  restore check takes the badge off once it holds it, unless the copy reads as
+  a restore: above. A copy accepted before 0.9.37 keeps it.) Such a
   qube is removed by the operator: `qmcp revoke QUBE --remove`, or by
   accepting the hub's `qube-revoke` proposal with `remove`, or its
   `project-delete` when it is a member. The badge gates in this one direction
@@ -1009,7 +1027,7 @@ networks where they are read or referenced.
 | `qmcp.GetPropertyAIManaged` | One property of a managed or guarded qube. Only properties qubesd lists, and `power_state` and `tags`; references out of scope redacted, and so are the netvm's addresses (`visible_gateway`, `dns`, …) when the netvm is out of scope, and refused when it cannot be read; an enrolled gateway is named (for a lead, one of its worker networks); `tags` filtered to `ai-managed` and `qmcp-guarded`, and refused when they cannot be read. |
 | `qmcp.SetPropertyAIManaged` | `label`, `memory`, `maxmem`, `vcpus`, and `netvm` only to null. Everything else (`template`, `name`, `default_dispvm`, `provides_network`, …) is operator-only. |
 | `qmcp.SetFeatureAIManaged` | Allowlist: `service.*`, `vm-config.*`, `menu-items`, `default-menu-items`. Every other key, including any a future Qubes adds, is operator-only. |
-| `qmcp.LifecycleAIManaged` | start, shutdown, kill, pause, unpause, remove. Remove is a real remove, of a qube qmcp created (one wearing a `qmcp-owner_*` badge) only; removing a lead, and any qube qmcp did not create, is the operator's. |
+| `qmcp.LifecycleAIManaged` | start, shutdown, kill, pause, unpause, remove. Remove is a real remove, of a qube qmcp created (one wearing a `qmcp-owner_*` badge) and not waiting for review only; removing a lead, and any qube qmcp did not create, is the operator's. |
 | `qmcp.SpawnAIManagedQube` | AppVM, StandaloneVM or DispVMTemplate from a TemplateVM, or a named DispVM from a disposable template. The template may be managed or guarded, but not one that provides network. A lead spawns AppVMs, StandaloneVMs and DispVMs from its approved templates only. |
 | `qmcp.CloneAIManagedQube` | Clone a managed qube, templates and standalones included; the clone lands where its source is (see Projects). A guarded source is refused: a clone is a managed, editable copy of everything in it. The template a clone is built on is checked (not stopped by the gate, not held or waiting for review, for a lead on its approved list), and the source, that template and the project it lands in are read again under the create lock and the source's own lock. The hub's clone of a qube whose template is hidden answers as a source that does not exist. |
 | `qmcp.SpawnDisposableAIManaged` | A disposable from a managed or guarded disposable template, born managed. Uses Qubes 4.3's preloaded disposables when the template has `preload-dispvm-max` (measured: a `qubes_run_disposable` cycle took 1.5 s with `preload-dispvm-max=1`, about 8 s without). |
@@ -1214,7 +1232,7 @@ and that the model lines sit between the denies that guard them.
 | `qmcp settings set [--pool-cap SIZE] [--private-cap SIZE] [--birth-egress QUBE\|none]` | Change the caps (in a quota's format, `200G`) or birth egress, under the create lock and the records' lock. A pool cap below what AI space holds is refused; birth egress must be an enrolled gateway that is not held for review, `none` unsets it. Each file is written whole; a write that fails prints the changes already made before the error. It cannot change the hub, the mode or the name prefix (an import onto a fresh install brings the export's name prefix). Root. |
 | `qmcp template prepare QUBE` / `refresh` | Write the two in-qube services, from dom0's copy, into a TemplateVM or a StandaloneVM as root, and label it with their version (`qmcp-services`): a halted one is started for it and shut down again, and a stop that did not complete is said and exits 1. A lookup that fails is said as such, never as no such qube. Refuses another class, a qube the anonymity gate stopped and one held for review, and refuses, within half a second, while an install or another prepare runs in it. Root. `refresh` (`qmcp-refresh.timer`, every minute, as the gate's user) does the same for every RUNNING prepared qube whose label is behind, never starting one, and leaves one audit line per qube it wrote into, as caller `refresh` (a write that fails goes to the unit's journal and makes the run exit 3, with no line). A template's own disk is up to date at once; the qubes built on it get the new services once it has shut down and they restart. |
 | `qmcp template install TEMPLATE PACKAGE...` | Install exact packages, and what they depend on (never recommended or weak dependencies; an install that would remove an installed package is refused, though one may be upgraded when a new one needs it, and on Arch `-Su` may replace a package as the repositories say), into a TemplateVM in AI space, guarded or managed, as root, with its own package manager (apt-get, dnf or pacman, which a probe names by its exit status), from the repositories it already trusts, over its update proxy; a halted template is started for it and shut down again, a running one keeps running (the qubes built on it get the packages once it has shut down and they restart). A name is letters, digits, `.`, `_`, `+` and `-`, a letter or digit first, never a `-` last (apt reads `sl-` as removing `sl`), at most 32 of them. Inside the template, before anything is installed, each must be a package's exact name in its repositories, or the whole install is refused: apt reads a name it does not know that holds a `.` as a regular expression, and dnf a name with a version as that version, a downgrade included (both measured on Qubes 4.3.1 templates). apt-get runs non-interactive and keeps a changed configuration file, as Qubes' own updater runs it, with `--no-install-recommends` and `--no-remove` (with `-y` alone it removes a package that conflicts: measured, `chrony` removes `systemd-timesyncd`); dnf refreshes its metadata first (a name is never refused for lists it could not fetch), takes no weak dependencies, ignores obsoletes, removes nothing (it never does without `--allowerasing`) and takes no `--`, which dnf5 refuses; on Arch it runs `pacman -Sy`, the check, then `pacman --needed -Su` with the names, so the install upgrades the whole template, never a partial upgrade. dom0 decides on the exit status alone; the last 40 lines the package manager wrote follow, escaped, as the template's words, read in bounded chunks, and after a successful install they end with each package's installed version (on Debian, Qubes' own hook lists every pending upgrade after each run, which would otherwise fill them). On Arch, a name refused inside the template leaves its package lists refreshed and the template not upgraded, until its next install or update. Refuses another class, a template outside AI space, one the anonymity gate stopped, one held for review, a hidden project's and one open to the hub (the window's expiry would kill it part-way: seal it first), and refuses, within half a second, while a prepare or another install runs in the same qube (either may shut down a qube it started, which would stop the other part-way). Waits up to 30 minutes; one that does not finish is a failed step that says whether dom0 shut the template down, stopping the install part-way, the shutdown did not complete, or, in a template that was already running, the install may still be running or may have stopped part-way, with the lines written so far. Root. |
-| `qmcp restored list [--json]` / `accept QUBE...\|--all` / `reject QUBE` | The qubes waiting for review: each one wearing `ai-managed`, `ai-dump` or a qmcp badge whose label is not its own UUID, held or not yet, and each one held whatever its label says; what its badges make it, and whether that agrees with the project records now (`null`, not known, when the records do not read). `accept` takes the qubes named, or with `--all` every qube held when it runs (after an import), with one audit line per qube it acted on; a qube whose tags or label cannot be read then is named, not accepted, and makes it exit 1, never "nothing is held". It writes the label first and only then lifts the hold, so a failure leaves it held; its badges stay as they came back. `reject` takes every qmcp badge, `ai-managed` and `ai-dump` off, the routed ones first and the hold last, then its label; the qube and its data stay. It refuses the hub, which is the hub by `/etc/qmcp/hub` and not by a badge (a reject would take the gate's stop off it), and any qube while that file does not read. `manage` and `guard` label a qube with no qmcp badge afresh, and refuse a badged one whose label is missing or another qube's; `revoke` refuses a held qube (reject it instead). Both root. |
+| `qmcp restored list [--json]` / `accept QUBE...\|--all` / `reject QUBE` | The qubes waiting for review: each one wearing `ai-managed`, `ai-dump` or a qmcp badge whose label is not its own UUID, held or not yet, and each one held whatever its label says; what its badges make it, and whether that agrees with the project records now (`null`, not known, when the records do not read). `accept` takes the qubes named, or with `--all` every qube held when it runs (after an import), with one audit line per qube it acted on; a qube whose tags or label cannot be read then is named, not accepted, and makes it exit 1, never "nothing is held". It takes off every `qmcp-owner_*` badge the restore check did not record as kept for that qube (`qmcp-owner-kept` naming its own UUID), and says so, then writes the label, and only then lifts the hold, so a failure leaves it held; its other badges stay as they came back. `accept` and `reject` refuse a disposable Qubes made itself from a labelled disposable template, unless it is held: it is not waiting for review. `reject` takes every qmcp badge, `ai-managed` and `ai-dump` off, the routed ones first and the hold last, then its label; the qube and its data stay. It refuses the hub, which is the hub by `/etc/qmcp/hub` and not by a badge (a reject would take the gate's stop off it), and any qube while that file does not read. `manage` and `guard` label a qube with no qmcp badge afresh, and refuse a badged one whose label is missing or another qube's; `revoke` refuses a held qube (reject it instead). Both root. |
 | `qmcp export [FILE]` / `import FILE` | `export` writes the operator files under `/etc/qmcp` into one JSON file, by default `qmcp-export-<UTC time>.json` in the sudo user's home, mode 0600, never over an existing file: a Qubes backup takes dom0 in as its user's home and nothing else (measured), so a backup with dom0 ticked carries it. It holds the audit log's keep-days and the install's audit mode too; `import` writes keep-days, and only names the mode when it differs from this install's (it is chosen at install: `install.sh --audit-log`), and takes an export from before 0.9.33, which has neither. Not in it: the proposals and the audit chain. It names on standard error every qube waiting for review then (held, or not yet held), and each whose tags or label cannot be read, or says the review could not be read at all, and says to accept or reject them before backing up: after a restore every AI qube is held alike, and `restored accept --all` takes them with the rest. It writes the export either way and exits 0. `import` writes an export back onto a fresh install, the records and the registry through their own parsers and the rest checked by shape, refusing while any project, gateway or p00 sink is recorded (a gateway registry that is exactly the export's excepted: the records are written last, so an import that failed part-way prints what it wrote and is finished by running it again), for an export of another hub, and for an ordinary export onto an install in anonymous mode. An export of an install in anonymous mode goes onto a normal install; `install.sh --anonymous` then turns the mode on once the qubes are restored and accepted. A backup does not carry dom0's update routing: with anonymous projects, send templates' updates through the anonymiser again (Global Config) before the import, since the gate runs right after it. Both root. |
 | `qmcp gateway list [--json]` | The gateway registry: each entry, whether it is still usable and why not, its upstream (marked when that is a Whonix gateway, whose clients' firewall rules have no effect), and the qubes and projects that use it. |
 | `qmcp gateway enroll QUBE [--anonymising [--updates]] [--label TEXT]` / `set QUBE [--anonymising yes\|no] [--updates yes\|no] [--label TEXT]` / `remove QUBE` | Let AI space use a gateway, change its entry, stop AI space using it. Marking one anonymising records its network as it is then; one with no network is refused, and unmarking one an anonymous project uses is refused. `--updates` ticks it for templates' updates (see "Anonymous projects"); marking it again keeps the tick only on the same network, and taking the tick off is refused where the gate would then stop a project or the hub. In anonymous mode a gateway that is not anonymising is refused, and so is unmarking one. Enrolling refuses a qube that does not provide network, lacks Qubes' `qubes-firewall` marker, is a Whonix gateway, sits on a template the hub manages, is the hub, a drop box, a lead or a member, or is in AI space unguarded; removing refuses while a project lists it or a qube in AI space sits on it, and, for a gateway ticked for updates, where the gate would then stop a project or the hub. Root. |
@@ -1229,7 +1247,7 @@ and that the model lines sit between the denies that guard them.
 | `qmcp project firewall NAME [--json]` | The lead's model (an endpoint or a model qube), the firewall rules the operator accepted and its live ones. With `--model HOST:PORT`, `--model-qube QUBE\|none`, `--rule RULE` (repeatable) or `--accept-current`, set a new model endpoint (for a lead with a network; its firewall becomes that endpoint, and DNS for a host name; refused while the model is a qube), a model qube (see "Model qubes") or none, exactly these rules, or accept the live rules as they are, if they are in qmcp's rule format (no comment or expire, at most 32). A write that does not read back as set is undone. Each change needs root. |
 | `qmcp project dump NAME` | Create a dump sink for a project, or for p00 (`hub-dump`). A dump sink is always a fresh qube: a qube of that name refuses it, and one that wears no dump badge is named as a `project dump` that did not finish, to remove (`qvm-remove`) before running the command again. |
 | `qmcp project unblock NAME` | Clear the anonymity gate's stop once a fresh run finds the project sound; `autostart` stays off. `p00` (or `hub`): the hub's stop, and every qube under the hub's check, once the gate finds the hub sound; in normal mode it takes off the stop badges anonymous mode left (`qmcp-blocked`, `qmcp-stopped`), with no gate run. A qube that cannot be looked up, or in normal mode whose tags cannot be read, is named as not unblocked. Root. |
-| `qmcp gate [--json]` | First hold for review every qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID (the restore check; what it holds goes to standard error), then judge every anonymous project now, and in anonymous mode the hub (its verdict has `hub` and `offenders`), and stop what is not sound (the timer runs this). Prints only what is not sound and what it did, unless `--json`. Exit 0 all sound, 1 one is not, 3 one could not be judged, or the restore check could not run, a hold or a read in it failed, or a hold was made while a call kept the qube's lock past both its waits (said on standard error, as is a qube that a call already running removed, before or after the hold's own write). Runs as any member of `qubes`. |
+| `qmcp gate [--json]` | First hold for review every qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID (the restore check; what it holds, and each owner badge it takes off, keeps or fails to decide, goes to standard error), then judge every anonymous project now, and in anonymous mode the hub (its verdict has `hub` and `offenders`), and stop what is not sound (the timer runs this). Prints only what is not sound and what it did, unless `--json`. Exit 0 all sound, 1 one is not, 3 one could not be judged, or the restore check could not run, a hold, an owner-badge decision or a read in it failed, or a hold was made while a call kept the qube's lock past both its waits (said on standard error, as is a qube that a call already running removed, before or after the hold's own write). Runs as any member of `qubes`. |
 | `qmcp project move QUBE TARGET` | Move a managed AppVM or StandaloneVM into p00, a project, or no slot. Its network does not change, so a project takes it only with no network or on one of its worker networks; out of one slot into another needs `--yes`, and so does a move into, out of or between anonymous projects, which says first what the qube carries with it. A move is refused if the anonymous project it goes into would be unsound or, in anonymous mode, if the hub's check would stop more qubes or the moved qube itself. A qube the gate stopped does not move. A qube that is not shut down (running, paused, or its power state does not read) moves from one slot to another only once it is: refused, never killed, since a kill loses what is being written; between p00 and no slot, both the hub's, it moves running. Such a move puts `qmcp-blocked` on the qube first (the rulebook refuses every call into it), requires it to read Halted for 10 s, a start admitted just before having time to show, changes the slot badges, and takes the block off last; a start that shows refuses the move, one that lands after the badges changed undoes it, and a step that fails half-way leaves the block on and says so. |
 | `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink and the model qube without the slot's badge, strip every badge of the slot, free it. A member of another slot too, a template, a disposable template, a gateway, a model qube, a guarded qube, a dump sink or the hub is kept without the slot's badges. Given a slot with no record, finish a delete that stopped half-way. Without `--yes` it prints, by name, what it would remove, keep and strip, and changes nothing; that needs no root. |
 | `qmcp proposal list [--json]` / `show N [--json]` | The hub's proposals, newest first; one proposal with its stored options, the command it is the options of (an edit shows its project before and after instead; a lead-firewall proposal adds the lead's model and rules now and after), why it needs the second tick, the plan of a delete, and its decision and report once decided. Reads, as any member of `qubes`. |
@@ -1493,7 +1511,7 @@ disposable template with curl and network; Qubes' stock `default-dvm` has both):
 ```sh
 # in dom0
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.36.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.37.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -1546,8 +1564,8 @@ update in the mode puts it back where it is missing), sets every operator file u
 under sudo comes out 0600 under dom0's umask), runs the gate once, and exits
 with the status of `qmcp check`, which it runs as the gate's user, as the
 operator does, not as root. Besides `qmcp-anon`, the open badges
-the seal takes off, and what the gate's run and the closing `qmcp check` hold
-or stop, it changes no qube tag. `uninstall.sh` removes the policy first (so no AI
+the seal takes off, and what the gate's run and the closing `qmcp check` hold,
+stop or take off a qube waiting for review (its owner badge), it changes no qube tag. `uninstall.sh` removes the policy first (so no AI
 caller reaches a half-removed service), then everything else, and ends with a
 clean-state check that names what it keeps; `--purge` also removes
 `/etc/qmcp`, the proposal store `/var/lib/qmcp`, the audit log and its rotated
@@ -1556,7 +1574,23 @@ files, so it is also what turns anonymous mode off. Backups under
 the change history some older installers kept. Qubes keep their tags: after
 anonymous mode, remove `qmcp-anon` from the hub, or `qmcp check` fails on it.
 
-**From v0.9.35**: install. **breaking:** the lifecycle service refuses the hub
+**From v0.9.36**: install. **breaking:** the lifecycle service refuses to
+remove a qube waiting for review, the restore check decides the owner badges
+of every qube waiting for review (above), and `restored accept` takes off any
+it did not record as kept. A copy 0.9.36 held is decided on the first pass
+after the install: if its source was removed while 0.9.36 ran, it reads as a
+restore and keeps the badge, so look at `qmcp restored list` and reject such
+a copy, or take its badge off by hand. A copy accepted before 0.9.37 is
+labelled as its own and never looked at again: it keeps the owner badge it was
+copied with until you take it off (`qvm-tags QUBE del qmcp-owner_...`; the
+audit log's `qmcp restored accept` lines name the qubes you accepted, except a
+`restored accept --all` run on 0.9.32 or earlier, whose one line names none). To roll back to 0.9.36, run this
+release's `uninstall.sh` before 0.9.36's installer (not drilled for this
+release; the uninstaller is unchanged since 0.9.33): a copy whose badge 0.9.37
+took off stays without it, `qmcp-owner-kept` stays on the qubes it was written
+to and nothing reads it, and a new copy carries its source's badge again.
+
+**From v0.9.35**: install, then see the v0.9.36 note. **breaking:** the lifecycle service refuses the hub
 and a lead `remove` for a qube with no `qmcp-owner_*` badge (above); the hub
 asks with a `qube-revoke` proposal with `remove`, and `qmcp revoke QUBE
 --remove` does it by hand. To roll back to 0.9.35, run this release's
@@ -1771,14 +1805,14 @@ changes nothing.
 | `tests/test_models.py` | anywhere with python3-qrexec | model qubes and model endpoints against the same fake: the one command and the order it changes authority in, each refusal, sharing, creates and lead changes, the check's findings, what the lead and the hub are told, the record, proposals, and the DNS rule an address endpoint no longer gets |
 | `tests/test_anon.py` | anywhere with python3-qrexec | anonymous projects against the same fake, with dom0's update question asked of qrexec's real parser: each gate condition broken on its own from a sound project, the block in its order, a read that fails once and twice, unblock, hub-blind services answering as for a missing name (`test_dom0.py` pins the cost), the commands' refusals, and proposals |
 | `tests/test_mode.py` | anywhere with python3-qrexec | anonymous mode against the same fake, with the update question asked of qrexec's real parser (and of our rulebook, for a stopped qube): the mode file, the updates tick, the hub's check and what each violation stops, unblock p00, the hub's creates and proposals in the mode, and moves into, out of and between anonymous projects |
-| `tests/test_operator_tools.py` | anywhere with python3-qrexec | 0.9.26's and 0.9.28's tools against the same fake: `template install` (each package manager's script, the shape of a name, every refusal before anything runs, a name the template refuses, a failed, hung or endless install, the escaped tail), `template prepare` and the refresh (what is written, what is never started or written into, a write that fails or hangs), the restore check (every create labelled, a restored or hand-copied qube held and refused by the services and the commands, review, accept and reject in authority order), `settings set`, export and import, their audit lines, and the installer's seed: when it runs, its place while the gate's timer is stopped, and its own program on both paths, run again after it stopped part-way |
+| `tests/test_operator_tools.py` | anywhere with python3-qrexec | 0.9.26's and 0.9.28's tools against the same fake: `template install` (each package manager's script, the shape of a name, every refusal before anything runs, a name the template refuses, a failed, hung or endless install, the escaped tail), `template prepare` and the refresh (what is written, what is never started or written into, a write that fails or hangs), the restore check (every create labelled, a restored or hand-copied qube held and refused by the services and the commands, a copy's owner badge taken off at the hold and a restore's kept, review, accept and reject in authority order), `settings set`, export and import, their audit lines, and the installer's seed: when it runs, its place while the gate's timer is stopped, and its own program on both paths, run again after it stopped part-way |
 | `tests/test_proposals.py` | anywhere with python3-qrexec | proposals against the same fake: who may submit, the shape, the store, the second tick, accepting and rejecting through the real commands, an accept that never finished, the operator's audit lines, and the qube types: managing, revoking (never a qube outside AI space, never dom0), installing (with no project lock held), and a hidden project's qube named by one |
-| `tests/test_interleave.py` | anywhere with python3-qrexec | 25 pairs of operations (a hub's call against an operator command, two commands, two calls, an accept against an accept or a reject) run at once on the same fake: each pauses the first at every qubesd call it makes, runs the second in a thread with real lock waits, and fails unless the end state, and what each side was told, is one some serial order gives, with no new authority, no deadlock and no lock taken in the other order (`tests/racefixture.py`) |
+| `tests/test_interleave.py` | anywhere with python3-qrexec | 26 pairs of operations (a hub's call against an operator command, two commands, two calls, an accept against an accept or a reject) run at once on the same fake: each pauses the first at every qubesd call it makes, runs the second in a thread with real lock waits, and fails unless the end state, and what each side was told, is one some serial order gives, with no new authority, no deadlock and no lock taken in the other order (`tests/racefixture.py`) |
 | `tests/test_crashpoints.py` | anywhere with python3-qrexec | 41 state-changing operations (the hub's and leads' service calls, the role actions, windows, project, gateway and settings commands, the restore check and accepted proposals) interrupted at every qubesd call, by a failure the code handles and by a death it cannot: no qube gains authority or loses a restriction, none is lost, a state between before and after is named by `qmcp check`, and no failed change reports success |
 | `tests/test_audit_modes.py` | anywhere with python3-qrexec | where audit lines go (the install's and the projects' modes, the place read before and after a call), the budget and the room for lines kept nowhere or in RAM, rotation, removal by age and the RAM chains' bound by size, and their wiring (the timer, the installer, `qmcp check`) |
 | `tests/test_strict_reads.py` | anywhere with python3-qrexec | a failed read is never an answer: each read of each key failed in turn, and the dom0 source walked for a read with a default |
 | `tests/test_server.py` | anywhere | the MCP server and CLI against a fake qrexec client |
-| `tests/test_inqube_services.py` | anywhere | the two in-qube services run as a qube runs them, with a fake `qvm-copy-to-vm`: the timeout and the process group it kills, the target's shape, the path, and `--` |
+| `tests/test_inqube_services.py` | anywhere | the two in-qube services run as a qube runs them, with a fake `qvm-copy-to-vm`: the timeout and the process group it kills, the target's shape, the path, and `--`; and `project_suite.py`'s start line under bash, and dash where it is installed, which must answer while the seat runs on |
 | `tests/test_gui.py` | anywhere; the widget tests where GTK 3 and a display exist | the operator's window, driving the real `qmcp` command against the same fake: the tree, the escaping, every form's command, and that no command, option or field is left out |
 | `tests/seat_suite.py` | in the hub, on a real box | the tools through the real chain |
 | `tests/redteam_suite.py` | in the hub, on a real box | attacks from the hub and from a managed qube, with positive controls; a probe that hangs on a dialog fails |
@@ -1825,9 +1859,11 @@ real dom0's policy set.
 - **A window's firewall half outlives it.** A seal takes the hub's authority
   away, not what it wrote: firewall rules it set through `--firewall` stay on
   the qube, and the seal's report says so (`qvm-firewall QUBE` lists them).
-- **The remove refusal tells the caller one bit of provenance:** that a qube
-  it already operates wears no owner badge (qmcp did not make it, or it was
-  revoked since). The tag read behind it shows the
+- **The remove refusal tells the caller two bits:** that a qube
+  it already operates wears no owner badge (qmcp did not make it, it was
+  revoked since, or it is a copy whose badge the restore check took off); and,
+  through "held for the operator's review", that a qube it can see is waiting
+  for review, which a create from it already says. The tag read behind it shows the
   caller nothing else; `qmcp-owner_*` stays out of every read.
 - **Root in a managed qube can still destroy its data** without removing it:
   the hub runs commands in the managed qubes it operates, and a lead in its
@@ -2110,6 +2146,13 @@ real dom0's policy set.
 - **The labels are dom0's word, not proof.** `qmcp-id` says dom0 badged this
   qube, or, on a disposable that cleans itself up, its template; `qmcp-services` says what dom0 wrote into a template, not what is in it
   now. The hub cannot write either, but anything the operator runs in dom0 can.
+- **A copy whose source is removed before the gate's next pass keeps its owner
+  badge.** The restore check decides when it holds the copy, normally within
+  about 15 seconds (a create in flight or a failed read can delay a pass),
+  whether the qube its label names still exists. A source removed before then,
+  or before a decision that failed is tried again, makes the copy read as a
+  restore, so it keeps the badge and the hub may remove it once it is accepted. Clone, and wait until `qmcp restored list` shows the
+  copy without its `qmcp-owner_*` badge, before removing the source.
 - **A fresh install holds every badged qube whose label is missing or not its
   own,** one restored before qubes-mcp was installed included, until
   `qmcp restored accept`. A qube kept through `uninstall.sh --purge` keeps its
@@ -2136,8 +2179,9 @@ last proposal types: managing and revoking a qube, and a template's packages; th
 audit round from both seats, whose fixes ship by severity from 0.9.29 (the high
 ones; 0.9.30 and 0.9.31 the medium ones; 0.9.32 the window's; 0.9.33
 the low ones and the docs; 0.9.34 what their gates and the box left; 0.9.35 what
-the reinstall rehearsal left), 0.9.36, this one, which removes only what qmcp
-created and asks the operator for the rest, and 1.0.0
+the reinstall rehearsal left), 0.9.36, which removes only what qmcp
+created and asks the operator for the rest, 0.9.37, this one, in which a hand copy
+loses its owner badge, and 1.0.0
 once all of it is green on a reinstalled machine.
 
 ## Anti-goals (immutable)

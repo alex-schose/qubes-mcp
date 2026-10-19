@@ -3474,6 +3474,12 @@ class RestoredModel(GuiBase):
         back, rogue = gm.restored_row(rows, "ai-back"), gm.restored_row(rows, "ai-rogue")
         self.assertIn("(ai-managed, qmcp-proj-p01), which make it member of p01",
                       gm.accept_restored_intro("ai-back", back))
+        self.assertNotIn("owner badge", gm.accept_restored_intro("ai-back", back))
+        owned = dict(back, badges=["ai-managed", "qmcp-owner_mcp-control", "qmcp-proj-p01"])
+        text = gm.accept_restored_intro("ai-back", owned)
+        self.assertIn("It keeps its other badges (ai-managed, qmcp-proj-p01)", text)
+        self.assertIn("Its owner badge (qmcp-owner_mcp-control) stays only if the restore "
+                      "check recorded it a restore", text)
         self.assertEqual(gm.accept_restored_red(back), "")
         self.assertFalse(rogue["agrees"])
         red = gm.accept_restored_red(rogue)
