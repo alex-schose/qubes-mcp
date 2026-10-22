@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (0.9.39). Read it first in any
+**This file describes the code at this version (1.0.0). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -1562,7 +1562,7 @@ disposable template with curl and network; Qubes' stock `default-dvm` has both):
 ```sh
 # in dom0
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.39.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.0.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -1625,8 +1625,14 @@ files, so it is also what turns anonymous mode off. Backups under
 the change history some older installers kept. Qubes keep their tags: after
 anonymous mode, remove `qmcp-anon` from the hub, or `qmcp check` fails on it.
 
-**From v0.9.38**: install. If an earlier `uninstall.sh --purge` left
-qubes wearing a project's slot badges with no record behind them, the
+**From v0.9.39**: install. The code does not change, only the version, so no
+template reads as behind; the installer still seals every open window before
+the policy goes in, killing an open qube that runs, as every install does. To roll
+back, install 0.9.39 over it.
+
+**From v0.9.38**: install. If an earlier `uninstall.sh --purge`, or a project
+delete that stopped half-way, left qubes wearing a project's slot badges with
+no record behind them, the
 installer lists them and refuses until it is run with `--strip-stale-badges`,
 which takes them off before the policy goes in. On an upgrade from before
 0.9.33 with no keep-days setting and rotated audit logs older than 90 days,
@@ -2282,9 +2288,9 @@ the low ones and the docs; 0.9.34 what their gates and the box left; 0.9.35 what
 the reinstall rehearsal left), 0.9.36, which removes only what qmcp
 created and asks the operator for the rest, 0.9.37, in which a hand copy
 loses its owner badge, 0.9.38, which keeps a hidden project's disposable
-templates from projects the hub sees, 0.9.39, this one, the fixes of a last
-audit before 1.0, and 1.0.0
-once all of it is green on a reinstalled machine.
+templates from projects the hub sees, 0.9.39, the fixes of a last audit
+before 1.0, and 1.0.0, this one: 0.9.39's code, tagged once it was green on the
+machine the reinstall pass rebuilt, updated to it by the README's steps.
 
 ## Anti-goals (immutable)
 
@@ -2342,9 +2348,15 @@ tests/              the suites above, GUI-CHECKLIST.md; data/ holds the upstream
 
 ## Versioning
 
-Semantic versioning from 0.9.0. Every commit takes one patch bump, one
-`CHANGELOG.md` entry and one tag. Before 1.0.0 a breaking change still takes a
-patch bump and is labelled `BREAKING`.
+Semantic versioning from 0.9.0. Every commit takes one version, one
+`CHANGELOG.md` entry and one tag. Before 1.0.0 a breaking change took a patch
+bump and was labelled `BREAKING`. From 1.0.0 a patch fixes, a minor adds, and a
+major needs the operator to act beyond the README's "Updating" steps, removes
+or changes a command, an option, an MCP tool or a record, widens what AI space
+or the hub may do, or drops a property of the trust model (the anti-goals never
+change, not even in a major). A fix that
+takes something away from AI space is a patch even when it changes what an MCP
+tool allows. `CHANGELOG.md`'s 1.0.0 entry has the whole rule.
 
 ## References
 

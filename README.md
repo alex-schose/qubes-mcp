@@ -18,7 +18,8 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.39 — the fixes of a last audit before 1.0.** Besides the hub, up to 15
+**Status: 1.0.0 — 0.9.39's code, released as stable.**
+Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -61,13 +62,11 @@ templates alike, and dom0 keeps its own copy of them, so
 `qmcp template prepare` writes them into a template or a standalone at any
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
-`qmcp export` puts qmcp's settings where a Qubes backup carries them. The
-audit round of 0.9.28 is being fixed by severity: 0.9.29 fixed the high
-findings, 0.9.30 and 0.9.31 the medium ones, 0.9.32 the window's, with limits
-on what one principal can put on the audit log (60 lines an hour of calls that
-changed nothing, about 20,000 a day of changes), and this release the low ones
-and the docs.
-Next: 1.0.0 once all of it is green on a reinstalled machine. 0.9.17 replaced the tier model of 0.9.0–0.9.16; see `CHANGELOG.md`.
+`qmcp export` puts qmcp's settings where a Qubes backup carries them. One
+principal can put only so much on the audit log: 60 lines an hour of calls
+that changed nothing, about 20,000 a day of changes. What 1.0 promises, and
+what a major, minor or patch version asks of you, is in `CHANGELOG.md`'s 1.0.0
+entry. 0.9.17 replaced the tier model of 0.9.0–0.9.16.
 
 ## How it works
 
@@ -237,7 +236,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.39.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.0.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -295,7 +294,21 @@ window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
 
-Coming from 0.9.37? Install over it. `qmcp project create` and `edit` now refuse
+Coming from 0.9.39? Install over it. The code does not change, only the
+version: no template reads as behind. The installer still seals every open
+window before the policy goes in, killing an open qube that runs, as every
+install does. To roll back, install 0.9.39 over this one.
+
+Coming from 0.9.38? Install over it. If qubes wear a project's slot badges
+with no project behind them (left by `uninstall.sh --purge`, or by a project
+delete that stopped half-way), the installer names them and refuses until you
+run it with `--strip-stale-badges`. `qmcp check` adds `boot seal` and `removal
+record` (and `audit clock`, which warns while removal of old audit logs is
+paused because dom0's clock may have moved). Each principal's audit budget
+starts afresh once, and again on a rollback. The CHANGELOG's 0.9.39 entry has
+the whole list. To roll back, install 0.9.38 over this one.
+
+Coming from 0.9.37? See the note above too. Install over it. `qmcp project create` and `edit` now refuse
 to share a disposable template between a hidden project and one the hub sees,
 either way round: each disposable the project the hub sees tried to make from
 it was rolled back at birth, with no word of why. `qmcp check` warns of a share
@@ -835,7 +848,11 @@ rule decides nothing. `tests/seat_suite.py`, `tests/redteam_suite.py` and
 machine running Qubes 4.3.1 they passed 41 of 41 checks, 39 of 39 probes and
 80 of 80 checks on 2026-10-05, the lead seat inside a lead with no network that
 asked its self-hosted model qube (Ollama, `qwen2.5:0.5b`) a question through
-`qvm-connect-tcp`.
+`qvm-connect-tcp`. On 2026-10-22, on a machine reinstalled from stock Qubes
+4.3.2 three days before and updated by the README's steps, the code 1.0.0 tags
+passed 49 of 49 checks, 41 of 43 probes and 61 of 62
+checks, none failing; the other three need a model qube, which that machine did
+not have.
 `tests/test_strict_reads.py` fails qube reads one at a time, at each point a
 call makes them, and requires the restrictive answer: a failed read is never
 taken for "no tags", "no network" or "not a gateway".

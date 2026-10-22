@@ -9,7 +9,7 @@ and 0.9.x as further stages. 0.9.17 replaced that design and deleted the
 per-stage installers and suites; the stage names below are the record of what
 each version shipped, and the git history keeps the code.
 
-**Every commit ships a version.** One commit, one patch bump, one entry here, one
+**Every commit ships a version.** One commit, one version, one entry here, one
 tag. There is no accumulating "unreleased" pile: if a change is worth committing
 it is worth saying what it changed, and a reader who has `0.9.7` installed can
 tell exactly what `0.9.9` adds. Versions **0.9.1 … 0.9.9 were assigned
@@ -17,14 +17,50 @@ retroactively** on 2026-08-19 to commits that were already public — the histor
 itself is unchanged, because this project does not rewrite published history, so
 those versions are a record laid over it rather than a rebase.
 
-While the major version is `0`, a breaking change takes a patch bump and is
-labelled **BREAKING** in its entry. That is SemVer's own rule for `0.y.z`, not a
-shortcut: nothing here is stable until 1.0.0, and pretending otherwise by
-burning minor versions would misrepresent it.
+Up to 0.9.39, while the major version was `0`, a breaking change took a patch
+bump and was labelled **BREAKING** in its entry, as SemVer allows for `0.y.z`.
+From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how.
 
 ## [Unreleased]
 
 Nothing — the working tree is the last released version.
+
+## [1.0.0] — 2026-10-22
+
+**1.0: 0.9.39's code, released as stable.** The code is 0.9.39's, line for line; this release
+changes only the version and the docs. It was tagged after 0.9.39 passed on a test machine that
+had been reinstalled from stock Qubes 4.3.2 and set up by the README's own steps (2026-10-19),
+then updated to 0.9.39 by its "Updating" steps. There the seat suite passed 49 of 49 checks, the
+red-team suite 41 of 43 probes and a lead's seat 61 of 62 checks, none failing; the other three
+need a model qube, which that machine did not have.
+
+### What 1.0 promises
+
+- **The trust model and the anti-goals in `CLAUDE.md` are the contract**, among them: dom0 is the
+  only enforcement point and qrexec's caller the only identity; the hub asks and only the operator
+  decides; nothing relays between a principal and dom0, and nothing writes the policy at run time.
+  The anti-goals never change, not even in a major. A change that widens what AI space or the hub may do, or drops a
+  property of the trust model, takes a major version, and its entry says so first.
+- **Each release installs over the one before it** with `deploy/install.sh`, and its entry here
+  (and the README's "Coming from" note) says what that update asks of you. From an older release,
+  read each entry in between.
+- **The version says what an update asks of you.** A patch fixes and a minor adds (a command, an
+  option, a tool, a setting; one that widens what AI space or the hub may do is a major, as above); both
+  install over the last release with nothing beyond the README's "Updating" steps. A major is a
+  release that needs you to act beyond those steps, or that removes or changes a command, an
+  option, an MCP tool or a record the last one had. A fix that takes something away from AI space
+  is a patch even when it changes what an MCP tool allows, and its entry says what AI space can no
+  longer do.
+- **Fixes go to the newest release only.** There are no maintained older branches.
+
+What 1.0 does not promise is in the README's Caveat and in the residual risks in `CLAUDE.md`: the
+hub is part of the trust boundary, and the limits stated there stay.
+
+### Upgrading
+
+Install over 0.9.39 and follow the README's "Updating" steps. The code does not change, only the
+version, so no template reads as behind. The installer still seals every open window before the
+policy goes in, killing an open qube that runs, as every install does. To roll back, install 0.9.39 over it.
 
 ## [0.9.39] — 2026-10-22
 
