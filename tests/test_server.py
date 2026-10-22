@@ -1238,6 +1238,13 @@ class LostCreateTests(InProcessFakeCase):
                     self.assertEqual(tools.call_tool(tool, arguments),
                                      {"ok": False, "error": text})
 
+    def test_a_proposal_whose_reply_never_came_says_it_may_be_stored(self):
+        self.fake.answer({"qmcp.SubmitProposal": {"sleep": 1.5, "json": {"ok": True, "id": 1}}})
+        with mock.patch.object(tools, "DOM0_TIMEOUT", 0.5), \
+                self.assertLogs("qubes_mcp.qrexec", level="WARNING"):
+            r = tools.call_tool("qubes_propose_dump", {"title": "a sink", "project": "osint"})
+        self.assertEqual(r, {"ok": False, "error": tools.PROPOSAL_LOST})
+
     def test_an_ordinary_refusal_stays_opaque(self):
         for tool, arguments, service, _ in self.CASES:
             for label, response in {"policy denial": {"raw": "", "rc": 126},
@@ -1493,6 +1500,30 @@ class InProcessServerTests(unittest.TestCase):
         self.assertTrue(started.wait(5))
         srv.handle_line(self.call_line("mark", 2))
         return srv, out, release, ran
+
+    def test_eight_long_calls_never_hold_up_a_short_one(self):
+        release = threading.Event()
+        started = threading.Semaphore(0)
+
+        def long(args):
+            started.release()
+            release.wait(10)
+            return {"ok": True}
+        out = io.BytesIO()
+        reg = {name: _tool(name, long) for name in server.LONG_TOOLS}
+        reg["qubes_list"] = _tool("qubes_list", lambda args: {"ok": True, "qubes": []})
+        srv = server.Server(out, registry=reg)
+        self.addCleanup(srv.drain, 5)
+        self.addCleanup(release.set)
+        for i in range(server.WORKERS):
+            srv.handle_line(self.call_line("qubes_run", 100 + i))
+        for _ in range(server.WORKERS):
+            self.assertTrue(started.acquire(timeout=5))
+        srv.handle_line(self.call_line("qubes_list", 1))
+        deadline = time.monotonic() + 5
+        while b'"id":1,' not in out.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn(b'"id":1,', out.getvalue())
 
     def test_a_queued_call_runs_when_nothing_cancels_it(self):
         # The positive for the two tests below.
@@ -2384,6 +2415,18 @@ class CliTests(FakeCase):
         done = self.cli("qubes_run", "name=ai-a", 'cmd=["id"]')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn(b'"stdout": "a\\ud800b"', done.stdout)
+
+    def test_terminal_controls_in_a_result_are_printed_escaped(self):
+        # C1 controls (U+009B is CSI), DEL, bidi overrides and line separators
+        # from a qube's output never reach the terminal raw.
+        out = "a\u009b2Jb\u007fc\u202ed\u2028e\u0085f"
+        self.fake.answer({"qmcp.RunInAIManaged": {"raw": json.dumps(
+            {"ok": True, "rc": 0, "stdout": out, "stderr": ""})}})
+        done = self.cli("qubes_run", "name=ai-a", 'cmd=["id"]')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        raw = done.stdout
+        self.assertFalse(any(b > 0x7e or (b < 0x20 and b not in (0x0a,)) for b in raw), raw)
+        self.assertEqual(json.loads(raw)["stdout"], out)
 
     def test_null_and_quoted_strings(self):
         self.assertEqual(self.cli("qubes_spawn", "name=ai-new", "template=ai-tpl",

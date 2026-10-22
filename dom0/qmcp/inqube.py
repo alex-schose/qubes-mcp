@@ -337,20 +337,53 @@ def _prepare(vm, name, files, current, timeout) -> dict:
         except Exception as e:
             raise InQubeError(f"the services were written, but the {LABEL} label was not "
                               f"({type(e).__name__}): run the prepare again") from None
-    finally:
-        stopped = _stop(vm) if started else None
+    except InQubeError as e:
+        # The stop's outcome goes with the failure: a template that was halted
+        # and is left running must be said, as an install says it.
+        if started and not _stop(vm):
+            raise InQubeError(f"{e}; it was started for this, and its shutdown did not "
+                              f"complete: qvm-shutdown {name}, or qvm-kill {name}") from None
+        raise
+    except BaseException:
+        if started:
+            _stop(vm)
+        raise
+    stopped = _stop(vm) if started else None
     return {"qube": name, "version": current, "started": started, "stopped": stopped}
 
 
-def refresh(app, timeout: float = TIMEOUT_S) -> list:
+#: How long one refresh run may go on starting writes: inside the unit's
+#: `TimeoutStartSec=300`, with room for the write in flight (`TIMEOUT_S`).
+REFRESH_BUDGET_S = 240
+
+
+def refresh(app, timeout: float = TIMEOUT_S, done=None, budget_s: float | None = None) -> list:
     """Bring every RUNNING prepared qube up to the installed services. Returns
     [(name, outcome)], outcome "updated" or a reason it was not; qubes already
     current, never prepared or not running are left out. Raises InQubeError
-    when dom0's own copy cannot be read."""
+    when dom0's own copy cannot be read.
+
+    `done(name, outcome, wrote)` is called for each qube as soon as it is
+    settled, so its audit line is written then, not at the end of a run the
+    unit's timeout may cut short; `wrote` is True when the services were
+    written into it, also when its label then failed. The qubes are taken in
+    a random order, and no write starts once `budget_s` has passed, so qubes
+    that stall each write (a qube the hub has root in can) cannot keep the
+    same others from ever being refreshed."""
+    import random
     files = read_services()
     current = version(files)
+    budget = REFRESH_BUDGET_S if budget_s is None else budget_s
+    deadline = time.monotonic() + budget
     out = []
-    for vm in list(app.domains):
+
+    def settle(name, outcome, wrote=False):
+        out.append((name, outcome))
+        if done is not None:
+            done(name, outcome, wrote)
+    vms = list(app.domains)
+    random.shuffle(vms)
+    for vm in vms:
         try:
             name = core.name_of(vm)
             if core.klass_of(vm) not in OWN_ROOT:
@@ -363,18 +396,27 @@ def refresh(app, timeout: float = TIMEOUT_S) -> list:
             if vm.get_power_state() != "Running":
                 continue
         except core.Unreadable as e:
-            out.append((getattr(vm, "name", "?"), f"not judged: {e}"))
+            settle(getattr(vm, "name", "?"), f"not judged: {e}")
+            continue
+        if time.monotonic() >= deadline:
+            settle(name, f"not updated: this run's {budget:.0f} s ran out; the next run tries "
+                         f"again")
             continue
         try:
             _push(vm, files, timeout)
-            vm.features[LABEL] = current
         except InQubeError as e:
-            out.append((name, f"not updated: {e}"))
+            settle(name, f"not updated: {e}")
             continue
         except Exception as e:
-            out.append((name, f"not updated: the label write failed ({type(e).__name__})"))
+            settle(name, f"not updated: the write failed ({type(e).__name__})")
             continue
-        out.append((name, "updated"))
+        try:
+            vm.features[LABEL] = current
+        except Exception as e:
+            settle(name, f"written, but its label was not ({type(e).__name__}): the next run "
+                         f"writes it again", wrote=True)
+            continue
+        settle(name, "updated", wrote=True)
     return out
 
 

@@ -624,6 +624,69 @@ class FakeDomains:
         self._hidden.clear()
 
 
+class CachedDomains:
+    """qubesadmin's VMCollection as one process sees it (v4.3.35): the list
+    is read from qubesd at the first access and reused until `clear_cache()`.
+    `FakeDomains` answers from the live fleet on every access, so a decision
+    taken on a list read before a lock wait cannot fail a test against it;
+    `ProcApp` gives each simulated service process one of these."""
+
+    def __init__(self, base):
+        self.base, self._list = base, None
+
+    def refresh_cache(self, force=False):
+        if force or self._list is None:
+            self._list = {**self.base._vms, **self.base._hidden}
+
+    def clear_cache(self, invalidate_name=None):
+        self._list = None
+
+    def __iter__(self):
+        self.refresh_cache()
+        return iter(list(self._list.values()))
+
+    def values(self):
+        self.refresh_cache()
+        return list(self._list.values())
+
+    def __contains__(self, item):
+        self.refresh_cache()
+        return getattr(item, "name", item) in self._list
+
+    def __getitem__(self, item):
+        key = getattr(item, "name", item)
+        if key not in self:
+            raise KeyError(key)
+        return self._list[key]
+
+    def __delitem__(self, item):
+        self.base.__delitem__(getattr(item, "name", item))
+        self.clear_cache()
+
+    @property
+    def lookups(self):
+        return self.base.lookups
+
+    @lookups.setter
+    def lookups(self, v):
+        self.base.lookups = v
+
+
+class ProcApp:
+    """The app one dom0 service process holds: its own cached domain list
+    (`CachedDomains`) over the shared fleet."""
+
+    def __init__(self, base):
+        object.__setattr__(self, "_b", base)
+        object.__setattr__(self, "domains", CachedDomains(base.domains))
+
+    def __getattr__(self, k):
+        return getattr(object.__getattribute__(self, "_b"), k)
+
+    def __setattr__(self, k, v):
+        setattr(object.__getattribute__(self, "_b"), k, v)
+
+
 class FakeApp:
     def __init__(self):
         self.domains = FakeDomains(self)

@@ -644,6 +644,23 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
                                  f"their audit lines stop without a symptom "
                                  f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
 
+    # 11a. the record of what AI space removed: the services write it before
+    # every remove of theirs, and the restore check reads it; a remove is
+    # refused while it cannot be written.
+    rst = _safe(lambda: os.stat(restored.REMOVED_DIR))
+    if rst is None:
+        add("fail", "removal record", f"{restored.REMOVED_DIR} missing: every remove of the "
+                                      f"hub's and the leads' is refused (systemd-tmpfiles "
+                                      f"--create /etc/tmpfiles.d/qmcp.conf)")
+    elif not (shared(rst) and rst.st_mode & stat.S_ISGID):
+        add("fail", "removal record", f"{restored.REMOVED_DIR} is not the services group's, "
+                                      f"group-writable and setgid (2770 root:{SERVICES_GROUP}): "
+                                      f"a remove of the hub's or a lead's may be refused, and "
+                                      f"while the gate's user cannot list it no restore is "
+                                      f"proven")
+    else:
+        add("pass", "removal record", f"{restored.REMOVED_DIR} is the services' to write")
+
     # 11b. the proposal store: the services (a non-root dom0 user in `qubes`)
     # write proposals into it, and the operator's accept and reject (root)
     # write decisions the services must read back. Without the group's write
@@ -704,6 +721,9 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("pass" if ok else "fail", "audit chain", f"{n} entries intact" if ok else
             f"{err}: keep the file as the record of the break; sudo qmcp audit rotate starts a new "
             f"log, so a later break is not hidden behind this one")
+        linked, why = audit.verify_links()
+        if not linked:
+            add("fail", "audit chain", f"{why}: keep the files as the record of the break")
     for name, _ in audit.ram_chains():
         path = os.path.join(audit.ram_dir(), name)
         ok, n, err = audit.verify(path)
@@ -736,7 +756,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         if count is None:
             continue                    # named above
         add("warn", "calls not logged",
-            f"{caller}: {count} call(s) past {audit.REFUSALS_PER_HOUR} in a clock hour were "
+            f"{caller}: {count} call(s) past {audit.REFUSALS_PER_HOUR} in an hour were "
             f"counted, not logged, since {first} (calls that changed nothing, and kills past its "
             f"daily budget); a principal that does that so often is worth a look. Removing the counter once read (sudo rm "
             f"{os.path.join(calls, caller + audit.REFUSED_SUFFIX)}) also gives it a new day's "
@@ -745,7 +765,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("warn", "audit budget spent",
             f"{caller}: {today} line(s) today of its {audit.AUDIT_LINES_PER_DAY} a day"
             + (f"; {over} change(s) refused for its budget since {first}" if over else "")
-            + (": its changes are refused until the next UTC day" if today >= audit.AUDIT_LINES_PER_DAY
+            + (": its changes are refused until its next day (24 h of dom0's uptime)" if today >= audit.AUDIT_LINES_PER_DAY
                else ": it has a new day's share now")
             + ". A principal that busy is worth a look; removing its counter (sudo rm "
               f"{os.path.join(calls, caller + audit.REFUSED_SUFFIX)}) gives it a new day's share "
@@ -767,6 +787,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("warn", "audit size", f"{size // (1024 * 1024)} MiB; the hourly timer rotates it "
                                   f"(qmcp-audit.timer), or by hand: sudo qmcp audit rotate")
     _audit_retention(add, audit_records, audit_mode)
+    _boot_seal_item(add)
 
     # 14. nothing of v0.9.16 left behind
     left = [p for p in legacy_paths if os.path.lexists(p)]
@@ -1201,6 +1222,39 @@ def _gate_timer_item(add, anonymous: bool) -> None:
         add("pass", "gate timer", f"{anon.TIMER} runs every 15 seconds"
                                   + (": the gate, " if anonymous else ": ")
                                   + "the window expiry and the restore hold")
+
+
+#: The boot seal: its unit, and the drop-in on Qubes' own autostart unit that
+#: orders every autostart qube after it (`deploy/qubes-vm-qmcp-seal.conf`).
+SEAL_UNIT = "qmcp-seal.service"
+SEAL_DROPIN = "/etc/systemd/system/qubes-vm@.service.d/10-qmcp-seal.conf"
+
+
+def _boot_seal_item(add) -> None:
+    """Every boot ends every window before any autostart qube starts: the unit
+    must be enabled, and the drop-in must order Qubes' autostart after it."""
+    enabled = anon.unit_enabled(SEAL_UNIT)
+    try:
+        with open(SEAL_DROPIN, encoding="utf-8") as fh:
+            ordered = any(line.strip() == f"After={SEAL_UNIT}" for line in fh.read(8192).splitlines())
+    except FileNotFoundError:
+        ordered = False
+    except (OSError, UnicodeDecodeError):
+        ordered = None
+    if enabled is None or ordered is None:
+        add("error", "boot seal", f"cannot tell whether {SEAL_UNIT} is enabled and ordered "
+                                  f"before Qubes' autostart ({SEAL_DROPIN})")
+    elif not enabled:
+        add("fail", "boot seal", f"{SEAL_UNIT} is not enabled, so a window open at shutdown "
+                                 f"is still open at the next boot until the gate's timer runs "
+                                 f"(sudo systemctl enable {SEAL_UNIT})")
+    elif not ordered:
+        add("fail", "boot seal", f"{SEAL_DROPIN} is missing or does not order Qubes' autostart "
+                                 f"after {SEAL_UNIT}, so an autostart qube can start with a "
+                                 f"window's badge still on (run the installer again)")
+    else:
+        add("pass", "boot seal", f"{SEAL_UNIT} ends every window at boot, before any autostart "
+                                 f"qube")
 
 
 def _member(tags, slot: str) -> bool:
@@ -1707,6 +1761,13 @@ def _model_qube_refusal(by_name: dict, name: str, hub) -> str | None:
         return "is a drop box"
     if _held(tags):
         return HELD_WHY
+    try:
+        # Checked before anything changes: the model badge would refuse it
+        # anyway, after the lead and the qube had lost their networks.
+        if restored.in_scope(tags) and not restored.known(vm):
+            return WAITS_WHY
+    except core.Unreadable as e:
+        return f"its qmcp-id label cannot be read ({e})"
     if core.UMBRELLA not in tags:
         return f"is outside AI space: guard it first (qmcp guard {name})"
     if projects.LEAD in tags or projects.lead_slots(tags):
@@ -2114,8 +2175,9 @@ def _network_enrolled(vm, name) -> None:
     if net is not None and not _is_gateway(vm):
         try:
             enrolled = net in gateways.load()
-        except gateways.GatewaysUnreadable:
-            enrolled = False
+        except gateways.GatewaysUnreadable as e:
+            raise RoleError(f"'{name}' is on {net}, and whether that is an enrolled gateway "
+                            f"cannot be told: the gateway registry does not read ({e})") from None
         if not enrolled:
             raise RoleError(f"'{name}' is on {net}, which is not an enrolled gateway: enroll it "
                             f"(qmcp gateway enroll {net}) or clear the qube's network first")
@@ -2300,6 +2362,11 @@ def _manage(app, name, from_hub: bool = False) -> str:
                             f"qmcp manage {name} again") from None
         clear_window(name)
         ended = "; its open window ended, with no kill: it is managed now"
+    elif kill_pending(name):
+        # A seal whose kill failed left it pending: the expiry pass would
+        # kill the qube the operator just handed to the hub.
+        clear_window(name)
+        ended = "; the kill its seal could not make is dropped: it is managed now"
     for t in sorted((tags & LEGACY_TIER_TAGS) | ({core.GUARDED} & tags)):
         vm.tags.discard(t)
     serves = projects.model_slots(tags)
@@ -2395,8 +2462,13 @@ def _guard(app, name, in_ai_space_only: bool = False) -> str:
     if in_ai_space_only and core.UMBRELLA not in before:
         raise RoleError(f"'{name}' is outside AI space, and --only-in-ai-space refuses to add "
                         f"it (qmcp guard {name} without it adds it to AI space, guarded)")
-    _network_enrolled(vm, name)
-    mode = anonymous_mode()                 # read before anything is written
+    # The network and the mode decide only for a qube joining AI space: a
+    # guard of one already in it only takes authority away, and a registry or
+    # mode file that does not read must not stop it.
+    joining = core.UMBRELLA not in before
+    if joining:
+        _network_enrolled(vm, name)
+    mode = anonymous_mode() if joining else False     # read before anything is written
     _label(vm, name)
     serves = sorted(projects.model_slots(before))
     # A model qube's maintenance window closes (managed to guarded): what the
@@ -2664,7 +2736,11 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
     if from_hub:
         if core.UMBRELLA not in before:
             raise RoleError(f"'{name}' is not in AI space: the hub revokes only a qube it can see")
-        reachable = (core.GUARDED not in before) or bool(before & {core.OPEN, core.OPEN_FW})
+        # A qube a seal could not kill yet still runs what the hub started in
+        # it through the window: kept running, outside AI space, the revoke
+        # would drop the kill the timer owes it.
+        reachable = (core.GUARDED not in before) or bool(before & {core.OPEN, core.OPEN_FW}) \
+            or kill_pending(name)
         if reachable and not shutdown:
             raise RoleError(f"the hub could run commands in '{name}', so a hub's proposal to "
                             f"revoke it kills it: propose it without shutdown false")
@@ -2678,22 +2754,39 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
         why = _remove_refusal(app, vm, name, before)
         if why:
             raise RoleError(f"{why}; nothing was changed")
+    # A window (open, or a seal's kill still owed) becomes a pending kill
+    # before anything comes off, as a seal does: then a kill of this revoke's
+    # that fails, or a failure before it, leaves a kill the timer tries again.
+    windowed = bool(before & {core.OPEN, core.OPEN_FW}) or kill_pending(name)
+    owed = windowed and not (before & {core.OPEN, core.OPEN_FW})
+    early = []
+    if windowed and shutdown:
+        try:
+            mark_kill_pending(name, None, vm)
+        except OSError as e:
+            early.append(f"its window could not be marked for a kill ({type(e).__name__})")
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
+    # Whatever fails after the badges came off, the kill still happens: a
+    # qube out of AI space (or half out) must not run on what the hub started
+    # in it because a later step failed. The failures are said together.
+    problems = list(early)
     try:
         left = sorted(t for t in _tags(vm) if birth.controlled(t))
     except core.Unreadable as e:
-        raise RoleError(f"'{name}''s badges were taken off, but {e}; run qmcp revoke {name} "
-                        f"again") from None
+        left = None
+        problems.append(f"its badges were taken off, but {e}")
     if left:
-        raise RoleError(f"'{name}' still wears {', '.join(left)}; run qmcp revoke {name} again")
-    if before & {core.OPEN, core.OPEN_FW}:
-        clear_window(name)              # its badges went with the rest
-    try:
-        _pin_dispvm(vm, name)
-    except RoleError as e:
-        raise RoleError(f"'{name}' is out of AI space, but {e}") from None
-    msg = f"{name}: revoked"
+        problems.append(f"it still wears {', '.join(left)}")
+    dropped = False
+    # Left running on purpose (--no-shutdown): the window's record goes with
+    # its badges, and a seal's kill still owed is dropped, and said. With a
+    # kill, the record goes only once that kill reads back (below).
+    if windowed and not shutdown and not problems:
+        clear_window(name)
+        dropped = owed
+    msg = f"{name}: revoked" + ("; the kill its seal could not make is dropped" if dropped
+                                else "")
     if shutdown:
         # Killed, never asked: a guest the hub ran as root can ignore a
         # shutdown request, and a paused one refuses it, and either would run
@@ -2703,10 +2796,24 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
         if done not in ("halted", "killed"):
             raise RoleError(f"'{name}' is revoked, but it could NOT be killed ({done}): a process "
                             f"the hub started in it may still run, outside AI space; kill it by "
-                            f"hand (qvm-kill {name})")
+                            f"hand (qvm-kill {name})"
+                            + (f"; and {'; '.join(problems)}: run qmcp revoke {name} again"
+                               if problems else ""))
         if done == "killed":
             msg += (", killed: what the hub had running in it was stopped"
                     + ("" if remove else "; what it wrote to disk stays"))
+        if windowed:
+            clear_window(name)              # this kill read back: none is owed now
+            if owed:
+                msg += "; the kill its seal could not make is made"
+    try:
+        _pin_dispvm(vm, name)
+    except RoleError as e:
+        problems.append(str(e))
+    if problems:
+        state = ("killed" if shutdown else "left running, as asked")
+        raise RoleError(f"'{name}' is {state}, but {'; '.join(problems)}; run qmcp revoke "
+                        f"{name} again" + ("; it was NOT removed" if remove else ""))
     if remove:
         err = _remove_qube(app, name)
         if err:
@@ -2764,7 +2871,8 @@ def _window_path(name: str, dir_: str | None = None) -> str:
 
 
 def read_window(name: str, dir_: str | None = None) -> dict:
-    """`{"opened": int, "expires": int, "firewall": bool}`, or raise.
+    """`{"opened": int, "expires": int, "firewall": bool, "boot_expires": int}`
+    (`boot_expires` absent in a record before 0.9.39), or raise.
 
     A record that does not parse, or whose fields are the wrong shape, is
     unreadable rather than read as any expiry. `expires` must be an `int` and
@@ -2777,29 +2885,58 @@ def read_window(name: str, dir_: str | None = None) -> dict:
             rec = json.loads(fh.read(4096))
     except FileNotFoundError:
         raise WindowUnreadable(f"'{name}' wears an open badge and has no window record") from None
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise WindowUnreadable(f"'{name}''s window record cannot be read "
                                f"({type(e).__name__})") from None
     ok = (isinstance(rec, dict)
           and isinstance(rec.get("expires"), int) and not isinstance(rec.get("expires"), bool)
           and isinstance(rec.get("opened"), int) and not isinstance(rec.get("opened"), bool)
-          and isinstance(rec.get("firewall"), bool))
+          and isinstance(rec.get("firewall"), bool)
+          and (rec.get("boot_expires") is None
+               or (isinstance(rec.get("boot_expires"), int)
+                   and not isinstance(rec.get("boot_expires"), bool))))
     if not ok:
         raise WindowUnreadable(f"'{name}''s window record is malformed")
     return rec
 
 
+def _boot_clock() -> float:
+    """Seconds since boot, which no one sets: `/run/qmcp/open` is cleared at
+    every boot, so a record's reading of it is good for the record's life."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+#: How far ahead of the wall clock a record's opening may lie before the
+#: clock is taken to have moved back.
+CLOCK_SLACK_S = 60
+
+
 def window_left(name: str, dir_: str | None = None, now: float | None = None) -> int:
-    """Whole seconds left, zero or less when the window has run out."""
-    return read_window(name, dir_)["expires"] - int(time.time() if now is None else now)
+    """Whole seconds left, zero or less when the window has run out. Judged by
+    the wall clock and by the clock since boot, which nothing can set: the
+    window is over when either says so, so a wall clock stepped back never
+    lengthens it. A record whose opening lies ahead of the wall clock, or
+    whose end lies further ahead than the longest window, means the clock
+    moved: over."""
+    rec = read_window(name, dir_)
+    wall = int(time.time() if now is None else now)
+    left = rec["expires"] - wall
+    if left > WINDOW_MAX_S or rec["opened"] > wall + CLOCK_SLACK_S:
+        return 0
+    boot = rec.get("boot_expires")
+    if boot is not None:
+        left = min(left, int(boot - _boot_clock()))
+    return left
 
 
 def write_window(name: str, seconds: int, firewall: bool, dir_: str | None = None) -> dict:
     """Write the record, before any badge is written. A failure between the two
-    leaves a record and no badge, which opens nothing."""
+    leaves a record and no badge, which opens nothing. The end is written on
+    both clocks (`window_left`)."""
     path = _window_path(name, dir_)
     now = int(time.time())
-    rec = {"opened": now, "expires": now + seconds, "firewall": bool(firewall)}
+    rec = {"opened": now, "expires": now + seconds, "firewall": bool(firewall),
+           "boot_expires": int(_boot_clock()) + seconds}
     old = os.umask(0o007)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
@@ -2860,7 +2997,7 @@ def _pending_record(name: str, dir_: str | None = None) -> dict | None:
     try:
         with open(_window_path(name, dir_), encoding="utf-8") as fh:
             rec = json.loads(fh.read(4096))
-    except (OSError, ValueError, WindowUnreadable):
+    except (OSError, ValueError, RecursionError, WindowUnreadable):
         return None
     return rec if isinstance(rec, dict) and rec.get("kill") is True else None
 
@@ -2981,15 +3118,20 @@ def _open_window(app, name, seconds: int, firewall: bool = False,
             + (f"; WARNING: {warning}" if warning else ""))
 
 
-def open_window_report(app, name, seconds: int, firewall: bool = False) -> "Report":
+def open_window_report(app, name, seconds: int, firewall: bool = False,
+                       gate_held: bool = False) -> "Report":
     """`open_window` as a Report, for an accepted proposal: the accept
     path wants a report, while `qmcp open` wants a line.
 
-    It takes the gate's lock, which `qmcp open` takes at the command layer, so
-    an accept never races the pass that expires a window. The lock cannot
-    nest: nothing that already holds it calls this.
+    It runs under the gate's lock, which `qmcp open` takes at the command
+    layer, so an accept never races the pass that expires a window. The lock
+    cannot nest: `gate_held` says the caller holds it (an accept takes it
+    before it marks the proposal); otherwise this takes it.
     """
     report = Report()
+    if gate_held:
+        report.append(open_window(app, name, seconds, firewall=firewall))
+        return report
     with anon.gate_lock() as got:
         if not got:
             raise RoleError("another run held the gate past its wait; the window was not opened, "
@@ -3473,6 +3615,16 @@ def _audit_retention(add, records, mode) -> None:
     if os.path.exists(audit.LOG_PATH + audit.ROTATING_SUFFIX):
         add("warn", "audit retention", f"{audit.LOG_PATH}{audit.ROTATING_SUFFIX} is there: a "
                                        f"rotation stopped part-way; the next one takes it over")
+    try:
+        with open(audit.CLOCK_MOVED_PATH, encoding="utf-8", errors="replace") as fh:
+            moved = fh.read(512).strip() or "the clock moved"
+    except FileNotFoundError:
+        moved = None
+    except OSError as e:
+        moved = f"{audit.CLOCK_MOVED_PATH} does not read ({type(e).__name__})"
+    if moved is not None:
+        add("warn", "audit clock", f"removal of old audit logs is paused: {moved}; once dom0's "
+                                   f"clock is right, sudo rm {audit.CLOCK_MOVED_PATH}")
     keep = audit.keep_days()
     if keep is None:
         add("fail", "audit retention", f"{audit.KEEP_DAYS_PATH} does not read, or holds neither "
@@ -4051,6 +4203,56 @@ def _badges_of_slot(app, slot: str) -> tuple:
     return out, unread
 
 
+def stale_slot_badges(app, records: dict) -> tuple:
+    """The routed slot badges no record backs: ([(qube, [badges])], [qubes
+    whose tags do not read]). The rulebook routes on badges, not records
+    (`qmcp-lead-pNN` alone gives root exec into the slot's members), so after
+    `uninstall.sh --purge` removed the records a fresh install would put the
+    rulebook back over every project the qubes still wear. `qmcp-lead` goes
+    with the last stale lead badge a qube wears."""
+    stale, unread = [], []
+    for vm in list(app.domains):
+        try:
+            if core.klass_of(vm) == "AdminVM":
+                continue
+            tags = core.tags_of(vm)
+        except core.Gone:
+            continue
+        except core.Unreadable:
+            unread.append(getattr(vm, "name", "?"))
+            continue
+        parts = [(t, projects.slot_badge_parts(t)) for t in tags]
+        gone = sorted(t for t, part in parts if part and part[1] not in records)
+        if not gone:
+            continue
+        leads_left = [t for t, part in parts if part and part[0] == "lead" and t not in gone]
+        if projects.LEAD in tags and not leads_left \
+                and any(projects.slot_badge_parts(t)[0] == "lead" for t in gone):
+            gone.append(projects.LEAD)
+        stale.append((core.name_of(vm), sorted(gone, key=_removal_order)))
+    return stale, unread
+
+
+def strip_stale_slot_badges(app, records: dict) -> list:
+    """Take off the badges `stale_slot_badges` names, routed ones first, and
+    read each qube back. Lines of what was done; raises `RoleError` naming the
+    first qube that still wears one."""
+    stale, unread = stale_slot_badges(app, records)
+    if unread:
+        raise RoleError(f"the tags of {', '.join(sorted(unread))} do not read, so whether they "
+                        f"wear a slot's badges is not known")
+    out = []
+    for name, badges in stale:
+        vm = app.domains[name]
+        for t in badges:
+            vm.tags.discard(t)
+        left = sorted(set(badges) & _read_tags(vm))
+        if left:
+            raise RoleError(f"'{name}' still wears {', '.join(left)}")
+        out.append(f"{name}: took off {', '.join(badges)} (no project record backs them)")
+    return out
+
+
 def _removal_order(tag: str) -> tuple:
     """Badges come off in this order, and go on in the reverse: first the
     badges the rulebook routes on (`qmcp-lead-pNN` alone gives root exec
@@ -4137,6 +4339,50 @@ def _remove_qube(app, name) -> str:
     # for (`core.retire_qube_locks`); one in use is left until a reboot.
     core.retire_qube_locks(name)
     return ""
+
+
+def _remove_qube_locked(app, name, lock=None) -> str:
+    """`_remove_qube` of a lead or a member under the qube's lock, which the
+    services hold from their check to their effect, so a hub's start admitted
+    between the kill and the remove cannot leave it running. Goes on without
+    the lock when it is held past the wait (a removal only takes authority
+    away), and then, if the qube is still there, waits for the lock once more
+    and kills and removes it again. `lock`: the qube's lock, already held by
+    the caller (`_demote_lead`'s `keep`), which this lets go."""
+    if not core.valid_qube_name(name):
+        return _remove_qube(app, name)
+    if lock is None:
+        lock = core.qube_lock(name, must=False)
+        try:
+            held = lock.__enter__()
+        except core.Refusal:
+            held = False
+    else:
+        held = lock.fd is not None
+    try:
+        err = _remove_qube(app, name)
+        if held and not err:
+            # Its lock file goes under the lock this holds (`_remove_qube`
+            # could only try it free, and it was not).
+            core.retire_qube_locks(name, held=(lock.fd,))
+    finally:
+        if held:
+            lock.__exit__(None, None, None)
+    if err and not held:
+        late = core.qube_lock(name, must=False)
+        try:
+            got = late.__enter__()
+        except core.Refusal:
+            got = False
+        try:
+            if got:
+                err = _remove_qube(app, name)
+                if not err:
+                    core.retire_qube_locks(name, held=(late.fd,))
+        finally:
+            if got:
+                late.__exit__(None, None, None)
+    return err
 
 
 def _plan_lead(app, space: str, source: str, origin: str, lead_netvm, name=None,
@@ -4355,7 +4601,7 @@ def _recorded_lead(app, p):
     return vm
 
 
-def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
+def _demote_lead(app, p, report: list, removing: bool = False, keep=None) -> bool:
     """Take the lead's authority first: its badges, which the rulebook routes on
     and the services require. Then a kill, read back. A recorded name whose
     qube does not wear the slot's lead badge is left alone and reported as a
@@ -4373,7 +4619,11 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
     Only when the wait runs out can a call of the lead's finish after this
     command: one still running then, or one that reaches its check before the
     badges come off, each checked while the lead still had them; the report
-    says the wait ran out."""
+    says the wait ran out.
+
+    `keep`: a list; when the lead's lock is had, it is not let go but
+    appended there, for the caller to remove the qube under it and then let
+    it go, so no call lands between the kill and the remove."""
     vm = _vm(app, p.lead) if p.lead else None
     if vm is None:
         if p.lead:
@@ -4429,7 +4679,10 @@ def _demote_lead(app, p, report: list, removing: bool = False) -> bool:
                                                              for f, why in left))
                           + "; they grant nothing, and a reboot clears them")
     finally:
-        lock.__exit__(None, None, None)
+        if held and keep is not None:
+            keep.append(lock)
+        else:
+            lock.__exit__(None, None, None)
     if not held:
         # A call of the hub's on the lead held its lock past the wait: once it
         # has finished, a start it made is killed again.
@@ -4459,6 +4712,11 @@ def _demote_and_kill(vm, p, report: list, removing: bool) -> None:
         # would keep its network and lose A8's guard on its firewall.
         report.fail(f"{p.slot}: {p.lead}'s lead badges were taken off, but {e}; qmcp check "
                     f"shows whether any is left")
+    except Exception:
+        # A badge that did not come off stops the command, but not before the
+        # kill: what the lead runs must not outlive a demotion that failed.
+        _kill_if_running(vm)
+        raise
     done = _kill_if_running(vm)
     if done in ("halted", "killed"):
         return
@@ -4702,15 +4960,20 @@ def _remove_lead(report, app, key):
     if p.lead is None:
         raise ProjectError(f"project '{p.label}' has no lead")
     _refuse_held_lead(app, p)
-    ours = _demote_lead(app, p, report, removing=True)
-    # The accepted rules were the removed lead's; the model stays for the next one.
-    old, p.lead, p.lead_firewall = p.lead, None, None
-    projects.save(records)
-    report.append(f"{p.slot}: the record names no lead")
-    if ours:
-        err = _remove_qube(app, old)
-        report.append(f"{p.slot}: removed {old}") if not err else \
-            _not_removed(report, p.slot, old, err)
+    kept = []
+    try:
+        ours = _demote_lead(app, p, report, removing=True, keep=kept)
+        # The accepted rules were the removed lead's; the model stays for the next one.
+        old, p.lead, p.lead_firewall = p.lead, None, None
+        projects.save(records)
+        report.append(f"{p.slot}: the record names no lead")
+        if ours:
+            err = _remove_qube_locked(app, old, kept.pop() if kept else None)
+            report.append(f"{p.slot}: removed {old}") if not err else \
+                _not_removed(report, p.slot, old, err)
+    finally:
+        for lock in kept:
+            lock.__exit__(None, None, None)
 
 
 def set_lead(app, key: str, lead_source: str, lead_origin: str, lead_netvm=None,
@@ -4755,7 +5018,7 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                 lead_name = next(f"{p.space(prefix)}lead{n}" for n in range(2, 100)
                                  if _vm(app, f"{p.space(prefix)}lead{n}") is None)
         old_vm = _recorded_lead(app, p)
-        old_net, disconnect = None, False
+        old_net, disconnect, widened = None, False, None
         if add_old_network and not keep_old:
             raise ProjectError("--add-old-network goes with --keep-old")
         if keep_old and old_vm is not None:
@@ -4771,7 +5034,10 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
                                            f"lead's")
                     if p.anonymous:
                         _anonymous_networks(app, [old_net])
-                    p.networks = tuple(_check_networks(app, p.networks + (old_net,)))
+                    # Saved only with the demotion below: a step that fails
+                    # before it must not leave the old lead's own network on
+                    # the list while it is still the lead.
+                    widened = tuple(_check_networks(app, p.networks + (old_net,)))
                 else:
                     disconnect = True
         if model is None and _lead_network(app, lead_source, lead_origin, lead_netvm) is not None:
@@ -4790,40 +5056,53 @@ def _set_lead(report, app, key, lead_source, lead_origin, lead_netvm, keep_old, 
             _plan_model_qube(app, p.slot, model_qube, records, p)
         elif model is not None and p.model_qube is not None:
             _model_badge_holders(app, p.slot)
+        kept_networks = p.networks
         try:
+            if widened is not None:
+                p.networks = widened
             projects.parse(projects.dump_json(records))     # the record as it will be saved
         except projects.ProjectsUnreadable as e:
             raise ProjectError(f"the project's record would not be valid: {e}") from None
+        finally:
+            p.networks = kept_networks
         if model is not None and p.model_qube is not None:
             # The project's model becomes a remote endpoint: its model qube goes
             # first, before any lead changes, so no lead ever has both.
             _set_model_qube(report, app, records, p, None)
         old = p.lead
+        kept = []
         if old is not None:
-            ours = _demote_lead(app, p, report, removing=not keep_old)
-            # The accepted rules were that lead's; the model stays for the next one.
-            p.lead, p.lead_firewall = None, None
-            projects.save(records)
-            report.append(f"{p.slot}: the record names no lead now")
-            if ours and keep_old:
-                old_vm = _vm(app, old)
-                if disconnect:
-                    # Off the network before it joins: never a moment as a worker
-                    # on a network its project does not list.
-                    old_vm.netvm = None
-                    report.append(f"{p.slot}: {old} lost its network ({old_net} is not on the "
-                                  f"list)")
-                elif add_old_network and old_net is not None:
-                    report.append(f"{p.slot}: {old_net} added to the worker networks")
-                try:
-                    _set_tags(old_vm, add={projects.member_badge(p.slot)})
-                    report.append(f"{p.slot}: {old} kept as a worker")
-                except core.Unreadable as e:
-                    report.fail(f"{p.slot}: {old} was kept as a worker, but {e}")
-            elif ours:
-                err = _remove_qube(app, old)
-                report.append(f"{p.slot}: removed {old}") if not err else \
-                    _not_removed(report, p.slot, old, err)
+            try:
+                ours = _demote_lead(app, p, report, removing=not keep_old,
+                                    keep=None if keep_old else kept)
+                # The accepted rules were that lead's; the model stays for the next one.
+                p.lead, p.lead_firewall = None, None
+                if widened is not None:
+                    p.networks = widened
+                projects.save(records)
+                report.append(f"{p.slot}: the record names no lead now")
+                if ours and keep_old:
+                    old_vm = _vm(app, old)
+                    if disconnect:
+                        # Off the network before it joins: never a moment as a worker
+                        # on a network its project does not list.
+                        old_vm.netvm = None
+                        report.append(f"{p.slot}: {old} lost its network ({old_net} is not on the "
+                                      f"list)")
+                    elif add_old_network and old_net is not None:
+                        report.append(f"{p.slot}: {old_net} added to the worker networks")
+                    try:
+                        _set_tags(old_vm, add={projects.member_badge(p.slot)})
+                        report.append(f"{p.slot}: {old} kept as a worker")
+                    except core.Unreadable as e:
+                        report.fail(f"{p.slot}: {old} was kept as a worker, but {e}")
+                elif ours:
+                    err = _remove_qube_locked(app, old, kept.pop() if kept else None)
+                    report.append(f"{p.slot}: removed {old}") if not err else \
+                        _not_removed(report, p.slot, old, err)
+            finally:
+                for lock in kept:
+                    lock.__exit__(None, None, None)
         lead, fresh, before, stored, old_rules, old_net = _make_lead(app, p.slot, lead_source,
                                                                      lead_origin, name, lead_netvm,
                                                                      model, p.badges(), lead_class)
@@ -5634,14 +5913,19 @@ def _delete_project(report, app, key):
     elif p is None or p.slot == projects.HUB_SLOT:
         raise ProjectError(f"no project '{key}'")
     else:
-        ours = _demote_lead(app, p, report, removing=True)
-        del records[p.slot]
-        projects.save(records)
-        report.append(f"{p.slot}: record of '{p.label}' deleted")
-        if ours:
-            err = _remove_qube(app, p.lead)
-            report.append(f"{p.slot}: removed {p.lead}") if not err else \
-                _not_removed(report, p.slot, p.lead, err)
+        held = []
+        try:
+            ours = _demote_lead(app, p, report, removing=True, keep=held)
+            del records[p.slot]
+            projects.save(records)
+            report.append(f"{p.slot}: record of '{p.label}' deleted")
+            if ours:
+                err = _remove_qube_locked(app, p.lead, held.pop() if held else None)
+                report.append(f"{p.slot}: removed {p.lead}") if not err else \
+                    _not_removed(report, p.slot, p.lead, err)
+        finally:
+            for lock in held:
+                lock.__exit__(None, None, None)
     # Only qubes really in the project are removed. A stray badge on a qube
     # outside AI space is stripped below, never the qube. A qube whose tags
     # cannot be read is neither removed nor stripped: the delete reports it,
@@ -5652,7 +5936,7 @@ def _delete_project(report, app, key):
     members, kept, _ = _slot_members(app, p.slot)
     kept = dict(kept)
     for name in members:
-        err = _remove_qube(app, name)
+        err = _remove_qube_locked(app, name)
         report.append(f"{p.slot}: removed {name}") if not err else \
             _not_removed(report, p.slot, name, err)
     holders, _ = _badges_of_slot(app, p.slot)
@@ -5670,7 +5954,7 @@ def _delete_project(report, app, key):
                 continue
             if _member(tags, p.slot) and not why:
                 # A member the first pass could not read: removed like the rest.
-                err = _remove_qube(app, name)
+                err = _remove_qube_locked(app, name)
                 report.append(f"{p.slot}: removed {name}") if not err else \
                     _not_removed(report, p.slot, name, err)
                 continue
@@ -5750,7 +6034,10 @@ def _unblock(report, app, key):
     records = _load_records()
     slot = projects.HUB_SLOT if key in (projects.HUB_SLOT, "hub") else _project(records, key).slot
     try:
-        report.extend(anon.unblock(app, records, slot))
+        for line in anon.unblock(app, records, slot):
+            # A qube NOT unblocked is a failed step: the command exits 1 and
+            # its audit line says so.
+            (report.fail if isinstance(line, anon.NotUnblocked) else report.append)(line)
     except ValueError as e:
         raise ProjectError(str(e)) from None
 

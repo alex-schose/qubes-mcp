@@ -923,6 +923,141 @@ class StrayLeadBadges(ProjectBase):
         self.assertFalse({"qmcp-lead", "qmcp-lead-p01"} & self.tags(name))
 
 
+class StaleSlotBadges(ProjectBase):
+    """After `uninstall.sh --purge` the records are gone and the qubes keep
+    their badges: the installer lists them, and takes them off, routed first,
+    with --strip-stale-badges."""
+
+    def test_badges_of_a_slot_with_no_record_are_found_and_taken_off(self):
+        self.assertEqual(fleet.stale_slot_badges(self.app, self.records()), ([], []))
+        pathlib.Path(projects.PROJECTS_PATH).unlink()            # as a purge leaves it
+        stale, unread = fleet.stale_slot_badges(self.app, self.records())
+        self.assertEqual(unread, [])
+        found = dict(stale)
+        self.assertEqual(found[LEAD], ["qmcp-lead-p01", "qmcp-lead"])   # routed one first
+        self.assertEqual(found["ai-osint-w1"], ["qmcp-proj-p01"])
+        self.assertEqual(found["osint-dump"], ["qmcp-dump-p01"])
+        self.assertNotIn("ai-hubq", found)                        # p00 always has its record
+        lines = fleet.strip_stale_slot_badges(self.app, self.records())
+        self.assertEqual(len(lines), len(stale))
+        self.assertEqual(self.tags(LEAD), {"ai-managed"})
+        self.assertEqual(fleet.stale_slot_badges(self.app, self.records()), ([], []))
+
+    def test_a_tag_read_that_fails_refuses_the_strip(self):
+        pathlib.Path(projects.PROJECTS_PATH).unlink()
+        self.app.fail_reads(f"tag.List:{LEAD}", "fail fail fail")
+        with self.assertRaises(fleet.RoleError):
+            fleet.strip_stale_slot_badges(self.app, self.records())
+
+
+class LeadChangeKeepsTheListUntilTheDemotion(ProjectBase):
+    def test_a_failure_before_the_demotion_leaves_the_worker_networks_as_they_were(self):
+        # --keep-old --add-old-network with a remote --model on a project with a
+        # model qube: the model qube's step saves the record, and must not
+        # carry the old lead's own network onto the list while it is the lead.
+        a = self.app
+        a.vm("gw2", provides_network=True, netvm=a.domains["sys-firewall"],
+             tags={"ai-managed", "qmcp-guarded"}, features={"qubes-firewall": "1"})
+        self.enroll("gw2")
+        a.domains[LEAD].netvm = a.domains["gw2"]
+        a.vm("ai-mq", template=a.domains["ai-tpl-g"], netvm=None,
+             tags={"ai-managed", "qmcp-guarded", "qmcp-model-p01"})
+        doc = json.loads(pathlib.Path(projects.PROJECTS_PATH).read_text())
+        doc["slots"]["p01"]["model_qube"] = "ai-mq"
+        self.write_records(doc)
+        before = projects.load()["p01"].networks
+        real = fleet._demote_lead
+
+        def failing(app, p, report, removing=False, **kw):
+            raise core.Unreadable(f"cannot look up {LEAD}")
+        fleet._demote_lead = failing
+        self.addCleanup(setattr, fleet, "_demote_lead", real)
+        with self.assertRaises(Exception):
+            fleet.set_lead(a, "osint", "template", "ai-debian-13", lead_netvm="ai-net-router",
+                           keep_old=True, lead_name="ai-osint-lead2", model="api.example.com:443",
+                           add_old_network=True)
+        p = projects.load()["p01"]
+        self.assertEqual((p.lead, p.networks), (LEAD, before))
+        r = self.lcall("qmcp.SpawnAIManagedQube", {"name": "ai-osint-w9",
+                                                   "template": "ai-debian-13", "netvm": "gw2"})
+        self.assertFalse(r["ok"], r)
+        # The positive: the same command without the failure adds it.
+        fleet._demote_lead = real
+        fleet.set_lead(a, "osint", "template", "ai-debian-13", lead_netvm="ai-net-router",
+                       keep_old=True, lead_name="ai-osint-lead2", model="api.example.com:443",
+                       add_old_network=True)
+        self.assertIn("gw2", projects.load()["p01"].networks)
+
+
+class RevokeKillsWhateverFailsAfter(ProjectBase):
+    def test_a_failed_pin_or_read_back_still_kills_and_says_so(self):
+        # The read-back after the discards is the fifth tag read of a revoke.
+        for fail, why in ((lambda a: a.fail.add("set.default_dispvm"), "could not be pinned"),
+                          (lambda a: a.fail_reads("tag.List:ai-osint-w2", "ok ok ok ok fail"),
+                           "badges were taken off, but")):
+            a = self.app
+            w = a.domains["ai-osint-w2"]
+            if w.get_power_state() != "Running":
+                w.start()
+            if core.UMBRELLA not in w.tags.raw():
+                w.tags.add(core.UMBRELLA)
+                w.tags.add("qmcp-proj-p01")
+            fail(a)
+            with self.assertRaises(fleet.RoleError) as cm:
+                fleet.revoke(a, "ai-osint-w2")
+            a.fail.clear()
+            self.assertIn("is killed, but", str(cm.exception))
+            self.assertIn(why, str(cm.exception))
+            self.assertEqual(w.get_power_state(), "Halted")
+
+
+class GuardNeedsNoReadItDoesNotUse(ProjectBase):
+    def test_a_guard_in_ai_space_needs_neither_the_mode_nor_the_registry(self):
+        pathlib.Path(core.MODE_PATH).write_text("banana\n")
+        fleet.guard(self.app, "ai-work2")
+        self.assertIn(core.GUARDED, self.tags("ai-work2"))
+        pathlib.Path(core.MODE_PATH).unlink()
+        pathlib.Path(gateways.GATEWAYS_PATH).write_text("{not json")
+        fleet.guard(self.app, "ai-work")                         # on a router
+        self.assertIn(core.GUARDED, self.tags("ai-work"))
+
+    def test_a_qube_joining_ai_space_on_a_router_is_refused_when_the_registry_does_not_read(self):
+        self.app.vm("op-x", template=self.app.domains["ai-debian-13"],
+                    netvm=self.app.domains["ai-net-router"], tags=set())
+        pathlib.Path(gateways.GATEWAYS_PATH).write_text("{not json")
+        with self.assertRaisesRegex(fleet.RoleError, "registry does not read"):
+            fleet.guard(self.app, "op-x")
+        self.assertNotIn(core.UMBRELLA, self.tags("op-x"))
+
+
+class ModelQubeWaitingForReview(ProjectBase):
+    def test_a_model_qube_waiting_for_review_is_refused_before_anything_changes(self):
+        import uuid
+        a = self.app
+        a.vm("ai-mq", template=a.domains["ai-tpl-g"], netvm=a.domains["ai-net-router"],
+             tags={"ai-managed", "qmcp-proj-p00"}, features={"qmcp-id": str(uuid.uuid4())})
+        with self.assertRaisesRegex(Exception, "waits for your review"):
+            fleet.set_lead_firewall(a, "osint", model_qube="ai-mq")
+        self.assertEqual(a.domains[LEAD].netvm.name, "ai-net-router")
+        self.assertEqual(a.domains["ai-mq"].netvm.name, "ai-net-router")
+        self.assertIn("qmcp-proj-p00", self.tags("ai-mq"))
+
+
+class DeepNesting(ProjectBase):
+    def test_records_nested_too_deep_are_unreadable_not_a_crash(self):
+        pathlib.Path(projects.PROJECTS_PATH).write_text("[" * 200000)
+        with self.assertRaises(projects.ProjectsUnreadable):
+            projects.load()
+        items = [f for f in fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})
+                 if f.check == "project records"]
+        self.assertEqual([f.status for f in items], ["fail"])
+
+    def test_a_request_nested_too_deep_is_invalid_json(self):
+        with self.assertRaises(core.Refusal) as cm:
+            core.read_request(io.BytesIO(b"[" * 60000))
+        self.assertEqual(cm.exception.payload.get("error"), "invalid JSON input")
+
+
 class CheckProjects(ProjectBase):
     def findings(self):
         records = self.records()

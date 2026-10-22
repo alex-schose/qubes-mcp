@@ -259,7 +259,9 @@ def fill_copy(app, vm, source, standalone: bool) -> None:
         # `preload-dispvm*` is a disposable template's queue of its own
         # disposables, and its maximum would start preloading from the copy
         # while it is half-built and outside AI space; the operator sets it.
-        if key == core.ID_FEATURE or key.startswith("preload-dispvm"):
+        # The restore check's record that the source was proven a restore
+        # (`qmcp-owner-kept`) is that qube's decision, never its copy's.
+        if key in (core.ID_FEATURE, core.OWNER_KEPT_FEATURE) or key.startswith("preload-dispvm"):
             continue
         vm.features[key] = value
     if not standalone:

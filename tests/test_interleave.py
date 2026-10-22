@@ -123,10 +123,20 @@ PAIRS = {
     "accept-x-reject": (REVOKE_PROPOSAL, rf.accept_op, rf.reject_op),
     # The restore check and the gate.
     "restored-accept-x-gate": (rf.held_restored, cmd("restored", "accept", "ai-back"), cmd("gate")),
+    # A qube taken out of AI space while the pass would hold it: never left held.
+    "restored-reject-x-gate": (rf.unheld_restored, cmd("restored", "reject", "ai-back"), cmd("gate")),
+    "revoke-x-gate": (rf.unheld_restored, cmd("revoke", "ai-back"), cmd("gate")),
     "manage-x-gate": (rf.outsider, cmd("manage", "op-x"), cmd("gate")),
     "copy-remove-x-gate": (rf.hand_copy, svc("qmcp.LifecycleAIManaged", {"name": "ai-hub-src-copy",
                                                                        "action": "remove"}),
                            cmd("gate")),
+    # A removal against a hub's start of the qube being removed: removed, not
+    # left running as a managed qube.
+    "lead-remove-x-start-lead": (rf.nothing, cmd("project", "lead", "osint", "--remove"),
+                                 svc("qmcp.LifecycleAIManaged", {"name": LEAD, "action": "start"})),
+    "delete-x-start-member": (rf.nothing, cmd("project", "delete", "osint", "--yes"),
+                              svc("qmcp.LifecycleAIManaged", {"name": "ai-osint-w1",
+                                                              "action": "start"})),
     "lead-new-x-lead-spawn": (rf.nothing, cmd("project", "lead", "osint", "--lead-template", "ai-debian-13"),
                               LEAD_SPAWN),
 }

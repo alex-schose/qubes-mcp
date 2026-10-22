@@ -105,7 +105,8 @@ if [ "$MODE" != check ]; then
     if [ "$MODE" = purge ]; then
         rm -rf /etc/qmcp /var/lib/qmcp /var/log/qmcp-audit.log /var/log/qmcp-audit.log.pad
         for f in $(rotated); do rm -f "$f"; done
-        say "purged /etc/qmcp, /var/lib/qmcp (the hub's proposals), /var/log/qmcp-audit.log and its rotated files"
+        say "purged /etc/qmcp, /var/lib/qmcp (the hub's proposals, the restore check's records and the audit clock), /var/log/qmcp-audit.log and its rotated files"
+        say "the qubes keep their tags: a project's slot badges, which the rulebook routes on, stay on them; a new install refuses while they do, and takes them off with --strip-stale-badges"
     fi
 fi
 
@@ -133,7 +134,7 @@ if [ "$MODE" = purge ]; then
     for f in $(rotated); do report "$f"; done
 else
     [ -e /etc/qmcp ] && echo "    kept  /etc/qmcp (operator config; --purge removes it)"
-    [ -e /var/lib/qmcp ] && echo "    kept  /var/lib/qmcp (the hub's proposals and their decisions; --purge removes it)"
+    [ -e /var/lib/qmcp ] && echo "    kept  /var/lib/qmcp (the hub's proposals and their decisions, the restore check's records, the audit clock; --purge removes it)"
     [ -e /var/log/qmcp-audit.log ] && echo "    kept  /var/log/qmcp-audit.log (--purge removes it)"
     [ -e /var/log/qmcp-audit.log.pad ] && echo "    kept  /var/log/qmcp-audit.log.pad, zeros only (--purge removes it)"
     n=$(rotated | wc -l)

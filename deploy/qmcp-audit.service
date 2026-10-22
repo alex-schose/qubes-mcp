@@ -13,7 +13,10 @@
 #   3. the RAM chains under /run/qmcp/audit, which a reboot clears, are bounded
 #      by size instead: one past 8 MiB is rotated, and the oldest rotated RAM
 #      files are removed while all of them hold more than 64 MiB. A flood can
-#      push earlier RAM lines off; a live chain is never removed.
+#      push earlier RAM lines off; a live chain is never removed;
+#   4. the restore check's removal record (/var/lib/qmcp/removed): an entry
+#      older than a week that no qube's qmcp-id label names is dropped;
+#      nothing is while any label does not read. Never this run's status.
 #
 # A run that did neither writes no line; a rotation writes its anchor, a
 # removal one line naming the files, as caller "rotate". In install mode ram

@@ -9,8 +9,13 @@ project's lead; an agent reaches it over stdio, often through SSH.
   process can only ever reach stderr, and replies leave through a private
   duplicate of the original stdout. A foreign line on stdout would corrupt the
   client's stream; this makes one impossible rather than unlikely.
-- tools/call runs on a pool of 8 worker threads, so a long qubes_events window
-  never blocks other calls. Everything else is answered on the reader thread.
+- tools/call runs on worker threads: the tools that may run for a long time
+  (a command or a copy in a qube, a disposable's run, an events window, a
+  create, a start) on a pool of 8, everything else on a pool of its own, so
+  long calls never hold up a list, a state read, a shutdown or a kill here.
+  dom0 still caps the hub at 8 calls of its own at once, so 8 events windows
+  or creates in flight make it refuse a ninth call as busy. Everything else is
+  answered on the reader thread.
 - A tool result with "ok": false is a normal result (isError false): the agent
   has to read the refusal. Only an exception inside a handler gives isError
   true, with the fixed text "internal error"; the traceback goes to stderr.
@@ -37,6 +42,11 @@ LATEST_VERSION = SUPPORTED_VERSIONS[0]
 # Protocol versions whose tool results may carry structuredContent.
 STRUCTURED_VERSIONS = frozenset({"2025-06-18"})
 WORKERS = 8
+#: The tools that may run for minutes or hours, on `WORKERS` threads; every
+#: other tool runs on `QUICK_WORKERS` threads of its own.
+LONG_TOOLS = frozenset({"qubes_run", "qubes_copy", "qubes_run_disposable", "qubes_events",
+                        "qubes_spawn", "qubes_clone", "qubes_spawn_disposable", "qubes_start"})
+QUICK_WORKERS = 4
 # How long in-flight calls may run on after stdin closes. Long enough for a
 # create, or a disposable's teardown, to finish rather than be abandoned half
 # way; bounded so a dead session cannot keep the process alive indefinitely.
@@ -122,6 +132,8 @@ class Server:
         self._write_lock = threading.Lock()
         self._out_closed = False
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qubes-mcp-call")
+        self._quick = ThreadPoolExecutor(max_workers=min(QUICK_WORKERS, workers),
+                                         thread_name_prefix="qubes-mcp-quick")
         self._pending = 0
         self._pending_cv = threading.Condition()
         self._version: Optional[str] = None
@@ -268,7 +280,8 @@ class Server:
         with self._queued_lock:
             self._queued.setdefault(key, {})[token] = (msg_id, sink)
         try:
-            self._pool.submit(self._run_call, tool, args, msg_id, version, sink, key, token)
+            pool = self._pool if tool.name in LONG_TOOLS else self._quick
+            pool.submit(self._run_call, tool, args, msg_id, version, sink, key, token)
         except RuntimeError:     # the pool has been shut down
             self._take(key, token)
             self._call_finished()
@@ -350,9 +363,11 @@ class Server:
         if left:
             log.warning("%d call(s) still running %.0fs after stdin closed; exiting without them",
                         left, timeout)
-            self._pool.shutdown(wait=False, cancel_futures=True)
+            for pool in (self._pool, self._quick):
+                pool.shutdown(wait=False, cancel_futures=True)
             return False
-        self._pool.shutdown(wait=True)
+        for pool in (self._pool, self._quick):
+            pool.shutdown(wait=True)
         return True
 
     # ---- output ----------------------------------------------------------

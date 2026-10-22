@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 0.9.38 — a hidden project's disposable templates stay its own.** Besides the hub, up to 15
+**Status: 0.9.39 — the fixes of a last audit before 1.0.** Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
@@ -237,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.38.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.39.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -251,9 +251,13 @@ overrides its 54 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user
-NAME`, `--anonymous` (step 8), `--updates-via GATEWAY`, `--dry-run`. `deploy/uninstall.sh` removes the policy
+NAME`, `--anonymous` (step 8), `--updates-via GATEWAY`, `--strip-stale-badges`, `--dry-run`.
+`deploy/uninstall.sh` removes the policy
 first, then the rest, and ends with a clean-state check that names what it
-keeps.
+keeps. After `uninstall.sh --purge` the qubes keep their tags: a new install
+lists any qube still wearing a project's slot badges, which the rulebook would
+route on again, and refuses until it is run with `--strip-stale-badges`, which
+takes them off before the policy goes in.
 
 **The audit log.** One more installer option, `--audit-log disk|ram|none`,
 says where qmcp's audit lines go for the whole install: `disk` (the default)
@@ -880,7 +884,7 @@ This is operator-grade infrastructure for one use case: AI agents working in
 Qubes-isolated qubes. It is not a hardened product. The hub is itself part of
 the trust boundary: a compromised hub controls every managed qube but a
 hidden anonymous project's (a guarded one only through a window you open), and the audit log records what it does through the dom0
-services (past 60 calls that changed nothing in a clock hour, those are only
+services (past 60 calls that changed nothing in an hour, those are only
 counted).
 
 ## License

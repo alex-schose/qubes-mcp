@@ -144,7 +144,10 @@ def main(argv: list[str] | None = None) -> int:
         result = tool.handler(validated)
         if not isinstance(result, dict):
             raise TypeError(f"{tool.name} returned {type(result).__name__}, not a dict")
-        text = json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
+        # ASCII on the terminal: a qube's output may hold C1 controls (U+009B
+        # is CSI), DEL, bidi overrides and line separators, which a terminal
+        # acts on; escaped, they are text.
+        text = json.dumps(result, indent=2, ensure_ascii=True, allow_nan=False)
     except Exception:
         log.exception("%s raised", tool.name)
         sys.stderr.write("qubes-mcp: internal error\n")

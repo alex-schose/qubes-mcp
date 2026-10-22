@@ -593,6 +593,26 @@ def svc_lifecycle(app, call, req):
         # carries its source's owner badge until then) is the operator's to
         # review first: refused as a held one is, on a strict read.
         _reviewed(vm)
+        # And so is the source of a copy that waits for review: removed
+        # first, it would let the copy read as a restore whose original is
+        # gone, keeping the owner badge the hub could then use on it.
+        try:
+            waiting = restored.copies_waiting(app, vm)
+        except core.Unreadable:
+            call.error_class = "Unreadable"
+            raise refuse("whether a copy of this qube waits for the operator's review cannot "
+                         "be read; try again") from None
+        if waiting:
+            raise refuse("a copy of this qube waits for the operator's review; removing it "
+                         "takes the operator's approval until then")
+        # Recorded before the remove, in dom0: a copy still being cloned,
+        # which the check above could not see, never proves a restore of it.
+        try:
+            restored.record_removed(vm)
+        except (OSError, core.Unreadable) as e:
+            call.error_class = type(e).__name__
+            raise refuse("the record of what AI space removes cannot be written; nothing "
+                         "was removed") from None
     # The gate may stop the qube between the check above and the start: read
     # again right before waking it.
     if action in ("start", "unpause") and projects.BLOCKED in core.tags_of(vm):
@@ -1324,6 +1344,15 @@ def svc_events(app, call, req, dispatcher_factory=None):
             return
         if filters is not None and not _event_matches(event, filters):
             return
+        if event.startswith("domain-feature-"):
+            # qubesd names a feature event after its key: dom0's own keys
+            # (the qmcp-id label, the restore check's owner record, the
+            # in-qube services' version) are dom0's bookkeeping, not the
+            # hub's. Only the keys the hub may set itself pass, as tag events
+            # pass only for the badges it may see.
+            key = event.split(":", 1)[1] if ":" in event else kwargs.get("feature")
+            if not isinstance(key, str) or not _feature_allowed(key):
+                return
         base, tag = _split_tag_event(event)
         if base is not None:
             tag = tag if tag is not None else kwargs.get("tag")
@@ -1438,7 +1467,7 @@ NO_AUDIT_ROOM = "refused: dom0's audit log has no room"
 
 
 #: Fixed vocabulary: this caller has put its day's share of lines on the log.
-NO_AUDIT_BUDGET = "refused: this caller's audit budget for today is spent"
+NO_AUDIT_BUDGET = "refused: this caller's audit budget for the day (24 h of dom0's uptime) is spent"
 #: Fixed vocabulary: the caller's audit counter cannot be kept (qmcp check fails).
 NO_AUDIT_COUNTER = "refused: this caller's audit counter cannot be kept"
 
@@ -1471,7 +1500,7 @@ def main(service: str, stdin=None, environ=None, app_factory=None, out=None) -> 
     # the log. A principal's calls that changed nothing (refused, failed, or a
     # feature, or a property set explicitly, set to the value already there)
     # are logged up to
-    # `audit.REFUSALS_PER_HOUR` in each clock hour and counted past it. A
+    # `audit.REFUSALS_PER_HOUR` in each hour (of the clock since boot) and counted past it. A
     # failed create that made a qube, or may have (`call.landed`), is always
     # logged. A call that changed something spends the caller's day's share
     # (`audit.AUDIT_LINES_PER_DAY`), refused before it acts once spent; a kill

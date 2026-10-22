@@ -27,7 +27,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import (audit, birth, budget, cli, core, fleet, gateways, inqube, opfiles,  # noqa: E402
+from qmcp import (anon, audit, birth, budget, cli, core, fleet, gateways, inqube, opfiles,  # noqa: E402
                   projects, proposals, restored, services)
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
@@ -291,6 +291,44 @@ class InQube(ToolsBase):
         self.assertEqual(dict.get(q["behind-running"].features, inqube.LABEL), "sha256:old")
         self.assertEqual(done["s-behind"], "updated")
 
+    def test_a_refresh_cut_short_has_a_line_for_every_qube_it_wrote(self):
+        qs = [self.app.vm(f"s-behind-{i}", klass="StandaloneVM", power="Running",
+                          tags={"ai-managed"}, features={inqube.LABEL: "sha256:old"})
+              for i in range(4)]
+        real, calls = inqube._push, []
+
+        def push(vm, files, timeout):
+            calls.append(vm.name)
+            if len(calls) == 3:
+                raise KeyboardInterrupt                         # the unit is killed here
+            return real(vm, files, timeout)
+        before = len(self.audit_lines())
+        with mock.patch.object(inqube, "_push", push):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("template", "refresh", root=False)
+        written = sorted(q.name for q in qs if dict.get(q.features, inqube.LABEL) != "sha256:old")
+        lines = sorted(l["args"]["qube"] for l in self.audit_lines()[before:]
+                       if l["caller"] == "refresh")
+        self.assertEqual(len(written), 2)
+        self.assertEqual(lines, written)
+
+    def test_a_refresh_whose_label_fails_says_it_wrote_and_logs_it(self):
+        self.fleet_for_refresh()
+        self.app.fail.add("feature.set")
+        before = len(self.audit_lines())
+        seen = []
+        inqube.refresh(self.app, done=lambda n, o, w: seen.append((n, o, w)))
+        self.app.fail.clear()
+        self.assertTrue(any(w and o.startswith("written, but its label was not")
+                            for _, o, w in seen), seen)
+        self.cli("template", "refresh", root=False)             # written again, and logged
+        self.assertTrue(len(self.audit_lines()) > before)
+
+    def test_a_refresh_starts_no_write_past_its_budget(self):
+        self.fleet_for_refresh()
+        done = dict(inqube.refresh(self.app, budget_s=0))
+        self.assertTrue(done and all("ran out" in o for o in done.values()), done)
+
     def test_refresh_reports_a_label_it_cannot_read_and_writes_nothing_there(self):
         q = self.fleet_for_refresh()
         self.app.fail.add("feature.get:t-behind-run")
@@ -371,6 +409,23 @@ class InQube(ToolsBase):
 
 
 # ======================================================================= the restore check
+
+class PrepareStop(ToolsBase):
+    def test_a_failed_prepare_says_when_the_template_it_started_did_not_stop(self):
+        tpl = self.app.vm("tpl-hostile", klass="TemplateVM")
+        self.app.vmshell[tpl.name] = "exit1"          # the write fails
+        self.app.fail.add("shutdown")                 # and so does the shutdown
+        rc, out, err = self.cli("template", "prepare", "tpl-hostile")
+        self.assertEqual(rc, 1)
+        self.assertIn("the write exited 1", err)
+        self.assertIn("its shutdown did not complete", err)
+        self.assertEqual(tpl.get_power_state(), "Running")
+        self.app.fail.clear()
+        tpl.shutdown()
+        rc, out, err = self.cli("template", "prepare", "tpl-hostile")
+        self.assertNotIn("shutdown did not complete", err)     # stopped: only the failure
+        self.assertEqual(tpl.get_power_state(), "Halted")
+
 
 class Labels(ToolsBase):
     def assert_own_label(self, name):
@@ -457,6 +512,59 @@ class Hold(ToolsBase):
         t.start()
         self.addCleanup(t.join, 5)
         return t
+
+    def test_the_holds_waits_are_bounded_in_all_whatever_is_in_flight(self):
+        # A call keeps the lock of every qube to be held: the pass waits for
+        # qube locks only until its budget is spent, holds the rest without,
+        # and settles them together, so its time does not grow with the
+        # number of qubes AI space keeps busy.
+        self.waits(0.4, 0.4)
+        self.addCleanup(setattr, restored, "HOLD_PASS_S", restored.HOLD_PASS_S)
+        restored.HOLD_PASS_S = 0.6
+        pick = [vm for vm in self.app.domains if core.UMBRELLA in vm.tags.raw()
+                and vm.klass == "AppVM" and core.QUARANTINE not in vm.tags.raw()][:6]
+        self.assertGreaterEqual(len(pick), 4)
+        fds = []
+        for vm in pick:
+            vm.features[core.ID_FEATURE] = "00000000-0000-0000-0000-000000000000"
+            fds.append(core.acquire_qube_lock(vm.name, 1.0))
+        self.addCleanup(lambda: [os.close(fd) for fd in fds if fd is not None])
+        started = time.monotonic()
+        held = restored.hold(self.app)
+        took = time.monotonic() - started
+        self.assertLess(took, 0.6 + 0.4 + 0.5)            # the budget, one settle, slack
+        self.assertEqual(sorted(held.unsettled), sorted(vm.name for vm in pick))
+        for vm in pick:
+            self.assertIn(core.QUARANTINE, vm.tags.raw())
+
+    def test_the_gate_judges_the_anonymous_projects_before_the_restore_check(self):
+        order = []
+        real_run, real_hold = anon.run, restored.hold
+        self.addCleanup(setattr, anon, "run", real_run)
+        self.addCleanup(setattr, restored, "hold", real_hold)
+        anon.run = lambda *a, **k: (order.append("anon"), real_run(*a, **k))[1]
+        restored.hold = lambda *a, **k: (order.append("hold"), real_hold(*a, **k))[1]
+        self.cli("gate", "--json", root=False)
+        self.assertEqual(order, ["anon", "hold"])
+
+    def test_a_hold_without_the_lock_on_a_qube_rejected_meanwhile_comes_off(self):
+        # The reject holds the qube's lock throughout, so the pass holds
+        # without it and cannot settle under it either: it still judges the
+        # qube, and a qube out of AI space is never left held.
+        self.restore_worker()
+        real, calls = core.acquire_qube_lock, []
+
+        def busy(name, timeout=None, queue=False):
+            if name == "ai-osint-w9":
+                calls.append(name)
+                if len(calls) == 1:
+                    restored._reject(self.app, "ai-osint-w9")
+                return None
+            return real(name, timeout, queue)
+        with mock.patch.object(core, "acquire_qube_lock", busy):
+            held = restored.hold(self.app)
+        self.assertNotIn("ai-osint-w9", held.held)
+        self.assertEqual(self.tags("ai-osint-w9") & {core.QUARANTINE, core.UMBRELLA}, set())
 
     def test_a_remove_in_flight_when_the_hold_went_on_is_reported_not_held(self):
         self.waits(0.1, 3.0)
@@ -589,7 +697,11 @@ class Hold(ToolsBase):
         self.assertNotIn(core.QUARANTINE, self.tags("ai-hub-src-copy"))
         self.assertEqual(self.hub_remove("ai-hub-src-copy"), core.QUARANTINE_REFUSAL)
         self.assertIn("ai-hub-src-copy", self.app.domains)
-        self.assertTrue(self.hub_remove("ai-hub-src")["ok"])     # the positive: its own qube
+        # Nor its source while the copy waits (removed first, it would make
+        # the copy read as a restore); the positive: a qube with no copy.
+        self.assertIn("waits for the operator's review", self.hub_remove("ai-hub-src")["error"])
+        self.hub_made("ai-hub-other")
+        self.assertTrue(self.hub_remove("ai-hub-other")["ok"])
 
     def test_a_restore_whose_original_is_gone_keeps_its_owner_badge(self):
         self.restore_of_gone()
@@ -617,6 +729,215 @@ class Hold(ToolsBase):
             restored.accept(self.app, n)
         self.assertIn("qmcp did not create", self.hub_remove("ai-hub-back-copy")["error"])
         self.assertTrue(self.hub_remove("ai-hub-back")["ok"])
+
+    def test_a_copy_of_a_decided_restore_accepted_before_the_next_pass_loses_it(self):
+        # The original is accepted (its label becomes its own UUID) before the
+        # pass that decides the copy: the copy's label is then worn by no qube
+        # and names none, so only dom0's record of the replaced label, and the
+        # copied record naming a qube that exists, tell it is a copy.
+        self.restore_of_gone("ai-hub-back")
+        restored.hold(self.app)
+        self.app.clone_vm(self.app.domains["ai-hub-back"], "ai-hub-back-copy")
+        restored.accept(self.app, "ai-hub-back")
+        held = restored.hold(self.app)
+        self.assertEqual((held.unowned, held.owner_kept), (["ai-hub-back-copy"], []))
+        restored.accept(self.app, "ai-hub-back-copy")
+        self.assertIn("qmcp did not create", self.hub_remove("ai-hub-back-copy")["error"])
+
+    def test_the_hub_removing_the_accepted_original_first_leaves_the_copy_without_it(self):
+        # The evidence is dom0's (`REPLACED_PATH`), not the original's: the hub
+        # may remove a kept restore once accepted, and that must not turn the
+        # operator's copy of it into a restore whose original is gone.
+        self.restore_of_gone("ai-hub-back")
+        restored.hold(self.app)
+        self.app.clone_vm(self.app.domains["ai-hub-back"], "ai-hub-back-copy")
+        restored.accept(self.app, "ai-hub-back")
+        # The hub cannot remove the original while the copy waits: the guard.
+        self.assertIn("waits for the operator's review", self.hub_remove("ai-hub-back")["error"])
+        # And were it gone (removed by hand), dom0's record still tells.
+        del self.app.domains["ai-hub-back"]
+        held = restored.hold(self.app)
+        self.assertEqual((held.unowned, held.owner_kept), (["ai-hub-back-copy"], []))
+        restored.accept(self.app, "ai-hub-back-copy")
+        self.assertIn("qmcp did not create", self.hub_remove("ai-hub-back-copy")["error"])
+        self.assertEqual(os.stat(restored.REPLACED_PATH).st_mode & 0o777, 0o644)
+
+    def test_a_record_of_replaced_labels_that_does_not_read_proves_no_restore(self):
+        self.restore_of_gone("ai-hub-back")
+        os.makedirs(os.path.dirname(restored.REPLACED_PATH), exist_ok=True)
+        os.mkdir(restored.REPLACED_PATH)                        # not a file: does not read
+        held = restored.hold(self.app)
+        self.assertEqual(held.owner_kept, [])
+        self.assertFalse(self.owned("ai-hub-back"))
+
+    def test_qmcps_own_clone_of_a_kept_restore_does_not_inherit_its_record(self):
+        self.restore_of_gone("ai-hub-back")
+        restored.hold(self.app)
+        restored.accept(self.app, "ai-hub-back")
+        r = self.call("qmcp.CloneAIManagedQube", {"source": "ai-hub-back", "name": "ai-hub-c"})
+        self.assertTrue(r["ok"], r)
+        self.assertIsNone(self.kept("ai-hub-c"))
+
+    def test_the_hub_cannot_remove_the_source_of_a_copy_that_waits_for_review(self):
+        # Removed first, the source would make the copy read as a restore whose
+        # original is gone, keeping the owner badge the hub could then use.
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        r = self.hub_remove("ai-hub-src")
+        self.assertIn("a copy of this qube waits for the operator's review", r["error"])
+        held = restored.hold(self.app)
+        self.assertEqual(held.unowned, ["ai-hub-src-copy"])
+        self.assertIn("waits for the operator's review", self.hub_remove("ai-hub-src")["error"])
+        restored.accept(self.app, "ai-hub-src-copy")            # reviewed: its own label now
+        self.assertTrue(self.hub_remove("ai-hub-src")["ok"])
+        self.assertIn("qmcp did not create", self.hub_remove("ai-hub-src-copy")["error"])
+
+    def test_a_copy_still_being_cloned_when_the_hub_removed_its_source_loses_it(self):
+        # qubesadmin's clone_vm copies the tags before the label: the remove's
+        # check of the copies cannot see a copy in that gap, so dom0's record
+        # of the UUIDs AI space removed is what tells.
+        src = self.hub_made("ai-hub-src")
+        s_uuid = restored._uuid(src)
+        c = self.app.vm("ai-hub-src-copy", labelled=False,
+                        template=self.app.domains["ai-debian-13"], netvm=None,
+                        tags=set(src.tags))
+        real = restored.copies_waiting
+
+        def scan_then_clone_finishes(app, vm):
+            got = real(app, vm)
+            c.features[core.ID_FEATURE] = s_uuid              # clone_vm's feature loop lands
+            return got
+        with mock.patch.object(restored, "copies_waiting", scan_then_clone_finishes):
+            self.assertTrue(self.hub_remove("ai-hub-src")["ok"])
+        self.assertIn(s_uuid, restored.removed_uuids())
+        held = restored.hold(self.app)
+        self.assertEqual((held.unowned, held.owner_kept), (["ai-hub-src-copy"], []))
+        restored.accept(self.app, "ai-hub-src-copy")
+        self.assertIn("qmcp did not create", self.hub_remove("ai-hub-src-copy")["error"])
+
+    def test_the_removal_record_is_pruned_after_a_week_but_never_while_a_label_names_it(self):
+        src = self.hub_made("ai-hub-old")
+        s_uuid = restored._uuid(src)
+        self.app.clone_vm(src, "ai-hub-old-copy")               # a copy that names it
+        self.hub_made("ai-hub-x")
+        self.assertTrue(self.hub_remove("ai-hub-x")["ok"])
+        old = time.time() - restored.REMOVED_KEEP_S - 60
+        for n in os.listdir(restored.REMOVED_DIR):
+            os.utime(os.path.join(restored.REMOVED_DIR, n), (old, old))
+        pathlib.Path(restored.REMOVED_DIR, s_uuid).touch()       # as if its remove had landed
+        os.utime(os.path.join(restored.REMOVED_DIR, s_uuid), (old, old))
+        self.assertEqual(restored.prune_removed(self.app), 1)    # ai-hub-x's, not the named one
+        self.assertEqual(os.listdir(restored.REMOVED_DIR), [s_uuid])
+        # A label that does not read: nothing is pruned at all.
+        del self.app.domains["ai-hub-old-copy"]
+        self.app.fail_reads("feature.get", "fail")
+        self.assertEqual(restored.prune_removed(self.app), 0)
+
+    def test_a_fresh_entry_survives_a_prune_though_no_label_names_it_yet(self):
+        # The age is what keeps a copy still between its tags and its label
+        # (qubesadmin's clone_vm): its source's entry must outlive the prune.
+        src = self.hub_made("ai-hub-src")
+        s_uuid = restored._uuid(src)
+        self.app.vm("ai-hub-src-copy", labelled=False,
+                    template=self.app.domains["ai-debian-13"], netvm=None, tags=set(src.tags))
+        restored.record_removed(src)
+        del self.app.domains["ai-hub-src"]
+        self.assertEqual(restored.prune_removed(self.app), 0)
+        self.assertIn(s_uuid, restored.removed_uuids())
+
+    def test_the_hourly_run_prunes_the_record_and_says_so(self):
+        q = self.hub_made("ai-hub-gone")
+        restored.record_removed(q)
+        path = os.path.join(restored.REMOVED_DIR, restored._uuid(q))
+        del self.app.domains["ai-hub-gone"]
+        old = time.time() - restored.REMOVED_KEEP_S - 60
+        os.utime(path, (old, old))
+        rc, out, err = self.cli("audit", "rotate", "--auto")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("removal record: 1 entry older than 7 days dropped", out)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_prune_that_fails_never_changes_the_hourly_runs_status(self):
+        def broken(app, now=None):
+            raise RuntimeError("qubesd is down")
+        with mock.patch.object(restored, "prune_removed", broken):
+            rc, out, err = self.cli("audit", "rotate", "--auto")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("removal record", out)
+
+    def test_an_entry_is_aged_from_its_latest_remove(self):
+        q = self.hub_made("ai-hub-again")
+        restored.record_removed(q)
+        path = os.path.join(restored.REMOVED_DIR, restored._uuid(q))
+        old = time.time() - restored.REMOVED_KEEP_S - 60
+        os.utime(path, (old, old))
+        restored.record_removed(q)                               # a later write
+        self.assertLess(time.time() - os.stat(path).st_mtime, 60)
+
+    def test_a_remove_is_refused_while_its_record_cannot_be_written(self):
+        self.hub_made("ai-hub-other")
+        os.chmod(restored.REMOVED_DIR, 0o500)
+        self.addCleanup(os.chmod, restored.REMOVED_DIR, 0o2770)
+        if os.geteuid() == 0:
+            self.skipTest("root writes a read-only directory")
+        r = self.hub_remove("ai-hub-other")
+        self.assertIn("cannot be written; nothing was removed", r["error"])
+        self.assertIn("ai-hub-other", self.app.domains)
+
+    def test_a_removal_record_that_does_not_read_proves_no_restore(self):
+        self.restore_of_gone("ai-hub-back")
+        os.rmdir(restored.REMOVED_DIR)
+        held = restored.hold(self.app)
+        self.assertEqual(held.owner_kept, [])
+        self.assertFalse(self.owned("ai-hub-back"))
+
+    def test_the_record_of_replaced_labels_is_read_after_every_label(self):
+        # An accept writes the record before it relabels: read after the
+        # labels, a relabel the pass saw is always in the record it reads.
+        self.restore_of_gone("ai-hub-back")
+        order = []
+        real_label, real_record = restored.label_of, restored.replaced_labels
+        with mock.patch.object(restored, "label_of",
+                               lambda vm: (order.append("label"), real_label(vm))[1]), \
+                mock.patch.object(restored, "replaced_labels",
+                                  lambda *a: (order.append("record"), real_record(*a))[1]):
+            restored.Origins(self.app)
+        self.assertEqual(order[-1], "record")
+        self.assertEqual(order.count("record"), 1)
+
+    def test_a_label_that_names_no_qube_proves_nothing_and_never_blocks_a_reject(self):
+        for bad in ("", "not a uuid", "ZZZ"):
+            self.restore_of_gone("ai-hub-back")
+            self.app.domains["ai-hub-back"].features[core.ID_FEATURE] = bad
+            held = restored.hold(self.app)
+            self.assertEqual(held.owner_kept, [], bad)
+            restored.reject(self.app, "ai-hub-back")
+            self.assertNotIn(core.QUARANTINE, self.tags("ai-hub-back"))
+            del self.app.domains["ai-hub-back"]
+
+    def test_an_accept_takes_off_a_hold_the_pass_put_on_while_it_ran(self):
+        self.restore_of_gone("ai-hub-back")
+        vm = self.app.domains["ai-hub-back"]
+        real = restored.label
+
+        def label_then_held(v):
+            real(v)
+            v.tags.add(core.QUARANTINE)                         # the pass, without the lock
+        with mock.patch.object(restored, "label", label_then_held):
+            restored.accept(self.app, "ai-hub-back")
+        self.assertNotIn(core.QUARANTINE, vm.tags.raw())
+
+    def test_a_copy_made_before_any_pass_whose_original_is_accepted_or_rejected_loses_it(self):
+        for decide in (restored.accept, restored.reject):
+            self.restore_of_gone("ai-hub-back")
+            self.app.clone_vm(self.app.domains["ai-hub-back"], "ai-hub-back-copy")
+            decide(self.app, "ai-hub-back")
+            held = restored.hold(self.app)
+            self.assertEqual((held.owner_kept, held.unowned), ([], ["ai-hub-back-copy"]),
+                             decide.__name__)
+            self.assertFalse(self.owned("ai-hub-back-copy"))
+            del self.app.domains["ai-hub-back-copy"]
+            del self.app.domains["ai-hub-back"]
 
     def test_two_qubes_with_one_label_before_any_pass_both_lose_it(self):
         # A restore copied before the pass ran, or one backup restored twice:
@@ -1623,6 +1944,44 @@ class StampMode(ToolsBase):
             self.assertIn("held its lock", str(self.stamp(write_mode=True)))
         self.assertFalse(self.mode_path.exists())
         self.assertNotIn(projects.ANON, self.tags(HUB))
+
+
+class StaleBadgePreflight(ToolsBase):
+    """The installer's stale-badge preflight, cut out of install.sh and run
+    against the fake: 0 none, 1 found, 2 a qube whose tags do not read, and 3
+    (never 1) when the fleet itself cannot be read."""
+
+    TEXT = (HERE.parent / "deploy" / "install.sh").read_text()
+    _start = TEXT.index("<<'PYEOF'\n", TEXT.index('STALE_OUT="$(')) + len("<<'PYEOF'\n")
+    PROGRAM = TEXT[_start:TEXT.index("\nPYEOF\n", _start) + 1]
+
+    def run_program(self, app_factory=None):
+        import types
+        qa = types.ModuleType("qubesadmin")
+        qa.app = types.ModuleType("qubesadmin.app")
+        qa.app.QubesLocal = app_factory or (lambda: self.app)
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"qubesadmin": qa, "qubesadmin.app": qa.app}), \
+                redirect_stdout(out):
+            try:
+                exec(compile(self.PROGRAM, "install.sh stale", "exec"), {"__name__": "__main__"})
+                rc = 0
+            except SystemExit as e:
+                rc = e.code or 0
+        return rc, out.getvalue()
+
+    def test_its_exit_statuses(self):
+        self.assertEqual(self.run_program()[0], 0)
+        pathlib.Path(projects.PROJECTS_PATH).unlink()           # as a purge leaves it
+        rc, out = self.run_program()
+        self.assertEqual(rc, 1)
+        self.assertIn("qmcp-lead-p01", out)
+
+        def broken():
+            raise RuntimeError("qubesd is down")
+        rc, out = self.run_program(broken)
+        self.assertEqual(rc, 3)
+        self.assertIn("could not be read", out)
 
 
 class Seed(ToolsBase):

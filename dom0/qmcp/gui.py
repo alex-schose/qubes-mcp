@@ -223,7 +223,13 @@ READ_TIMEOUT_S = 120
 
 #: The status bar after a failed read, first, as the bar cuts a long line: only
 #: what takes authority away stays on (its commands decide for themselves).
-STATUS_OFF = "Only Seal, Revoke and Reject restored are on until a refresh reads everything."
+#: Named from `guimodel.LOWERING`, so the sentence cannot leave one out.
+_LOWERING_NAMES = {"seal": "Seal", "revoke": "Revoke (without Remove)", "guard": "Guard",
+                   "reject_restored": "Reject restored"}
+STATUS_OFF = ("Only " + ", ".join(_LOWERING_NAMES[k] for k in ("seal", "revoke", "guard"))
+              + " and " + _LOWERING_NAMES["reject_restored"]
+              + " are on until a refresh reads everything.")
+assert set(_LOWERING_NAMES) == set(gm.LOWERING), "STATUS_OFF must name every LOWERING action"
 #: What closing the window while a change runs means, asked before it closes.
 CLOSE_NOTE = ("Closing the window does not stop it: it runs to its end, and its report is not "
               "shown. If it changes something, the audit log records how it ended (Audit tab, or "
@@ -835,7 +841,8 @@ class ProjectForm(Form, LeadFields, NetworkFields):
                 gm.not_managed(t, self._fleet, "the template")
         gm.anonymous_model_qube(qube, None, anonymous, self._fleet, self._projects)
         why = gm.create_refusal(None if anonymous else label, self.prefix, self._projects,
-                                self._fleet, self.dump.get_active(), templates, source, origin)
+                                self._fleet, self.dump.get_active(), templates, source, origin) \
+            or gm.dvmt_share_refusal(templates, self.hidden(), None, self._projects, self._fleet)
         if why:
             raise gm.FormError(why)
         return gm.create_project(
@@ -846,7 +853,7 @@ class ProjectForm(Form, LeadFields, NetworkFields):
 
 
 class EditForm(Form, NetworkFields):
-    def __init__(self, parent, fleet_rows, gw_rows, record):
+    def __init__(self, parent, fleet_rows, gw_rows, record, project_rows=()):
         super().__init__(parent, f"Edit project {record.get('label')}", "Apply",
                          "Only what you change is sent. Workers keep their networks, and a "
                          "network still in use by a worker cannot be taken off the list. A "
@@ -855,6 +862,7 @@ class EditForm(Form, NetworkFields):
         self.record = record
         self._gateways = gw_rows
         self._fleet = list(fleet_rows or ())
+        self._projects = list(project_rows or ())
         current_t = list(record.get("templates") or ())
         names = sorted(set(gm.approved_template_choices(fleet_rows)) | set(current_t))
         self.templates = self.checks("Approved templates", names, current_t)
@@ -881,6 +889,12 @@ class EditForm(Form, NetworkFields):
                 gm.not_managed(t, self._fleet, "the template")
             if not same_networks:
                 gm.anonymous_networks(networks, self._gateways)
+        if templates is not None:
+            # As the command refuses a new list (`fleet._dvmt_share_refusal`).
+            why = gm.dvmt_share_refusal(templates, bool(rec.get("hidden")), rec.get("slot"),
+                                        self._projects, self._fleet)
+            if why:
+                raise gm.FormError(why)
         if not same_networks:
             gm.check_networks(networks, self._gateways)
             why = gm.networks_in_use(rec, networks, self._fleet)
@@ -1100,8 +1114,11 @@ class MoveForm(Form):
 
 
 class RevokeForm(Form):
-    def __init__(self, parent, name, note=""):
-        """`note`: what revoking it means beyond that (`guimodel.revoke_note`)."""
+    def __init__(self, parent, name, note="", remove_refusal=None):
+        """`note`: what revoking it means beyond that (`guimodel.revoke_note`).
+        `remove_refusal`: why the command would refuse Remove, as the view
+        shows it (`guimodel.remove_refusal`), so OK is off while it is ticked."""
+        self._remove_refusal = remove_refusal
         super().__init__(parent, f"Revoke {name}", "Revoke",
                          "Takes it out of AI space: removes ai-managed and every other qmcp "
                          "badge, so the hub and every lead lose it and this window stops "
@@ -1122,6 +1139,8 @@ class RevokeForm(Form):
 
     def build(self):
         remove = self.remove.get_active()
+        if remove and self._remove_refusal:
+            raise gm.FormError(self._remove_refusal)
         _set(self.warning, esc(f"Removes {self.qube_name} and its storage after the revoke: "
                                f"this cannot be undone." if remove else ""))
         return gm.role("revoke", self.qube_name, keep_running=self.keep.get_active(),
@@ -1728,6 +1747,16 @@ class Window(Gtk.Window):
         self.settings: dict = {}
         self.check_doc = None
         self.audit_rows: list = []
+        #: The caller the Audit tab shows, or None for every caller; the caller
+        #: the rows on show were read for; and the one a refresh's read was
+        #: started for, so rows are never shown under another caller's name.
+        self.audit_caller = None
+        self.audit_rows_caller = None
+        self._audit_read_for = None
+        #: When the rows on show were read.
+        self.audit_rows_at = None
+        #: The lines on show could not be read: none are shown, and said so.
+        self.audit_unread = False
         #: `audit status --json` of the last complete refresh; never shown
         #: before one has read it.
         self.audit_status: dict = {}
@@ -1986,13 +2015,32 @@ class Window(Gtk.Window):
         bar.pack_start(_button(esc("Verify the chain"), lambda *_: self.verify()), False, False, 0)
         self.rotate_button = _button(esc("Rotate..."), lambda *_: self.act("rotate"))
         bar.pack_start(self.rotate_button, False, False, 0)
-        self.verify_label = _label(esc(f"Calls from the hub and the leads to dom0's state-changing "
-                                       f"services, and every command of yours that changes "
-                                       f"something (caller operator), newest first (the last "
-                                       f"{gm.AUDIT_TAIL})."), wrap=True)
+        self.verify_label = _label(esc(f"The install's chain: calls from the hub and the leads "
+                                       f"to dom0's state-changing services, every command of "
+                                       f"yours that changes something (caller operator) and "
+                                       f"what dom0's passes did, newest first: the last "
+                                       f"{gm.AUDIT_TAIL} lines of every caller, or of the one "
+                                       f"chosen below. "
+                                       + gm.AUDIT_ELSEWHERE), wrap=True)
         _named(self.verify_label, esc("verify result"))
         bar.pack_start(self.verify_label, True, True, 0)
         box.pack_start(bar, False, False, 0)
+        # Whose lines: every caller's last lines, or one caller's, so a busy
+        # hub never pushes the operator's or the gate's lines off the tab.
+        who = Gtk.Box(spacing=8)
+        who.pack_start(_label(esc("Caller")), False, False, 0)
+        self.audit_caller_combo = Gtk.ComboBoxText()
+        _fill(self.audit_caller_combo, [("", esc("every caller"))])
+        self.audit_caller_combo.set_active_id("")
+        self._audit_callers = []
+        self.audit_caller_combo.connect("changed", self._on_audit_caller)
+        _named(self.audit_caller_combo, esc("audit caller"))
+        who.pack_start(self.audit_caller_combo, False, False, 0)
+        # What a chooser read that failed says, until a read succeeds.
+        self.audit_note = _label(esc(""), wrap=True)
+        _named(self.audit_note, esc("audit caller note"))
+        who.pack_start(self.audit_note, True, True, 0)
+        box.pack_start(who, False, False, 0)
         # The gauge: the log and its files, the free space against the floor
         # and each principal's budget today (`audit status --json`).
         self.audit_gauge = Gtk.Grid(column_spacing=12, row_spacing=4)
@@ -2054,9 +2102,77 @@ class Window(Gtk.Window):
         self.reads = {}
         self._start_reads(gm.FIRST_READS)
 
+    def _offered(self, caller):
+        """`caller` if the chooser still offers it, else None (every caller)."""
+        return caller if caller in self._audit_callers else None
+
+    def _read_argv(self, name):
+        if name == "audit":
+            self._audit_read_for = self.audit_caller
+            return gm.audit_tail(self.audit_caller)
+        return gm.READS[name]
+
+    def _set_caller_combo(self, caller):
+        """Show `caller` in the chooser without reading anything."""
+        self.audit_caller_combo.handler_block_by_func(self._on_audit_caller)
+        self.audit_caller_combo.set_active_id(caller or "")
+        self.audit_caller_combo.handler_unblock_by_func(self._on_audit_caller)
+
+    def _on_audit_caller(self, combo):
+        """Read the audit lines again for the caller chosen; nothing else."""
+        self.audit_caller = combo.get_active_id() or None
+        self._read_audit_for(self.audit_caller)
+
+    def _read_audit_for(self, caller):
+        def done(result):
+            if caller != self.audit_caller:
+                return                  # another caller was chosen meanwhile
+            try:
+                rows = gm.parse_audit(result) if result.rc == 0 else None
+            except Exception:
+                rows = None
+            if rows is None:
+                # The rows on show stay, under the caller they were read for,
+                # when the chooser still offers it; else none is shown under
+                # a name it no longer offers.
+                back = self._offered(self.audit_rows_caller)
+                if back != self.audit_rows_caller:
+                    # No lines of a caller the chooser offers are on show:
+                    # none, and said as not read, never as an empty log.
+                    self.audit_rows, self.audit_rows_caller = [], back
+                    self.audit_unread = True
+                    self._render_audit()
+                self.audit_caller = back
+                self._set_caller_combo(back)
+                when = (f", read at {time.strftime('%H:%M:%S', time.localtime(self.audit_rows_at))}"
+                        if self.audit_rows_at and self.audit_rows else "")
+                _set(self.audit_note, esc(f"the lines of {caller or 'every caller'} could not "
+                                          f"be read; " + ("no lines are on show"
+                                                          if self.audit_unread else
+                                                          f"the lines on show are "
+                                                          f"{back or 'every caller'}'s{when}")))
+                return
+            self.audit_rows, self.audit_rows_caller = rows, caller
+            self.audit_rows_at, self.audit_unread = time.time(), False
+            _set(self.audit_note, esc(""))
+            self._render_audit()
+        self.runner.run(gm.audit_tail(caller), done, timeout=READ_TIMEOUT_S, kill=True)
+
+    def _render_audit(self):
+        self.audit_store.clear()
+        for i, rec in reversed(list(enumerate(self.audit_rows))):
+            _list_append(self.audit_store, str(i), gm.audit_cells(rec))
+        if self.audit_unread:
+            _set_lines(self.audit_detail, esc_lines(
+                "The audit lines could not be read, so none are shown: Refresh."))
+            return
+        _set_lines(self.audit_detail, esc_lines(gm.audit_hint(
+            self.audit_rows, self.audit_status if self.audit_status_read else None,
+            self.audit_rows_caller)))
+
     def _start_reads(self, names):
         for name in names:
-            self.runner.run(gm.READS[name],
+            self.runner.run(self._read_argv(name),
                             lambda result, name=name: self._read_done(name, result),
                             timeout=READ_TIMEOUT_S, kill=name not in gm.ACTING_READS)
 
@@ -2131,7 +2247,12 @@ class Window(Gtk.Window):
             self.settings = settings
             self.settings_read = True
         if audit_rows is not None:
-            self.audit_rows = audit_rows
+            if self._audit_read_for == self.audit_caller:
+                self.audit_rows, self.audit_rows_caller = audit_rows, self._audit_read_for
+                self.audit_rows_at, self.audit_unread = time.time(), False
+                _set(self.audit_note, esc(""))
+            # Else it was read for a caller since changed: every change of the
+            # chooser starts that caller's own read, which stands.
         if audit_status is not None:
             self.audit_status = audit_status
             self.audit_status_read = True
@@ -2195,10 +2316,23 @@ class Window(Gtk.Window):
         else:
             _set(self.checked, esc("the check did not answer"))
 
-        self.audit_store.clear()
-        for i, rec in reversed(list(enumerate(self.audit_rows))):
-            _list_append(self.audit_store, str(i), gm.audit_cells(rec))
-        _set_lines(self.audit_detail, esc_lines(gm.audit_hint(self.audit_rows)))
+        callers = gm.audit_callers(self.settings, self.project_rows)
+        if callers != self._audit_callers:
+            # The hub and the leads change: rebuilt, the choice kept when it
+            # still names a caller (else every caller, read again below).
+            self._audit_callers = callers
+            keep = self.audit_caller if self.audit_caller in callers else ""
+            self.audit_caller_combo.handler_block_by_func(self._on_audit_caller)
+            _fill(self.audit_caller_combo,
+                  [("", esc("every caller"))] + [(c, esc(c)) for c in callers])
+            self.audit_caller_combo.set_active_id(keep)
+            self.audit_caller_combo.handler_unblock_by_func(self._on_audit_caller)
+            if self.audit_caller is not None and self.audit_caller not in callers:
+                # The chosen caller is gone (a lead removed): every caller's
+                # lines, read now, never a filter the chooser no longer shows.
+                self.audit_caller = None
+                self._read_audit_for(None)
+        self._render_audit()
         _clear(self.audit_gauge)
         for i, (heading, text, fraction) in enumerate(gm.audit_gauge(
                 self.audit_status if self.audit_status_read else None)):
@@ -2622,10 +2756,10 @@ class Window(Gtk.Window):
             return self._open(AddForm(self, self.fleet, hub, sinks, self.gateways),
                               "Add to AI space")
         if ident == "rotate":
+            status = self.audit_status if self.audit_status_read else None
             return self._open(ConfirmForm(
-                self, "Rotate the audit log", "Rotate",
-                "Moves the log aside and starts a new one anchored on the old head hash.",
-                gm.audit_rotate()), "Rotate the audit log")
+                self, "Rotate the audit log", "Rotate", gm.rotate_intro(status),
+                gm.audit_rotate(), refusal=gm.rotate_refusal(status)), "Rotate the audit log")
         if ident in ProposalForm.KINDS:
             return self.decide(ident)
         if ident in dict(self.GATEWAY_ACTIONS):
@@ -2649,7 +2783,8 @@ class Window(Gtk.Window):
         if node is None:
             return None
         if ident == "edit_project":
-            return self._open(EditForm(self, self.fleet, self.gateways, node.data), "Edit project")
+            return self._open(EditForm(self, self.fleet, self.gateways, node.data,
+                                              self.project_rows), "Edit project")
         if ident == "change_lead":
             form = LeadForm(self, self.fleet, self.gateways, hub, node.data, prefix,
                             self.project_rows)
@@ -2676,7 +2811,8 @@ class Window(Gtk.Window):
         if ident == "move":
             return self._open(MoveForm(self, node.data, self.records), "Move")
         if ident == "revoke":
-            form = RevokeForm(self, name, gm.revoke_note(node.data))
+            form = RevokeForm(self, name, gm.revoke_note(node.data),
+                              gm.remove_refusal(node.data, self.records, self.fleet))
             # A revoke only takes authority away and runs on any view; one that
             # removes the qube cannot be undone, so it waits for a fresh one.
             return self._open(form, "Revoke", lowers=lambda: not form.remove.get_active())
@@ -2765,10 +2901,11 @@ class Window(Gtk.Window):
             return self._open(form, "Prepare a template",
                               check=lambda: self._prepare_now(form.qube.get_active_id()))
         rows = self.restored_view()
-        opened = gm.held_names(rows)
+        opened = gm.held_state(rows)
         red = gm.accept_all_red(rows)
         form = ConfirmForm(self, "Accept every held qube", "Accept all",
-                           esc_lines(gm.accept_all_intro(rows)), gm.restored_accept(opened),
+                           esc_lines(gm.accept_all_intro(rows)),
+                           gm.restored_accept(gm.held_names(rows)),
                            warning=esc_lines(red) if red else None,
                            refusal=gm.accept_all_refusal(rows))
         return self._open(form, "Accept every held qube",

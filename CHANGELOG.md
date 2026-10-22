@@ -26,6 +26,125 @@ burning minor versions would misrepresent it.
 
 Nothing — the working tree is the last released version.
 
+## [0.9.39] — 2026-10-22
+
+**The fixes of a last audit before 1.0.** Five reviewers read 0.9.38 again, each a part of the
+code, with most of their time on the code 0.9.29-0.9.38 added; the fixes were then reviewed again,
+seven rounds, until one found nothing that let AI space past a guarantee, and that round's findings
+are fixed here too. AI space could get past two guarantees: parallel disposables could pass the
+pool cap, and the hub could make the operator's copy of a qube removable. Every defect found is
+fixed, most with a test; two limits stay, now stated in the design's residual risks: a change whose
+process is killed before its audit line, and an operator command's own cached domain list.
+
+### Fixed
+
+- **The pool cap and a lead's quota hold for parallel disposables.** qubesadmin reads the domain
+  list once per process, and a disposable's budget was summed on the list read before its wait
+  for the create lock, so several parallel `qmcp.SpawnDisposableAIManaged` calls each found the
+  same room. The budget now sums a list read under the lock. The test fake gains qubesadmin's
+  list-once cache (`fakequbes.ProcApp`).
+- **The hub can no longer make the operator's copy of a qube removable.** An accept or a reject
+  rewrote the label a copy made earlier still wore, and the hub could remove a copy's source
+  before the restore check decided the copy: either way the copy then read as a restore whose
+  original is gone and kept the hub's owner badge, which let the hub remove it. Accept and
+  reject now record the label they replace in dom0 (`/var/lib/qmcp/replaced-labels`), the
+  restore check never proves a restore on one of them, a qube whose `qmcp-owner-kept` names
+  another qube that exists is a copy, the lifecycle service refuses to remove the source of a
+  copy that waits for review and records in dom0 every qube the hub or a lead removes
+  through it (`/var/lib/qmcp/removed`, kept at least a week and while a label names it; a copy naming one is
+  never a restore, even one still being cloned when its source went), and qmcp's own clones no longer copy `qmcp-owner-kept`. A label
+  that is not a UUID proves nothing and is not recorded. A source the operator removes by hand
+  before the next pass is still the residual the design states.
+- A lead change with `--keep-old --add-old-network --model` on a project with a model qube no
+  longer saves the old lead's own network onto the worker networks before the old lead is
+  demoted: a failure in between left it the lead with its network on the list.
+- `qmcp revoke` kills the qube whatever fails after its badges come off (a read-back, the
+  `default_dispvm` pin), and says both; a lead's demotion kills before it reports a badge that
+  did not come off.
+- `qmcp gate` judges the anonymous projects first and then runs the restore check, whose waits are
+  bounded in all (the create lock 10 s in its turnstile; the qubes' locks 10 s together, then the
+  hold without the lock, settled together within 5 s). A restore with calls held on many qubes
+  could keep the gate from judging anything inside its 60 s. Creates kept in flight can still
+  delay a hold past one pass, as the design's residual says; `qmcp gate` says so and exits 3 (1
+  when a project is not sound).
+- A window's end is judged by the clock since boot as well as the wall clock: a clock stepped back
+  no longer lengthens a window, even past 24 h.
+- Removing old audit logs pauses while dom0's clock may have moved (drift against the clock since
+  boot, or a jump across a boot), until the operator removes `/var/lib/qmcp/audit-clock-moved`;
+  `qmcp check` warns (`audit clock`). A clock stepped forward could remove every rotated log at once.
+- A principal's daily audit budget and hourly cap are counted on the clock since dom0 booted,
+  never the wall clock: a clock stepped back no longer gives a fresh share, nor does one stepped
+  forward and corrected lock a principal out.
+- A rotated audit log is read-only from its rotation on; `qmcp check` checks each rotated log on
+  disk against the next one's anchor, and `qmcp audit verify` each rotated file of the chain it
+  verifies, so lines cut from its end are found.
+- A proposal stored more than 5 minutes ahead of the clock reads as expired.
+- An install over qubes still wearing slot badges no record backs (after `uninstall.sh --purge`)
+  refuses until it is run with the new `--strip-stale-badges`, which takes them off, routed ones
+  first, before the policy goes in; `uninstall.sh --purge` says so.
+- An upgrade from before 0.9.33 with no keep-days setting and rotated logs older than 90 days
+  writes the setting `off`, and says so, before the hourly timer can remove them.
+- With `/etc/qmcp/hub` unreadable in anonymous mode, the gate's stop reaches the hub by the name
+  the installed rulebook gives it.
+- `qmcp project unblock` exits 1, and its audit line says not ok, when a qube was not unblocked;
+  it reads each qube's badges back.
+- `qmcp manage` drops a seal's pending kill; `qmcp revoke` marks a window (open, or a kill still
+  owed) as a pending kill before any badge comes off and drops it once its own kill read back,
+  or, when it leaves the qube running on purpose, once its badges read back gone, so the timer no longer kills a qube the
+  operator just handed to the hub or left running; the hub's `qube-revoke` with `shutdown`
+  false is refused for a qube a seal still owes a kill.
+- `qmcp check` fails when `qmcp-seal.service` is not enabled or its drop-in does not order Qubes'
+  autostart after it (`boot seal`), and when `/var/lib/qmcp/removed`, which the installer's
+  tmpfiles makes, is missing or not the services' to write (`removal record`).
+- A lead's removal and a project delete kill and remove each qube under that qube's lock (or,
+  past its wait, without it, and again under it if that remove failed), so a hub's start admitted in between no
+  longer leaves it running unreported.
+- The restore check re-reads, under the qube's lock, that a qube is still in scope, and takes a
+  hold back off one a reject or a revoke took out of AI space meanwhile; `qmcp restored reject`
+  takes off a hold the pass put on while it ran.
+- `qmcp guard` of a qube already in AI space no longer reads the gateway registry or the mode
+  file: an unreadable one stopped a guard that only takes authority away. A qube joining AI space
+  whose registry does not read is refused with that reason.
+- `--model-qube` on a qube waiting for review is refused before anything changes; it refused at
+  the first badge, after the lead and the qube had lost their networks.
+- Project records, a request or a window record nested too deep read as unreadable rather than
+  raising.
+- A dom0 service refuses a request that has not arrived whole within 15 s, so a stream left open
+  holds the caller's call slot for 15 s at most (a lead that keeps re-opening them is the "busy
+  leads" residual).
+- The event stream passes feature events only for the keys the hub may set itself; dom0's own
+  labels and records (`qmcp-id`, `qmcp-owner-kept`, `qmcp-services`) stay out.
+- `qmcp template refresh` logs each qube as soon as it is written, takes the qubes in a random
+  order, and starts no write after 240 s, so a run cut short by its unit loses no line and
+  stalled qubes cannot starve the rest; a qube whose label write failed is said and logged.
+- `qmcp template prepare` says when a template it started did not stop after a failed write.
+- Accepting a `qube-open` while a gate run holds the gate's lock past its 10 s wait is refused and
+  the proposal stays pending; it was consumed as failed.
+- The hub's server runs the long tools (`qubes_run`, `qubes_copy`, `qubes_run_disposable`,
+  `qubes_events`, the creates and `qubes_start`) on their own threads, so long calls no longer
+  hold up a list or a kill in the server; dom0's cap of 8 hub calls at once still applies.
+- A proposal tool whose reply never came says the proposal may be stored.
+- The `qubes-mcp` command line escapes non-ASCII in its output, so a qube's C1 controls and bidi
+  characters never reach the terminal raw.
+- `qmcp audit tail --caller C` gives one caller's last lines, and the window's Audit tab has a
+  Caller chooser: 200 calls of a busy hub no longer push the operator's and the gate's lines
+  off the tab.
+- The window: Import no longer refuses an interrupted import the command finishes; the project
+  forms refuse a hidden project's disposable template for a project the hub sees before OK;
+  Revoke refuses Remove before OK where the view shows the command's refusal; Accept all
+  re-checks every row it showed; the Audit tab and Rotate follow the install's audit mode and
+  say which chain they show; the failed-read status names Guard; the open and held texts say
+  what they leave out; `restored accept`'s help names the owner badge.
+
+### Upgrading
+
+Install over 0.9.38. See the design's "From v0.9.38" note: an install after a purge may need
+`--strip-stale-badges`, and each principal's audit budget starts afresh once (the counters 0.9.38
+kept count by date; a rollback does the same). The clock check of the audit log's removal begins
+once an hourly run has noted the clocks: the first run after the install removes by age as before.
+To roll back, install 0.9.38 over it; the new records (`/var/lib/qmcp/replaced-labels`, `removed`,
+`audit-clock` and `audit-clock-moved`) stay, and nothing older reads them.
+
 ## [0.9.38] — 2026-10-19
 
 **A hidden project's disposable templates stay its own.** Found while reinstalling the test machine: qmcp let one

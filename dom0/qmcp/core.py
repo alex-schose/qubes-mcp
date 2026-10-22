@@ -32,6 +32,7 @@ is a lead, and a missing runtime directory refuses the call.
 from __future__ import annotations
 
 import fcntl
+import io
 import json
 import os
 import re
@@ -72,6 +73,9 @@ ID_FEATURE = "qmcp-id"
 UNREADABLE = "<unreadable>"
 
 HUB_PATH = "/etc/qmcp/hub"
+#: The restore check's record that a qube was proven a restore (`restored.KEPT`):
+#: that qube's own decision, which no copy takes (`birth.fill_copy`).
+OWNER_KEPT_FEATURE = "qmcp-owner-kept"
 RUN_DIR = "/run/qmcp"
 #: Anonymous mode: the one word `anonymous`, written by `install.sh --anonymous`
 #: and removed only by `uninstall.sh --purge`. Absent means normal mode.
@@ -259,6 +263,34 @@ def principal(app, caller_name: str, hub: str | None = None) -> Principal:
 
 # ------------------------------------------------------------------ the caps
 
+#: How long a caller has to send its whole request. The request is read while
+#: the caller holds its call slots: a stream left open would hold them for
+#: ever (the hub's own transport closes it as soon as it has written).
+REQUEST_TIMEOUT_S = 15.0
+
+
+def _read_bounded(stream, n: int):
+    """Up to `n` bytes, until end of stream, within `REQUEST_TIMEOUT_S` in all;
+    refused past it. A stream with no descriptor (a test's) is read as it is."""
+    import select
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        return stream.read(n)
+    deadline = time.monotonic() + REQUEST_TIMEOUT_S
+    chunks, total = [], 0
+    while total < n:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            raise refuse("request timed out")
+        chunk = os.read(fd, min(65536, n - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 def read_request(stream, limit: int | None = None) -> dict:
     """Read and parse one JSON request object, at most `limit` bytes.
 
@@ -267,7 +299,7 @@ def read_request(stream, limit: int | None = None) -> dict:
     refusal text never echoes the payload or the parser's message.
     """
     limit = MAX_REQUEST_BYTES if limit is None else limit
-    raw = getattr(stream, "buffer", stream).read(limit + 1)
+    raw = _read_bounded(getattr(stream, "buffer", stream), limit + 1)
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "replace")
     if len(raw) > limit:
@@ -276,7 +308,7 @@ def read_request(stream, limit: int | None = None) -> dict:
         return {}
     try:
         obj = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise refuse("invalid JSON input") from None
     if not isinstance(obj, dict):
         raise refuse("request must be a JSON object")

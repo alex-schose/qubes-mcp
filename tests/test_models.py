@@ -483,9 +483,9 @@ class CreatesAndLeads(ModelBase):
         seen = []
         real = fleet._demote_lead
 
-        def demote(app, p, report, removing=False):
+        def demote(app, p, report, removing=False, **kw):
             seen.append(BADGE2 in self.raw(MODEL))
-            return real(app, p, report, removing)
+            return real(app, p, report, removing, **kw)
         fleet._demote_lead = demote
         try:
             fleet.set_lead(self.app, "other", "template", "ai-debian-13", "ai-net-router", False,
@@ -672,9 +672,11 @@ class KillComesFirst(ModelBase):
     kill comes right after the guard lands, and is tried when the guard's own
     call fails, since qubesd may have set the tag before it failed."""
 
+    # A guard of a qube already in AI space reads no network: it only takes
+    # authority away, and a network read that fails must not stop it.
     GUARD_KEYS = (f"tag.List:{MODEL}", "tag.add:ai-managed", "tag.add:qmcp-guarded",
                   "tag.add.landed:qmcp-guarded", f"get.provides_network:{MODEL}",
-                  f"get.template_for_dispvms:{MODEL}", f"get.netvm:{MODEL}")
+                  f"get.template_for_dispvms:{MODEL}")
     COMMAND_KEYS = (f"tag.List:{MODEL}", "tag.add:qmcp-guarded", "tag.add.landed:qmcp-guarded",
                     "tag.add:qmcp-model-p02", f"get.netvm:{MODEL}")
 

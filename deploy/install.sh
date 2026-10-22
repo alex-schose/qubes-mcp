@@ -102,6 +102,10 @@
 #                                    or a copy, or was badged before 0.9.26 and kept through a
 #                                    purge, and the gate holds it for review. (With --anonymous
 #                                    it labels the hub as it gets qmcp-anon.)
+#   stale slot badges                with --strip-stale-badges: the slot badges no project
+#                                    record backs (after uninstall.sh --purge), routed ones
+#                                    first, before the policy; without it the install refuses
+#                                    while any qube wears one
 #   /etc/qmcp/mode                   with --anonymous: the word anonymous, written after the
 #                                    policy, once qmcp-anon is on the hub and on every qube
 #                                    under the hub's check; then they are stamped once more
@@ -139,6 +143,7 @@ GATE_USER=""
 ANONYMOUS=0
 UPDATES_VIA=""
 AUDIT_LOG_MODE=""
+STRIP_STALE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub) HUB="$2"; shift 2 ;;
@@ -150,6 +155,7 @@ while [ $# -gt 0 ]; do
         --pool-cap) POOL_CAP="$2"; shift 2 ;;
         --private-cap) PRIVATE_CAP="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --strip-stale-badges) STRIP_STALE=1; shift ;;
         *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -317,6 +323,42 @@ if [ "$FLEET_STATUS" -ne 0 ]; then
     echo "    sudo PYTHONPATH=$SRC/dom0 python3 -m qmcp.cli migrate          # dry run" >&2
     echo "    sudo PYTHONPATH=$SRC/dom0 python3 -m qmcp.cli migrate --apply" >&2
     exit 1
+fi
+
+# The rulebook routes on badges, not records: a slot badge no record backs
+# (left by uninstall.sh --purge, which removes the records and keeps the qubes'
+# tags) would give a former lead root exec into its former workers again the
+# moment the policy goes in. Listed here; taken off before the policy only with
+# --strip-stale-badges, routed badges first.
+STALE_STATUS=0
+STALE_OUT="$(PYTHONPATH="$SRC/dom0" python3 - <<'PYEOF'
+import sys
+try:
+    from qmcp import fleet, projects
+    import qubesadmin.app
+    stale, unread = fleet.stale_slot_badges(qubesadmin.app.QubesLocal(), projects.load())
+except Exception as e:
+    # Exit 1 means "stale badges found": a crash must never read as that.
+    print(f"    the fleet could not be read ({type(e).__name__})")
+    sys.exit(3)
+for name, badges in stale:
+    print(f"    {name}: {' '.join(badges)}")
+for name in sorted(unread):
+    print(f"    {name}: its tags do not read")
+sys.exit(2 if unread else 1 if stale else 0)
+PYEOF
+)" || STALE_STATUS=$?
+case "$STALE_STATUS" in
+    0|1|2) ;;
+    *) die "whether any qube wears stale slot badges could not be told: $STALE_OUT" ;;
+esac
+if [ "$STALE_STATUS" -eq 2 ] || { [ "$STALE_STATUS" -ne 0 ] && [ "$STRIP_STALE" -ne 1 ]; }; then
+    echo "install.sh: qubes wear slot badges that no project record backs (left by" >&2
+    echo "uninstall.sh --purge, or a project delete that stopped half-way); the rulebook" >&2
+    echo "would route on them again once it is installed:" >&2
+    printf '%s\n' "$STALE_OUT" >&2
+    [ "$STALE_STATUS" -eq 2 ] && die "the tags of a qube do not read; try again"
+    die "run again with --strip-stale-badges to take them off before the policy goes in"
 fi
 
 # Render the hub's name into the policy, then check the result with qrexec's
@@ -674,6 +716,32 @@ PYEOF
     say "$AUDIT_SAID"
 fi
 
+# --- an upgrade from before 0.9.33 has no keep-days setting, and the hourly timer
+# would remove, at the default, rotated logs that release kept for ever: where
+# any of them is older than the default, the setting is written "off", and said,
+# before the timer first runs. Removing evidence is the step that cannot be undone.
+KEEP_SAID="$(PYTHONPATH="$LIB" python3 - <<'PYEOF'
+import datetime, os
+from qmcp import audit
+if os.path.exists(audit.KEEP_DAYS_PATH):
+    raise SystemExit(0)
+cutoff = datetime.datetime.now(datetime.timezone.utc) \
+    - datetime.timedelta(days=audit.KEEP_DAYS_DEFAULT)
+old = [n for n, when in audit.rotated() if when < cutoff]
+if not old:
+    raise SystemExit(0)
+tmp = audit.KEEP_DAYS_PATH + ".new"
+with open(tmp, "w", encoding="ascii") as fh:
+    fh.write("off\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, audit.KEEP_DAYS_PATH)
+print(f"wrote {audit.KEEP_DAYS_PATH} = off: {len(old)} rotated audit log(s) are older than "
+      f"the default {audit.KEEP_DAYS_DEFAULT} days, and no setting said to remove them; "
+      f"set one with qmcp settings set --audit-keep-days N once you have kept what you need")
+PYEOF
+)" || die "could not judge or write $ETC_QMCP/audit-keep-days"
+[ -n "$KEEP_SAID" ] && say "$KEEP_SAID"
+
 # --- the anonymity gate's timer, as the services' user
 sed "s/@GATE_USER@/$GATE_USER/" "$SRC/deploy/qmcp-gate.service" > "$SCRATCH/qmcp-gate.service"
 grep -qx "User=$GATE_USER" "$SCRATCH/qmcp-gate.service" || die "the gate's unit did not render"
@@ -721,6 +789,16 @@ for g in $UPDATES_VIA; do
     PYTHONPATH="$LIB" python3 -c 'import sys, qubesadmin.app; from qmcp import audit, fleet; print(fleet.set_gateway(qubesadmin.app.QubesLocal(), sys.argv[1], updates=True)); audit.audit("qmcp gateway set", "operator", {"qube": sys.argv[1][:128], "updates": True}, True, slots=())' "$g" \
         || die "could not tick $g for updates; the new policy is NOT installed (nor, with --anonymous, the mode), but the gate's timer starts again on the new code and may stop a project, or in anonymous mode the hub, whose templates update through $g: run the install again at once"
 done
+
+# --- slot badges no record backs, taken off with --strip-stale-badges (the
+# preflight listed them and refused without it)
+if [ "$STRIP_STALE" -eq 1 ]; then
+    PYTHONPATH="$LIB" python3 -c 'import qubesadmin.app; from qmcp import audit, fleet, projects
+for line in fleet.strip_stale_slot_badges(qubesadmin.app.QubesLocal(), projects.load()):
+    print("==> " + line)
+    audit.audit("qmcp install", "operator", {"stale badges": line.split(":")[0][:128]}, True, slots=())' \
+        || die "the stale slot badges could not all be taken off; the new policy is NOT installed: run the install again"
+fi
 
 # --- the policy last: the services run the new library under the old rulebook from the
 # library step on, and under the new one from here

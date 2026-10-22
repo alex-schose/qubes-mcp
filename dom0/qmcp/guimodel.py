@@ -175,6 +175,27 @@ ACTING_READS = frozenset({"gate", "check"})
 AUDIT_VERIFY = read_cmd("audit", "verify")
 
 
+def audit_tail(caller=None) -> list:
+    """The Audit tab's read: the install's last `AUDIT_TAIL` lines, or with
+    `caller` the last `AUDIT_TAIL` of that caller's, so a busy hub never
+    pushes the operator's or the gate's lines off the tab."""
+    argv = read_cmd("audit", "tail", str(AUDIT_TAIL))
+    return argv + ["--caller", caller] if caller else argv
+
+
+def audit_callers(settings, project_rows) -> list:
+    """The callers the Audit tab offers: dom0's own and the principals."""
+    out = ["operator", "gate", "refresh", "rotate"]
+    hub = (settings or {}).get("hub") if isinstance(settings, dict) else None
+    if isinstance(hub, str) and hub and hub not in out:
+        out.append(hub)
+    for r in project_rows or ():
+        lead = r.get("lead") if isinstance(r, dict) else None
+        if isinstance(lead, str) and lead and lead not in out:
+            out.append(lead)
+    return out
+
+
 class Result:
     """One finished command."""
 
@@ -728,15 +749,17 @@ BUILDERS = (create_project, edit_project, remove_lead, change_lead, add_dump, mo
             reject_proposal, enroll_gateway, change_gateway, remove_gateway,
             show_lead_firewall, set_lead_model, set_lead_model_qube, set_lead_rules,
             accept_lead_rules, unblock_project, settings_set, prepare_template,
-            install_packages, restored_accept, restored_reject, export_config, import_config)
+            install_packages, restored_accept, restored_reject, export_config, import_config,
+            audit_tail)
 
 #: Commands and options the window does not offer, and why the operator types
 #: them. An entry covers everything under it. Adding one is a decision, not a
 #: way to get the suite green.
 CLI_ONLY = {
     ("migrate",): "a one-time step from v0.9.16, run before the first install of this release",
-    ("audit", "--path"): "reads a log other than the live one, such as a rotated file; "
-                         "the window shows the live log",
+    ("audit", "--path"): "reads a chain other than the install's, such as a rotated file "
+                         "or a project's RAM chain under /run/qmcp/audit; the window shows the "
+                         "install's own chain",
     ("audit", "--auto"): "the hourly rotation and removal: qmcp-audit.timer runs it as root, and "
                          "the window rotates by hand with Rotate",
     ("seal", "--all"): "the boot seal: qmcp-seal.service runs it before any user session exists, "
@@ -903,13 +926,31 @@ def audit_detail(rec: dict) -> Shown:
     return Shown("\n".join(f"{esc(k)}: {esc(rec.get(k))}" for k in keys if k in rec))
 
 
-def audit_hint(rows) -> str:
-    """What the pane under the audit list says before a line is selected."""
+#: Where the lines the Audit tab cannot show are: it reads the install's
+#: chain only (`audit tail`), never a project's own.
+AUDIT_ELSEWHERE = ("A project whose audit log is ram keeps its lines on a chain of its own "
+                   "under /run/qmcp/audit, and one set to off keeps none; neither shows here.")
+
+
+def audit_hint(rows, status=None, caller=None) -> str:
+    """What the pane under the audit list says before a line is selected.
+    `status`: `audit status --json` as read, for the install's mode, or None
+    when it was not read. `caller`: the one the rows were read for."""
+    mode = status.get("mode") if isinstance(status, dict) else None
+    if not rows and caller:
+        return (f"No line of {caller} on the install's chain. Choose every caller to see "
+                f"the others'.")
     if not rows:
-        return ("Nothing on this log yet. It records every call the hub and the leads make to "
-                "dom0's state-changing services, and every command of yours that changes "
-                "something, as caller operator: accepting and rejecting proposals included. A "
-                "rotation starts a new log with a line of its own.")
+        if mode == "none":
+            return ("This install keeps no audit log (install mode none, set by install.sh "
+                    "--audit-log): no qmcp audit line is written anywhere, so this tab stays "
+                    "empty.")
+        where = ("the install's RAM chain (install mode ram), gone at shutdown" if mode == "ram"
+                 else "the install's audit log")
+        return (f"Nothing on {where} yet. It records every call the hub and the leads make to "
+                f"dom0's state-changing services, and every command of yours that changes "
+                f"something, as caller operator: accepting and rejecting proposals included. A "
+                f"rotation starts a new log with a line of its own. " + AUDIT_ELSEWHERE)
     first = rows[0] if isinstance(rows[0], dict) else {}
     if first.get("service") == "qmcp.audit-rotate":
         cont = (first.get("args") or {}).get("continues", "?")
@@ -1045,7 +1086,8 @@ ATTENTION = {
              "held for your review: it came back from a backup or was copied by hand, so its "
              "qmcp-id label did not match its UUID when the gate held it. The rulebook refuses every call into it and out "
              "of it, and the services will not operate it or create from it, until you accept it "
-             "(it is labelled, the hold comes off and its badges stay) or reject it (every qmcp "
+             "(it is labelled, the hold comes off and its badges stay, but an owner badge the "
+             "restore check did not record as a restore's comes off) or reject it (every qmcp "
              "badge comes off; the qube stays)"),
     "unheld": ("restored, not held yet",
                "its qmcp-id label is missing or not its own UUID: it came back from a backup or was copied "
@@ -1600,7 +1642,8 @@ def window_left(row) -> str:
 def open_intro(row) -> str:
     """What opening a guarded qube does, for the form that asks."""
     name = (row or {}).get("name")
-    return (f"{name} is guarded, so the rulebook refuses the hub every service into it. A window "
+    return (f"{name} is guarded, so the rulebook refuses the hub every service into it but reading "
+            f"its firewall rules and its dialog asks. A window "
             f"lets the hub run commands in it as root, and copy a file in, which Qubes asks you "
             f"to confirm one file at a time. With the firewall box ticked it may also write the "
             f"qube's firewall rules; it can never change which network the qube is on, which "
@@ -1704,6 +1747,45 @@ def revoke_note(row) -> str:
     return (f"It is the model qube of {_and(serves)}: revoking takes its model badges too, so "
             f"their leads no longer reach it, and qmcp check warns until each project gets "
             f"another (Set model qube...).")
+
+
+def remove_refusal(row, records, fleet_rows) -> str | None:
+    """Why `qmcp revoke --remove` refuses `row`'s qube, as far as the view
+    shows it, in the command's words (`fleet._remove_refusal`): a guarded
+    qube (a gateway is one), a model qube by record or badge, a project's
+    recorded lead or dump sink, an approved template or worker network, and a
+    qube another qube on show is built on or sits on. None when the view
+    shows no reason; the command reads everything again, and refuses more
+    (another qube's default disposable template, a global setting)."""
+    if not isinstance(row, dict):
+        return None
+    name, b = row.get("name"), badges(row)
+    if b["guarded"] or row.get("state") == "guarded" or row.get("gateway") is True:
+        return (f"'{name}' is guarded: qmcp removes no guarded qube or gateway; qvm-remove it "
+                f"by hand if you mean to")
+    recs = [r for r in (records or {}).values() if isinstance(r, dict)] \
+        if isinstance(records, dict) else []
+    serves = sorted(r.get("label") or r.get("slot") for r in recs if r.get("model_qube") == name)
+    if serves or b["model"]:
+        return (f"'{name}' is the model qube of {', '.join(serves) or 'a project'}: take it off "
+                f"first (qmcp project firewall PROJECT --model-qube none)")
+    named = sorted(r.get("label") or r.get("slot") for r in recs
+                   if name in (r.get("lead"), r.get("dump")))
+    if named:
+        return f"'{name}' is the lead or dump sink a project's record names ({', '.join(named)})"
+    listing = sorted(r.get("label") or r.get("slot") for r in recs
+                     if name in (r.get("templates") or ()) or name in (r.get("networks") or ()))
+    if listing:
+        return (f"'{name}' is an approved template or worker network of {', '.join(listing)}: "
+                f"take it off the list first (qmcp project edit)")
+    users = sorted(r.get("name") for r in fleet_rows or ()
+                   if isinstance(r, dict) and r.get("name") != name
+                   and name in (r.get("template"), r.get("netvm")))
+    if users:
+        shown = ", ".join(users[:5]) + (", ..." if len(users) > 5 else "")
+        return (f"'{name}' is in use by {len(users)} qube(s) (their template or network): "
+                f"{shown}; qubesd would refuse the remove")
+    return None
 
 
 def slot_of(node: Node) -> str | None:
@@ -3582,6 +3664,39 @@ def create_refusal(label, prefix, project_rows, fleet_rows, dump=False, template
     return None
 
 
+def dvmt_share_refusal(templates, hidden, slot, project_rows, fleet_rows) -> str | None:
+    """Why `project create` or `edit` refuses a disposable template the view
+    shows shared between a hidden project and one the hub sees, either way
+    round, in the command's words (`fleet._dvmt_share_refusal`). `slot`: the
+    project being edited, None for a new one. A template whose row is missing
+    or does not say whether it is a disposable template is the command's to
+    judge."""
+    rows = {r["name"]: r for r in fleet_rows or () if isinstance(r, dict)
+            and isinstance(r.get("name"), str)}
+    recs = [r for r in project_rows or () if isinstance(r, dict)]
+    for t in templates or ():
+        row = rows.get(t)
+        if row is None or row.get("dvmt") is not True:
+            continue
+        others = [q for q in recs if q.get("slot") != slot and t in (q.get("templates") or ())]
+        if hidden:
+            seen = sorted(q.get("label") or q.get("slot") for q in others if not q.get("hidden"))
+            if seen:
+                return (f"the disposable template {t} is approved by {', '.join(seen)}, which "
+                        f"the hub sees: a hidden project's disposable templates are hidden from "
+                        f"the hub, and that project's disposables would then be refused at "
+                        f"birth; give this project a disposable template of its own")
+            continue
+        hiding = sorted(q.get("label") or q.get("slot") for q in others if q.get("hidden"))
+        if hiding or projects.HUBBLIND in set(row.get("badges") or ()):
+            whose = (f"the hidden project {', '.join(hiding)}'s" if hiding
+                     else f"hidden from the hub ({projects.HUBBLIND}), a hidden project's")
+            return (f"the disposable template {t} is {whose}: a disposable made from it is born "
+                    f"hidden from the hub and refused for a project the hub sees; give this "
+                    f"project a disposable template of its own")
+    return None
+
+
 def lead_name_refusal(name, space, old, keep, fleet_rows) -> str | None:
     """Why the command refuses the new lead's name, from the view: a qube of
     that name (`name`, or `<space>lead` when none is typed) exists, and is not
@@ -3617,6 +3732,8 @@ def role_refusal(action, row, gw_rows) -> str | None:
         return f"'{name}' is a drop box (ai-dump); a drop box is never in AI space"
     if action == "manage" and row.get("gateway") is True:
         return f"'{name}' provides network; gateways are always guarded (qmcp guard)"
+    if action == "guard" and row.get("state") is not None:
+        return None                     # already in AI space: a guard only takes authority away
     net = row.get("netvm")
     if net == UNREADABLE:
         return f"'{name}''s network cannot be read; try again"
@@ -3780,7 +3897,8 @@ RECORDS_UNREAD = ("not known: the command could not read the project records, so
 #: A qube that wears the hold and has no row: its label is its own.
 HELD_LABELLED = ("it wears the hold, but its qmcp-id label is its own, so qmcp restored list has "
                  "no row for it: the hold stayed on after an accept, or was put on by hand. "
-                 "Accept restored... lifts it, and its badges stay")
+                 "Accept restored... lifts it, and its badges stay, but an owner badge the "
+                 "restore check did not record as kept comes off")
 
 
 def _restored_shape(row) -> bool:
@@ -3990,13 +4108,21 @@ def held_names(rows) -> list:
     return sorted(r["name"] for r in held_rows(rows))
 
 
+def held_state(rows) -> list:
+    """What an Accept all form shows of each held qube (its whole row of
+    `restored list`: role, badges, whether the records back them), asked again
+    at OK, as the single-qube form asks `review_state`."""
+    return sorted(json.dumps(r, sort_keys=True) for r in held_rows(rows))
+
+
 def held_changed(opened, rows) -> str | None:
-    """Why an Accept all form opened on the held qubes `opened` may no longer
-    run, or None: none is held now, or another set is."""
+    """Why an Accept all form opened on the held qubes' rows `opened`
+    (`held_state`) may no longer run, or None: none is held now, or another
+    set is, or a row the form showed reads differently now."""
     why = accept_all_refusal(rows)
     if why:
         return why
-    if held_names(rows) != opened:
+    if held_state(rows) != opened:
         return ("the qubes held changed since this form opened: look at them again, and open "
                 "the form again")
     return None
@@ -4207,13 +4333,36 @@ AUDIT_STATUS_FIELDS = (
     ("log_bytes", "Log size"), ("rotated", "Rotated logs"), ("ram", "Chains in RAM"),
     ("free_bytes", "Free under the log"), ("floor_bytes", "Floor"),
     ("principals", "Principals"), ("needed_bytes", "A full budget for that long needs"),
-    ("budgets", "Budget used today"),
+    ("budgets", "Budget used this day (24 h of uptime)"),
 )
 
 
 def _mib(n) -> str:
     return "not known" if not isinstance(n, int) or isinstance(n, bool) else \
         f"{n / 1024 ** 2:.1f} MiB"
+
+
+def rotate_refusal(status) -> str | None:
+    """Why `qmcp audit rotate` refuses, from `audit status --json` as read, in
+    its words (`cli.cmd_audit`): mode none, or a mode that does not read. None
+    when the status was not read: the command judges it."""
+    if not isinstance(status, dict):
+        return None
+    if status.get("mode") is None:
+        return "the install's audit mode cannot be read; nothing was rotated"
+    if status.get("mode") == "none":
+        return "the install keeps no audit log (mode none); nothing was rotated"
+    return None
+
+
+def rotate_intro(status) -> str:
+    """What Rotate does, for the form that asks: the install's chain, as the
+    mode puts it."""
+    mode = status.get("mode") if isinstance(status, dict) else None
+    where = ("the install's RAM chain under /run/qmcp/audit (install mode ram)" if mode == "ram"
+             else "the install's audit log")
+    return (f"Moves {where} aside and starts a new one anchored on the old head hash. "
+            f"A project's own RAM chain is rotated by the hourly timer, not here.")
 
 
 def audit_gauge(doc) -> list:
@@ -4255,7 +4404,7 @@ def audit_gauge(doc) -> list:
             continue
         used, cap = b.get("lines_today"), b.get("budget")
         if isinstance(used, int) and isinstance(cap, int) and cap > 0:
-            rows.append((f"Budget: {b.get('caller')}", f"{used} of {cap} lines today",
+            rows.append((f"Budget: {b.get('caller')}", f"{used} of {cap} lines this day",
                          min(1.0, used / cap)))
         else:
             rows.append((f"Budget: {b.get('caller')}", "its counter does not read: its changes "
@@ -4350,13 +4499,15 @@ def pool_cap_refusal(text, used) -> str | None:
 
 
 def import_refusal(records, gw_rows) -> str | None:
-    """Why the command refuses an import, as far as the records and the
-    registry on show tell it (`opfiles.plan_import`), in its words: a project,
-    a sink for p00, or an enrolled gateway. The export's hub and mode are the
-    command's to check."""
+    """Why the command refuses an import, as far as the records on show tell
+    it (`opfiles.plan_import`), in its words: a project, or a sink for p00.
+    An enrolled gateway is the command's to judge, not the form's: a registry
+    that is exactly the export's is accepted, since the records are written
+    last and an import that failed part-way is finished by running it again.
+    The export's hub, mode and registry are the command's to check."""
     recs = records if isinstance(records, dict) else {}
     hub_slot = recs.get(projects.HUB_SLOT) if isinstance(recs.get(projects.HUB_SLOT), dict) else {}
-    if set(recs) - {projects.HUB_SLOT} or hub_slot.get("dump") or gateway_list(gw_rows):
+    if set(recs) - {projects.HUB_SLOT} or hub_slot.get("dump"):
         return ("this install already has projects or gateways: an import is for a fresh "
                 "install, and changes nothing here")
     return None

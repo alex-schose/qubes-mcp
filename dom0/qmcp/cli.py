@@ -427,24 +427,29 @@ def cmd_template(args) -> int:
         print(f"{r['qube']}: prepared ({r['version']}); it was started for this, and its "
               f"shutdown did not complete: qvm-shutdown {r['qube']}, or qvm-kill {r['qube']}")
         return 1
-    try:
-        done = inqube.refresh(_app())
-    except inqube.InQubeError as e:
-        print(f"qmcp template refresh: {e}", file=sys.stderr)
-        return 3
-    rc = 0
-    for name, outcome in done:
-        print(f"{name}: {outcome}")
+    rc = [0]
+
+    def settled(name, outcome, wrote):
+        # Said and logged as each qube settles: a run the unit's timeout cuts
+        # short still has a line for every qube it wrote into.
+        print(f"{name}: {outcome}", flush=True)
         if outcome != "updated":
-            rc = 3
-            continue
+            rc[0] = 3
+        if not wrote:
+            return
         try:
             # A standalone lead is prepared too: its line follows its project.
-            audit.audit("qmcp template refresh", "refresh", {"qube": str(name)[:128]}, True,
+            audit.audit("qmcp template refresh", "refresh", {"qube": str(name)[:128]},
+                        outcome == "updated", None if outcome == "updated" else outcome[:256],
                         slots=_place({"qube": str(name)[:128]}))
         except Exception:
             pass
-    return rc
+    try:
+        inqube.refresh(_app(), done=settled)
+    except inqube.InQubeError as e:
+        print(f"qmcp template refresh: {e}", file=sys.stderr)
+        return 3
+    return rc[0]
 
 
 def cmd_restored(args) -> int:
@@ -591,15 +596,30 @@ def cmd_import(args) -> int:
 
 def cmd_gate(args) -> int:
     """Judge every anonymous project now, and stop one that is not (the timer
-    runs this). Prints only what is not sound, or what it did, unless --json.
-    Exit 0 all sound, 1 one is not, 3 one could not be judged, or another run
-    held the gate so nothing was."""
+    runs this), then hold the restored qubes. Prints only what is not sound,
+    or what it did, unless --json. Exit 0 all sound, 1 one is not, 3 one could
+    not be judged, another run held the gate so nothing was, or the restore
+    check did not complete.
+
+    The anonymity pass runs first: both passes only take authority away, and
+    the restore check waits for locks AI space can keep busy (a create, a
+    call on a qube), so it never delays the stop of an unsound project inside
+    the unit's time."""
     held = None
     # The lock files of names that are gone (a disposable qubesd removed after
     # a kill, a qube or a lead removed by hand): the qube locks, the in-qube
     # writer locks and a gone caller's call locks, never its counter.
     # Best-effort, and never the gate's verdict.
     core.sweep_qube_locks(_app())
+    verdicts, problem = None, None
+    try:
+        verdicts = anon.run(_app(), beat=os.environ.get(anon.HEARTBEAT_ENV) == "1")
+        if verdicts is None:
+            problem = "another run held the gate past its wait; nothing was judged"
+    except projects.ProjectsUnreadable as e:
+        problem = f"{e}; the anonymous projects were not judged"
+    except Exception as e:
+        problem = f"{type(e).__name__}; the anonymous projects were not judged"
     try:
         held = restored.hold(_app())
         restored.notify(held)
@@ -631,18 +651,8 @@ def cmd_gate(args) -> int:
         if not held.judged:
             print("qmcp gate: a create held the lock, so no restored qube was looked for; the "
                   "next run looks", file=sys.stderr)
-    try:
-        verdicts = anon.run(_app(), beat=os.environ.get(anon.HEARTBEAT_ENV) == "1")
-    except projects.ProjectsUnreadable as e:
-        print(f"qmcp gate: {e}; the anonymous projects were not judged", file=sys.stderr)
-        return 3
-    except Exception as e:
-        print(f"qmcp gate: {type(e).__name__}; the anonymous projects were not judged",
-              file=sys.stderr)
-        return 3
-    if verdicts is None:
-        print("qmcp gate: another run held the gate past its wait; nothing was judged",
-              file=sys.stderr)
+    if problem is not None:
+        print(f"qmcp gate: {problem}", file=sys.stderr)
         return 3
     if args.json:
         print(json.dumps([v.to_json() for v in verdicts], indent=2))
@@ -809,7 +819,17 @@ def cmd_audit(args) -> int:
             _need_root("rotate --auto", "audit")
             lines, ok = audit.auto_rotate()
             for line in lines:
-                print(line)
+                print(line, flush=True)
+            # The restore check's removal record, bounded the same hour, after
+            # the rotation's lines are out (it talks to qubesd): best-effort,
+            # never this run's status.
+            try:
+                n = restored.prune_removed(_app())
+                if n:
+                    print(f"removal record: {n} {'entry' if n == 1 else 'entries'} older "
+                          f"than {restored.REMOVED_KEEP_S // 86400} days dropped", flush=True)
+            except Exception:
+                pass
             return 0 if ok else 1
         # The install's own log, wherever it is: on disk, or its RAM chain. In
         # mode none there is none; a mode that does not read could be either.
@@ -837,12 +857,19 @@ def cmd_audit(args) -> int:
             print(json.dumps({"ok": True, "entries": 0, "error": None}))
             return 0
         ok, n, err = audit.verify(path)
+        if ok:
+            # And against the rotated logs still beside it (`verify_links`).
+            ok, err = audit.verify_links(path)
         print(json.dumps({"ok": ok, "entries": n, "error": err}))
         return 0 if ok else 1
     if path is None:
         return 0                        # install mode none: no line is kept
+    if args.caller is not None and not (0 < len(args.caller) <= 64 and args.caller.isprintable()
+                                        and " " not in args.caller):
+        print("qmcp audit tail: --caller wants a caller's name", file=sys.stderr)
+        return 2
     try:
-        records = audit.tail(args.n, path)
+        records = audit.tail(args.n, path, caller=args.caller)
     except OSError as e:
         print(f"qmcp audit tail: cannot read the log ({e.strerror or type(e).__name__})",
               file=sys.stderr)
@@ -923,7 +950,9 @@ def build_parser() -> argparse.ArgumentParser:
     q = rsub.add_parser("list", help="every badged qube whose label is not its own, and every "
                                      "held one, with what it came back as")
     q.add_argument("--json", action="store_true")
-    q = rsub.add_parser("accept", help="label each and lift the hold; its badges stay (root)")
+    q = rsub.add_parser("accept", help="label each and lift the hold; its badges stay, but an "
+                                       "owner badge the restore check did not record as kept "
+                                       "comes off (root)")
     q.add_argument("qube", nargs="*", help="the qubes you reviewed")
     q.add_argument("--all", action="store_true",
                    help="every qube held when it runs (after qmcp import)")
@@ -1095,10 +1124,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("what", choices=("verify", "tail", "rotate", "status"))
     p.add_argument("n", nargs="?", type=int, default=20)
     p.add_argument("--path", default=None)
+    p.add_argument("--caller", default=None, metavar="CALLER",
+                   help="with tail: only this caller's lines (operator, gate, refresh, rotate, "
+                        "the hub or a lead), the last n of them")
     p.add_argument("--auto", action="store_true",
                    help="with rotate: what the hourly timer runs: rotate when the log's first "
                         "line is from an earlier UTC day or it is past 32 MiB, then remove "
-                        "rotated logs older than the keep-days setting (root)")
+                        "rotated logs older than the keep-days setting, and the restore "
+                        "check's removal-record entries older than a week that no label "
+                        "names (root)")
     p.add_argument("--json", action="store_true", help="with status")
     sub.add_parser("version")
     return ap

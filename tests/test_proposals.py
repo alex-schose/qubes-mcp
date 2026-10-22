@@ -385,6 +385,13 @@ class Services(PBase):
         self.assertTrue(self.submit()["ok"])
         self.assertEqual({x["state"] for x in self.status()["proposals"][1:]}, {"expired"})
 
+    def test_a_proposal_submitted_ahead_of_the_clock_is_expired(self):
+        # The clock went back since it was submitted: its age cannot be told,
+        # so it never stays pending past its 7 days by a step back.
+        proposals.submit(proposals.normalise(create(label="ahead"), "ai-"), HUB,
+                         now=time.time() + 2 * DAY)
+        self.assertEqual(self.status()["proposals"][0]["state"], "expired")
+
     def test_a_missing_store_refuses_and_says_so(self):
         os.rmdir(self.store())
         self.assertEqual(self.submit()["error"], "the proposal store is unavailable")
@@ -1453,6 +1460,24 @@ class Install(PBase):
         self.assertNotIn("rm -rf /etc/systemd/system/qubes-vm@.service.d", uninstall)
 
 
+class RevokeKeepsAPendingKill(PBase):
+    def test_a_hub_revoke_that_keeps_running_a_qube_owed_a_kill_is_refused(self):
+        a = self.app
+        a.vm("ai-g1", template=a.domains["ai-debian-13"], netvm=None, power="Running",
+             tags={"ai-managed", "qmcp-guarded"})
+        fleet.open_window(a, "ai-g1", 3600)
+        a.fail.add("kill")
+        fleet.seal(a, "ai-g1")                                  # its kill fails: pending
+        a.fail.clear()
+        self.assertEqual(fleet.pending_kills(), ["ai-g1"])
+        r = self.submit({"type": "qube-revoke", "title": "t", "qube": "ai-g1", "shutdown": False})
+        ok, report = self.accept(r["id"], yes=True)
+        self.assertFalse(ok, report)
+        self.assertEqual(fleet.pending_kills(), ["ai-g1"])
+        fleet.expire_windows(a)
+        self.assertEqual(a.domains["ai-g1"].get_power_state(), "Halted")
+
+
 class OpenProposal(PBase):
     """The hub may ask for a window on a guarded qube; only the operator opens
     one. The hub cannot write the badges — the rulebook refuses it every
@@ -1540,6 +1565,27 @@ class OpenProposal(PBase):
         self.assertGreater(fleet.window_left(self.TPL), 7100)
 
 
+
+
+    def test_an_accept_while_the_gate_runs_refuses_and_stays_pending(self):
+        import fcntl
+        from qmcp import anon
+        self.assertTrue(self.ask()["ok"])
+        doc = proposals.show(self.app, 1)
+        held = os.open(anon.LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o660)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        saved = anon.LOCK_WAIT_S
+        self.addCleanup(setattr, anon, "LOCK_WAIT_S", saved)
+        anon.LOCK_WAIT_S = 0.3
+        with self.assertRaisesRegex(proposals.Refused, "still pending"):
+            proposals.accept(self.app, 1, doc["sha256"], tick=doc["tick"])
+        self.assertEqual(proposals.show(self.app, 1)["state"], "pending")
+        self.assertFalse(self.tags() & {core.OPEN})
+        fcntl.flock(held, fcntl.LOCK_UN)
+        ok, _ = proposals.accept(self.app, 1, doc["sha256"], tick=doc["tick"])
+        self.assertTrue(ok)
+        self.assertIn(core.OPEN, self.tags())
 
 class QubeProposals(PBase):
     """0.9.28's three: manage a qube (adopt it, or un-guard it), revoke one,

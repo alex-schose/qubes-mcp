@@ -88,7 +88,16 @@ def persistent_sum(app, badge: str | None = None) -> int:
     or any qube's tags, cannot be read: an under-count would let a create
     through the cap, and a qube whose tags cannot be read may be in AI space.
     A qube qubesd says is gone (removed since the list was read) is skipped:
-    it holds no disk."""
+    it holds no disk.
+
+    The list is read afresh: qubesadmin reads it once per process and keeps
+    it, and a create's budget is judged under the create lock, after a wait
+    in which the creates ahead of it landed. A list from before the wait
+    would leave them out, and every one of several parallel creates would
+    find the same room."""
+    clear = getattr(app.domains, "clear_cache", None)
+    if clear is not None:
+        clear()
     total = 0
     for vm in app.domains:
         try:

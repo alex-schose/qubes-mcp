@@ -56,6 +56,7 @@ import json
 import os
 import re
 import stat
+import time
 
 LOG_PATH = "/var/log/qmcp-audit.log"
 GENESIS = hashlib.sha256(b"").hexdigest()
@@ -243,6 +244,13 @@ def rotate(path: str | None = None, caller: str = "operator") -> str:
         os.link(path, aside)
         os.rename(tmp, path)
         tmp = None
+        # Nothing appends to a rotated log again (a writer that waited for
+        # the old lock finds the new file at the name): read-only, so cutting
+        # its last lines takes root, as removing it does.
+        try:
+            os.chmod(aside, st.st_mode & 0o7444)
+        except OSError:
+            pass
         return aside
     finally:
         if tmp is not None:
@@ -267,8 +275,9 @@ FLOOR_BYTES = 64 * 1024 * 1024
 
 
 #: A principal's calls that changed nothing (refused, failed, or a feature, or
-#: a property set explicitly, set to the value already there) are logged up to this many in each clock hour (UTC)
-#: each; past it they are counted in `<run>/calls/<caller>.refused`, on
+#: a property set explicitly, set to the value already there) are logged up
+#: to this many in each hour of the clock since boot (`_periods`), for each
+#: caller; past it they are counted in `<run>/calls/<caller>.refused`, on
 #: tmpfs, and `qmcp check` warns while that counts one (a reboot clears it). A
 #: failed create that made a qube, or may have, is always logged.
 #: Without the cap a compromised principal could fill the log's disk down to
@@ -277,8 +286,8 @@ REFUSALS_PER_HOUR = 60
 REFUSED_SUFFIX = ".refused"
 
 
-#: Each principal may put this many lines a day (UTC) on the log for calls
-#: that changed something; past it, its state-changing calls are refused
+#: Each principal may put this many lines a day (of the clock since boot,
+#: `_periods`) on the log for calls that changed something; past it, its state-changing calls are refused
 #: before they act (a kill goes on), counted in the same file, not logged. One
 #: compromised principal then spends only its own budget, and the 64 MiB
 #: floor stays the backstop for all of them. Lines of calls that changed
@@ -300,7 +309,9 @@ def _update(path: str, change):
     opened, read or written: each caller decides which way that fails."""
     old = os.umask(0o007)
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+        # Never through a link: the counter is a file of its own, as every
+        # lock file under /run/qmcp is.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o660)
     finally:
         os.umask(old)
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
@@ -320,21 +331,41 @@ def _update(path: str, change):
         return answer
 
 
+def _boot_clock() -> float:
+    """Seconds since dom0 booted, which nothing can set."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def _periods(now: str | None = None) -> tuple:
+    """(day, hour): the periods the daily budget and the hourly cap count in.
+    Counted on the clock since boot, which no one sets and which only moves
+    forward, never on the wall clock: a wall clock stepped back would give a
+    principal a fresh share, and one stepped forward and corrected would keep
+    it refused. The counters live on /run, cleared at every boot, so a period
+    is good for a counter's whole life. `now`, an ISO time, is a test's: its
+    UTC day and hour."""
+    if now is not None:
+        return now[:10], now[:13]
+    b = _boot_clock()
+    return f"boot-day-{int(b // 86400)}", f"boot-hour-{int(b // 3600)}"
+
+
 def take_refusal(path: str, now: str | None = None) -> bool:
     """Count one call that changed nothing, of the caller whose counter is
     `path`. True when its line may be written (under the cap this hour);
     False when it is counted instead. A counter that cannot be kept logs the
     line: the cap only ever withholds a line it has counted."""
-    now = now or _utc_now_iso()
+    _, hour = _periods(now)
+    stamp = now or _utc_now_iso()
 
     def change(rec):
-        if rec.get("hour") != now[:13]:
-            rec["hour"], rec["logged"] = now[:13], 0
+        if rec.get("hour") != hour:
+            rec["hour"], rec["logged"] = hour, 0
         if int(rec.get("logged", 0)) < REFUSALS_PER_HOUR:
             rec["logged"] = int(rec.get("logged", 0)) + 1
             return True
         rec["unlogged"] = int(rec.get("unlogged", 0)) + 1
-        rec["first"] = rec.get("first") or now
+        rec["first"] = rec.get("first") or stamp
         return False
     try:
         return _update(path, change)
@@ -348,12 +379,13 @@ def budget_left(path: str, now: str | None = None) -> bool | None:
     counter cannot be kept: a gate, so the caller refuses then too (with its
     own reason), and `qmcp check` fails on a counter that does not read or is
     not the services group's to write."""
-    now = now or _utc_now_iso()
+    day, _ = _periods(now)
+    stamp = now or _utc_now_iso()
 
     def change(rec):
-        if rec.get("day") == now[:10] and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY:
+        if rec.get("day") == day and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY:
             rec["over"] = int(rec.get("over", 0)) + 1
-            rec["over_first"] = rec.get("over_first") or now
+            rec["over_first"] = rec.get("over_first") or stamp
             return False
         return True
     try:
@@ -372,8 +404,8 @@ def first_capped(path: str, kind: str, now: str | None = None) -> str | None:
     """The hour (`kind` "hour") or day ("day") just capped for this caller,
     the first time it is asked in that period, else None: at most one line
     per caller per period. None too when the counter cannot be kept."""
-    now = now or _utc_now_iso()
-    period = now[:13] if kind == "hour" else now[:10]
+    day, hour = _periods(now)
+    period = hour if kind == "hour" else day
 
     def change(rec):
         key = f"noted_{kind}"
@@ -391,7 +423,7 @@ def budget_spent(path: str, now: str | None = None) -> bool:
     """Has this caller spent today's share? Read only, under the counter's
     lock; a counter that does not read counts as spent. For a kill, which acts
     whatever the answer: it decides only whether its line is capped."""
-    now = now or _utc_now_iso()
+    day, _ = _periods(now)
     try:
         with open(path, encoding="utf-8") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
@@ -402,7 +434,7 @@ def budget_spent(path: str, now: str | None = None) -> bool:
         return True
     try:
         rec = _counter(text)
-        return rec.get("day") == now[:10] and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY
+        return rec.get("day") == day and int(rec.get("lines", 0)) >= AUDIT_LINES_PER_DAY
     except Exception:
         return True
 
@@ -410,11 +442,11 @@ def budget_spent(path: str, now: str | None = None) -> bool:
 def spend(path: str, now: str | None = None) -> None:
     """One line of a call that changed something, against the day's budget.
     Best-effort: a counter that cannot be kept is caught by `budget_left`."""
-    now = now or _utc_now_iso()
+    day, _ = _periods(now)
 
     def change(rec):
-        if rec.get("day") != now[:10]:
-            rec["day"], rec["lines"] = now[:10], 0
+        if rec.get("day") != day:
+            rec["day"], rec["lines"] = day, 0
         rec["lines"] = int(rec.get("lines", 0)) + 1
     try:
         _update(path, change)
@@ -464,12 +496,12 @@ def spent_budgets(calls_dir: str, now: str | None = None) -> list:
     """[(caller, lines today, refused past the budget, first such refusal)]
     for every caller that reached its daily budget today or was refused for it
     since its counter was made."""
-    now = now or _utc_now_iso()
+    day, _ = _periods(now)
     out = []
     for caller, rec in counters(calls_dir):
         if rec is None:
             continue
-        today = int(rec.get("lines", 0) or 0) if rec.get("day") == now[:10] else 0
+        today = int(rec.get("lines", 0) or 0) if rec.get("day") == day else 0
         over = int(rec.get("over", 0) or 0)
         if today >= AUDIT_LINES_PER_DAY or over:
             out.append((caller, today, over, rec.get("over_first")))
@@ -919,6 +951,86 @@ _STAMP = "%Y%m%dT%H%M%SZ"
 _ROTATED_RE = re.compile(r"\A\d{8}T\d{6}Z\Z")
 
 
+#: The clocks of the last retention run, to tell a clock that moved from time
+#: that passed: `{"boot_id", "wall", "boot"}`. Root's (the timer runs as root),
+#: under /var/lib so it outlives a boot.
+CLOCK_PATH = "/var/lib/qmcp/audit-clock"
+#: Present while removal is paused because the clock moved: what was seen.
+#: Only the operator removes it, once dom0's clock is right; `qmcp check` warns.
+CLOCK_MOVED_PATH = "/var/lib/qmcp/audit-clock-moved"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+#: How far the wall clock may drift from the clock since boot between two runs.
+CLOCK_SLACK_S = 300
+
+
+def _boot_id():
+    try:
+        with open(BOOT_ID_PATH, encoding="ascii") as fh:
+            return fh.read(64).strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def clock_moved(now, keep) -> str | None:
+    """Why the wall clock cannot be trusted to remove old logs, or None. A
+    removal judged by a clock stepped forward would erase the record for good,
+    so each run compares the wall clock with the clock since boot, which no
+    one sets, against the last run: within one boot they must agree within
+    `CLOCK_SLACK_S`; across a boot, the wall clock must not have gone back,
+    nor forward by more than the keep-days (which would make every file
+    removable at once). A run that finds it moved pauses removal until the
+    operator removes `CLOCK_MOVED_PATH`. `now`: the run's wall clock (a
+    datetime)."""
+    wall, boot, bid = now.timestamp(), time.clock_gettime(time.CLOCK_BOOTTIME), _boot_id()
+    why = None
+    try:
+        with open(CLOCK_PATH, encoding="ascii") as fh:
+            prev = json.loads(fh.read(512))
+        pw, pb, pid = float(prev["wall"]), float(prev["boot"]), prev.get("boot_id")
+    except (OSError, ValueError, KeyError, TypeError):
+        prev = None
+    if prev is not None:
+        if pid is not None and pid == bid:
+            drift = (wall - pw) - (boot - pb)
+            if abs(drift) > CLOCK_SLACK_S:
+                why = (f"the wall clock moved {drift:+.0f} s against the clock since boot "
+                       f"since the last run")
+        elif wall < pw - CLOCK_SLACK_S:
+            why = f"the wall clock is {pw - wall:.0f} s behind the last run's, across a boot"
+        elif isinstance(keep, int) and wall - pw > keep * 86400:
+            why = (f"the wall clock is {(wall - pw) / 86400:.0f} days past the last run's, "
+                   f"across a boot: more than the {keep} days kept")
+    try:
+        os.makedirs(os.path.dirname(CLOCK_PATH), exist_ok=True)
+        _write_small(CLOCK_PATH, json.dumps({"boot_id": bid, "wall": wall, "boot": boot}))
+        if why is not None:
+            _write_small(CLOCK_MOVED_PATH, f"{now.strftime(_STAMP)} {why}")
+    except OSError:
+        pass
+    if why is not None:
+        return why
+    try:
+        with open(CLOCK_MOVED_PATH, encoding="utf-8", errors="replace") as fh:
+            return fh.read(512).strip() or "the clock moved"
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return f"{CLOCK_MOVED_PATH} does not read"
+
+
+def _write_small(path: str, text: str) -> None:
+    tmp = f"{path}.tmp"
+    old = os.umask(0o022)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        os.umask(old)
+    os.replace(tmp, path)
+
+
 def keep_days(path: str | None = None):
     """The days a rotated log is kept: an int, "off", or None when the file
     does not read or does not hold one of them. None removes nothing: removing
@@ -974,7 +1086,10 @@ def _first_record(path: str):
     with open(path, "rb") as fh:
         for line in fh:
             if line.strip():
-                return json.loads(line.decode("utf-8"))
+                try:
+                    return json.loads(line.decode("utf-8"))
+                except RecursionError:
+                    raise ValueError("the first line nests too deep") from None
     return None
 
 
@@ -1033,6 +1148,11 @@ def auto_rotate(now=None) -> tuple:
         return out, False
     if keep == "off":
         return out, ok
+    moved = clock_moved(now, keep)
+    if moved is not None:
+        out.append(f"nothing removed: {moved}; once dom0's clock is right, remove "
+                   f"{CLOCK_MOVED_PATH}")
+        return out, False
     removed, failed = [], []
     cutoff = now - datetime.timedelta(days=keep)
     d = os.path.dirname(LOG_PATH) or "."
@@ -1137,7 +1257,7 @@ def room_needed(principals: int, keep) -> int | None:
 def status(calls_dir: str, principals, now: str | None = None) -> dict:
     """What `qmcp audit status --json` answers. A value that does not read
     is None, never 0."""
-    now = now or _utc_now_iso()
+    day, _ = _periods(now)
     mode, problem = install_mode()
     keep = keep_days()
 
@@ -1152,7 +1272,7 @@ def status(calls_dir: str, principals, now: str | None = None) -> dict:
     budgets = []
     for caller, rec in counters(calls_dir):
         lines = None if rec is None else rec.get("lines", 0)
-        if rec is not None and rec.get("day") != now[:10]:
+        if rec is not None and rec.get("day") != day:
             today = 0
         elif isinstance(lines, int) and not isinstance(lines, bool) and lines >= 0:
             today = lines
@@ -1209,9 +1329,43 @@ def verify(path: str | None = None) -> tuple[bool, int, str | None]:
     return True, len(lines), None
 
 
-def tail(n: int = 20, path: str | None = None) -> list[dict]:
-    """The last `n` records. A log that does not exist yet has none; one that
-    cannot be read raises, so it is never shown as an empty one."""
+def verify_links(path: str | None = None) -> tuple[bool, str | None]:
+    """Each file of the chain against the next, for the rotated logs still on
+    disk: the next file's anchor must carry the head hash and last seq of the
+    file it names. `verify` walks one file and trusts its anchor, so records
+    cut from the end of a rotated log would otherwise go unseen. A file
+    removed by age (the oldest present names one that is gone) is no break.
+    Returns (ok, first problem)."""
+    path = LOG_PATH if path is None else path
+    d = os.path.dirname(path) or "."
+    files = [os.path.join(d, n) for n, _ in rotated(path)] + [path]
+    for earlier, later in zip(files, files[1:]):
+        try:
+            first = _first_record(later)
+        except (OSError, ValueError):
+            return False, f"{os.path.basename(later)}: its first line does not read"
+        if not isinstance(first, dict) or first.get("service") != ROTATE_SERVICE:
+            continue
+        args = first.get("args") or {}
+        if args.get("continues") != os.path.basename(earlier):
+            continue
+        try:
+            with open(earlier, "rb") as fh:
+                seq, head = _tail_state(fh)
+        except OSError as e:
+            return False, f"{os.path.basename(earlier)} cannot be read ({e.strerror})"
+        if first.get("prev") != head or args.get("after_seq") != seq:
+            return False, (f"{os.path.basename(later)} continues {os.path.basename(earlier)} "
+                           f"after seq {args.get('after_seq')}, which ends at seq {seq} with "
+                           f"another head: lines are missing from its end")
+    return True, None
+
+
+def tail(n: int = 20, path: str | None = None, caller: str | None = None) -> list[dict]:
+    """The last `n` records, or with `caller` the last `n` of that caller's
+    (a line that does not parse belongs to no caller then). A log that does
+    not exist yet has none; one that cannot be read raises, so it is never
+    shown as an empty one."""
     path = LOG_PATH if path is None else path
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -1219,9 +1373,12 @@ def tail(n: int = 20, path: str | None = None) -> list[dict]:
     except FileNotFoundError:
         return []
     out = []
-    for line in lines[-n:]:
+    for line in (lines if caller is not None else lines[-n:]):
         try:
-            out.append(json.loads(line))
-        except ValueError:
-            out.append({"unparseable": line[:200]})
-    return out
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            rec = {"unparseable": line[:200]}
+        if caller is not None and (not isinstance(rec, dict) or rec.get("caller") != caller):
+            continue
+        out.append(rec)
+    return out[-n:] if n > 0 else []

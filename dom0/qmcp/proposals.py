@@ -95,6 +95,9 @@ SCHEMA = 1
 #: Pending proposals at once, and how long one waits for the operator.
 MAX_PENDING = 10
 EXPIRY_S = 7 * 24 * 3600
+#: How far ahead of the clock a proposal's submission may lie before the clock
+#: is taken to have gone back (`Entry.state`).
+CLOCK_SLACK_S = 300
 #: The hub's title: plain printable ASCII, so no bidi override, zero-width
 #: character or line break is ever stored, whatever the window escapes later.
 TITLE_MAX = 100
@@ -664,7 +667,10 @@ class Entry:
             return "failed"
         if self.record is None:
             return UNREADABLE
-        return "expired" if now >= self.submitted + EXPIRY_S else "pending"
+        # Submitted "in the future" means the clock went back since: its age
+        # cannot be told, so it is expired, never pending for longer than 7 days.
+        return ("expired" if now >= self.submitted + EXPIRY_S
+                or self.submitted > now + CLOCK_SLACK_S else "pending")
 
     @property
     def needs_closing(self) -> bool:
@@ -1425,7 +1431,7 @@ def _refuse_hidden(app, p: dict, records: dict) -> None:
         _refuse_hidden_qube(app, p)
 
 
-def _execute(app, p: dict) -> list:
+def _execute(app, p: dict, gate_held: bool = False) -> list:
     """Run the command a proposal is the options of; returns its report. The
     hidden checks are accept's, made before it (`_refuse_hidden`)."""
     from qmcp import fleet
@@ -1459,7 +1465,7 @@ def _execute(app, p: dict) -> list:
         # Parsed again here, by the same parser that refused a bad duration at
         # submit: the stored proposal holds the hub's own words.
         return fleet.open_window_report(app, p["qube"], fleet.duration_seconds(p["for"]),
-                                        firewall=p["firewall"])
+                                        firewall=p["firewall"], gate_held=gate_held)
     if t == "qube-manage":
         report = fleet.Report()
         report.append(fleet.manage(app, p["qube"], from_hub=True))
@@ -1861,7 +1867,7 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
     if clock is None:
         clock = time.time if now is None else (lambda fixed=now: fixed)
     summary = {"id": pid, "sha256": str(sha256)[:64], "yes": tick is not None}
-    held, interrupted = None, None
+    held, interrupted, gate = None, None, None
     try:
         if not valid_fingerprint(sha256):
             raise Refused("--sha256 wants the proposal's 64-character fingerprint, as shown")
@@ -1887,6 +1893,30 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
             raise Refused(f"proposal {pid} cannot be accepted now (the project locks cannot be "
                           f"taken: {type(err).__name__}); nothing was run, and it is still "
                           f"pending") from None
+        # A window takes the gate's lock too (`fleet.open_window_report`): taken
+        # here, before the mark, so a gate run holding it refuses the accept
+        # and leaves the proposal pending, rather than consuming it as failed.
+        # A peek at the type without the store's lock: the file is judged again
+        # under it below, and a type that changed would not hash to `sha256`.
+        try:
+            peek = _entry(pid, directory).proposal
+        except Exception:
+            peek = None
+        if isinstance(peek, dict) and peek.get("type") == "qube-open":
+            from qmcp import anon
+            gate = anon.gate_lock()
+            try:
+                got = gate.__enter__()
+            except OSError as err:
+                gate = None
+                raise Refused(f"proposal {pid} cannot be accepted now (the gate's lock cannot "
+                              f"be taken: {type(err).__name__}); nothing was run, and it is "
+                              f"still pending") from None
+            if not got:
+                gate.__exit__(None, None, None)
+                gate = None
+                raise Refused(f"proposal {pid} cannot be accepted now (another run held the "
+                              f"gate past its wait); nothing was run, and it is still pending")
         with _Locked(DECIDE_WAIT_S, lock_path):
             e = _entry(pid, directory)
             if e.proposal is not None:
@@ -1940,7 +1970,9 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
         try:
             if hidden is not None:
                 raise hidden
-            report = _execute(app, p)
+            # The additive keyword only when it has a value (a stand-in for
+            # `_execute` takes the two arguments it always had).
+            report = _execute(app, p, **({"gate_held": True} if gate is not None else {}))
             failure = "a step did not complete" if getattr(report, "failed", None) else None
             ok, report = failure is None, list(report)
         except BaseException as err:
@@ -1993,6 +2025,8 @@ def accept(app, pid: int, sha256: str, tick: str | None = None, now: float | Non
     finally:
         if held is not None:
             held.__exit__(None, None, None)
+        if gate is not None:
+            gate.__exit__(None, None, None)
     _audit("qmcp proposal accept", summary, ok, failure, app)
     if interrupted is not None:
         raise interrupted

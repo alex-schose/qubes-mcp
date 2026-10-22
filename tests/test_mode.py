@@ -197,6 +197,31 @@ class Gateways(ModeBase):
         self.assertIn("do not count", fleet.set_gateway(self.app, "ai-net-tor", updates=False))
 
 
+class HubFileUnread(ModeBase):
+    def test_a_hub_file_that_does_not_read_still_stops_the_hub_the_rulebook_names(self):
+        # The verdict is unreadable without the hub file; the stop reaches the
+        # hub by the name the installed rulebook routes its calls on.
+        a = self.app
+        a.vm("ai-p00-w", tags={"ai-managed", projects.ANON, "qmcp-proj-p00"},
+             netvm=a.domains["ai-net-tor"], power="Running")
+        pdir = self.tmp / "policy.d"
+        pdir.mkdir()
+        (pdir / fleet.POLICY_NAME).write_text(f"* * {HUB} @anyvm deny\n")
+        saved = fleet.POLICY_DIR
+        self.addCleanup(setattr, fleet, "POLICY_DIR", saved)
+        fleet.POLICY_DIR = str(pdir)
+        hubp = pathlib.Path(core.HUB_PATH)
+        hubp.unlink()
+        hubp.mkdir()
+        self.assertIsNone(core.read_hub())
+        verdicts = anon.run(a, act=True)
+        hub = [v for v in verdicts if v.slot == anon.HUB.slot][0]
+        self.assertEqual(hub.status, anon.UNREADABLE)
+        self.assertIn(projects.BLOCKED, a.domains[HUB].tags.raw())
+        self.assertIn(projects.BLOCKED, a.domains["ai-p00-w"].tags.raw())
+        self.assertEqual(a.domains[HUB].get_power_state(), "Running")     # no kill
+
+
 class HubCheck(ModeBase):
     def test_a_sound_hub_is_judged_only_in_the_mode(self):
         self.spawn("ai-hub-w")

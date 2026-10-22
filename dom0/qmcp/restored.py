@@ -50,6 +50,8 @@ and `qmcp check` reports the read.
 from __future__ import annotations
 
 import os
+import re
+import time
 
 from qmcp import audit, budget, core, projects
 from qmcp.birth import OWNER_PREFIX
@@ -57,18 +59,40 @@ from qmcp.birth import OWNER_PREFIX
 ID = core.ID_FEATURE
 #: dom0's record that the restore check proved a qube a restore, so it keeps
 #: its owner badge: that qube's own UUID, which no copy of it shares.
-KEPT = "qmcp-owner-kept"
+KEPT = core.OWNER_KEPT_FEATURE
+#: dom0's record of every label an accept or a reject replaced or removed,
+#: one per line: a copy made before then still wears it, and must never read
+#: as a restore whose original is gone (`proven_restore`). Kept in dom0, not
+#: on the qube, so removing the accepted original (the hub may remove a kept
+#: restore) takes none of it away. Root writes it; the gate's user reads it.
+REPLACED_PATH = "/var/lib/qmcp/replaced-labels"
+#: dom0's record of every qube the hub or a lead removed: one empty file per
+#: UUID, written by the lifecycle service before it removes. A copy whose
+#: label names one of them is a copy of a qube AI space removed, never a
+#: restore, however its remove and the copy's clone interleaved (qubesadmin's
+#: `clone_vm` copies the tags before the label, so a check of the copies at
+#: the remove cannot see one still being cloned). 2770 root:qubes in tmpfiles:
+#: the services write it, the gate's user reads it.
+REMOVED_DIR = "/var/lib/qmcp/removed"
 HOLD = core.QUARANTINE
 SERVICE = "qmcp gate"
 CALLER = "gate"
-#: How long the pass waits for a create in flight. Short: the anonymity gate
-#: runs right after it, and a pass that cannot have the lock judges nothing
-#: this time and says so.
-LOCK_WAIT_S = 5
+#: How long the pass waits for a create in flight, in the create lock's
+#: turnstile: creates that arrive after it wait behind it, so only the ones
+#: already past it (at most the callers' slots) go first. The anonymity gate
+#: runs before this pass (`cli.cmd_gate`), so the wait costs this run's stop
+#: nothing; it is short because the next run, and its heartbeat, wait for this
+#: one to end. A pass that cannot have the lock judges nothing this time and
+#: says so (`qmcp gate` exits 3): creates kept in flight can delay a hold past
+#: one pass, the residual the design states.
+LOCK_WAIT_S = 10
 #: How long the hold waits for one qube's lock before holding it without.
 HOLD_LOCK_WAIT_S = 2.0
-#: How long a hold made without the lock then waits for it again, so the call
-#: that held it has finished, and the hold is read back.
+#: The most the pass spends waiting for qube locks, in all: past it, a qube is
+#: held without waiting (a hold only takes authority away) and settled below.
+HOLD_PASS_S = 10.0
+#: How long the holds made without a lock then wait, together, for those locks
+#: again, so the calls that held them have finished, and each hold is read back.
 HOLD_SETTLE_WAIT_S = 5.0
 NOTICE = ("qubes-mcp is holding {name} for your review: it came back from a backup, or was "
           "copied by hand. Open the qubes-mcp window.")
@@ -127,6 +151,40 @@ def known(vm) -> bool:
     if label is not None and label == _uuid(vm):
         return True
     return born_of_its_template(vm, label)
+
+
+#: A UUID's shape, as qubesd writes one: only such a label names a qube, and
+#: only such a label is recorded or proves a restore.
+_UUID_RE = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+
+def is_uuid(text) -> bool:
+    return isinstance(text, str) and bool(_UUID_RE.match(text))
+
+
+def copies_waiting(app, vm) -> bool:
+    """Is a copy of `vm` waiting for review: a qube in scope, not known (held,
+    or not yet), whose `qmcp-id` label or `qmcp-owner-kept` record names
+    `vm`'s UUID? The hub may remove a qube it made; removing the source of a
+    copy before the restore check decides the copy would make the copy read
+    as a restore whose original is gone, so the source's remove waits for the
+    operator's review of the copy. Raises core.Unreadable on any read that
+    fails: then the remove is refused."""
+    own = _uuid(vm)
+    for other in list(app.domains):
+        try:
+            if other is vm or core.name_of(other) == core.name_of(vm):
+                continue
+            tags = core.tags_of(other)
+        except core.Gone:
+            continue
+        if not in_scope(tags):
+            continue
+        if HOLD not in tags and known(other):
+            continue
+        if own in (label_of(other), kept_of(other)):
+            return True
+    return False
 
 
 def label(vm) -> None:
@@ -212,14 +270,129 @@ def kept_of(vm):
     return None if value is None else str(value).strip().lower()
 
 
-class Origins:
-    """Every qube's UUID and `qmcp-id` label, read once per pass. `complete`
-    is False when any read failed but that of a qube qubesd says is gone."""
+def replaced_labels(path: str | None = None) -> set:
+    """Every label an accept or a reject replaced (`REPLACED_PATH`); empty when
+    none was. Raises core.Unreadable: a record that does not read proves no
+    restore."""
+    path = REPLACED_PATH if path is None else path
+    try:
+        with open(path, encoding="ascii") as fh:
+            return {w for w in fh.read().split() if w}
+    except FileNotFoundError:
+        return set()
+    except (OSError, UnicodeDecodeError) as e:
+        raise core.Unreadable(f"{path} cannot be read ({type(e).__name__})") from None
 
-    __slots__ = ("uuids", "labels", "complete")
+
+def record_removed(vm) -> None:
+    """Before the hub or a lead removes `vm`: record its UUID. Raises
+    OSError or core.Unreadable: the remove is then refused."""
+    own = _uuid(vm)
+    if not is_uuid(own):
+        raise core.Unreadable(f"the UUID of {core.name_of(vm)} is not one")
+    old = os.umask(0o007)
+    try:
+        fd = os.open(os.path.join(REMOVED_DIR, own),
+                     os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+    finally:
+        os.umask(old)
+    try:
+        os.utime(fd)                    # aged from this remove, not an earlier write
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    # And the entry itself, so a crash right after cannot keep the remove
+    # and lose its record.
+    dfd = os.open(REMOVED_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+#: How long the removal record keeps a UUID at least. It exists for a copy
+#: being cloned while its source was removed; an entry goes only once it is
+#: this old AND no qube's label names it, so a copy still undecided keeps it
+#: however long the gate's timer was stopped.
+REMOVED_KEEP_S = 7 * 86400
+
+
+def prune_removed(app, now=None) -> int:
+    """Drop the entries older than `REMOVED_KEEP_S` whose UUID no qube's
+    `qmcp-id` label names: how many. Nothing at all unless every qube's label
+    reads. Run hourly by root (`qmcp audit rotate --auto`); best-effort."""
+    now = time.time() if now is None else now
+    named = set()
+    try:
+        # A qube removed during the scan reads as unlabelled (qubesadmin's
+        # feature read answers the default for a qube that is gone), which
+        # is the right answer here; any read that fails keeps everything.
+        for vm in list(app.domains):
+            lab = label_of(vm)
+            if lab is not None:
+                named.add(lab)
+    except Exception:
+        return 0
+    dropped = 0
+    try:
+        names = os.listdir(REMOVED_DIR)
+    except OSError:
+        return 0
+    for n in names:
+        if n in named:
+            continue
+        path = os.path.join(REMOVED_DIR, n)
+        try:
+            if now - os.lstat(path).st_mtime > REMOVED_KEEP_S:
+                os.unlink(path)
+                dropped += 1
+        except OSError:
+            continue
+    return dropped
+
+
+def removed_uuids() -> set:
+    """The UUIDs AI space removed (`REMOVED_DIR`). Raises core.Unreadable,
+    a missing record included: then no restore is proven."""
+    try:
+        return {n for n in os.listdir(REMOVED_DIR) if is_uuid(n)}
+    except OSError as e:
+        raise core.Unreadable(f"{REMOVED_DIR} cannot be read ({type(e).__name__})") from None
+
+
+def keep_former_label(vm) -> None:
+    """Before an accept rewrites the label, or a reject removes it: record the
+    label it wore in dom0 (`REPLACED_PATH`), so a copy made earlier, which
+    still wears it, never reads as a restore whose original is gone. Raises
+    on any failure: the label stays as it was then."""
+    lab = label_of(vm)
+    if not is_uuid(lab) or lab == _uuid(vm):
+        return                          # names no qube, so proves no restore
+    path = REPLACED_PATH
+    if lab in replaced_labels(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        os.fchmod(fd, 0o644)            # whatever the umask: the gate's user reads it
+        os.write(fd, (lab + "\n").encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if lab not in replaced_labels(path):
+        raise RuntimeError(f"the replaced label did not read back from {path}")
+
+
+class Origins:
+    """Every qube's UUID and `qmcp-id` label, and the labels accepts and
+    rejects replaced (`REPLACED_PATH`), read once per pass. `complete` is
+    False when any read failed but that of a qube qubesd says is gone."""
+
+    __slots__ = ("uuids", "labels", "former", "removed", "complete")
 
     def __init__(self, app):
-        self.uuids, self.labels, self.complete = set(), {}, True
+        self.uuids, self.labels, self.former, self.removed = set(), {}, set(), set()
+        self.complete = True
         try:
             domains = list(app.domains)
         except Exception:
@@ -240,6 +413,14 @@ class Origins:
                 continue
             if lab is not None:
                 self.labels[lab] = self.labels.get(lab, 0) + 1
+        # The record last: an accept writes it (and syncs it) before it
+        # relabels, so a relabel the enumeration above saw is recorded by now,
+        # and one it did not see left the old label on the qube it read.
+        try:
+            self.former = replaced_labels()
+            self.removed = removed_uuids()
+        except core.Unreadable:
+            self.complete = False
 
 
 def proven_restore(vm, origins) -> bool:
@@ -247,15 +428,18 @@ def proven_restore(vm, origins) -> bool:
     that no qube has now, and no other qube carries that label: a restore
     whose original is gone. A copy names a qube that exists, or shares its
     label with the qube it was copied from (a copy of a held restore, a second
-    restore of one backup); a qube with no label, or its own, is not proven."""
+    restore of one backup); a qube with no label, or its own, is not proven.
+    Nor is one whose label an accept or a reject replaced (`REPLACED_PATH`):
+    a copy of that qube made before then."""
     if origins is None or not origins.complete:
         return False
     try:
         lab, own = label_of(vm), _uuid(vm)
     except core.Unreadable:
         return False
-    return (lab is not None and lab != own and lab not in origins.uuids
-            and origins.labels.get(lab, 0) == 1)
+    return (is_uuid(lab) and lab != own and lab not in origins.uuids
+            and origins.labels.get(lab, 0) == 1 and lab not in origins.former
+            and lab not in origins.removed)
 
 
 def decide_owner(vm, origins):
@@ -272,9 +456,13 @@ def decide_owner(vm, origins):
     if not owners:
         return None
     own = _uuid(vm)
-    if kept_of(vm) == own:
+    kept = kept_of(vm)
+    if kept == own:
         return None
-    if proven_restore(vm, origins):
+    # A record naming another qube that exists is that qube's decision, copied
+    # with it: a copy of a decided restore, never a restore itself.
+    copied = kept is not None and origins is not None and kept in origins.uuids
+    if not copied and proven_restore(vm, origins):
         vm.features[KEPT] = own
         if kept_of(vm) != own:
             raise RuntimeError(f"the {KEPT} record did not read back")
@@ -299,6 +487,11 @@ def hold(app, lock_wait: float | None = None) -> Held:
     except Exception:
         out.judged = False
         return out
+    # Bounded in all, whatever AI space keeps in flight: the qube locks are
+    # waited for until the pass's budget is spent, then not at all, and the
+    # holds made without one settle together after the loop.
+    deadline = time.monotonic() + HOLD_PASS_S
+    unsettled = []
     try:
         for vm in list(app.domains):
             try:
@@ -329,7 +522,9 @@ def hold(app, lock_wait: float | None = None) -> Held:
             # hold only takes authority away, so it goes on without the lock
             # when it cannot be had, and settles once the call has finished.
             try:
-                qfd = core.acquire_qube_lock(name, HOLD_LOCK_WAIT_S, queue=True)
+                qfd = core.acquire_qube_lock(
+                    name, max(0.0, min(HOLD_LOCK_WAIT_S, deadline - time.monotonic())),
+                    queue=True)
             except core.Refusal:
                 qfd = None
             if qfd is not None:
@@ -337,7 +532,10 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 # this pass waited has labelled the qube, and the operator was
                 # told it was accepted.
                 try:
-                    again = HOLD in core.tags_of(vm) or known(vm)
+                    # Still in scope, too: a reject or a revoke that finished
+                    # while this pass waited took it out of AI space.
+                    now = core.tags_of(vm)
+                    again = HOLD in now or not in_scope(now) or known(vm)
                 except core.Gone:
                     again = True
                 except core.Unreadable as e:
@@ -362,12 +560,21 @@ def hold(app, lock_wait: float | None = None) -> Held:
             finally:
                 if qfd is not None:
                     os.close(qfd)
-            if qfd is None and _settle(app, vm, name, out):
+            if qfd is None:
+                unsettled.append((vm, name))
                 continue
             out.held.append(name)
             _audit(name, True, app=app)
             # Held first, then its owner badge decided: the hold is the larger
             # restriction, and a held qube's badge grants nothing until accept.
+            origins = _decide(app, vm, name, out, origins)
+        settle_by = time.monotonic() + HOLD_SETTLE_WAIT_S
+        for vm, name in unsettled:
+            if _settle(app, vm, name, out,
+                       max(0.0, min(HOLD_SETTLE_WAIT_S, settle_by - time.monotonic()))):
+                continue
+            out.held.append(name)
+            _audit(name, True, app=app)
             origins = _decide(app, vm, name, out, origins)
     finally:
         try:
@@ -422,18 +629,29 @@ def _is_gone(app, name: str) -> bool:
         return False
 
 
-def _settle(app, vm, name: str, out: Held) -> bool:
+def _settle(app, vm, name: str, out: Held, wait: float | None = None) -> bool:
     """After a hold made without the qube's lock: wait for the lock again, so
     the call that held it has finished, then read the hold back. True when the
     qube is gone (that call removed it), or its hold could not be read back or
     put back, which `out` records; False otherwise: held, or not settled
     because the lock was not had again (`out.unsettled`)."""
     try:
-        late = core.acquire_qube_lock(name, HOLD_SETTLE_WAIT_S, queue=True)
+        late = core.acquire_qube_lock(name, HOLD_SETTLE_WAIT_S if wait is None else wait,
+                                      queue=True)
     except core.Refusal:
         late = None
     try:
         if late is None:
+            # Still judged, without the lock: a reject or a revoke that took
+            # the qube out of AI space meanwhile must not leave it held.
+            try:
+                if not in_scope(core.tags_of(vm) - {HOLD}):
+                    vm.tags.discard(HOLD)
+                    _audit(name, False, "taken out of AI space by a call that was already "
+                                        "running", app=app)
+                    return True
+            except Exception:
+                pass
             out.unsettled.append(name)
             return False
         if _is_gone(app, name):
@@ -442,7 +660,15 @@ def _settle(app, vm, name: str, out: Held) -> bool:
             return True
         try:
             # An accept that was already running labelled the qube and told
-            # the operator so: the hold this pass put on comes off again.
+            # the operator so, or a reject or a revoke took it out of AI
+            # space: the hold this pass put on comes off again.
+            if not in_scope(core.tags_of(vm) - {HOLD}):
+                vm.tags.discard(HOLD)
+                if HOLD in core.tags_of(vm):
+                    raise RuntimeError("the hold did not come off")
+                _audit(name, False, "taken out of AI space by a call that was already running",
+                       app=app)
+                return True
             if known(vm):
                 vm.tags.discard(HOLD)
                 if HOLD in core.tags_of(vm):
@@ -657,8 +883,10 @@ def _accept(app, name: str) -> str:
         if _owner_badges(vm):
             raise RuntimeError("the owner badge did not come off")
         unowned = True
+    keep_former_label(vm)
     label(vm)
-    if HOLD in tags:
+    # Whether this read saw the hold or the gate's pass put it on meanwhile.
+    if HOLD in tags or HOLD in core.tags_of(vm):
         vm.tags.discard(HOLD)
         if HOLD in core.tags_of(vm):
             raise RuntimeError("the hold did not come off")
@@ -692,10 +920,13 @@ def _reject(app, name: str) -> str:
                           f"stays); the hub changes only through uninstall.sh --purge and a "
                           f"fresh install")
     vm, tags = _subject(app, name)
+    keep_former_label(vm)
     strip = {t for t in tags if t != HOLD and
              (t in (core.UMBRELLA, core.GUARDED, projects.DROP_BOX) or t.startswith("qmcp-"))}
     fleet._set_tags(vm, remove=strip)
-    if HOLD in tags:
+    # The hold last, and whether this read saw it or the gate's pass put it on
+    # while the strip ran: a qube out of AI space is never left held.
+    if HOLD in tags or HOLD in core.tags_of(vm):
         fleet._set_tags(vm, remove={HOLD})
     # The label it came back with goes too: it is an ordinary qube now, and the
     # operator bringing it back into AI space later labels it afresh.

@@ -524,6 +524,7 @@ def covered_by(parser, argv) -> set:
 
 #: One or more calls of every builder the window uses.
 SAMPLES = {
+    gm.audit_tail: [dict(), dict(caller="operator")],
     gm.create_project: [
         dict(label="newp", lead_source="template", lead_origin="ai-debian-13",
              lead_name="ai-newp-boss", lead_netvm="ai-net-router", templates=["ai-dvm"],
@@ -3495,8 +3496,17 @@ class RestoredModel(GuiBase):
         self.assertIn("ai-rogue: p05's record names no such project as lead", red)
         self.assertNotIn("ai-back", red)
         self.assertEqual(gm.held_names(rows), ["ai-back", "ai-rogue"])
-        self.assertIsNone(gm.held_changed(["ai-back", "ai-rogue"], rows))
-        self.assertIn("changed since this form opened", gm.held_changed(["ai-back"], rows))
+        self.assertIsNone(gm.held_changed(gm.held_state(rows), rows))
+        self.assertIn("changed since this form opened",
+                      gm.held_changed(gm.held_state(rows[:1]), rows))
+        # Same names, but a row the form showed reads differently now: its
+        # badges changed (a project delete of its slot, say) under the form.
+        changed = [dict(r) for r in rows]
+        changed[0]["badges"] = "qmcp-lead qmcp-lead-p01"
+        changed[0]["agrees"] = False
+        self.assertEqual(gm.held_names(changed), gm.held_names(rows))
+        self.assertIn("changed since this form opened",
+                      gm.held_changed(gm.held_state(rows), changed))
         self.assertEqual(gm.held_changed([], []), "nothing is held")
         self.assertEqual(gm.accept_all_refusal([]), "nothing is held")
         opened = gm.review_state("ai-back", self.read_json("list", "--all", "--json"), rows)
@@ -3571,7 +3581,9 @@ class RestoredModel(GuiBase):
         refused = ("this install already has projects or gateways: an import is for a fresh "
                    "install, and changes nothing here")
         self.assertEqual(gm.import_refusal(records, []), refused)
-        self.assertEqual(gm.import_refusal({}, gws), refused)
+        # A registry alone is the command's to judge: one that is exactly the
+        # export's is how an import that failed part-way is finished.
+        self.assertIsNone(gm.import_refusal({}, gws))
         self.assertEqual(gm.import_refusal({"p00": {"slot": "p00", "dump": "hub-dump"}}, []),
                          refused)
         self.assertIsNone(gm.import_refusal({"p00": {"slot": "p00", "dump": None}}, []))
@@ -4210,7 +4222,7 @@ class Widgets(GuiBase):
                                              "audit_rotate", "show_proposal", "remove_gateway",
                                              "show_lead_firewall", "unblock_project",
                                              "seal_qube", "guard_qube", "restored_accept",
-                                             "restored_reject"},
+                                             "restored_reject", "audit_tail"},
                           "a builder without a form")
         for ident in ("prepare", "packages", "accept_restored", "reject_restored"):
             self.assertIn(ident, dict(self.gui.Window.ACTIONS))
@@ -4308,6 +4320,42 @@ class Widgets(GuiBase):
         form.dump.set_active(dump)
         form.update()
         return form
+
+    def test_the_project_forms_refuse_sharing_a_hidden_projects_disposable_template(self):
+        # 0.9.38's refusal, before OK: a disposable template a hidden project
+        # approves (and so wears qmcp-hubblind) for a project the hub sees.
+        self.tor()
+        fleet.create_project(self.app, None, "template", "ai-tpl-g", ["ai-dvm-g"],
+                             ["ai-net-tor"], "5G", "ai-net-tor", False, None,
+                             "api.example.org:443", None, True, False, None)
+        self.assertIn(projects.HUBBLIND, self.app.domains["ai-dvm-g"].tags.raw())
+        self.win.refresh()
+        self.assertTrue(self.win.changes_on())
+        form = self.win.act("new_project")
+        form.label_entry.set_text("newp")
+        form.source["template"].set_active(True)
+        form.origin.set_active_id("ai-debian-13")
+        form.templates["ai-dvm-g"].set_active(True)
+        form.nets["none"].set_active(True)
+        form.quota.set_text("5G")
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("the disposable template ai-dvm-g is the hidden project",
+                      form.error.get_text())
+        form.templates["ai-dvm-g"].set_active(False)
+        form.destroy()
+        self.select("project:p01")
+        form = self.gui.EditForm(self.win, self.win.fleet, self.win.gateways,
+                                 self.win.node().data, self.win.project_rows)
+        form.templates["ai-dvm-g"].set_active(True)
+        self.assertFalse(form.ok.get_sensitive())
+        self.assertIn("the disposable template ai-dvm-g is the hidden project",
+                      form.error.get_text())
+        argv = gm.edit_project(self.win.node().data["label"],
+                               templates=[*self.win.node().data["templates"], "ai-dvm-g"])
+        result = self.runner.execute(argv)                      # the command, in its words
+        self.assertEqual(result.rc, 1)
+        self.assertIn("the disposable template ai-dvm-g is the hidden project", result.err)
+        form.destroy()
 
     def test_new_project_refuses_before_ok_what_the_view_shows_the_command_refuses(self):
         a = self.app
@@ -4607,6 +4655,10 @@ class Widgets(GuiBase):
         self.assertFalse(self.win.rotate_button.get_sensitive())
         # What is off comes first: the bar cuts a long line.
         self.assertTrue(self.win.status.get_text().startswith(self.gui.STATUS_OFF))
+        # The status names exactly the actions a failed read leaves on.
+        for name in self.gui._LOWERING_NAMES.values():
+            self.assertIn(name, self.gui.STATUS_OFF)
+        self.assertEqual(set(self.gui._LOWERING_NAMES), set(gm.LOWERING))
         self.assertFalse(self.win.write("t", gm.audit_rotate()))
         # What only takes authority away stays on, and runs: its command
         # decides for itself, and a failed read must not keep a badge on.
@@ -4699,6 +4751,30 @@ class Widgets(GuiBase):
         self.assertEqual(len(writes()), len(before) + 1)
         self.release_all()
         self.runner.hold = False
+
+    def test_remove_is_refused_before_ok_where_the_view_shows_the_command_refuses(self):
+        # The form refuses Remove where the view already shows the command's
+        # refusal (a guarded template, a gateway), in the command's words, and
+        # leaves it on for a worker, which the command removes.
+        for key in ("qube:ai-tpl-g", "qube:ai-net-router"):
+            self.select(key)
+            self.assertIn("revoke", self.sensitive(), key)
+            name = self.win.node().data["name"]
+            form = self.win.act("revoke")
+            form.remove.set_active(True)
+            self.assertFalse(form.ok.get_sensitive(), key)
+            self.assertIn("qmcp removes no guarded qube or gateway", form.error.get_text())
+            result = self.runner.execute(gm.role("revoke", name, remove=True))
+            self.assertEqual(result.rc, 1)
+            self.assertIn("qmcp removes no guarded qube or gateway", result.err)
+            form.remove.set_active(False)                       # a plain revoke stays on
+            self.assertTrue(form.ok.get_sensitive(), key)
+            form.destroy()
+        self.select("qube:ai-osint-w1")
+        form = self.win.act("revoke")
+        form.remove.set_active(True)
+        self.assertTrue(form.ok.get_sensitive())
+        form.destroy()
 
     def test_while_a_refresh_runs_the_old_view_grants_nothing(self):
         # A view goes stale when its refresh starts: after a change, until the
@@ -4828,6 +4904,12 @@ class Widgets(GuiBase):
         # proves the forms make them, by filling each form every way.
         parser = cli.build_parser()
         argvs = list(gm.READS.values()) + [gm.AUDIT_VERIFY]
+        # The Audit tab's Caller chooser makes `audit tail --caller`.
+        self.win.refresh()
+        n = len(self.runner.calls)
+        self.win.audit_caller_combo.set_active_id("operator")
+        argvs += [c for c in self.runner.calls[n:] if "--caller" in c]
+        self.win.audit_caller_combo.set_active_id("")
         model_qube(self.app)                    # a qube the hub set up to serve a model
         # A qube to add, on no network: on one not enrolled, Add refuses before OK.
         self.app.domains["personal"].netvm = None
@@ -5240,7 +5322,7 @@ class Widgets(GuiBase):
     def test_the_audit_pane_says_whose_calls_it_shows(self):
         buf = self.win.audit_detail.get_buffer()
         text = lambda: buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)  # noqa: E731
-        self.assertIn("Nothing on this log yet", text())
+        self.assertIn("Nothing on the install's audit log yet", text())
         self.assertIn("every command of yours that changes something", text())
         self.assertIn("(caller operator)", self.win.verify_label.get_text())
         self.assertNotIn("not on", self.win.verify_label.get_text() + text())
@@ -7441,6 +7523,146 @@ class AuditWindow(GuiBase):
         self.win.store.foreach(visit)
         self.assertEqual(self.win.selected, key)
 
+    def test_the_tab_and_rotate_follow_the_install_mode(self):
+        # Mode none: no log anywhere, and Rotate is refused as the command
+        # refuses it. Mode ram: both name the RAM chain. The header says which
+        # chain the tab shows, and where a project's own lines are.
+        self.assertIn("/run/qmcp/audit", self.win.verify_label.get_text())
+        for mode in ("none", "ram"):
+            pathlib.Path(audit.MODE_PATH).write_text(mode + "\n")
+            os.chmod(audit.MODE_PATH, 0o644)
+            self.win.refresh()
+            buf = self.win.audit_detail.get_buffer()
+            hint = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            form = self.win.act("rotate")
+            result = self.runner.execute(gm.audit_rotate())
+            if mode == "none":
+                if not self.win.audit_rows:
+                    self.assertIn("keeps no audit log", hint)
+                self.assertFalse(form.ok.get_sensitive())
+                self.assertIn("keeps no audit log (mode none)", form.error.get_text())
+                self.assertEqual(result.rc, 1)
+                self.assertIn("keeps no audit log (mode none)", result.err)
+            else:
+                self.assertTrue(form.ok.get_sensitive())
+                self.assertIn("RAM chain", form.intro.get_text())
+                self.assertEqual(result.rc, 0)
+            form.destroy()
+        self.assertEqual(gm.rotate_refusal({"mode": None}),
+                         "the install's audit mode cannot be read; nothing was rotated")
+        self.assertIsNone(gm.rotate_refusal(None))                # not read: the command judges
+        self.assertIn("keeps no audit log", gm.audit_hint([], {"mode": "none"}))
+        self.assertIn("RAM chain", gm.audit_hint([], {"mode": "ram"}))
+
+    def test_a_busy_hub_never_hides_the_operators_lines_from_its_caller_view(self):
+        result = self.runner.execute(gm.role("manage", "ai-tpl-g"))   # an operator line
+        self.assertEqual(result.rc, 0, result.err)
+        for i in range(gm.AUDIT_TAIL + 5):                      # the hub floods the chain
+            self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "memory",
+                                                    "value": 900 + i % 2})
+        self.win.refresh()
+        callers = {r.get("caller") for r in self.win.audit_rows}
+        self.assertNotIn("operator", callers)                   # every caller: pushed off
+        self.win.audit_caller_combo.set_active_id("operator")
+        self.assertTrue(self.win.audit_rows)
+        self.assertEqual({r.get("caller") for r in self.win.audit_rows}, {"operator"})
+        self.assertIn("operator", [r[0] for r in self.win.audit_caller_combo.get_model()])
+
+    def audit_callers(self):
+        return {r.get("caller") for r in self.win.audit_rows}
+
+    def test_a_chosen_lead_that_is_removed_falls_back_to_every_caller(self):
+        for _ in range(3):              # refused calls, logged under the lead's own cap
+            self.call("qmcp.SetPropertyAIManaged", {"name": "no-such-qube", "property": "memory",
+                                                    "value": 900}, caller=LEAD)
+        self.win.refresh()
+        self.win.audit_caller_combo.set_active_id(LEAD)
+        self.assertEqual(self.audit_callers(), {LEAD})
+        slot = next(r["label"] for r in self.win.project_rows if r.get("lead") == LEAD)
+        self.assertEqual(self.runner.execute(gm.remove_lead(slot)).rc, 0)
+        self.win.refresh()
+        self.assertEqual(self.win.audit_caller_combo.get_active_id(), "")
+        self.assertIsNone(self.win.audit_caller)
+        self.assertNotEqual(self.audit_callers(), {LEAD})
+        n = len(self.runner.calls)
+        self.win.refresh()
+        self.assertFalse(any("--caller" in c for c in self.runner.calls[n:]))
+
+    def test_a_failed_fallback_read_never_brings_back_a_removed_caller(self):
+        for _ in range(3):
+            self.call("qmcp.SetPropertyAIManaged", {"name": "no-such-qube", "property": "memory",
+                                                    "value": 900}, caller=LEAD)
+        self.win.refresh()
+        self.win.audit_caller_combo.set_active_id(LEAD)
+        slot = next(r["label"] for r in self.win.project_rows if r.get("lead") == LEAD)
+        self.assertEqual(self.runner.execute(gm.remove_lead(slot)).rc, 0)
+        self.runner.fail.add(tuple(gm.audit_tail(None)))       # the fallback read fails once
+        self.win.refresh()
+        self.runner.fail.clear()
+        self.assertIsNone(self.win.audit_caller)
+        self.assertNotEqual(self.audit_callers(), {LEAD})
+        buf = self.win.audit_detail.get_buffer()
+        pane = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self.assertFalse(pane.startswith("Nothing on"), pane)   # never an empty log
+        self.assertIn("could not be read", pane)
+        self.assertIn("no lines are on show", self.win.audit_note.get_text())
+        n = len(self.runner.calls)
+        self.win.refresh()
+        self.assertFalse(any("--caller" in c for c in self.runner.calls[n:]))
+        # A good read clears it: the pane no longer says the lines did not read.
+        pane = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self.assertNotIn("could not be read", pane)
+        self.assertFalse(self.win.audit_unread)
+
+    def test_a_refresh_read_for_another_caller_never_lands_under_the_chosen_one(self):
+        self.runner.hold = True
+        self.win.refresh()
+        self.runner.release()                       # the gate; the other reads start, held
+        self.win.audit_caller_combo.set_active_id("operator")
+        chooser = self.runner.held.pop()            # the chooser's read answers first
+        self.runner.held.insert(0, chooser)
+        while self.runner.held:
+            self.runner.release()
+        self.runner.hold = False
+        self.assertEqual(self.win.audit_caller_combo.get_active_id(), "operator")
+        self.assertIn(self.audit_callers(), ({"operator"}, set()))
+
+    def test_a_refresh_after_the_chooser_keeps_the_operators_lines(self):
+        self.assertEqual(self.runner.execute(gm.role("manage", "ai-tpl-g")).rc, 0)
+        for first in ("chooser", "refresh"):
+            self.win.audit_caller_combo.set_active_id("")
+            self.runner.hold = True
+            self.win.refresh()
+            self.runner.release()                   # the gate; the other reads start, held
+            self.win.audit_caller_combo.set_active_id("operator")
+            if first == "chooser":
+                self.runner.held.insert(0, self.runner.held.pop())
+            while self.runner.held:
+                self.runner.release()
+            self.runner.hold = False
+            self.assertEqual(self.win.audit_rows_caller, "operator", first)
+            self.assertEqual(self.audit_callers(), {"operator"}, first)
+
+    def test_a_failed_chooser_read_keeps_the_rows_under_their_own_caller(self):
+        before = self.audit_callers()
+        self.runner.fail.add(tuple(gm.audit_tail("operator")))
+        self.win.audit_caller_combo.set_active_id("operator")
+        self.assertEqual(self.audit_callers(), before)
+        self.assertEqual(self.win.audit_caller_combo.get_active_id(), "")   # back to theirs
+        self.assertIn("could not be read", self.win.audit_note.get_text())
+        self.runner.fail.clear()
+        self.win.refresh()
+        self.assertEqual(self.win.audit_note.get_text(), "")
+
+    def test_an_empty_caller_view_names_the_caller_and_clears_the_pane(self):
+        self.win.audit_view.get_selection().select_path(0)
+        self.win.audit_caller_combo.set_active_id("rotate")     # never rotated here
+        self.assertEqual(self.win.audit_rows, [])
+        buf = self.win.audit_detail.get_buffer()
+        hint = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self.assertIn("No line of rotate", hint)
+        self.assertNotIn("caller: mcp-control", hint)
+
     def test_every_field_of_the_status_read_is_named(self):
         doc = self.read_json("audit", "status", "--json")
         self.assertEqual(set(doc), {k for k, _ in gm.AUDIT_STATUS_FIELDS})
@@ -7448,7 +7670,7 @@ class AuditWindow(GuiBase):
     def test_the_gauge_shows_the_log_the_floor_and_each_budget(self):
         text = self.gauge()
         self.assertIn("Budget: mcp-control", text)
-        self.assertIn("1 of 20000 lines today", text)
+        self.assertIn("1 of 20000 lines this day", text)
         self.assertTrue(any("the services refuse changes below 64.0 MiB" in s for s in text), text)
         bars = [c for c in self.win.audit_gauge.get_children()
                 if isinstance(c, self.gui.Gtk.LevelBar)]

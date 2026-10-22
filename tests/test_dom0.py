@@ -24,7 +24,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import anon, audit, birth, budget, core, firewall, fleet, gateways, inqube, projects, proposals, services  # noqa: E402
+from qmcp import anon, audit, birth, budget, core, firewall, fleet, gateways, inqube, projects, proposals, restored, services  # noqa: E402
 import fakequbes  # noqa: E402
 import scratch  # noqa: E402
 from fakequbes import GiB, SECRET, standard_fleet  # noqa: E402
@@ -55,6 +55,10 @@ class Base(unittest.TestCase):
             (audit, "LOG_PATH", self.tmp / "audit.log"),
             (audit, "MODE_PATH", self.tmp / "audit-mode"),
             (audit, "KEEP_DAYS_PATH", self.tmp / "audit-keep-days"),
+            (audit, "CLOCK_PATH", str(self.tmp / "lib" / "audit-clock")),
+            (audit, "CLOCK_MOVED_PATH", str(self.tmp / "lib" / "audit-clock-moved")),
+            (restored, "REPLACED_PATH", str(self.tmp / "lib" / "replaced-labels")),
+            (restored, "REMOVED_DIR", str(self.tmp / "lib" / "removed")),
             (fleet, "TIER_DEFAULT_PATH", self.tmp / "tier-default"),
             (fleet, "ENFORCE_MODE_PATH", self.tmp / "enforce-mode"),
             (fleet, "GUARDED_LIST_PATH", self.tmp / "guarded"),
@@ -66,6 +70,7 @@ class Base(unittest.TestCase):
             (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
             (proposals, "BUS_DIR", self.tmp / "no-session"),
             (fleet, "WINDOW_DIR", self.tmp / "run" / "open"),
+            (fleet, "SEAL_DROPIN", self.tmp / "10-qmcp-seal.conf"),
             (anon, "LOCK_PATH", self.tmp / "run" / "gate.lock"),
             (anon, "HEARTBEAT_PATH", self.tmp / "run" / "gate.last"),
             # The files the fixtures make are this user's group, as tmpfiles makes
@@ -79,11 +84,16 @@ class Base(unittest.TestCase):
         self._saved.append((anon, "TIMER_CHECK", anon.TIMER_CHECK))
         anon.TIMER_CHECK = lambda: True
         self.addCleanup(self._restore)
+        # The boot seal's drop-in, as the installer writes it.
+        (self.tmp / "10-qmcp-seal.conf").write_text(
+            (pathlib.Path(__file__).parent.parent / "deploy" / "qubes-vm-qmcp-seal.conf").read_text())
         (self.tmp / "run" / "calls").mkdir(parents=True)
         (self.tmp / "run" / "open").mkdir()
         (self.tmp / "run" / "qubes").mkdir()
         for d in ("run", "run/calls", "run/open", "run/qubes"):  # as tmpfiles makes them
             os.chmod(self.tmp / d, 0o2770)
+        (self.tmp / "lib" / "removed").mkdir(parents=True)        # as tmpfiles makes it
+        os.chmod(self.tmp / "lib" / "removed", 0o2770)
         (self.tmp / "proposals").mkdir(mode=0o2770)
         os.chmod(self.tmp / "proposals", 0o2770)
         # As the installer and tmpfiles leave it: present, group-writable.
@@ -382,7 +392,7 @@ class Funnel(Base):
             found = {f.check: f for f in fleet.check(self.app, legacy_paths=(),
                                                      system_info={"domains": {}})}
             self.assertEqual(found["calls not logged"].status, "warn")
-            self.assertIn(f"{HUB}: 2 call(s) past 3 in a clock hour", found["calls not logged"].detail)
+            self.assertIn(f"{HUB}: 2 call(s) past 3 in an hour", found["calls not logged"].detail)
             # A change is logged whatever the count.
             r = self.call("qmcp.SetPropertyAIManaged",
                           {"name": "ai-work", "property": "memory", "value": 700})
@@ -535,7 +545,7 @@ class Funnel(Base):
                                                      system_info={"domains": {}})}
             self.assertEqual(found["audit budget spent"].status, "warn")
             self.assertIn(f"{HUB}: 2 line(s) today", found["audit budget spent"].detail)
-            self.assertIn(f"{HUB}: 2 call(s) past {audit.REFUSALS_PER_HOUR} in a clock hour", found["calls not logged"].detail)
+            self.assertIn(f"{HUB}: 2 call(s) past {audit.REFUSALS_PER_HOUR} in an hour", found["calls not logged"].detail)
             self.assertIn("2 change(s) refused", found["audit budget spent"].detail)
             # The cap's lines do not spend the budget, and another caller has its own.
             other = self.counter("ai-osint-lead")
@@ -1985,6 +1995,75 @@ class PolicyFacts(Base):
         self.assertEqual(f["policy parses"].status, "fail")
 
 
+class EventFeatureKeys(Base):
+    def test_only_the_feature_keys_the_hub_may_set_reach_it(self):
+        script = [("ai-work", "domain-feature-set:qmcp-owner-kept", {"feature": "qmcp-owner-kept"}),
+                  ("ai-work", "domain-feature-set:qmcp-id", {}),
+                  ("ai-work", "domain-feature-delete:qmcp-id", {}),
+                  ("ai-work", "domain-feature-set:qmcp-services", {}),
+                  ("ai-work", "domain-feature-set:service.cups", {"feature": "service.cups"}),
+                  ("ai-work", "domain-feature-set:menu-items", {})]
+        saved = services._dispatcher
+        services._dispatcher = lambda app: FakeDispatcher(app, script)
+        try:
+            r = self.call("qmcp.AIManagedEvents", {"duration": 1})
+        finally:
+            services._dispatcher = saved
+        self.assertEqual([e["event"] for e in r["events"]],
+                         ["domain-feature-set:service.cups", "domain-feature-set:menu-items"])
+
+
+class RequestDeadline(Base):
+    def test_a_request_stream_left_open_frees_the_callers_slots(self):
+        saved = core.REQUEST_TIMEOUT_S
+        self.addCleanup(setattr, core, "REQUEST_TIMEOUT_S", saved)
+        core.REQUEST_TIMEOUT_S = 0.3
+        r, w = os.pipe()
+        self.addCleanup(os.close, w)
+        os.write(w, b'{"name": ')                              # and never more, never closed
+        stdin = os.fdopen(r, "rb")
+        self.addCleanup(stdin.close)
+        out = io.StringIO()
+        started = time.monotonic()
+        services.main("qmcp.GetPoolStats", stdin=stdin, environ={"QREXEC_REMOTE_DOMAIN": HUB},
+                      app_factory=lambda: self.app, out=out)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(json.loads(out.getvalue())["error"], "request timed out")
+        self.assertTrue(self.call("qmcp.GetPoolStats")["ok"])  # its slot is free again
+
+
+class StaleDomainList(Base):
+    """A create's budget is judged on the domain list as it is under the
+    create lock, not as the process first read it (qubesadmin keeps it)."""
+
+    def test_parallel_disposables_never_pass_the_pool_cap(self):
+        from fakequbes import ProcApp
+        self.egress("ai-net-router")
+        used = budget.persistent_sum(self.app)
+        (self.tmp / "pool-cap").write_text(str(used + 2 * GiB) + "\n")   # room for one
+        real = budget.acquire_create_lock
+        other = {}
+
+        def another_lands_while_this_waits(*a, **kw):
+            if not other:
+                budget.acquire_create_lock = real
+                other["r"] = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"},
+                                       app=ProcApp(self.app))
+                budget.acquire_create_lock = another_lands_while_this_waits
+            return real(*a, **kw)
+        budget.acquire_create_lock = another_lands_while_this_waits
+        try:
+            mine = self.call("qmcp.SpawnDisposableAIManaged", {"template": "ai-dvm"},
+                             app=ProcApp(self.app))
+        finally:
+            budget.acquire_create_lock = real
+        self.assertTrue(other["r"]["ok"], other)
+        self.assertFalse(mine["ok"], mine)
+        self.assertIn("pool cap", mine["error"])
+        self.app.domains.clear_cache()
+        self.assertLessEqual(budget.persistent_sum(self.app), used + 2 * GiB)
+
+
 class Windows(Base):
     """The operator's open window on a guarded qube.
 
@@ -2222,6 +2301,101 @@ class Windows(Base):
         lines = fleet.expire_windows(self.app)
         self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
         self.assertTrue(any("cannot be told" in line for line in lines), lines)
+
+    def test_a_revoke_whose_kill_fails_keeps_the_seals_pending_kill(self):
+        vm = self.app.domains[self.TPL]
+        vm.start()
+        fleet.open_window(self.app, self.TPL, 3600)
+        self.app.fail.add("kill")
+        fleet.seal(self.app, self.TPL)
+        with self.assertRaises(fleet.RoleError):
+            fleet.revoke(self.app, self.TPL)                    # its own kill fails too
+        self.app.fail.clear()
+        self.assertEqual(fleet.pending_kills(), [self.TPL])
+        fleet.expire_windows(self.app)
+        self.assertEqual(vm.get_power_state(), "Halted")
+
+    def test_a_revoke_of_an_open_qube_whose_kill_fails_leaves_a_pending_kill(self):
+        # W: an open window; E: a seal that marked its kill and could not take
+        # the badge off. Either way a kill of the revoke's that fails leaves
+        # a kill the timer tries again.
+        for case in ("W", "E"):
+            vm = self.app.domains[self.TPL]
+            if core.UMBRELLA not in vm.tags.raw():
+                fleet.guard(self.app, self.TPL)
+            if vm.get_power_state() != "Running":
+                vm.start()
+            fleet.open_window(self.app, self.TPL, 3600)
+            if case == "E":
+                self.app.fail.add("tag.discard:qmcp-open")
+                try:
+                    fleet.seal(self.app, self.TPL)
+                except Exception:
+                    pass
+                self.app.fail.clear()
+                self.assertEqual(fleet.pending_kills(), [self.TPL], case)
+            self.app.fail.add("kill")
+            with self.assertRaises(fleet.RoleError):
+                fleet.revoke(self.app, self.TPL)
+            self.app.fail.clear()
+            self.assertEqual(fleet.pending_kills(), [self.TPL], case)
+            fleet.expire_windows(self.app)
+            self.assertEqual(vm.get_power_state(), "Halted", case)
+            self.assertEqual(fleet.pending_kills(), [], case)
+
+    def test_the_check_fails_on_a_boot_seal_disabled_or_unordered(self):
+        def item():
+            return [(f.status, f.detail) for f in fleet.check(self.app) if f.check == "boot seal"]
+        self.assertEqual([st for st, _ in item()], ["pass"])
+        saved = anon.TIMER_CHECK
+        self.addCleanup(setattr, anon, "TIMER_CHECK", saved)
+        anon.TIMER_CHECK = lambda unit=None: unit != fleet.SEAL_UNIT
+        self.assertEqual([st for st, _ in item()], ["fail"])
+        anon.TIMER_CHECK = saved
+        os.unlink(fleet.SEAL_DROPIN)
+        found = item()
+        self.assertEqual([st for st, _ in found], ["fail"])
+        self.assertIn("does not order Qubes' autostart", found[0][1])
+
+    def test_manage_and_revoke_drop_a_pending_kill_so_the_sweep_kills_nothing(self):
+        for act in ("manage", "revoke"):
+            vm = self.app.domains[self.TPL]
+            if core.UMBRELLA not in vm.tags.raw():                # back after the revoke
+                fleet.guard(self.app, self.TPL)
+            vm.start()
+            fleet.open_window(self.app, self.TPL, 3600)
+            self.app.fail.add("kill")
+            fleet.seal(self.app, self.TPL)
+            self.app.fail.clear()
+            self.assertEqual(fleet.pending_kills(), [self.TPL])
+            msg = (fleet.manage(self.app, self.TPL) if act == "manage"
+                   else fleet.revoke(self.app, self.TPL, shutdown=False))
+            self.assertIn("the kill its seal could not make is dropped", msg)
+            self.assertEqual(fleet.pending_kills(), [])
+            fleet.expire_windows(self.app)
+            self.assertEqual(vm.get_power_state(), "Running", act)
+            if act == "manage":
+                fleet.guard(self.app, self.TPL)
+
+    def test_a_wall_clock_stepped_back_never_lengthens_a_window(self):
+        # The end is kept on the clock since boot too, which nothing sets: a
+        # wall clock held back (within the slack) still ends a 2 h window when
+        # the boot clock says 2 h have passed, and one stepped back further
+        # (the window opened "in the future", or ends past the 24 h cap) ends
+        # it at once.
+        boot = [1000.0]
+        with mock.patch.object(fleet, "_boot_clock", lambda: boot[0]):
+            fleet.open_window(self.app, self.TPL, 7200)
+            self.assertLessEqual(fleet.window_left(self.TPL, now=time.time() - 3600), 0)
+            back = time.time() - 30
+            self.assertGreater(fleet.window_left(self.TPL, now=back), 0)
+            boot[0] += 7300
+            lines = fleet.expire_windows(self.app, now=back)
+            self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
+            fleet.open_window(self.app, self.TPL, 7200)
+            self.assertLessEqual(fleet.window_left(self.TPL, now=time.time() - 86400), 0)
+            lines = fleet.expire_windows(self.app, now=time.time() - 86400)
+            self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
 
     def test_an_expired_window_whose_tags_do_not_read_is_sealed(self):
         fleet.open_window(self.app, self.TPL, 60)

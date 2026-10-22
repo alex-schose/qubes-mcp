@@ -154,6 +154,24 @@ def timer_active(unit: str | None = None):
     return done.returncode == 0
 
 
+def unit_enabled(unit: str):
+    """Whether systemd starts `unit` at boot: True, False, or None when that
+    cannot be told. The tests' stand-in is `TIMER_CHECK`'s."""
+    if TIMER_CHECK is not None:
+        try:
+            return TIMER_CHECK(unit)
+        except TypeError:
+            return TIMER_CHECK()
+    import subprocess
+    try:
+        done = subprocess.run(["systemctl", "is-enabled", "--quiet", unit],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.returncode == 0
+
+
 def heartbeat_age(path: str | None = None):
     """Seconds since the last completed run, or None when there is no heartbeat."""
     try:
@@ -568,6 +586,22 @@ def evaluate_hub(app, hub, records: dict, registry: dict, policy_view, by_name: 
     return v
 
 
+def _hub_name() -> str | None:
+    """The hub, for what a stop must reach: `/etc/qmcp/hub`, or, when that
+    does not read, the hub the installed rulebook names (whose lines route the
+    hub's calls on that name), so a hub file that does not read never leaves
+    the hub running while its p00 qubes are blocked. The verdict itself still
+    reads the file (`evaluate_hub`), and is unreadable without it."""
+    hub = core.read_hub()
+    if hub:
+        return hub
+    try:
+        from qmcp import fleet
+        return fleet.policy_hub(os.path.join(fleet.POLICY_DIR, fleet.POLICY_NAME))
+    except Exception:
+        return None
+
+
 def hub_stop_set(v: Verdict, hub: str | None) -> list:
     """What a hub verdict stops: on a violation by the hub or a p00 qube, the
     hub, every p00 qube and every other offender (the hub first); on any
@@ -813,10 +847,10 @@ def _names_now(app, p) -> list:
         by_name, tags_by = _snapshot(app)
     except core.Unreadable:
         if p is HUB:
-            return [core.read_hub()] if core.read_hub() else []
+            return [_hub_name()] if _hub_name() else []
         return [p.lead] if p.lead else []
     if p is HUB:
-        hub = core.read_hub()
+        hub = _hub_name()
         return ([hub] if hub else []) + [n for n in p00_qubes(tags_by) if n != hub]
     names = _member_qubes(p, tags_by)
     if p.lead and p.lead in by_name and p.lead not in names:
@@ -876,7 +910,7 @@ def _verdict(app, p, records, policy_loader, retry_wait) -> Verdict:
             v.problems.append(("read", str(e)))
             v.names = _names_now(app, p)
             if p is HUB:
-                v.p00 = [n for n in v.names if n != core.read_hub()]
+                v.p00 = [n for n in v.names if n != _hub_name()]
             return v
 
 
@@ -922,10 +956,10 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
                 v.problems.append(("read", f"{mode_error}, so whether the hub is judged cannot "
                                            f"be told"))
                 v.names = _names_now(app, HUB)
-                v.p00 = [n for n in v.names if n != core.read_hub()]
+                v.p00 = [n for n in v.names if n != _hub_name()]
             else:
                 v = _verdict(app, p, records, policy_loader, retry_wait)
-            stop = hub_stop_set(v, core.read_hub()) if p is HUB else v.names
+            stop = hub_stop_set(v, _hub_name()) if p is HUB else v.names
             if act and v.status in (RED, UNREADABLE):
                 if deadline is None:
                     deadline = time.monotonic() + KILL_LOCK_WAIT_S
@@ -950,7 +984,7 @@ def run(app, act: bool = True, records=None, policy_loader=None, lock_path: str 
                 except Exception:
                     pass
                 if p is HUB:
-                    hub = core.read_hub()
+                    hub = _hub_name()
                     whom = ("the hub and its qubes in p00" if hub is not None and hub in stop
                             else ", ".join(stop))
                     notify((NOTICE_HUB if v.blocked else NOTICE_HUB_FAILED)
@@ -983,7 +1017,7 @@ def _stop_unread_records(app, err, lock_path) -> str:
         # project's members and leads and the hub. Its templates and model
         # qubes are guarded, so nothing operates them, and a block there would
         # outlast every unblock (a template could not even update).
-        hub = core.read_hub()
+        hub = _hub_name()
         worn = [n for n, t in tags_by.items() if projects.ANON in t
                 and (projects.member_slots(t) or projects.lead_slots(t) or n == hub)]
         names = sorted(n for n in worn if projects.BLOCKED not in tags_by[n])
@@ -1053,7 +1087,8 @@ def unblock(app, records: dict, key: str, policy_loader=None, lock_path: str | N
             try:
                 vm = app.domains[name]
             except Exception:
-                out.append(f"{p.slot}: {name} NOT unblocked (it cannot be looked up)")
+                out.append(NotUnblocked(f"{p.slot}: {name} NOT unblocked (it cannot be looked "
+                                        f"up)"))
                 continue
             try:
                 tags = core.tags_of(vm)
@@ -1061,13 +1096,31 @@ def unblock(app, records: dict, key: str, policy_loader=None, lock_path: str | N
                 tags = {projects.BLOCKED, projects.STOPPED}
             if not tags & {projects.BLOCKED, projects.STOPPED}:
                 continue
-            # The stop comes off first: the block is what keeps every call out.
-            err = _tag(vm, projects.STOPPED, False) or _tag(vm, projects.BLOCKED, False)
-            out.append(f"{p.slot}: {name} unblocked (autostart stays off)" if not err
-                       else f"{p.slot}: {name} NOT unblocked ({err})")
+            out.append(_take_stop_off(vm, p.slot, name))
         if not out:
             out.append(f"{p.slot}: nothing was blocked")
         return out
+
+
+class NotUnblocked(str):
+    """A line of an unblock's report that says a qube was NOT unblocked: the
+    command records it as a failed step (`fleet._unblock`), never as text."""
+
+
+def _take_stop_off(vm, where: str, name: str) -> str:
+    """Take the stop off one qube, the stop first (the block is what keeps
+    every call out), and read it back."""
+    err = _tag(vm, projects.STOPPED, False) or _tag(vm, projects.BLOCKED, False)
+    if not err:
+        try:
+            if core.tags_of(vm) & {projects.BLOCKED, projects.STOPPED}:
+                err = "the badges did not read back off"
+        except core.Gone:
+            err = "it was removed meanwhile"
+        except core.Unreadable:
+            err = "its tags did not read back"
+    return (f"{where}: {name} unblocked (autostart stays off)" if not err
+            else NotUnblocked(f"{where}: {name} NOT unblocked ({err})"))
 
 
 def unblock_hub(app, records: dict, policy_loader=None, lock_path: str | None = None) -> list:
@@ -1098,13 +1151,13 @@ def unblock_hub(app, records: dict, policy_loader=None, lock_path: str | None = 
             names = hub_candidates(core.read_hub(), records, tags_by) if core.read_hub() else []
             # A qube whose tags do not read may wear the stop: said, never skipped.
             unread = sorted(set(by_name) - set(tags_by))
-        out = [] if mode else [f"p00: {n} NOT unblocked (its tags cannot be read; run this "
-                               f"again once they read)" for n in unread]
+        out = [] if mode else [NotUnblocked(f"p00: {n} NOT unblocked (its tags cannot be read; "
+                                            f"run this again once they read)") for n in unread]
         for name in names:
             try:
                 vm = app.domains[name]
             except Exception:
-                out.append(f"p00: {name} NOT unblocked (it cannot be looked up)")
+                out.append(NotUnblocked(f"p00: {name} NOT unblocked (it cannot be looked up)"))
                 continue
             try:
                 tags = core.tags_of(vm)
@@ -1112,9 +1165,7 @@ def unblock_hub(app, records: dict, policy_loader=None, lock_path: str | None = 
                 tags = {projects.BLOCKED, projects.STOPPED}
             if not tags & {projects.BLOCKED, projects.STOPPED}:
                 continue
-            err = _tag(vm, projects.STOPPED, False) or _tag(vm, projects.BLOCKED, False)
-            out.append(f"p00: {name} unblocked (autostart stays off)" if not err
-                       else f"p00: {name} NOT unblocked ({err})")
+            out.append(_take_stop_off(vm, "p00", name))
         if not out:
             out.append("p00: nothing was blocked")
         return out

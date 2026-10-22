@@ -763,6 +763,31 @@ class Acting(AnonBase):
         self.assertIn(f"{self.p.slot}: {w2} NOT unblocked (it cannot be looked up)", out)
         self.assertIn(f"{self.p.slot}: {self.p.lead} unblocked (autostart stays off)", out)
         self.assertNotIn("qmcp-blocked", self.tags(self.p.lead))
+        # A qube NOT unblocked is a failed step, not a line of text.
+        self.assertEqual(out.failed, [f"{self.p.slot}: {w2} NOT unblocked (it cannot be looked "
+                                      f"up)"])
+
+    def test_an_unblock_whose_badge_did_not_come_off_exits_1(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+        from qmcp import cli
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-firewall"]
+        self.gate()
+        self.app.domains["ai-net-tor"].netvm = self.app.domains["sys-whonix"]
+        self.app.fail.add("tag.discard:qmcp-blocked")
+        saved, cli._app = cli._app, lambda: self.app
+        self.addCleanup(setattr, cli, "_app", saved)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                mock.patch("os.geteuid", return_value=0):
+            try:
+                rc = cli.main(["project", "unblock", self.p.label])
+            except SystemExit as e:
+                rc = e.code
+        self.assertEqual(rc, 1)
+        self.assertIn("qmcp-blocked", self.tags(self.p.lead))
+        line = [json.loads(x) for x in pathlib.Path(audit.LOG_PATH).read_text().splitlines()][-1]
+        self.assertEqual((line["caller"], line["ok"]), ("operator", False))
 
     def test_a_stop_that_did_not_land_is_never_called_stopped(self):
         import io

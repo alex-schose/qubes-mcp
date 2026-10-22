@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import ast
 import datetime
+import io
+from contextlib import redirect_stdout
 import json
 import os
 import pathlib
 import re
 import sys
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
@@ -217,7 +220,7 @@ class ServiceLines(ModeBase):
         audit.room = lambda path=None: False            # no room anywhere
         self.addCleanup(setattr, audit, "room", saved)
         counter = pathlib.Path(audit.ram_dir()).parent / "calls" / f"{HUB}{audit.REFUSED_SUFFIX}"
-        day = audit._utc_now_iso()[:10]
+        day = audit._periods()[0]
         counter.write_text(json.dumps({"day": day, "lines": audit.AUDIT_LINES_PER_DAY}))
         r = self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work2", "property": "memory",
                                                     "value": 900})
@@ -265,7 +268,7 @@ class ServiceLines(ModeBase):
     def test_the_budget_covers_ram_lines(self):
         self.set_project("p01", "ram")
         counter = pathlib.Path(audit.ram_dir()).parent / "calls" / f"{LEAD}{audit.REFUSED_SUFFIX}"
-        counter.write_text(json.dumps({"day": audit._utc_now_iso()[:10],
+        counter.write_text(json.dumps({"day": audit._periods()[0],
                                        "lines": audit.AUDIT_LINES_PER_DAY}))
         r = self.lcall("qmcp.SetPropertyAIManaged", {"name": "ai-osint-w1", "property": "memory",
                                                      "value": 900})
@@ -690,6 +693,67 @@ class Retention(ModeBase):
         self.assertEqual((last["service"], last["args"]["removed"], last["args"]["keep_days"]),
                          (audit.REMOVE_SERVICE, [old.name], 90))
 
+    def test_an_upgrade_keeps_rotated_logs_older_than_the_default(self):
+        """The installer's keep-days program, cut out of install.sh: with no
+        setting and a rotated log older than the default it writes off, 0644,
+        before the timer first runs; with none that old, or a setting, nothing."""
+        install = (DEPLOY / "install.sh").read_text()
+        start = install.index("<<'PYEOF'\n", install.index('KEEP_SAID="$(')) + len("<<'PYEOF'\n")
+        program = install[start:install.index("\nPYEOF\n", start) + 1]
+        self.assertLess(install.index('KEEP_SAID="$('), install.index("systemctl start qmcp-audit.timer"))
+
+        def run():
+            out = io.StringIO()
+            with redirect_stdout(out):
+                try:
+                    exec(compile(program, "install.sh keep-days", "exec"), {"__name__": "__main__"})
+                except SystemExit:
+                    pass
+            return out.getvalue()
+        young = self.rotated_file(10)
+        self.assertEqual(run(), "")
+        self.assertFalse(os.path.exists(audit.KEEP_DAYS_PATH))
+        old = self.rotated_file(200)
+        self.assertIn("= off", run())
+        self.assertEqual(pathlib.Path(audit.KEEP_DAYS_PATH).read_text(), "off\n")
+        self.assertEqual(os.stat(audit.KEEP_DAYS_PATH).st_mode & 0o777, 0o644)
+        self.assertEqual(audit.auto_rotate()[1], True)
+        self.assertTrue(old.exists() and young.exists())
+        self.assertEqual(run(), "")                         # a setting is there: nothing
+
+    def test_a_clock_stepped_forward_removes_nothing_until_the_operator_says(self):
+        # Removal judged by a clock stepped forward would erase the record for
+        # good: the run compares the wall clock with the clock since boot
+        # against the last run, and pauses removal until the operator clears it.
+        files = [self.rotated_file(age) for age in (1, 10, 30, 60, 89)]
+        self.assertTrue(audit.auto_rotate()[1])                 # the first run: clocks noted
+        jumped = self.now() + datetime.timedelta(days=400)
+        lines, ok = audit.auto_rotate(now=jumped)
+        self.assertFalse(ok)
+        self.assertTrue(any("nothing removed: the wall clock moved" in x for x in lines), lines)
+        self.assertTrue(all(f.exists() for f in files))
+        # Still paused on the next run, though the clocks now agree again.
+        lines, ok = audit.auto_rotate(now=jumped + datetime.timedelta(seconds=5))
+        self.assertFalse(ok)
+        self.assertTrue(all(f.exists() for f in files))
+        found = [(f.status, f.detail) for f in fleet.check(self.app) if f.check == "audit clock"]
+        self.assertEqual([st for st, _ in found], ["warn"], found)
+        self.assertIn("removal of old audit logs is paused", found[0][1])
+        os.unlink(audit.CLOCK_MOVED_PATH)                       # the operator's word
+        audit.auto_rotate()                                     # a real run notes real clocks
+        self.assertTrue(all(f.exists() for f in files))         # none older than 90 days
+
+    def test_a_wall_clock_gone_back_across_a_boot_pauses_removal_too(self):
+        audit.auto_rotate(now=self.now() + datetime.timedelta(days=2))   # noted, a run ahead
+        old = self.rotated_file(91)
+        saved = audit.BOOT_ID_PATH
+        self.addCleanup(setattr, audit, "BOOT_ID_PATH", saved)
+        audit.BOOT_ID_PATH = str(self.tmp / "no-boot-id")                # another boot
+        lines, ok = audit.auto_rotate()
+        self.assertFalse(ok)
+        self.assertTrue(any("behind the last run's" in x for x in lines), lines)
+        self.assertTrue(old.exists())
+
     def test_the_setting_decides_and_one_that_does_not_read_removes_nothing(self):
         old = self.rotated_file(40)
         pathlib.Path(audit.KEEP_DAYS_PATH).write_text("60\n")
@@ -826,6 +890,53 @@ class PlantedLinks(ModeBase):
             lines, ok = audit.auto_rotate()
         self.assertFalse(ok)
         self.assertFalse(os.path.exists(f"{live}.20261002T000000Z"), lines)
+
+
+class ClockBack(ModeBase):
+    def test_the_budget_and_the_cap_count_on_the_clock_since_boot(self):
+        # The wall clock is never read for them: stepped back it gives no
+        # fresh share, stepped forward and corrected it locks no one out. A
+        # new day, or hour, is 86,400 (3,600) s of the clock since boot.
+        boot = [1000.0]
+        saved = audit._boot_clock
+        self.addCleanup(setattr, audit, "_boot_clock", saved)
+        audit._boot_clock = lambda: boot[0]
+        path = str(self.tmp / "c.refused")
+        for _ in range(audit.AUDIT_LINES_PER_DAY):
+            audit.spend(path)
+        self.assertFalse(audit.budget_left(path))
+        with mock.patch.object(audit, "_utc_now_iso", lambda: "1999-01-01T00:00:00Z"):
+            self.assertFalse(audit.budget_left(path))
+            self.assertTrue(audit.budget_spent(path))
+        boot[0] += 86400
+        self.assertTrue(audit.budget_left(path))
+        cap = str(self.tmp / "h.refused")
+        for _ in range(audit.REFUSALS_PER_HOUR):
+            self.assertTrue(audit.take_refusal(cap))
+        self.assertFalse(audit.take_refusal(cap))
+        boot[0] += 3600
+        self.assertTrue(audit.take_refusal(cap))
+
+
+class TailByCaller(ModeBase):
+    def test_tail_keeps_the_last_n_of_one_caller(self):
+        audit.audit("qmcp manage", "operator", {"qube": "ai-work2"}, True)
+        for i in range(30):
+            audit.audit("qmcp.SetPropertyAIManaged", HUB, {"name": "ai-work2"}, True)
+        last = audit.tail(10)
+        self.assertNotIn("operator", {r["caller"] for r in last})
+        mine = audit.tail(10, caller="operator")
+        self.assertEqual([r["caller"] for r in mine], ["operator"])
+        self.assertEqual(len(audit.tail(5, caller=HUB)), 5)
+        self.assertEqual(audit.tail(10, caller="nobody"), [])
+        self.assertEqual(audit.tail(0, caller=HUB), [])
+
+    def test_the_command_refuses_a_caller_that_is_no_name(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), mock.patch("sys.stderr", err):
+            rc = cli.main(["audit", "tail", "5", "--caller", "a b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--caller wants a caller's name", err.getvalue())
 
 
 class StaleRotation(ModeBase):

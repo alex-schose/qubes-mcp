@@ -1006,7 +1006,7 @@ def _qubes_run_disposable(args: dict) -> dict:
 #: spent on it; a preloaded one, running already, is killed.
 NOT_ACTED = frozenset({
     "refused: dom0's audit log has no room",
-    "refused: this caller's audit budget for today is spent",
+    "refused: this caller's audit budget for the day (24 h of dom0's uptime) is spent",
     "refused: this caller's audit counter cannot be kept",
 })
 
@@ -1092,7 +1092,8 @@ def _qubes_feature_set(args: dict) -> dict:
     ts}; tag add and delete events also carry `tag`. Only events fired after
     the window opens are seen, so to catch the result of an action, open the
     window first (a concurrent tool call) and then act. Calls run concurrently,
-    so a long window does not hold up other tools.
+    and the short tools on threads of their own, so a long window does not
+    hold up other tools.
 
     - qube: only events whose subject is this qube; one that is out of scope or
       does not exist is reported as "not found".
@@ -1200,8 +1201,15 @@ def _proposal_doc(text: str) -> str:
     return inspect.cleandoc(text) + "\n\n" + _PROPOSAL_TERMS
 
 
+#: A proposal whose reply never came: dom0 may have stored it, and the same
+#: one submitted again would take a second place in the queue.
+PROPOSAL_LOST = ("no answer from dom0 in time: the proposal may have been stored; check "
+                 "qubes_proposals before submitting it again")
+
+
 def _submit(kind: str, args: dict) -> dict:
-    return qrexec.call_qmcp("qmcp.SubmitProposal", dict(args, type=kind), timeout=DOM0_TIMEOUT)
+    return qrexec.call_qmcp("qmcp.SubmitProposal", dict(args, type=kind), timeout=DOM0_TIMEOUT,
+                            on_timeout={"ok": False, "error": PROPOSAL_LOST})
 
 
 _TITLE = _prop("string", "What the proposal asks for, in 1-100 printable ASCII characters. "

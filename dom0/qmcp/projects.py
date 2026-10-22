@@ -321,7 +321,7 @@ def parse(text: str) -> dict:
     """slot -> Project, from the file's text. Raises ProjectsUnreadable."""
     try:
         doc = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise _bad("not JSON") from None
     if not isinstance(doc, dict) or doc.get("version") != VERSION or set(doc) != {"version", "slots"}:
         raise _bad(f"top level must be {{'version': {VERSION}, 'slots': {{...}}}}")
