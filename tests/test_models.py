@@ -37,9 +37,25 @@ MODEL = "ai-hub-model"
 BADGE1, BADGE2 = projects.model_badge("p01"), projects.model_badge("p02")
 
 
-def findings(app, **kw):
-    return {f"{f.status}:{f.check}": f for f in fleet.check(app, legacy_paths=(),
-                                                            system_info={"domains": {}}, **kw)}
+def findings(app, extra_policy="", **kw):
+    """`qmcp check` with dom0's policy as the daemon sees it (upstream 4.3,
+    Whonix's update lines, our rulebook), so the model-qube item can ask where
+    a model qube's updates go."""
+    import shutil
+    import tempfile
+    from test_anon import UPSTREAM, WHONIX_LINES, policy_view
+    pdir = tempfile.mkdtemp(prefix="qmcp-models-policy-")
+    try:
+        shutil.copytree(UPSTREAM, pdir, dirs_exist_ok=True)
+        pathlib.Path(pdir, "README.md").unlink(missing_ok=True)
+        shutil.copyfile(HERE.parent / "policy" / "30-mcp-control.policy",
+                        pathlib.Path(pdir, "30-mcp-control.policy"))
+        pathlib.Path(pdir, "50-config-updates.policy").write_text(WHONIX_LINES + extra_policy)
+        kw.setdefault("system_info", policy_view(app)[1])
+        kw.setdefault("policy_dir", pdir)
+        return {f"{f.status}:{f.check}": f for f in fleet.check(app, legacy_paths=(), **kw)}
+    finally:
+        shutil.rmtree(pdir)
 
 
 class ModelBase(ProjectBase):
@@ -815,6 +831,29 @@ class Check(ModelBase):
         for word in words:
             self.assertIn(word, detail)
         self.assertNotEqual(fleet.overall(list(findings(self.app).values())), "GREEN")
+
+    def test_a_model_qube_given_the_update_proxy_fails(self):
+        # No network is not no way out: Qubes' update proxy is an HTTP proxy
+        # around it, which a Whonix tag or a rule naming the qube gives.
+        a = self.app
+        if "sys-net" not in a.domains:
+            a.vm("sys-net", provides_network=True)
+        a.vm("sys-whonix", provides_network=True, netvm=a.domains["sys-net"],
+             tags={"anon-gateway"})
+        self.fails_on(lambda a: a.domains[MODEL].tags.add("whonix-updatevm"),
+                      f"{MODEL}: dom0's policy gives it the update proxy (sys-whonix)")
+        self.app.domains[MODEL].tags.discard("whonix-updatevm")
+        self.assertEqual(list(self.model_findings()), ["pass:model qubes"])
+        rule = f"qubes.UpdatesProxy * {MODEL} @default allow target=sys-net\n"
+        got = findings(self.app, extra_policy=rule)
+        self.assertIn(f"{MODEL}: dom0's policy gives it the update proxy (sys-net)",
+                      got["fail:model qubes"].detail)
+
+    def test_a_policy_that_does_not_load_is_incomplete_never_green(self):
+        got = {k: v for k, v in findings(self.app, extra_policy="not a rule\n").items()
+               if k.endswith(":model qubes")}
+        self.assertEqual(list(got), ["error:model qubes"])
+        self.assertIn(f"where dom0's policy sends the updates of {MODEL}", got["error:model qubes"].detail)
 
     def test_each_badge_out_of_place_fails(self):
         a = self.app

@@ -84,6 +84,32 @@ class StrictBase(ProjectBase):
 
 # ======================================================================= the services
 
+class GoneHandle(StrictBase):
+    """The fake answers a stale handle to a removed qube as qubesadmin did,
+    measured on Qubes 4.3.2 (2026-10-23): a KeyError for its feature reads and
+    writes, its tag reads and adds and its property list, so `features.get`
+    answers its default and `tags.discard` nothing; a property read fails;
+    its power state reads NA."""
+
+    def test_a_removed_qubes_handle_answers_as_qubesadmin_did(self):
+        vm = self.app.domains["ai-work2"]
+        vm.features["qmcp-x"] = "1"
+        vm.tags.add("qmcp-n-tag")
+        vm.__dict__["_power"] = "Halted"
+        del self.app.domains["ai-work2"]
+        self.assertEqual(vm.features.get("qmcp-x", "DEFAULT"), "DEFAULT")
+        for read in (lambda: vm.features["qmcp-x"], lambda: "qmcp-x" in vm.features,
+                     lambda: vm.features.items(), lambda: vm.features.__setitem__("y", "1"),
+                     lambda: list(vm.tags), lambda: "qmcp-n-tag" in vm.tags,
+                     lambda: vm.tags.add("qmcp-z"), lambda: vm.property_list()):
+            with self.assertRaises(KeyError):
+                read()
+        self.assertIsNone(vm.tags.discard("qmcp-n-tag"))
+        with self.assertRaises(AttributeError):
+            vm.netvm
+        self.assertEqual(vm.get_power_state(), "NA")
+
+
 class Services(StrictBase):
     def test_a_gateway_whose_role_cannot_be_read_is_guarded(self):
         # ai-gw-unbadged provides network and wears no qmcp-guarded badge.
@@ -869,6 +895,30 @@ def lenient_reads(tree) -> list:
     return found
 
 
+#: How many such `try`s an allowed function holds, where it is more than one:
+#: an allowance covers the trys its reason was written for, not a new one
+#: added beside them, which needs its own look (and a count raised here).
+ALLOWED_TRY_COUNT = {
+    ("anon.py", "block"): 2,
+    ("birth.py", "resolve_egress"): 2,
+    ("inqube.py", "refresh"): 2,
+    ("restored.py", "_settle"): 2,
+    ("services.py", "svc_list"): 2,
+    ("services.py", "svc_set_feature"): 3,
+}
+
+
+def unallowed_trys(scanned) -> list:
+    """Each allowed function whose count of swallowing trys is not the one
+    allowed (`ALLOWED_TRY_COUNT`, else 1): more is a try nobody looked at,
+    fewer an allowance wider than the code."""
+    import collections
+    seen = collections.Counter((m, fn) for m, reads in scanned for fn, _, what in reads
+                               if what.startswith("try") and (m, fn) in ALLOWED_TRY)
+    return [f"{m}: {fn} has {n} swallowing try(s), {ALLOWED_TRY_COUNT.get((m, fn), 1)} allowed"
+            for (m, fn), n in sorted(seen.items()) if n != ALLOWED_TRY_COUNT.get((m, fn), 1)]
+
+
 class NoLenientReads(unittest.TestCase):
     """A qube property read with a default answers a failed read with that
     default. In the dom0 library, `getattr` with a default, `hasattr` and
@@ -890,6 +940,18 @@ class NoLenientReads(unittest.TestCase):
         self.assertLessEqual({"core.py", "fleet.py", "services.py", "scope.py"}, modules)
         self.assertEqual(found, [], "read the property directly and handle the failure at the "
                                     "decision, or list a try in ALLOWED_TRY with its reason")
+
+    def test_an_allowance_covers_exactly_the_trys_it_was_given_for(self):
+        self.assertEqual(unallowed_trys(self.scanned()), [])
+        self.assertLessEqual(set(ALLOWED_TRY_COUNT), set(ALLOWED_TRY))
+
+    def test_a_second_try_in_an_allowed_function_is_found(self):
+        # Teeth: an allowed function that grows another swallowing try.
+        one = "    try:\n        a = vm.uuid\n    except Exception:\n        a = None\n"
+        src = "def hold(vm):\n" + one + one.replace("uuid", "label") + "    return a\n"
+        scanned = [("restored.py", lenient_reads(ast.parse(src)))]
+        self.assertEqual(unallowed_trys(scanned),
+                         ["restored.py: hold has 2 swallowing try(s), 1 allowed"])
 
     def test_every_allowance_is_still_used(self):
         used = {(m, fn) for m, reads in self.scanned() for fn, _, what in reads

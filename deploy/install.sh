@@ -7,7 +7,7 @@
 # tagged release in a fresh disposable instead:
 #
 #   qvm-run --dispvm=default-dvm --pass-io \
-#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v0.9.26.tar.gz' \
+#     'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/vX.Y.Z.tar.gz' \
 #     > /tmp/qmcp.tgz
 #   rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 #   tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -133,6 +133,14 @@ set -euo pipefail
 # Staged code is imported as root from a world-writable /tmp: never leave
 # root-owned bytecode behind it.
 export PYTHONDONTWRITEBYTECODE=1
+# Every python3 this runs, as root, imports from the release only: `-c`, `-` and
+# `-m` would otherwise put the operator's cwd first on sys.path, ahead of
+# PYTHONPATH, so a `qmcp/` (or `compileall.py`) there would run as root. Checked
+# in the preflight: a python3 before 3.11 ignores the variable. Nor root's user
+# site, nor any PYTHON* the caller's environment brought (sudo -E, a root
+# shell): every call below sets the PYTHONPATH it needs itself.
+export PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1
+unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE PYTHONEXECUTABLE
 
 HUB=""
 BIRTH_EGRESS=""
@@ -187,6 +195,8 @@ say() { echo "==> $*"; }
 # Nothing below this banner changes the system until "install".
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash $0)"
+python3 -c 'import sys; sys.exit(0 if sys.flags.safe_path and sys.flags.no_user_site else 1)' \
+    2>/dev/null || die "python3 does not honour PYTHONSAFEPATH (3.11 or later is needed)"
 [ -e /etc/qubes-release ] && command -v qvm-ls >/dev/null || die "this is not dom0"
 for f in dom0/qmcp/core.py dom0/qmcp/services.py dom0/qmcp/fleet.py dom0/qmcp/projects.py \
          dom0/qmcp/proposals.py dom0/qmcp/gateways.py dom0/qmcp/firewall.py dom0/rpc/qmcp-service \
@@ -320,8 +330,8 @@ sys.exit(1 if problems or blocking else 0)
 PYEOF
 if [ "$FLEET_STATUS" -ne 0 ]; then
     echo "install.sh: the fleet is not in the two-state shape yet. Run the staged migration first:" >&2
-    echo "    sudo PYTHONPATH=$SRC/dom0 python3 -m qmcp.cli migrate          # dry run" >&2
-    echo "    sudo PYTHONPATH=$SRC/dom0 python3 -m qmcp.cli migrate --apply" >&2
+    echo "    sudo PYTHONPATH=$SRC/dom0 python3 -P -m qmcp.cli migrate          # dry run" >&2
+    echo "    sudo PYTHONPATH=$SRC/dom0 python3 -P -m qmcp.cli migrate --apply" >&2
     exit 1
 fi
 

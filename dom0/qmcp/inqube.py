@@ -606,12 +606,16 @@ def install_script(manager: str, packages) -> bytes:
     elif manager == "pacman":
         # `-Sy`, the check, then `-Su` with the names: `-Syu` in two steps,
         # never a partial upgrade. A group or a provided name is no package.
-        lines = [f"pacman --noconfirm -Sy || exit {NO_REFRESH}",
+        # No 10 s download timeout: through an anonymising update proxy the
+        # first answer took 17 s (measured, Arch on Qubes 4.3.2), and every
+        # mirror then failed; dom0 bounds the whole install anyway.
+        lines = [f"pacman --noconfirm --disable-download-timeout -Sy || exit {NO_REFRESH}",
                  f"for n in {names}; do",
                  '  pacman -Si "$n" >/dev/null 2>&1 || '
                  f'{{ echo "not a package name here: $n"; exit {NOT_A_NAME}; }}',
                  "done",
-                 "pacman --noconfirm --needed -Su " + names + " || exit $?",
+                 "pacman --noconfirm --disable-download-timeout --needed -Su " + names
+                 + " || exit $?",
                  "pacman -Q " + names + " | sed 's/^/installed: /' || true"]
     else:
         raise InQubeError(f"no install for the package manager {manager}")

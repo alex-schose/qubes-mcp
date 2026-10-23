@@ -846,7 +846,14 @@ def cmd_audit(args) -> int:
             path = audit.install_chain()
             if mode == "ram":
                 audit._ram_dir_ready()
-        print(f"rotated: the old log is now {audit.rotate(path)}")
+        try:
+            aside = audit.rotate(path)
+        except OSError as e:
+            # The log is left as it was: the new one is renamed in last.
+            print(f"qmcp audit rotate: not rotated: {e.strerror or type(e).__name__}; "
+                  f"the log's content is unchanged", file=sys.stderr)
+            return 1
+        print(f"rotated: the old log is now {aside}")
         return 0
     if args.what == "status":
         return _audit_status(args)

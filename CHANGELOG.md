@@ -25,6 +25,84 @@ From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how.
 
 Nothing — the working tree is the last released version.
 
+## [1.0.2] — 2026-10-23
+
+A patch: the known debt of 1.0.1, cleared.
+
+### Fixed
+
+- **The installer's Python could be replaced from the directory it was run in.** `install.sh` runs
+  python3 as root with `-c`, `-` and `-m`, and each of those puts the current directory first on
+  Python's path, ahead of the release's: a `qmcp/` directory (or a `compileall.py`) where the
+  operator ran `sudo bash .../install.sh` would have run as root in its place. The installer now
+  exports `PYTHONSAFEPATH=1` before its first python3, and refuses, before it changes anything, a
+  python3 that does not honour it (one older than 3.11). It also turns off root's user site and
+  clears any `PYTHONPATH`, `PYTHONHOME` or other `PYTHON*` setting the caller's environment
+  brought. The upgrade advice it prints, and the migration steps for v0.9.16, run `python3 -P`.
+- **Root followed links in `/run/qmcp/open`.** A window record, and the pending kill a seal turns
+  it into, were read and written with an open that follows a symbolic link and waits on a FIFO,
+  in a directory the services' group may write: code running as the services' user could have had
+  root's `qmcp open` or `qmcp seal` write a record through a link to another file, or hang on a
+  FIFO. A window record is now read and written opening no link and no FIFO (a record that is
+  one reads as unreadable, which seals the window), and replaced in one rename from a file
+  created afresh; the restore check's new failure records do the same. Other files root opens
+  under `/run/qmcp` still follow a link; on a stock dom0 the services' user can already run
+  anything as root through sudo, so this matters only on a dom0 where it cannot.
+- **`qmcp check` judged a model qube's way out by its network alone.** A model qube with no network
+  that dom0's policy gives Qubes' update proxy (a `whonix-updatevm` tag, which Qubes' own policy
+  sends to `sys-whonix`, or a rule naming it) still reaches the network, and its leads through it.
+  The check now asks qrexec's parser where the qube's updates go, as the anonymity gate already did
+  for an anonymous project, and fails when they go anywhere; a policy that does not load is an
+  error.
+- **`qmcp revoke --remove` refused too little before it acted.** It did not see a qube that another
+  qube uses as its management disposable, GUI qube or audio qube, so Qubes refused that remove
+  after the revoke. It now refuses one before anything changes, and a read of those that fails
+  refuses too. A remove that lands takes the qube's lock file and turnstile with it, as every other
+  remove qmcp makes does, instead of leaving them for the gate's sweep (one a call still holds
+  is left for it).
+- **A failure the restore check kept repeating wrote an audit line every 15 seconds.** A hold, or an
+  owner-badge decision, that kept failing the same way logged once per pass, about 5,760 lines a
+  day for one qube. It now logs once, and again only when it fails another way or succeeds (a
+  record per qube, by its UUID, and step under `/run/qmcp`, which a boot clears). Every pass
+  still reports it on standard error and exits 3 (1 when an anonymous project is unsound).
+- **Two audit rotations in one second failed.** The second found the first's name taken and
+  stopped at its link, and `qmcp audit rotate` by hand showed a traceback. A rotation now waits for
+  the next second rather than taking a name retention would not match, and one that fails says
+  `not rotated` and that the log is unchanged; one whose last step fails takes the name it gave
+  the log off again.
+- **`qmcp audit tail` read the whole log.** The window reads it on every refresh. It now reads from
+  the end, only as far back as the lines it shows; `qmcp check` still walks the whole chain.
+- **`qmcp template install` on Arch failed through a slow update proxy.** pacman gives up on a
+  mirror that has not answered in 10 s; through an anonymising update proxy an answer took 17 s
+  (measured on Qubes 4.3.2), and every mirror timed out. The install now runs pacman without that timeout; dom0
+  still stops the whole install after 30 minutes.
+- **`qmcp check` warned on every run that it could not look in another user's home.** On a dom0
+  with a second member of `qubes`, a check run as the operator cannot read that home for v0.9.16's
+  leftovers, and said so as a warning each time. It is now a note on the item's pass: a leftover
+  unit there starts a program the installer removed, and the process scan, which still fails the
+  check, finds a daemon that runs. `sudo qmcp check` looks in every home.
+
+### Changed
+
+- **The README says how to run a lead tool-only**: its agent with qubes-mcp's tools and none of its
+  client's own, so a model a page has talked round cannot read the lead's model key or run
+  commands in the lead; and that the hub itself was measured on Debian 13 only.
+- **The design document names a residual risk it already accepted**: an enrolled gateway outside AI
+  space is named to the hub. It also gives a lead's calls timed end to end, from a lead, naming
+  another project's hidden lead against a missing name: not told apart (one 60-pair group was,
+  in the direction a leak would not give).
+- **The tests cover more.** The fake qubesadmin answers a stale handle to a removed qube as
+  qubesadmin does (measured on Qubes 4.3.2: `features.get` gives its default, the other feature
+  reads and writes, tag reads and adds and the property list raise, a tag discard answers
+  nothing). The window's Move form takes its tick and its network line from the window's model,
+  and a test holds them to `qmcp project move` itself. A spawn's template tags are tested as read
+  under the create lock. An allowance in the strict-read test covers exactly the swallowing reads
+  it was written for, no more.
+
+### Upgrading
+
+Install over 1.0.1; nothing beyond the README's "Updating" steps.
+
 ## [1.0.1] — 2026-10-23
 
 A patch: v0.9.16's consent daemon no longer survives an install.

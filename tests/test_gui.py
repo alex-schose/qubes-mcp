@@ -170,6 +170,29 @@ def _gtk():
 Gtk = _gtk()
 
 
+_POLICY_DIR = []
+
+
+def policy_dir() -> str:
+    """dom0's policy as the daemon sees it (upstream 4.3, Whonix's update
+    lines, our rulebook), written once for the module: `qmcp check` asks it
+    where a model qube's updates go."""
+    if not _POLICY_DIR:
+        import atexit
+        import shutil
+        import tempfile
+        from test_anon import UPSTREAM, WHONIX_LINES
+        d = tempfile.mkdtemp(prefix="qmcp-gui-policy-")
+        atexit.register(shutil.rmtree, d, True)
+        shutil.copytree(UPSTREAM, d, dirs_exist_ok=True)
+        pathlib.Path(d, "README.md").unlink(missing_ok=True)
+        shutil.copyfile(HERE.parent / "policy" / "30-mcp-control.policy",
+                        pathlib.Path(d, "30-mcp-control.policy"))
+        pathlib.Path(d, "50-config-updates.policy").write_text(WHONIX_LINES)
+        _POLICY_DIR.append(d)
+    return _POLICY_DIR[0]
+
+
 class CliRunner:
     """What `Gio.Subprocess` does for the window, in-process: a change runs as
     root (`sudo -n` stripped, euid 0), a read as the user. `hold` keeps the
@@ -207,8 +230,9 @@ class CliRunner:
         saved = cli._app, os.geteuid, fleet.check
         real_check = fleet.check
         cli._app = lambda: self.app
-        fleet.check = lambda app, **kw: real_check(app, legacy_paths=(),
-                                                   system_info={"domains": {}}, **kw)
+        fleet.check = lambda app, **kw: real_check(
+            app, legacy_paths=(), **{"system_info": policy_view(app)[1],
+                                     "policy_dir": policy_dir(), **kw})
         if root:
             os.geteuid = lambda: 0
         out, err = io.StringIO(), io.StringIO()
@@ -1107,6 +1131,53 @@ class Model(GuiBase):
         self.assertNotIn("dom0", outside)
         records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
         self.assertEqual([t for t, _ in gm.move_targets(records)], ["p00", "osint", "other", "none"])
+
+    def test_the_move_forms_tick_is_exactly_when_the_command_wants_yes(self):
+        # The form decides the tick from the view; the command from the fleet.
+        # Every pair of slot and target, on the real command.
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        slots = {"none": None, "p00": "p00", "osint": "p01", "other": "p02"}
+        i = 0
+        for current in (None, "p00", "p01", "p02"):
+            for target, slot in slots.items():
+                i += 1
+                name = f"ai-hub-mv{i}"
+                tags = {"ai-managed", "qmcp-owner_mcp-control"}
+                if current:
+                    tags.add(f"qmcp-proj-{current}")
+                self.app.vm(name, netvm=None, power="Halted", tags=tags)
+                with self.subTest(current=current, target=target):
+                    try:
+                        fleet.move(self.app, name, target, confirm=False)
+                        wants_yes = False
+                    except fleet.ProjectError as e:
+                        self.assertIn("re-run with --yes", str(e))
+                        wants_yes = True
+                    tick = gm.move_tick(records, current, slot)
+                    self.assertEqual(tick is not None, wants_yes, tick)
+                    if tick is not None:
+                        self.assertEqual(tick, f"tick the box: it leaves {current}")
+
+    def test_the_move_forms_network_line_says_what_the_command_will_judge(self):
+        records = {r["slot"]: r for r in self.read_json("project", "list", "--json")}
+        osint_nets = ["none" if n is None else n for n in records["p01"]["networks"]]
+        row = {"name": "ai-hub-x", "netvm": None}
+        self.assertEqual(gm.move_network_fit(row, records, "osint"),
+                         "ai-hub-x has no network: any project takes it, and p00 and no slot too.")
+        row = {"name": "ai-hub-x", "netvm": "sys-elsewhere"}
+        self.assertEqual(gm.move_network_fit(row, records, "p00"),
+                         "ai-hub-x is on sys-elsewhere; p00 and no slot take any network.")
+        line = gm.move_network_fit(row, records, "osint")
+        self.assertEqual(line, f"ai-hub-x is on sys-elsewhere; osint takes qubes on: "
+                               f"{', '.join(osint_nets)}. Not on that list, so the command will "
+                               f"refuse it: change its network first.")
+        self.app.vm("ai-hub-x", netvm=self.app.domains["sys-firewall"], power="Halted",
+                    tags={"ai-managed", "qmcp-owner_mcp-control"})
+        with self.assertRaises(fleet.ProjectError):           # and the command does
+            fleet.move(self.app, "ai-hub-x", "osint", confirm=True)
+        row = {"name": "ai-hub-x", "netvm": gm.UNREADABLE}
+        self.assertIn("cannot be read, so the command will refuse the move into osint",
+                      gm.move_network_fit(row, records, "osint"))
 
     def test_builders_refuse_what_the_command_would(self):
         cases = [

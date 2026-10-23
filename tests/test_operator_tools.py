@@ -994,6 +994,111 @@ class Hold(ToolsBase):
         self.assertEqual(held.unowned, ["ai-hub-src-copy"])
         self.assertFalse(self.owned("ai-hub-src-copy"))
 
+    def test_a_decision_that_keeps_failing_the_same_way_is_logged_once(self):
+        # A pass records what it changed: one line for a failure, again only
+        # when it fails another way or succeeds; every pass still reports it.
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        owner = birth.owner_tag(HUB)
+        self.app.fail.add(f"tag.discard:{owner}")
+
+        def owner_lines():
+            return [l for l in self.audit_lines()
+                    if l["args"].get("owner badge") and l["args"]["qube"] == "ai-hub-src-copy"]
+        for _ in range(3):
+            held = restored.hold(self.app)
+            self.assertEqual([n for n, _ in held.owner_failed], ["ai-hub-src-copy"])
+        self.assertEqual([(l["ok"], l["error"]) for l in owner_lines()], [(False, "Injected")])
+        copy = self.app.domains["ai-hub-src-copy"]
+        real = copy.tags.discard
+        copy.tags.discard = lambda tag: None          # fails another way: not read back
+        restored.hold(self.app)
+        restored.hold(self.app)
+        self.assertEqual(len(owner_lines()), 2)
+        self.assertEqual(owner_lines()[-1]["ok"], False)
+        copy.tags.discard = real
+        self.app.fail.discard(f"tag.discard:{owner}")
+        self.assertEqual(restored.hold(self.app).unowned, ["ai-hub-src-copy"])
+        self.assertEqual([l["ok"] for l in owner_lines()], [False, False, True])
+        self.assertEqual([f for f in os.listdir(core.RUN_DIR)
+                          if f.startswith(restored.FAILED_PREFIX)], [])
+
+    def test_a_hold_that_keeps_failing_the_same_way_is_logged_once(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.fail.add(f"tag.add:{core.QUARANTINE}")
+
+        def hold_lines():
+            return [l for l in self.audit_lines()
+                    if l["args"].get("held") and l["args"]["qube"] == "ai-hub-src-copy"]
+        for _ in range(3):
+            self.assertEqual([n for n, _ in restored.hold(self.app).failed], ["ai-hub-src-copy"])
+        self.assertEqual([l["ok"] for l in hold_lines()], [False])
+        self.app.fail.discard(f"tag.add:{core.QUARANTINE}")
+        self.assertEqual(restored.hold(self.app).held, ["ai-hub-src-copy"])
+        self.assertEqual([l["ok"] for l in hold_lines()], [False, True])
+
+    def test_a_new_qube_under_the_name_of_one_that_failed_is_logged_again(self):
+        # The record is the qube's, by UUID: a later qube of the same name that
+        # fails the same way is another qube's failure, and gets its line.
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.fail.add(f"tag.add:{core.QUARANTINE}")
+
+        def hold_lines():
+            return [l for l in self.audit_lines()
+                    if l["args"].get("held") and l["args"]["qube"] == "ai-hub-src-copy"]
+        restored.hold(self.app)
+        restored.hold(self.app)
+        self.assertEqual(len(hold_lines()), 1)
+        old = self.app.domains["ai-hub-src-copy"]
+        old.__dict__["_power"] = "Halted"
+        del self.app.domains["ai-hub-src-copy"]
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.assertNotEqual(self.app.domains["ai-hub-src-copy"].uuid, old.__dict__["_props"]["uuid"])
+        restored.hold(self.app)
+        self.assertEqual(len(hold_lines()), 2)
+
+    def test_a_qube_whose_uuid_does_not_read_logs_every_failure(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.fail.add(f"tag.add:{core.QUARANTINE}")
+        with mock.patch.object(restored, "_failure_key", lambda vm, name: None):
+            restored.hold(self.app)
+            restored.hold(self.app)
+        self.assertEqual(len([l for l in self.audit_lines() if l["args"].get("held")]), 2)
+
+    def test_a_link_or_fifo_planted_at_a_failure_record_is_never_followed(self):
+        # /run/qmcp is the services' group's to write: root's pass must not
+        # write through a link planted at the record or its temporary name, nor
+        # block on a FIFO there. Either way the failure is logged.
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.fail.add(f"tag.add:{core.QUARANTINE}")
+        vm = self.app.domains["ai-hub-src-copy"]
+        path = restored._failure_path("hold", "ai-hub-src-copy", restored._uuid(vm))
+        victim = pathlib.Path(self.tmp) / "victim"
+        victim.write_text("precious")
+        os.symlink(victim, path)
+        os.symlink(victim, f"{path}.{os.getpid()}.tmp")
+        restored.hold(self.app)
+        self.assertEqual(victim.read_text(), "precious")
+        self.assertFalse(os.path.islink(path))                # replaced, not followed
+        os.unlink(path)
+        os.mkfifo(path)
+        restored.hold(self.app)                               # no hang on the FIFO
+        lines = [l for l in self.audit_lines() if l["args"].get("held")]
+        self.assertEqual(len(lines), 2)
+
+    def test_a_failure_record_that_cannot_be_written_still_logs_every_failure(self):
+        src = self.hub_made()
+        self.app.clone_vm(src, "ai-hub-src-copy")
+        self.app.fail.add(f"tag.discard:{birth.owner_tag(HUB)}")
+        with mock.patch.object(restored.os, "replace", side_effect=PermissionError(13, "x")):
+            restored.hold(self.app)
+            restored.hold(self.app)
+        self.assertEqual(len([l for l in self.audit_lines() if l["args"].get("owner badge")]), 2)
+
     def test_a_discard_that_does_not_land_is_a_failed_decision(self):
         src = self.hub_made()
         copy = self.app.clone_vm(src, "ai-hub-src-copy") or self.app.domains["ai-hub-src-copy"]
@@ -2279,9 +2384,11 @@ class Packages(ToolsBase):
                       "install curl || exit $?\n", dnf)
         pac = inqube.install_script("pacman", ["curl"]).decode()
         # Never `-Sy` with names: a partial upgrade. `-Sy`, the check, `-Su`.
-        self.assertIn("pacman --noconfirm -Sy || exit 21", pac)
+        # No 10 s download timeout on either: an anonymising proxy is slower.
+        self.assertIn("pacman --noconfirm --disable-download-timeout -Sy || exit 21", pac)
         self.assertIn('pacman -Si "$n" >/dev/null 2>&1 ||', pac)
-        self.assertIn("\npacman --noconfirm --needed -Su curl || exit $?\n", pac)
+        self.assertIn("\npacman --noconfirm --disable-download-timeout --needed -Su curl "
+                      "|| exit $?\n", pac)
         self.assertNotRegex(pac, r"-Sy[^u\n]*curl")
         for text in (apt, dnf, pac):
             # The check comes first, then the install, whose failure is the

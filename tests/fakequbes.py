@@ -39,10 +39,12 @@ self-escalation bug green through a whole stage. So:
   source). A missing one raises AttributeError, as qubesadmin's
   QubesNoSuchPropertyError does. `template` is there only for an AppVM and a
   DispVM; the other properties modelled here are not trimmed per class;
-- a removed qube's tag read raises a KeyError, as qubesadmin's
-  QubesVMNotFoundError does; its property reads fail with the property-access
-  error, and its power state reads `NA`, as qubesadmin's do; its class, which
-  qubesadmin caches from the domain list, still reads;
+- a removed qube's tag read and tag add, its feature reads and writes and its
+  `property_list()` raise a KeyError, as qubesadmin's QubesVMNotFoundError
+  does, so its `features.get` answers the default and its `tags.discard`
+  nothing; its property reads fail with the property-access error, and its
+  power state reads `NA`, as qubesadmin's do (all measured on Qubes 4.3.2); its
+  class, which qubesadmin caches from the domain list, still reads;
 
 Failures are injected by name through `app.fail`, every read under that key,
 or `app.fail_reads(key, "ok fail")`, some reads in order. A tag read's keys are
@@ -158,6 +160,11 @@ class FakeTags:
         return tag in self._tags
 
     def add(self, tag):
+        # A removed qube's add raises, its discard answers nothing (measured
+        # on Qubes 4.3.2: qubesadmin's discard swallows the KeyError).
+        app, name = self._vm.app, self._vm.__dict__["name"]
+        if app.domains._any(name) is not self._vm:
+            raise InjectedNotFound(f"QubesVMNotFoundError {name}")
         self._vm.app._maybe_fail(f"tag.add:{tag}")
         self._vm.app._maybe_fail("tag.add")
         if not _TAG_RE.match(tag):
@@ -185,7 +192,16 @@ class FakeFeatures(dict):
         super().__init__(items or {})
         self._vm = vm
 
+    def _gone(self):
+        # A stale handle to a removed qube: qubesadmin raises its
+        # QubesVMNotFoundError, a KeyError, so `.get` answers its default
+        # (measured on Qubes 4.3.2).
+        app, name = self._vm.app, self._vm.__dict__["name"]
+        if app.domains._any(name) is not self._vm:
+            raise InjectedNotFound(f"QubesVMNotFoundError {name}")
+
     def _read(self):
+        self._gone()
         app = self._vm.app
         app._maybe_fail("feature.get")
         app._maybe_fail(f"feature.get:{self._vm.__dict__['name']}")
@@ -210,12 +226,14 @@ class FakeFeatures(dict):
         return list(dict.items(self))
 
     def __setitem__(self, key, value):
+        self._gone()
         self._vm.app._maybe_fail("feature.set")
         super().__setitem__(key, value)
         # qubesd applied it, and the reply was lost.
         self._vm.app._maybe_fail("feature.set.landed")
 
     def __delitem__(self, key):
+        self._gone()
         self._vm.app._maybe_fail("feature.remove")
         super().__delitem__(key)
 
@@ -305,6 +323,8 @@ class FakeVM:
     def property_is_default(self, item):
         return item in self.__dict__["_defaults"]
     def property_list(self):
+        if self.app.domains._any(self.__dict__["name"]) is not self:
+            raise InjectedNotFound(f"QubesVMNotFoundError {self.__dict__['name']}")
         self.app._maybe_fail("property_list")
         return sorted((set(_BASE_PROPS) | set(self._props)) - _CLASS_LACKS.get(self.klass, set()))
 
@@ -519,7 +539,7 @@ class FakeProc:
         else:
             last = next((line for line in text.split("\n")
                          if line.startswith(("apt-get install", "dnf -y -q ",
-                                             "pacman --noconfirm --needed -Su"))), text)
+                                             "pacman --noconfirm --disable-download-timeout --needed -Su"))), text)
             last = last.split(" || ")[0]
             names = [w.strip("'") for w in last.split()
                      if not w.startswith("-") and ":" not in w and "=" not in w

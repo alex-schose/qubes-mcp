@@ -533,6 +533,52 @@ def drain_caller(caller: str, timeout: float | None = None) -> int | None:
                             OPERATOR_WAIT_S if timeout is None else timeout, 0.05, True)
 
 
+def read_run_file(path: str, limit: int = 4096) -> str:
+    """A record under `RUN_DIR`, a directory the services' group may write:
+    never through a link, never a FIFO or device (opened non-blocking, then
+    required to be a plain file), at most `limit` bytes, as UTF-8. Raises
+    OSError (FileNotFoundError when absent) or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a plain file")
+        return os.read(fd, limit).decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def write_run_file(path: str, text: str) -> None:
+    """Replace a record under `RUN_DIR` in one rename, 0660 in the directory's
+    group: written to a temporary file created afresh (never opened through a
+    link someone planted at its name, nor one already there), then renamed
+    over the record, which replaces a link at that name rather than following
+    it. Raises OSError, and leaves no temporary file behind."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    old = os.umask(0o007)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o660)
+    finally:
+        os.umask(old)
+    try:
+        try:
+            os.fchmod(fd, 0o660)
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _remove_if_free(path: str) -> str | None:
     """Remove the lock file at `path` under its own lock, exclusive, taken
     without waiting: None when it is gone, or the reason it was left. Never
@@ -884,6 +930,31 @@ def default_dispvm_of(vm):
         return vm.default_dispvm
     except Exception:
         raise Unreadable(f"cannot read the default disposable template of {name_of(vm)}") from None
+
+
+#: A qube's own qube-valued properties besides its template, default
+#: disposable template and network, any of which makes qubesd refuse to
+#: remove the qube it names.
+SERVICE_QUBE_PROPS = ("management_dispvm", "guivm", "audiovm")
+
+
+def service_qubes_of(vm) -> list:
+    """The values of `SERVICE_QUBE_PROPS` the qube has (a class may lack one:
+    `property_list()` says which), None where one is unset. A failed read,
+    of the list or of a value, raises `Unreadable`: never an absence."""
+    try:
+        have = set(vm.property_list())
+    except Exception:
+        raise Unreadable(f"cannot read the properties of {name_of(vm)}") from None
+    out = []
+    for prop in SERVICE_QUBE_PROPS:
+        if prop not in have:
+            continue
+        try:
+            out.append(getattr(vm, prop))
+        except Exception:
+            raise Unreadable(f"cannot read the {prop} of {name_of(vm)}") from None
+    return out
 
 
 def is_guarded(vm, tags=None) -> bool:

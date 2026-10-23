@@ -49,6 +49,7 @@ and `qmcp check` reports the read.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import time
@@ -515,6 +516,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
             if HOLD in tags:
                 # Already held (a copy of a held qube copies the hold, and
                 # 0.9.36 held without deciding): its owner badge is decided here.
+                _failure_cleared("hold", vm, name)
                 origins = _decide(app, vm, name, out, origins)
                 continue
             # The qube's own lock, briefly: a service already past its check
@@ -555,7 +557,8 @@ def hold(app, lock_wait: float | None = None) -> Held:
                     _audit(name, False, "removed by a call that was already running", app=app)
                 else:
                     out.failed.append((name, type(e).__name__))
-                    _audit(name, False, f"not held: {type(e).__name__}", app=app)
+                    if _new_failure("hold", vm, name, type(e).__name__):
+                        _audit(name, False, f"not held: {type(e).__name__}", app=app)
                 continue
             finally:
                 if qfd is not None:
@@ -564,6 +567,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
                 unsettled.append((vm, name))
                 continue
             out.held.append(name)
+            _failure_cleared("hold", vm, name)
             _audit(name, True, app=app)
             # Held first, then its owner badge decided: the hold is the larger
             # restriction, and a held qube's badge grants nothing until accept.
@@ -574,6 +578,7 @@ def hold(app, lock_wait: float | None = None) -> Held:
                        max(0.0, min(HOLD_SETTLE_WAIT_S, settle_by - time.monotonic()))):
                 continue
             out.held.append(name)
+            _failure_cleared("hold", vm, name)
             _audit(name, True, app=app)
             origins = _decide(app, vm, name, out, origins)
     finally:
@@ -589,6 +594,7 @@ def _decide(app, vm, name: str, out: Held, origins):
     `decide_owner`). Returns the pass's Origins, read on first need."""
     try:
         if not _owner_badges(vm) or kept_of(vm) == _uuid(vm):
+            _failure_cleared("owner", vm, name)
             return origins
         if origins is None:
             origins = Origins(app)
@@ -599,8 +605,10 @@ def _decide(app, vm, name: str, out: Held, origins):
         if _is_gone(app, name):
             return origins
         out.owner_failed.append((name, type(e).__name__))
-        _audit_owner(name, False, "not decided", f"{type(e).__name__}", app=app)
+        if _new_failure("owner", vm, name, type(e).__name__):
+            _audit_owner(name, False, "not decided", f"{type(e).__name__}", app=app)
         return origins
+    _failure_cleared("owner", vm, name)
     if what == "removed":
         out.unowned.append(name)
         _audit_owner(name, True, "removed: a copy, or not proven a restore", app=app)
@@ -608,6 +616,57 @@ def _decide(app, vm, name: str, out: Held, origins):
         out.owner_kept.append(name)
         _audit_owner(name, True, "kept: a restore whose original is gone", app=app)
     return origins
+
+
+#: The failure a pass last logged for one qube and one step (`hold`, `owner`),
+#: keyed to the qube's UUID (a later qube of the same name is another qube), under
+#: `core.RUN_DIR`: a step that keeps failing the same way leaves one
+#: audit line, not one every 15 s, since a pass records what it changed. Every
+#: pass still reports the failure (standard error, exit 3); a success, or a
+#: failure of another kind, logs again; a boot clears them.
+FAILED_PREFIX = "gate-failed."
+
+
+def _failure_path(step: str, name: str, uuid: str) -> str:
+    key = hashlib.sha256(f"{step}\0{name}\0{uuid}".encode()).hexdigest()[:32]
+    return os.path.join(str(core.RUN_DIR), FAILED_PREFIX + key)
+
+
+def _failure_key(vm, name: str):
+    try:
+        return _uuid(vm)
+    except core.Unreadable:
+        return None
+
+
+def _new_failure(step: str, vm, name: str, reason: str) -> bool:
+    """True when `reason` is not the failure last logged for this qube and
+    step, and records it. A UUID, or a record, that cannot be read or written
+    counts as new: a line too many is the safe side, a line missing is not."""
+    uuid = _failure_key(vm, name)
+    if uuid is None:
+        return True
+    path = _failure_path(step, name, uuid)
+    try:
+        if core.read_run_file(path, 256) == reason:
+            return False
+    except (OSError, ValueError):
+        pass
+    try:
+        core.write_run_file(path, reason)
+    except OSError:
+        pass
+    return True
+
+
+def _failure_cleared(step: str, vm, name: str) -> None:
+    uuid = _failure_key(vm, name)
+    if uuid is None:
+        return
+    try:
+        os.unlink(_failure_path(step, name, uuid))
+    except OSError:
+        pass
 
 
 def _audit_owner(name: str, ok: bool, what: str, error: str | None = None, app=None) -> None:
@@ -681,7 +740,8 @@ def _settle(app, vm, name: str, out: Held, wait: float | None = None) -> bool:
                     raise RuntimeError("the hold did not read back")
         except Exception as e:
             out.failed.append((name, type(e).__name__))
-            _audit(name, False, f"not held: {type(e).__name__}", app=app)
+            if _new_failure("hold", vm, name, type(e).__name__):
+                _audit(name, False, f"not held: {type(e).__name__}", app=app)
             return True
         return False
     finally:

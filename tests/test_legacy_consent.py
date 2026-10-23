@@ -139,10 +139,11 @@ class Check(ModeBase):
         (home / ".config").mkdir(parents=True)
         home.chmod(0)
         self.addCleanup(home.chmod, 0o700)
-        # Another user's private home is a warning, never INCOMPLETE: the check
-        # runs as the operator, and the process scan still finds a daemon.
+        # Another user's private home is a note, never a warning on every run
+        # nor INCOMPLETE: the process scan still finds a daemon that runs.
         f = self.item(legacy_paths=[str(home / ".config" / "x")], legacy_procs=list)
-        self.assertEqual(f.status, "warn")
+        self.assertEqual(f.status, "pass")
+        self.assertIn("not looked at as this user", f.detail)
         self.assertIn("sudo qmcp check looks", f.detail)
         f = self.item(legacy_paths=[str(home / ".config" / "x")], legacy_procs=lambda: [9])
         self.assertEqual(f.status, "fail")

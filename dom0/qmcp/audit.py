@@ -202,6 +202,23 @@ def _append(record: dict, path: str) -> bool:
         f.close()
 
 
+def _free_aside(path: str, tries: int = 3) -> str:
+    """The rotated log's name, `<log>.<UTC time to the second>`, exactly as
+    retention matches it. A name already taken (a rotation earlier in the same
+    second) waits for the next second rather than adding a suffix no reader
+    would match; the caller holds the log's lock, so no other rotation of this
+    log can take it meanwhile."""
+    import datetime
+    import time
+    for _ in range(tries):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        aside = path + "." + now.strftime("%Y%m%dT%H%M%SZ")
+        if not os.path.lexists(aside):
+            return aside
+        time.sleep(1.0 - now.microsecond / 1e6 + 0.01)
+    raise FileExistsError(aside)
+
+
 def rotate(path: str | None = None, caller: str = "operator") -> str:
     """Keep the log aside and start a new one whose first record anchors on
     the old head, so the chain continues across files. Operator only (root).
@@ -219,8 +236,7 @@ def rotate(path: str | None = None, caller: str = "operator") -> str:
     try:
         seq, head = _tail_state(f)
         st = os.fstat(f.fileno())
-        import datetime
-        aside = path + "." + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        aside = _free_aside(path)
         tmp = path + ROTATING_SUFFIX
         # One left by a rotation killed part-way (it was never renamed in) is
         # taken over: this rotation holds the log's lock, so no other is running.
@@ -242,7 +258,16 @@ def rotate(path: str | None = None, caller: str = "operator") -> str:
             record["hash"] = _body_hash(record)
             _write(nf, record)
         os.link(path, aside)
-        os.rename(tmp, path)
+        try:
+            os.rename(tmp, path)
+        except OSError as e:
+            # The log stays the log: the name it was to move to goes again.
+            try:
+                os.unlink(aside)
+            except OSError:
+                raise OSError(e.errno, f"{e.strerror}, and {aside} is still a second name of "
+                                       f"the live log: remove it (rm {aside})") from e
+            raise
         tmp = None
         # Nothing appends to a rotated log again (a writer that waited for
         # the old lock finds the new file at the name): read-only, so cutting
@@ -1377,24 +1402,57 @@ def verify_links(path: str | None = None) -> tuple[bool, str | None]:
     return True, None
 
 
+def _lines_from_the_end(f, block: int = 65536):
+    """The non-empty lines of a binary file, last first, read backwards in
+    blocks: what iterating it in text mode gives (UTF-8 with replacement,
+    universal newlines, stripped), without reading what comes before the
+    lines wanted. A cut at a newline byte never splits a UTF-8 character."""
+    f.seek(0, os.SEEK_END)
+    pos = f.tell()
+    carry = b""
+    while pos > 0:
+        step = min(block, pos)
+        pos -= step
+        f.seek(pos)
+        segs = (f.read(step) + carry).split(b"\n")
+        carry = segs.pop(0)          # may continue in the block before
+        for seg in reversed(segs):
+            yield from _text_lines(seg)
+    yield from _text_lines(carry)
+
+
+def _text_lines(seg: bytes):
+    for part in reversed(seg.decode("utf-8", errors="replace").split("\r")):
+        part = part.strip()
+        if part:
+            yield part
+
+
 def tail(n: int = 20, path: str | None = None, caller: str | None = None) -> list[dict]:
     """The last `n` records, or with `caller` the last `n` of that caller's
     (a line that does not parse belongs to no caller then). A log that does
     not exist yet has none; one that cannot be read raises, so it is never
-    shown as an empty one."""
+    shown as an empty one. Read from the end, as far back as the lines it
+    returns: the window reads it on every refresh. It verifies nothing
+    (`verify` walks the whole chain)."""
     path = LOG_PATH if path is None else path
+    out = []
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = [s for s in (ln.strip() for ln in f) if s]
+        with open(path, "rb") as f:
+            if n <= 0:
+                return []
+            for line in _lines_from_the_end(f):
+                try:
+                    rec = json.loads(line)
+                except (ValueError, RecursionError):
+                    rec = {"unparseable": line[:200]}
+                if caller is not None and (not isinstance(rec, dict)
+                                           or rec.get("caller") != caller):
+                    continue
+                out.append(rec)
+                if len(out) == n:
+                    break
     except FileNotFoundError:
         return []
-    out = []
-    for line in (lines if caller is not None else lines[-n:]):
-        try:
-            rec = json.loads(line)
-        except (ValueError, RecursionError):
-            rec = {"unparseable": line[:200]}
-        if caller is not None and (not isinstance(rec, dict) or rec.get("caller") != caller):
-            continue
-        out.append(rec)
-    return out[-n:] if n > 0 else []
+    out.reverse()
+    return out

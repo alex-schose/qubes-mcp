@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 1.0.1 — a patch to 1.0.0, 0.9.39's code released as stable.**
+**Status: 1.0.2 — a patch to 1.0.1, which patched 1.0.0, 0.9.39's code released as stable.**
 Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
@@ -58,7 +58,8 @@ nothing happens until the operator accepts it in dom0, in that window or with
 `qmcp proposal accept`. The two
 in-qube services need python3 and `qvm-copy-to-vm` and nothing else; measured
 on Qubes 4.3.1, a lead and its workers run on Debian 13, Fedora 43 and Arch
-templates alike, and dom0 keeps its own copy of them, so
+templates alike (the hub itself was measured on Debian 13 only, though the
+server it runs is the one a lead runs), and dom0 keeps its own copy of them, so
 `qmcp template prepare` writes them into a template or a standalone at any
 time. A qube that comes back from a backup, or is copied by hand, is held for
 your review rather than rejoining a project that may have changed, and
@@ -236,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.1.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.2.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -293,6 +294,14 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 1.0.1? Install over it. The in-qube services do not change, so no
+template reads as behind. `qmcp check` now also fails on a model qube that dom0's
+policy gives Qubes' update proxy (a `whonix-updatevm` tag, or a rule naming it):
+take the tag or the rule off. `qmcp revoke --remove` refuses, before it changes
+anything, a qube another qube uses as its management disposable, GUI or audio
+qube. To roll back, install 1.0.1 over this one; the `gate-failed.*` records it
+leaves under `/run/qmcp` are read by nothing older, and a boot clears them.
 
 Coming from 1.0.0? Install over it. On a box that once ran v0.9.16's consent
 daemon, a `--user` unit in your home that every later install left enabled (and,
@@ -609,7 +618,26 @@ qvm-run --pass-io ai-osint-lead \
 
 Give the lead's agent its own model key. The agent runs in the lead, so its
 MCP client starts the server there (`cd ~/qubes-mcp && exec python3 -m
-qubes_mcp`), with no ssh. `qmcp project`, and the window, also edit, move
+qubes_mcp`), with no ssh.
+
+A lead whose project reads hostile content (web pages, mail, files from
+elsewhere) is best run **tool-only**, so a model a page has talked round can
+do no more than the `qubes_*` tools let it:
+
+1. In the lead's MCP client, make qubes-mcp its only MCP server.
+2. Let the model call only that server's tools. Turn off, or deny, every tool
+   the client has of its own: a shell, reading, writing and editing files,
+   fetching and searching the web, and any a plugin adds.
+3. Keep the model key in the client's own configuration in the lead. No
+   `qubes_*` tool runs anything in the lead itself: each is a call to dom0 or
+   into one of the project's qubes, and a qube cannot call into itself, so
+   the key and the lead's own files are out of the model's reach.
+4. Check it before you rely on it: ask the agent to show a file in the
+   lead's home directory, or to run `id` in the lead. It should say it has no
+   tool for either.
+
+The model still reads what the tools return, and it can still do in the
+project's qubes whatever the tools allow. `qmcp project`, and the window, also edit, move
 qubes between slots, remove or change a lead, and delete a project.
 
 Or let the hub ask: its agent calls `qubes_propose_project` (or another

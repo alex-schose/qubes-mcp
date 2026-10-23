@@ -276,6 +276,40 @@ class Funnel(Base):
         p.write_bytes(lines[0] + b"\n[1]\n")
         self.assertEqual(audit.verify(), (False, 2, "unparseable line 2"))
 
+    def test_two_rotations_in_one_second_keep_both_logs(self):
+        # The rotated name is the time to the second, exactly as retention
+        # matches it: a second rotation within that second waits for the next
+        # one rather than failing at the link or taking another name.
+        import re
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 777})
+        first = audit.rotate()
+        self.call("qmcp.SetPropertyAIManaged", {"name": "ai-work", "property": "memory", "value": 778})
+        frozen = os.path.basename(first).rsplit(".", 1)[1]
+        import datetime
+        real = datetime.datetime
+        calls = []
+
+        class Clock(real):
+            @classmethod
+            def now(cls, tz=None):
+                calls.append(1)
+                t = real.strptime(frozen, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+                if len(calls) == 1:   # still the first rotation's second
+                    return t.replace(microsecond=990000)
+                return t + datetime.timedelta(seconds=1)
+        with mock.patch.object(datetime, "datetime", Clock), \
+                mock.patch("time.sleep") as nap:
+            second = audit.rotate()
+        nap.assert_called_once()
+        self.assertNotEqual(first, second)
+        for aside in (first, second):
+            self.assertRegex(os.path.basename(aside), r"\.\d{8}T\d{6}Z$")
+        names = [n for n, _ in audit.rotated()]
+        self.assertIn(os.path.basename(first), names)
+        self.assertIn(os.path.basename(second), names)
+        self.assertEqual(audit.verify(first), (True, 1, None))
+        self.assertEqual(audit.verify(second), (True, 2, None))
+
     def test_a_rotation_never_leaves_the_log_missing(self):
         # A writer finding no file at the log's name would start a fresh,
         # unanchored chain from GENESIS.
@@ -1088,6 +1122,20 @@ class Creates(Base):
         self.assertTrue(self.spawn()["ok"])
         self.assertEqual(self.tags("ai-hub-new"), {"ai-managed", "qmcp-owner_mcp-control", "anon-vm",
                                                    "qmcp-proj-p00"})
+
+    def test_a_restriction_added_while_the_call_waits_reaches_the_child(self):
+        # The template's tags are read under the create lock, right before
+        # the create: an `anon-vm` put on while the call waited is carried.
+        self.egress("ai-net-router")
+        tpl = self.app.domains["ai-debian-13"]
+        real = budget.acquire_create_lock
+
+        def slow_lock(*a, **kw):
+            tpl.tags.add("anon-vm")
+            return real(*a, **kw)
+        with mock.patch.object(budget, "acquire_create_lock", slow_lock):
+            self.assertTrue(self.spawn()["ok"])
+        self.assertIn("anon-vm", self.tags("ai-hub-new"))
 
     def test_private_size(self):
         self.egress("ai-net-router")
@@ -2302,6 +2350,31 @@ class Windows(Base):
         self.assertFalse(self.tags() & {core.OPEN, core.OPEN_FW}, lines)
         self.assertTrue(any("cannot be told" in line for line in lines), lines)
 
+    def test_a_window_record_is_never_read_or_written_through_a_link(self):
+        # /run/qmcp/open is the services' group's to write: root opens no link
+        # planted at a record or its temporary name, nor blocks on a FIFO.
+        d = pathlib.Path(fleet.WINDOW_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        victim = self.tmp / "victim"
+        victim.write_text("precious")
+        os.symlink(victim, d / "ai-work")
+        os.symlink(victim, d / f"ai-work.{os.getpid()}.tmp")
+        with self.assertRaises(fleet.WindowUnreadable):
+            fleet.read_window("ai-work")                     # a link reads as unreadable
+        self.assertFalse(fleet.kill_pending("ai-work"))
+        fleet.write_window("ai-work", 600, False)
+        self.assertEqual(victim.read_text(), "precious")
+        self.assertFalse((d / "ai-work").is_symlink())
+        self.assertEqual(fleet.read_window("ai-work")["firewall"], False)
+        fleet.mark_kill_pending("ai-work")
+        self.assertTrue(fleet.kill_pending("ai-work"))
+        os.unlink(d / "ai-work")
+        os.mkfifo(d / "ai-work")
+        with self.assertRaises(fleet.WindowUnreadable):
+            fleet.read_window("ai-work")                     # and a FIFO never blocks it
+        self.assertEqual(victim.read_text(), "precious")
+        self.assertEqual(sorted(p.name for p in d.iterdir() if p.name.endswith(".tmp")), [])
+
     def test_a_revoke_whose_kill_fails_keeps_the_seals_pending_kill(self):
         vm = self.app.domains[self.TPL]
         vm.start()
@@ -2898,6 +2971,22 @@ class RemovingAQubeQmcpDidNotCreate(Base):
         self.assertTrue(msg.endswith(", removed"), msg)
         self.assertNotIn("ai-work2", self.app.domains)
 
+    def test_revoke_remove_removes_its_lock_files(self):
+        for name in ("ai-work2", "ai-work"):
+            os.close(core.acquire_qube_lock(name, 1))
+        files = lambda n: [p for p in (core.qube_lock_path(n),
+                                       core.queue_path(core.qube_lock_path(n)))
+                           if os.path.exists(p)]
+        self.assertTrue(files("ai-work2"))
+        fleet.revoke(self.app, "ai-work2", remove=True)
+        self.assertEqual(files("ai-work2"), [])
+        self.assertEqual(len(files("ai-work")), 2)       # another qube's stay
+
+    def test_a_revoke_that_does_not_remove_keeps_the_lock_files(self):
+        os.close(core.acquire_qube_lock("ai-work2", 1))
+        fleet.revoke(self.app, "ai-work2")
+        self.assertTrue(os.path.exists(core.qube_lock_path("ai-work2")))
+
     def test_revoke_remove_kills_a_running_qube_first(self):
         self.assertEqual(self.app.domains["ai-work"].get_power_state(), "Running")
         self.app.vm("ai-leaf", template=self.app.domains["ai-debian-13"], netvm=None,
@@ -2931,6 +3020,22 @@ class RemovingAQubeQmcpDidNotCreate(Base):
                           template_for_dispvms=True, tags={"ai-managed"})
         self.app.domains["ai-work2"]._props["default_dispvm"] = dvm
         self.refused("ai-ddvm", "in use by")
+
+    def test_revoke_remove_refuses_a_qube_another_uses_as_a_service_qube(self):
+        # qubesd refuses to remove a qube any qube's management disposable,
+        # GUI or audio qube is: refused before the revoke, not after it.
+        for prop in core.SERVICE_QUBE_PROPS:
+            with self.subTest(prop=prop):
+                self.app.domains["ai-work"]._props[prop] = self.app.domains["ai-work2"]
+                msg = self.refused("ai-work2", "in use by")
+                self.assertIn("ai-work", msg)
+                self.app.domains["ai-work"]._props[prop] = None
+
+    def test_revoke_remove_refuses_when_a_service_qube_cannot_be_read(self):
+        for prop in core.SERVICE_QUBE_PROPS:
+            with self.subTest(prop=prop):
+                self.app.fail_reads(f"get.{prop}:ai-work", "fail")
+                self.refused("ai-work2", "could not be read")
 
     def test_revoke_remove_refuses_a_qube_outside_ai_space(self):
         # The operator's own command too: one mistyped name is no remove.

@@ -813,6 +813,59 @@ class Retention(ModeBase):
         self.assertEqual(self.cli("audit", "rotate")[0], 0)
         self.assertEqual(len(audit.rotated()), 1)
 
+    def test_a_rotation_by_hand_that_fails_says_so_and_leaves_the_log(self):
+        from unittest import mock
+        self.write_log(audit._utc_now_iso())
+        self.set_install("disk")
+        disk = pathlib.Path(audit.LOG_PATH).read_bytes()
+        with mock.patch.object(audit.os, "link", side_effect=FileExistsError(17, "File exists")):
+            rc, out, err = self.cli("audit", "rotate")
+        self.assertEqual(rc, 1)
+        self.assertIn("not rotated: File exists; the log's content is unchanged", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(pathlib.Path(audit.LOG_PATH).read_bytes(), disk)
+        self.assertEqual(audit.rotated(), [])
+
+    def test_a_rotation_whose_rename_fails_leaves_no_second_name_on_the_log(self):
+        from unittest import mock
+        import os
+        self.write_log(audit._utc_now_iso())
+        self.set_install("disk")
+        disk = pathlib.Path(audit.LOG_PATH).read_bytes()
+        with mock.patch.object(audit.os, "rename", side_effect=OSError(5, "Input/output error")):
+            rc, _, err = self.cli("audit", "rotate")
+        self.assertEqual(rc, 1)
+        self.assertIn("not rotated", err)
+        self.assertEqual(pathlib.Path(audit.LOG_PATH).read_bytes(), disk)
+        self.assertEqual(audit.rotated(), [])
+        self.assertEqual(os.stat(audit.LOG_PATH).st_nlink, 1)
+
+    def test_a_rotation_whose_undo_fails_too_names_the_second_name(self):
+        from unittest import mock
+        self.write_log(audit._utc_now_iso())
+        self.set_install("disk")
+        import re
+        real_unlink = audit.os.unlink
+
+        def unlink(p, *a, **kw):
+            if re.search(r"\.\d{8}T\d{6}Z$", str(p)):        # the aside only
+                raise OSError(1, "Operation not permitted")
+            return real_unlink(p, *a, **kw)
+        with mock.patch.object(audit.os, "rename", side_effect=OSError(5, "Input/output error")), \
+                mock.patch.object(audit.os, "unlink", unlink):
+            rc, _, err = self.cli("audit", "rotate")
+        self.assertEqual(rc, 1)
+        self.assertIn("is still a second name of the live log: remove it", err)
+
+    def test_tail_of_a_log_that_does_not_read_raises_even_for_none(self):
+        import os
+        from unittest import mock
+        self.write_log(audit._utc_now_iso())
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "x")):
+            for n in (0, 5):
+                with self.assertRaises(PermissionError):
+                    audit.tail(n)
+
     def test_the_command_is_roots(self):
         rc, _, _ = self.cli("audit", "rotate", "--auto", root=False)
         self.assertNotEqual(rc, 0)
@@ -930,6 +983,85 @@ class TailByCaller(ModeBase):
         self.assertEqual(len(audit.tail(5, caller=HUB)), 5)
         self.assertEqual(audit.tail(10, caller="nobody"), [])
         self.assertEqual(audit.tail(0, caller=HUB), [])
+
+    @staticmethod
+    def _whole_file_tail(n, path, caller=None):
+        # 1.0.1's tail, which read the whole log: the oracle.
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [s for s in (ln.strip() for ln in f) if s]
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in (lines if caller is not None else lines[-n:]):
+            try:
+                rec = json.loads(line)
+            except (ValueError, RecursionError):
+                rec = {"unparseable": line[:200]}
+            if caller is not None and (not isinstance(rec, dict) or rec.get("caller") != caller):
+                continue
+            out.append(rec)
+        return out[-n:] if n > 0 else []
+
+    def test_tail_from_the_end_gives_what_reading_the_whole_log_gave(self):
+        import random
+        rnd = random.Random(1002)
+        pieces = [b'{"caller": "a", "seq": 1}', b'{"caller": "b", "seq": 2}', b"torn {",
+                  "\u00e9\u4e2d\U0001f600".encode(), b"\xff\xfe bad utf-8", b"", b"   ",
+                  b"x\ry", b"\r", b"[1]", b'{"caller": "a", "s": "\xc3\xa9"}']
+        path = str(self.tmp / "oracle.log")
+        for trial in range(200):
+            data = b"".join(rnd.choice(pieces) + rnd.choice([b"\n", b"\r\n", b"", b"\n\n"])
+                            for _ in range(rnd.randint(0, 40)))
+            pathlib.Path(path).write_bytes(data)
+            block = rnd.choice([1, 2, 3, 7, 64, 65536])
+            for n in (0, 1, 3, 10, 100):
+                for caller in (None, "a", "b", "z"):
+                    with mock.patch.object(audit, "_lines_from_the_end",
+                                           lambda f, _b=block, _real=audit._lines_from_the_end:
+                                           _real(f, _b)):
+                        got = audit.tail(n, path, caller=caller)
+                    self.assertEqual(got, self._whole_file_tail(n, path, caller),
+                                     (trial, block, n, caller, data))
+
+    def test_tail_reads_only_as_far_back_as_it_needs(self):
+        for _ in range(3000):
+            audit.audit("qmcp.SetPropertyAIManaged", HUB, {"name": "ai-work2"}, True)
+        size = os.path.getsize(audit.LOG_PATH)
+        self.assertGreater(size, 4 * 65536)
+        read = []
+        real_open = open
+
+        class Counted:
+            # Every byte or character handed out, by read() or by iteration.
+            def __init__(self, f):
+                self._f = f
+
+            def __getattr__(self, k):
+                return getattr(self._f, k)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self._f.close()
+
+            def read(self, k=-1):
+                b = self._f.read(k)
+                read.append(len(b))
+                return b
+
+            def __iter__(self):
+                for line in self._f:
+                    read.append(len(line))
+                    yield line
+
+        def counting_open(*a, **kw):
+            return Counted(real_open(*a, **kw))
+        with mock.patch("builtins.open", counting_open):
+            self.assertEqual(len(audit.tail(10)), 10)
+        self.assertGreater(sum(read), 0)
+        self.assertLessEqual(sum(read), 65536)
 
     def test_the_command_refuses_a_caller_that_is_no_name(self):
         out, err = io.StringIO(), io.StringIO()

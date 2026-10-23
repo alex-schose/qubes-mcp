@@ -597,6 +597,8 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         f"{', '.join(sorted(dd))} (qmcp migrate --apply pins them)" if dd else "none")
 
     # 9. the policy: installed, unmodified, and parseable by qrexec itself
+    # (kept for the model-qube item, which asks it where updates go)
+    loaded_policy = loaded_si = None
     installed = os.path.join(policy_dir, POLICY_NAME)
     shipped = os.path.join(lib_dir, "share", POLICY_NAME)
     try:
@@ -626,6 +628,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("pass", "policy parses", f"{policy_dir} loads in qrexec's parser")
         try:
             si = qrexec.utils.get_system_info() if system_info is None else system_info
+            loaded_policy, loaded_si = policy, si
             problems = precedence(policy, si, hub or "mcp-control")
             add("fail" if problems else "pass", "policy precedence",
                 "; ".join(problems[:5]) + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
@@ -890,10 +893,11 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("error", "v0.9.16 leftovers", f"cannot tell: the process list does not read "
                                           f"({procs_read})")
     elif unread:
-        # A unit whose program the installer removed runs nothing; another
-        # user's private home is theirs, and root's install looks in it.
-        add("warn", "v0.9.16 leftovers", f"none found, but these cannot be looked at as this "
-                                         f"user: {', '.join(unread)} (sudo qmcp check looks)")
+        # A unit whose program the installer removed runs nothing, and the
+        # process scan above finds a daemon that runs: another user's private
+        # home it cannot read is a note, not a warning on every run.
+        add("pass", "v0.9.16 leftovers", f"none running or found; not looked at as this user: "
+                                         f"{', '.join(unread)} (sudo qmcp check looks)")
     else:
         add("pass", "v0.9.16 leftovers", "none")
 
@@ -912,7 +916,8 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("pass", "project records",
             f"{sum(1 for p in records.values() if p.label)} project(s) in {projects.PROJECTS_PATH}")
     out.extend(project_findings(vms, by_name, records, prefix, registry, tags_by))
-    out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub))
+    out.extend(model_qube_findings(app, vms, by_name, records, tags_by, hub,
+                                   policy=loaded_policy, system_info=loaded_si))
     out.extend(lead_firewall_findings(app, by_name, records))
     out.extend(anonymity_findings(app, vms, records, tags_by, registry, hub))
     inqube.findings(vms, records, tags_by, add, os.path.join(lib_dir, "template-rpc"))
@@ -1889,7 +1894,8 @@ def _dump_slots(tags) -> set:
     return {p[1] for p in map(projects.slot_badge_parts, tags) if p and p[0] == "dump"}
 
 
-def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, hub) -> list:
+def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, hub,
+                        policy=None, system_info=None) -> list:
     """The model qubes, judged by the badges the rulebook routes on. A lead
     reaches whatever wears its slot's model badge on port 11434 (but the hub,
     a lead or a drop box, which the rulebook refuses first), so a badge in the
@@ -1897,7 +1903,10 @@ def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, h
     a way out for the lead around the firewall the operator owns: Ollama
     fetches a "model" from any host it is told to), outside AI space, on a
     member, lead, template, gateway, drop box or the hub, on a qube whose
-    template the hub manages, or a badge its slot's record does not name. An
+    template the hub manages, or a badge its slot's record does not name; and
+    on a qube dom0's policy gives Qubes' update proxy, an HTTP proxy out
+    around "no network" (a `whonix-updatevm` tag, or a rule naming it), asked
+    of qrexec's parser as the anonymity gate asks it. An
     un-guarded model qube is a warning: the operator's maintenance window,
     during which the hub may operate it. So is a recorded model qube that is
     gone or unbadged: its lead just cannot reach it."""
@@ -1945,6 +1954,18 @@ def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, h
             net = None
         if net is not None:
             bad.append(f"{name} has a network ({net}): its leads reach that network through it")
+        if policy is None or system_info is None:
+            unread.append(f"where dom0's policy sends the updates of {name} (the policy did not load)")
+        else:
+            from qmcp import anon
+            try:
+                target = anon.update_target(policy, system_info, name)
+            except anon.PolicyUnreadable as e:
+                unread.append(str(e))
+                target = None
+            if target is not None:
+                bad.append(f"{name}: dom0's policy gives it the update proxy ({target}), so its "
+                           f"leads reach the network through it all the same")
         if core.GUARDED not in tags:
             warn.append(f"{name} is not guarded: while it serves "
                         f"{', '.join(sorted(slots))}, the hub may operate it (qmcp guard {name} "
@@ -1965,7 +1986,8 @@ def model_qube_findings(app, vms, by_name: dict, records: dict, tags_by: dict, h
         out.append(Finding("error", "model qubes", note[2:]))
     else:
         out.append(Finding("pass", "model qubes",
-                           f"{len(holders)} model qube(s), each in AI space with no network, in no "
+                           f"{len(holders)} model qube(s), each in AI space with no network and no update "
+                           f"proxy, in no "
                            f"slot, and named by its projects' records" if holders else "none"))
     if warn:
         out.append(Finding("warn", "model qubes", "; ".join(warn)))
@@ -2718,9 +2740,15 @@ def revoke(app, name, shutdown: bool = True, from_hub: bool = False, remove: boo
     it (`--remove`, or an accepted `qube-revoke` with `remove`): the hub's way
     to have a qube without an owner badge removed, besides deleting a project
     it is a member of (the services refuse such a remove)."""
-    return _with_qube_lock(name, False,
-                           lambda held: _revoke(app, name, shutdown, from_hub, remove),
-                           settle=lambda: _settle_kill(app, name) if shutdown else "")
+    out = _with_qube_lock(name, False,
+                          lambda held: _revoke(app, name, shutdown, from_hub, remove),
+                          settle=lambda: _settle_kill(app, name) if shutdown else "")
+    if remove:
+        # Removed: its lock file and turnstile go too, as for every remove qmcp
+        # makes, once this command has let the lock go (a file a call holds by
+        # then is left for the gate's sweep; it grants nothing).
+        core.retire_qube_locks(name)
+    return out
 
 
 def _settle_kill(app, name) -> str:
@@ -2744,11 +2772,11 @@ def _remove_refusal(app, vm, name, tags, plan: bool = False) -> str | None:
     changes; None when it may. A guarded qube (a gateway is one), a model qube
     (by record or badge), a project's recorded lead, dump sink, approved
     template or worker network, a qube others are built on, start disposables
-    from or reach the network through, and one a global setting names. A lead
+    from, reach the network through or use as their management disposable, GUI
+    or audio qube, and one a global setting names. A lead
     by its badges and the drop box are refused before this (`_not_in_a_slot`,
-    `_target`). A read that fails refuses: a remove cannot be undone. Qubes
-    refuses more than this sees (another qube's management disposable, GUI or
-    audio qube): such a remove fails after the revoke, which says so. `plan`: for `proposal show`, where a
+    `_target`). A read that fails refuses: a remove cannot be undone. A remove
+    Qubes refuses all the same fails after the revoke, which says so. `plan`: for `proposal show`, where a
     read that failed proves nothing, so it gives no reason (`_refusal_seen`)."""
     if plan:
         try:
@@ -2784,7 +2812,8 @@ def _remove_refusal(app, vm, name, tags, plan: bool = False) -> str | None:
                 oname = core.name_of(other)
                 if oname == name:
                     continue
-                refs = (core.template_of(other), core.default_dispvm_of(other))
+                refs = (core.template_of(other), core.default_dispvm_of(other),
+                        *core.service_qubes_of(other))
                 if any(r is not None and _ref_name(r) == name for r in refs) \
                         or core.netvm_of(other) == name:
                     users.append(oname)
@@ -2800,7 +2829,8 @@ def _remove_refusal(app, vm, name, tags, plan: bool = False) -> str | None:
     if users:
         shown = ", ".join(sorted(users)[:5]) + (", ..." if len(users) > 5 else "")
         return (f"'{name}' is in use by {len(users)} qube(s) (their template, default "
-                f"disposable template or network): {shown}; qubesd would refuse the remove")
+                f"disposable template, network, management disposable, GUI or audio qube): "
+                f"{shown}; qubesd would refuse the remove")
     return None
 
 
@@ -2984,8 +3014,7 @@ def read_window(name: str, dir_: str | None = None) -> dict:
     """
     path = _window_path(name, dir_)
     try:
-        with open(path, encoding="utf-8") as fh:
-            rec = json.loads(fh.read(4096))
+        rec = json.loads(core.read_run_file(path))
     except FileNotFoundError:
         raise WindowUnreadable(f"'{name}' wears an open badge and has no window record") from None
     except (OSError, ValueError, RecursionError) as e:
@@ -3040,13 +3069,7 @@ def write_window(name: str, seconds: int, firewall: bool, dir_: str | None = Non
     now = int(time.time())
     rec = {"opened": now, "expires": now + seconds, "firewall": bool(firewall),
            "boot_expires": int(_boot_clock()) + seconds}
-    old = os.umask(0o007)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
-    finally:
-        os.umask(old)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    core.write_run_file(path, json.dumps(rec, sort_keys=True) + "\n")
     return rec
 
 
@@ -3083,23 +3106,13 @@ def mark_kill_pending(name: str, dir_: str | None = None, vm=None) -> None:
     """Replace the record with a pending kill (`KILL_PENDING`, plus `_run_of`
     the qube when it is given), in one rename. Raises OSError."""
     rec = dict(KILL_PENDING, **({} if vm is None else _run_of(vm)))
-    path = _window_path(name, dir_)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    old = os.umask(0o007)
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
-    finally:
-        os.umask(old)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    core.write_run_file(_window_path(name, dir_), json.dumps(rec, sort_keys=True) + "\n")
 
 
 def _pending_record(name: str, dir_: str | None = None) -> dict | None:
     """The pending kill recorded for `name`, or None."""
     try:
-        with open(_window_path(name, dir_), encoding="utf-8") as fh:
-            rec = json.loads(fh.read(4096))
+        rec = json.loads(core.read_run_file(_window_path(name, dir_)))
     except (OSError, ValueError, RecursionError, WindowUnreadable):
         return None
     return rec if isinstance(rec, dict) and rec.get("kill") is True else None

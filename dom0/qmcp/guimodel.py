@@ -3850,6 +3850,43 @@ def shut_down_first(row, where: str) -> str | None:
             f"({how}), then try again")
 
 
+def move_tick(records: dict, current, target_slot) -> str | None:
+    """Why the Move form's tick is needed, in its words, or None: when `qmcp
+    project move` without `--yes` would refuse (`fleet.move`): a move into,
+    out of or between anonymous projects, or out of one slot into another (no
+    slot is not a slot). `current`: the qube's slot as the view has it."""
+    current = current or None
+    if current == target_slot:
+        return None
+    if move_warnings(records, current, target_slot):
+        return "tick the box: it moves into or out of anonymous space"
+    if current is not None and target_slot is not None:
+        return f"tick the box: it leaves {current}"
+    return None
+
+
+def move_network_fit(row: dict, records: dict, target) -> str:
+    """What the Move form shows of the qube's network before OK: a project
+    takes a qube only with no network or on one of its worker networks
+    (`fleet.move`); p00 and no slot take any. The command decides."""
+    name = row.get("name")
+    net = row.get("netvm") or "none"
+    if net == "none":
+        return f"{name} has no network: any project takes it, and p00 and no slot too."
+    rec = next((r for r in records.values() if r.get("label") == target), None)
+    if rec is None:
+        on = "'s network cannot be read" if net == UNREADABLE else f" is on {net}"
+        return f"{name}{on}; p00 and no slot take any network."
+    if net == UNREADABLE:
+        return (f"the network of {name} cannot be read, so the command will refuse the move "
+                f"into {target} until it reads.")
+    nets = ["none" if n is None else n for n in rec.get("networks") or ()]
+    fits = net in nets
+    return (f"{name} is on {net}; {target} takes qubes on: {', '.join(nets) or '-'}."
+            + ("" if fits else
+               " Not on that list, so the command will refuse it: change its network first."))
+
+
 def move_warnings(records: dict, current, target_slot) -> list:
     """What the command says before a move into, out of or between anonymous
     projects (`fleet.move_warnings`), from the records on show; empty for a

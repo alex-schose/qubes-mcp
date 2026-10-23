@@ -1065,24 +1065,7 @@ class MoveForm(Form):
         self.done_building()
 
     def network_fit(self, target) -> str:
-        """What the command will judge, shown before OK: a project takes a qube
-        only on one of its worker networks, or with none. The command decides."""
-        net = self.row_data.get("netvm") or "none"
-        if net == "none":
-            return (f"{self.row_data.get('name')} has no network: any project takes it, and "
-                    f"p00 and no slot too.")
-        rec = next((r for r in self._records.values() if r.get("label") == target), None)
-        if rec is None:
-            on = "'s network cannot be read" if net == gm.UNREADABLE else f" is on {net}"
-            return f"{self.row_data.get('name')}{on}; p00 and no slot take any network."
-        if net == gm.UNREADABLE:
-            return (f"the network of {self.row_data.get('name')} cannot be read, so the command "
-                    f"will refuse the move into {target} until it reads.")
-        nets = ["none" if n is None else n for n in rec.get("networks") or ()]
-        fits = net in nets
-        return (f"{self.row_data.get('name')} is on {net}; {target} takes qubes on: "
-                f"{', '.join(nets) or '-'}." + ("" if fits else
-                " Not on that list, so the command will refuse it: change its network first."))
+        return gm.move_network_fit(self.row_data, self._records, target)
 
     def _target_slot(self, target):
         if target in (None, "none"):
@@ -1100,16 +1083,15 @@ class MoveForm(Form):
         # In red, in the form's own warning line: what the qube carries with it.
         _set(self.warning, esc(("; ".join(warnings) + ".")[:1].upper()
                                + ("; ".join(warnings) + ".")[1:] if warnings else ""))
-        crossing = bool(self.current) and slot not in (None, self.current)
-        needs = crossing or bool(warnings)
+        tick = gm.move_tick(self._records, self.current, slot) if moving else None
+        needs = tick is not None
         if moving and {self.current, slot} - {None, "p00"}:
             refusal = gm.shut_down_first(self.row_data, f"into {slot or 'no slot'}")
             if refusal:
                 raise gm.FormError(refusal)
         self.confirm.set_sensitive(needs)
         if needs and not self.confirm.get_active():
-            raise gm.FormError("tick the box: it moves into or out of anonymous space"
-                               if warnings else f"tick the box: it leaves {self.current}")
+            raise gm.FormError(tick)
         return gm.move(self.row_data.get("name"), target, confirm=needs)
 
 
