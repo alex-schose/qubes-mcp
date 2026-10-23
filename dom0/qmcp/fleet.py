@@ -53,6 +53,80 @@ LEGACY_PATHS = (
     "/etc/qmcp/budget.lock", "/etc/qmcp/tombstone-retention", "/etc/qmcp/guarded",
 )
 
+#: v0.9.16's consent daemon ran as a systemd --user unit of the operator's (its
+#: installer took SUDO_USER, else uid 1000), wanted by the graphical session,
+#: and listened in /run/qmcp, which 0.9.17 took over. It is in a home, so it is
+#: not in LEGACY_PATHS: `legacy_user_paths()` names it, `legacy_daemons()` finds
+#: one still running, and the installer stops it and removes all of this.
+LEGACY_USER_UNIT = "qmcp-consent.service"
+LEGACY_DAEMON = "qmcp-consentd"
+LEGACY_SOCKET = "/run/qmcp/consent.sock"
+
+
+def legacy_users(group: str = "qubes") -> list:
+    """[(user, home)] of every account v0.9.16's user unit may sit under: the
+    members of `group`, then uid 1000, each once. Never root: its installer
+    took SUDO_USER, and a dom0 operator does not run sudo from a root shell."""
+    import grp
+    import pwd
+    names = []
+    try:
+        names += list(grp.getgrnam(group).gr_mem)
+    except KeyError:
+        pass
+    try:
+        names.append(pwd.getpwuid(1000).pw_name)
+    except KeyError:
+        pass
+    out: list = []
+    for name in names:
+        if name == "root" or any(name == u for u, _ in out):
+            continue
+        try:
+            home = pwd.getpwnam(name).pw_dir
+        except KeyError:
+            continue
+        # Root resolves these paths: an empty or relative home would resolve
+        # against its working directory; the installer reads one per line.
+        if os.path.isabs(home) and home.strip("/") and not set(home) & {"\t", "\n"}:
+            out.append((name, home))
+    return out
+
+
+def legacy_home_paths(home: str) -> list:
+    """The unit and its wants link in one home."""
+    d = os.path.join(home, ".config", "systemd", "user")
+    return [os.path.join(d, LEGACY_USER_UNIT),
+            os.path.join(d, "graphical-session.target.wants", LEGACY_USER_UNIT)]
+
+
+def legacy_user_paths(users=None) -> list:
+    """The unit and its wants link in each of `users`' homes
+    (`legacy_users()` by default), then the daemon's socket."""
+    users = legacy_users() if users is None else users
+    return [p for _, home in users for p in legacy_home_paths(home)] + [LEGACY_SOCKET]
+
+
+def legacy_daemons(proc: str = "/proc") -> list:
+    """The pids whose command line runs v0.9.16's consent daemon (it keeps
+    running from the file the installer deleted), lowest first. Raises
+    OSError when `proc` does not list: none found is then not known."""
+    out = []
+    for pid in [n for n in os.listdir(proc) if n.isdigit()]:
+        try:
+            with open(os.path.join(proc, pid, "cmdline"), "rb") as fh:
+                argv = fh.read(4096).split(b"\0")
+        except OSError:
+            continue        # gone, or not ours to read
+        names = [os.path.basename(a) for a in argv[:2]] + [b""]
+        # Run as its unit ran it (the script's #! line puts python first), never
+        # a pager or an editor that has the file open.
+        if names[0] == LEGACY_DAEMON.encode() or \
+                (names[0].startswith(b"python") and names[1] == LEGACY_DAEMON.encode()):
+            out.append(int(pid))
+    return sorted(out)
+
+
 #: The other v0.9.16 flag a migration retires (TIER_DEFAULT_PATH is the first).
 ENFORCE_MODE_PATH = "/etc/qmcp/enforce-mode"
 
@@ -275,11 +349,14 @@ def policy_hub(path: str) -> str | None:
 # ------------------------------------------------------------------ check
 
 def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
-          rpc_dir: str | None = None, legacy_paths=None, system_info=None) -> list:
+          rpc_dir: str | None = None, legacy_paths=None, system_info=None,
+          legacy_procs=None) -> list:
     policy_dir = POLICY_DIR if policy_dir is None else policy_dir
     lib_dir = LIB_DIR if lib_dir is None else lib_dir
     rpc_dir = RPC_DIR if rpc_dir is None else rpc_dir
-    legacy_paths = LEGACY_PATHS if legacy_paths is None else legacy_paths
+    legacy_paths = (LEGACY_PATHS + tuple(legacy_user_paths())) if legacy_paths is None \
+        else legacy_paths
+    legacy_procs = legacy_daemons if legacy_procs is None else legacy_procs
     out: list = []
     add = lambda *a: out.append(Finding(*a))  # noqa: E731
 
@@ -790,9 +867,35 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     _boot_seal_item(add)
 
     # 14. nothing of v0.9.16 left behind
-    left = [p for p in legacy_paths if os.path.lexists(p)]
-    add("fail" if left else "pass", "v0.9.16 leftovers",
-        f"still present: {', '.join(left)}" if left else "none")
+    left, unread = [], []
+    for p in legacy_paths:
+        try:
+            os.lstat(p)
+            left.append(p)
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            unread.append(p)    # another user's home: absent is not known
+    try:
+        running, procs_read = legacy_procs(), True
+    except OSError as e:
+        running, procs_read = [], type(e).__name__
+    if running:
+        left.append(f"{LEGACY_DAEMON} running (pid {', '.join(map(str, running))}; "
+                    f"sudo kill {' '.join(map(str, running))})")
+    if left:
+        add("fail", "v0.9.16 leftovers", f"still present: {', '.join(left)}")
+    elif procs_read is not True:
+        # The scan is what finds a daemon that runs, wherever its unit sits.
+        add("error", "v0.9.16 leftovers", f"cannot tell: the process list does not read "
+                                          f"({procs_read})")
+    elif unread:
+        # A unit whose program the installer removed runs nothing; another
+        # user's private home is theirs, and root's install looks in it.
+        add("warn", "v0.9.16 leftovers", f"none found, but these cannot be looked at as this "
+                                         f"user: {', '.join(unread)} (sudo qmcp check looks)")
+    else:
+        add("pass", "v0.9.16 leftovers", "none")
 
     # 14b. qubes back from a backup or a copy, held for the operator's review
     restored.findings(app, add)
@@ -3615,6 +3718,18 @@ def _audit_retention(add, records, mode) -> None:
     if os.path.exists(audit.LOG_PATH + audit.ROTATING_SUFFIX):
         add("warn", "audit retention", f"{audit.LOG_PATH}{audit.ROTATING_SUFFIX} is there: a "
                                        f"rotation stopped part-way; the next one takes it over")
+    try:
+        foreign = audit.unpruned()
+    except OSError as e:
+        foreign = None
+        add("error", "audit retention", f"{os.path.dirname(audit.LOG_PATH)} does not list "
+                                        f"({type(e).__name__})")
+    if foreign:
+        shown = ", ".join(foreign[:5]) + (f" and {len(foreign) - 5} more" if len(foreign) > 5 else "")
+        add("warn", "audit retention", f"{shown} in {os.path.dirname(audit.LOG_PATH)}: not named "
+                                       f"as `qmcp audit rotate` names a log, so no retention "
+                                       f"removes it; once it is kept where you want it, remove "
+                                       f"it by hand")
     try:
         with open(audit.CLOCK_MOVED_PATH, encoding="utf-8", errors="replace") as fh:
             moved = fh.read(512).strip() or "the clock moved"

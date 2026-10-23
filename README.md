@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 1.0.0 — 0.9.39's code, released as stable.**
+**Status: 1.0.1 — a patch to 1.0.0, 0.9.39's code released as stable.**
 Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
@@ -236,7 +236,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.0.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.1.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -293,6 +293,14 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 1.0.0? Install over it. On a box that once ran v0.9.16's consent
+daemon, a `--user` unit in your home that every later install left enabled (and,
+until the next reboot, running), it stops the daemon and removes the unit and its
+socket.
+`qmcp check` now fails while any of that is there, and warns on a file beside the
+audit log, such as `qmcp-audit.log.1`, that no retention removes. To roll back,
+install 1.0.0 over this one.
 
 Coming from 0.9.39? Install over it. The code does not change, only the
 version: no template reads as behind. The installer still seals every open

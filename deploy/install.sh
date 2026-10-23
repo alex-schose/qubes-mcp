@@ -568,7 +568,77 @@ for unit in qmcp-consent.service qmcp-tombstone-reaper.timer qmcp-tombstone-reap
         say "stopped and disabled $unit"
     fi
 done
-LEGACY="$(PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import fleet; print("\n".join(fleet.LEGACY_PATHS))')"
+# v0.9.16's consent daemon was a --user unit of the operator's, and it listened
+# in /run/qmcp, which is ours now. Stop it through each user's own manager, end
+# any copy still running, then remove its unit and wants link (as the home's
+# owner) and its socket (with the files below).
+LEGACY_USERS="$(PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import fleet
+for user, home in fleet.legacy_users():
+    print(user + "\t" + home)')" || die "the dom0 users could not be read"
+# The unit and its wants link in one home (an absolute one: legacy_users() says so).
+home_paths() { PYTHONPATH="$SRC/dom0" python3 -c 'import sys
+from qmcp import fleet
+print("\n".join(fleet.legacy_home_paths(sys.argv[1])))' "$1"; }
+while IFS=$'\t' read -r user home; do
+    [ -n "$user" ] || continue
+    uid="$(id -u -- "$user")"
+    [ -S "/run/user/$uid/bus" ] || continue
+    paths="$(home_paths "$home")" || die "the v0.9.16 paths in $home could not be read"
+    found=0
+    while IFS= read -r path; do
+        if [ -e "$path" ] || [ -L "$path" ]; then found=1; fi
+    done <<< "$paths"
+    [ "$found" = 1 ] || continue
+    as_user() { timeout -k 5 30 sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"; }
+    rc=0; as_user disable --now qmcp-consent.service >/dev/null 2>&1 || rc=$?
+    state="$(as_user is-active qmcp-consent.service 2>/dev/null || true)"
+    if [ "$rc" = 0 ] && { [ "$state" = inactive ] || [ "$state" = failed ]; }; then
+        say "stopped and disabled $user's qmcp-consent.service"
+    else
+        say "WARN: $user's qmcp-consent.service did not stop (status $rc, ${state:-no state}); the next step ends it"
+    fi
+done <<< "$LEGACY_USERS"
+# Its program goes first, so a unit that restarts what is killed below has
+# nothing left to run (v0.9.16's restarts after 2 s).
+rm -f /usr/local/lib/qmcp/qmcp-consentd
+legacy_daemons() { timeout -k 5 15 env PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import fleet
+print(" ".join(map(str, fleet.legacy_daemons())))'; }
+PIDS="$(legacy_daemons)" || die "the running processes could not be read"
+if [ -n "$PIDS" ]; then
+    # shellcheck disable=SC2086  # a list of pids
+    kill $PIDS 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        sleep 1
+        PIDS="$(legacy_daemons)" || die "the running processes could not be read"
+        [ -n "$PIDS" ] || break
+    done
+    # shellcheck disable=SC2086
+    [ -z "$PIDS" ] || kill -9 $PIDS 2>/dev/null || true
+    sleep 1
+    PIDS="$(legacy_daemons)" || die "the running processes could not be read"
+    if [ -z "$PIDS" ]; then
+        say "ended the v0.9.16 consent daemon"
+    else
+        say "WARN: the v0.9.16 consent daemon still runs (pid $PIDS); qmcp check fails until it ends"
+    fi
+fi
+# Its unit and wants link sit in a home, so they go as that home's owner: root
+# never follows a path its user controls.
+while IFS=$'\t' read -r user home; do
+    [ -n "$user" ] || continue
+    paths="$(home_paths "$home")" || die "the v0.9.16 paths in $home could not be read"
+    while IFS= read -r path; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            if sudo -u "$user" rm -f -- "$path"; then
+                say "removed v0.9.16 file $path"
+            else
+                say "WARN: could not remove $path as $user"
+            fi
+        fi
+    done <<< "$paths"
+done <<< "$LEGACY_USERS"
+LEGACY="$(PYTHONPATH="$SRC/dom0" python3 -c 'from qmcp import fleet
+print("\n".join(fleet.LEGACY_PATHS + (fleet.LEGACY_SOCKET,)))')"
 while IFS= read -r path; do
     if [ -e "$path" ] || [ -L "$path" ]; then
         rm -f "$path"

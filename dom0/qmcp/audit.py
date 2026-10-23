@@ -1080,6 +1080,22 @@ def rotated(path: str | None = None) -> list:
     return sorted(out, key=lambda x: x[1])
 
 
+def unpruned(path: str | None = None) -> list:
+    """The files beside `path` named like a rotated log of it that `rotated()`
+    does not list (a hand copy, or another tool's rotation, such as `.1`), and
+    that this module does not write either: no retention ever removes them.
+    Sorted."""
+    path = LOG_PATH if path is None else path
+    d, base = os.path.dirname(path) or ".", os.path.basename(path) + "."
+    ours = {n for n, _ in rotated(path)} | {
+        os.path.basename(path) + s for s in (ROTATING_SUFFIX, PAD_SUFFIX)}
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return []
+    return sorted(n for n in names if n.startswith(base) and n not in ours)
+
+
 def _first_record(path: str):
     """The log's first record, or None for an empty one. Raises OSError for
     one that does not read, ValueError for a first line that does not parse."""

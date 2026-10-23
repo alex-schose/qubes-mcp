@@ -25,6 +25,33 @@ From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how.
 
 Nothing — the working tree is the last released version.
 
+## [1.0.1] — 2026-10-23
+
+A patch: v0.9.16's consent daemon no longer survives an install.
+
+### Fixed
+
+- **v0.9.16's consent daemon survived every install.** That release ran it as a systemd `--user`
+  unit of the operator's (`~/.config/systemd/user/qmcp-consent.service`, wanted by
+  `graphical-session.target`), listening on `/run/qmcp/consent.sock`. The installer removed the
+  daemon's file but neither stopped it nor removed the unit: until the next reboot it went on
+  running from the deleted file inside `/run/qmcp`, and the unit stayed enabled, to fail at each
+  login. Nothing in 0.9.17 or later talks to it. The installer now stops the unit through the
+  user's own manager, for every member of `qubes` and uid 1000 that has a session, ends any copy
+  still running, removes the unit and its wants link as the home's owner, and removes the socket.
+  `qmcp check`'s "v0.9.16 leftovers" fails on any of them and names a running daemon's pids; a
+  process list that does not read is an error, and a home it cannot read as the user running it is
+  a warning, not "none".
+- **`qmcp check` did not see rotated audit logs that no retention removes.** Retention removes
+  only the names `qmcp audit rotate` makes (`qmcp-audit.log.<UTC time>`). A file beside the log
+  named like a rotated one, such as `qmcp-audit.log.1` from a hand rotation, stayed forever,
+  unreported. The check now warns on each ("audit retention"); remove it by hand once it is kept
+  where you want it.
+
+### Upgrading
+
+Install over 1.0.0; nothing beyond the README's "Updating" steps.
+
 ## [1.0.0] — 2026-10-22
 
 **1.0: 0.9.39's code, released as stable.** The code is 0.9.39's, line for line; this release
