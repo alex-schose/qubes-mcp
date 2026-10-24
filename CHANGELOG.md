@@ -25,6 +25,44 @@ From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how.
 
 Nothing — the working tree is the last released version.
 
+## [1.0.3] — 2026-10-24
+
+A patch: root no longer follows what the services may put in the directories they share.
+
+### Fixed
+
+- **A subdirectory of `/run/qmcp` could be swapped for a link.** `/run/qmcp` was group-writable,
+  so code running as the services' user could rename `calls/`, `qubes/`, `open/` or `audit/` and
+  put a link to any directory in its place; every open root makes inside then resolved through
+  the link, whatever flags it used. `/run/qmcp` is now 2750, writable by root alone (renaming or
+  replacing an entry takes write permission on its parent), and what the services make there
+  themselves, or take and may have to make again, moved into `/run/qmcp/state/`: the create lock
+  and its turnstile, the proposal store's and the gate's locks and the gate's heartbeat, the
+  count of audit lines that could not be written, the restore check's failure records and the
+  in-qube writer locks. Only root's own `projects.lock` stays beside them. `qmcp check` fails on a
+  `/run/qmcp` that is not root's or that the group or others may write, on a subdirectory that
+  is not a directory, on a missing `state/`, and on a missing create lock, create turnstile or
+  proposal-store lock (a missing gate lock or heartbeat already failed it).
+- **Root followed links and waited on FIFOs in the shared directories.** The count of unwritten
+  audit lines (written through a link: root would truncate and write any file), the gate's,
+  the records' and the proposal store's locks (a link made root create an empty file anywhere),
+  the RAM chains' pad, the chains where root reads them, the callers' counters, the proposal store's
+  files and claims, and the gate's heartbeat (which the gate's timer writes, not root) were
+  opened with flags that follow a link or block on a FIFO. Each now opens no link, never blocks, and refuses anything but a plain file
+  (`core.open_run_file`); a refusal goes the way a failed open of that file already went. A
+  rotation sets the old log read-only through the file it holds, not by its name, and `qmcp
+  export` gives the file to its user through the file it wrote, not by its name in that user's
+  home.
+- **`qmcp check` read the whole audit log into memory to verify it.** It now walks the chain a
+  line at a time, and a line longer than any record (1 MiB) breaks the chain there.
+
+On a stock dom0 the services' user can already act as root through sudo, so none of this gave
+code running as that user anything; it matters on a dom0 where it cannot.
+
+### Upgrading
+
+Install over 1.0.2; nothing beyond the README's "Updating" steps.
+
 ## [1.0.2] — 2026-10-23
 
 A patch: the known debt of 1.0.1, cleared.

@@ -1577,14 +1577,77 @@ class HardwareFindings(ProjectBase):
         self.assertEqual(f["runtime dir"].status, "fail")
         self.assertIn("create.queue", f["runtime dir"].detail)
 
+    def runtime(self):
+        f = {x.check: x for x in fleet.check(self.app, legacy_paths=(), system_info={"domains": {}})}
+        return f["runtime dir"]
+
+    def test_the_runtime_dir_is_root_alones_to_write(self):
+        # Renaming or replacing an entry takes write permission on its parent:
+        # a group-writable /run/qmcp lets the services swap a subdirectory for
+        # a link that sends root's opens elsewhere.
+        self.assertEqual(self.runtime().status, "pass")
+        os.chmod(core.RUN_DIR, 0o2770)
+        r = self.runtime()
+        self.assertEqual(r.status, "fail")
+        self.assertIn("writable by root alone (2750", r.detail)
+
+    def test_a_subdirectory_swapped_for_a_link_fails(self):
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        os.chmod(core.RUN_DIR, 0o2770)                    # as an older release left it
+        aside = pathlib.Path(core.RUN_DIR) / "audit.x"
+        os.makedirs(pathlib.Path(core.RUN_DIR) / "audit", exist_ok=True)
+        os.rename(pathlib.Path(core.RUN_DIR) / "audit", aside)
+        os.symlink(other, pathlib.Path(core.RUN_DIR) / "audit")
+        os.chmod(core.RUN_DIR, 0o2750)
+        r = self.runtime()
+        self.assertEqual(r.status, "fail")
+        self.assertIn("not a directory:", r.detail)
+        self.assertIn("audit", r.detail)
+
+    def test_a_runtime_dir_not_roots_fails(self):
+        with mock.patch.object(fleet, "RUN_DIR_OWNER", os.getuid() + 1):
+            r = self.runtime()
+        self.assertEqual(r.status, "fail")
+        self.assertIn("2750", r.detail)
+
+    def test_what_both_sides_open_lives_where_both_may_make_it_again(self):
+        # In a 2750 /run/qmcp only root makes a file again: a lock the gate's
+        # user takes there would, once removed, stop the expiry seal and the
+        # gate's stop for good. Every file both sides open is in state/.
+        src = {m: (HERE.parent / "dom0" / "qmcp" / f"{m}.py").read_text()
+               for m in ("budget", "anon", "proposals", "audit", "projects")}
+        for m, const in (("budget", 'LOCK_PATH = "/run/qmcp/state/create.lock"'),
+                         ("anon", 'LOCK_PATH = "/run/qmcp/state/gate.lock"'),
+                         ("anon", 'HEARTBEAT_PATH = "/run/qmcp/state/gate.last"'),
+                         ("proposals", 'LOCK_PATH = "/run/qmcp/state/proposals.lock"'),
+                         ("audit", 'DROPPED_PATH = "/run/qmcp/state/audit-dropped"')):
+            self.assertIn(const, src[m], m)
+        # The one file left at the top is root's alone.
+        self.assertIn('LOCK_PATH = "/run/qmcp/projects.lock"', src["projects"])
+
+    def test_a_missing_state_dir_fails(self):
+        os.rename(core.state_dir(), core.state_dir() + ".gone")
+        r = self.runtime()
+        self.assertEqual(r.status, "fail")
+        self.assertIn(core.state_dir(), r.detail)
+
+    def test_tmpfiles_makes_the_runtime_dir_root_alones_and_state_the_groups(self):
+        conf = (HERE.parent / "deploy" / "qmcp-tmpfiles.conf").read_text().splitlines()
+        rules = {tuple(line.split()[:5]) for line in conf if line and not line.startswith("#")}
+        self.assertIn(("d", "/run/qmcp", "2750", "root", "qubes"), rules)
+        self.assertIn(("d", "/run/qmcp/state", "2770", "root", "qubes"), rules)
+        self.assertTrue(audit.DROPPED_PATH.startswith("/run/qmcp/state/") or
+                        audit.DROPPED_PATH.startswith(str(core.state_dir())))
+
     def test_tmpfiles_declares_the_create_lock(self):
         conf = (HERE.parent / "deploy" / "qmcp-tmpfiles.conf").read_text().splitlines()
         rules = {tuple(line.split()[:5]) for line in conf if line and not line.startswith("#")}
         for kind in ("f", "z"):
-            self.assertIn((kind, "/run/qmcp/create.lock", "0660", "root", "qubes"), rules)
+            self.assertIn((kind, "/run/qmcp/state/create.lock", "0660", "root", "qubes"), rules)
             # and its turnstile, which every create passes through first
-            self.assertIn((kind, "/run/qmcp/create.queue", "0660", "root", "qubes"), rules)
-        self.assertIn('LOCK_PATH = "/run/qmcp/create.lock"', (HERE.parent / "dom0" / "qmcp" / "budget.py").read_text())
+            self.assertIn((kind, "/run/qmcp/state/create.queue", "0660", "root", "qubes"), rules)
+        self.assertIn('LOCK_PATH = "/run/qmcp/state/create.lock"', (HERE.parent / "dom0" / "qmcp" / "budget.py").read_text())
 
 
 

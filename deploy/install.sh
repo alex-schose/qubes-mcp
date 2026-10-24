@@ -658,6 +658,24 @@ done <<< "$LEGACY"
 rm -rf /run/qmcp-consent 2>/dev/null || true
 systemctl daemon-reload
 
+# --- the runtime directory first: from the moment the library below is in place the services
+# take their locks under /run/qmcp/state, which this makes
+install -m 0644 "$SRC/deploy/qmcp-tmpfiles.conf" /etc/tmpfiles.d/qmcp.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf
+# 1.0.3 moved what the services make there into state/, and /run/qmcp became root's alone to
+# write: a count of audit lines that could not be written, which 1.0.2 kept beside the locks,
+# moves with it rather than going unseen until the next boot.
+if [ -f /run/qmcp/audit-dropped ] && [ ! -L /run/qmcp/audit-dropped ] \
+        && [ ! -e /run/qmcp/state/audit-dropped ]; then
+    # Moved as it is (the services made it 0660 in the qubes group): a chgrp or chmod by name in
+    # state/, which the group may write, would follow a link put there meanwhile.
+    mv -T /run/qmcp/audit-dropped /run/qmcp/state/audit-dropped || true
+fi
+# 1.0.2's files at the top of /run/qmcp: the locks and heartbeat now live in state/, and nothing
+# reads these any more (root removes them; the group can no longer).
+rm -f /run/qmcp/create.lock /run/qmcp/create.queue /run/qmcp/proposals.lock \
+      /run/qmcp/gate.lock /run/qmcp/gate.last /run/qmcp/inqube-*.lock /run/qmcp/gate-failed.*
+
 # --- the library and the operator command
 rm -rf "$LIB/qmcp"
 install -d -m 0755 "$LIB" "$LIB/qmcp" "$LIB/share"
@@ -742,8 +760,6 @@ done <<< "$SERVICES"
 say "installed $(echo "$SERVICES" | wc -l) services in $RPC"
 
 # --- runtime directory, proposal store, operator files, audit log
-install -m 0644 "$SRC/deploy/qmcp-tmpfiles.conf" /etc/tmpfiles.d/qmcp.conf
-systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf
 say "runtime directory /run/qmcp and proposal store /var/lib/qmcp/proposals in place"
 install -d -m 0755 "$ETC_QMCP"
 write_if_absent() {   # file value

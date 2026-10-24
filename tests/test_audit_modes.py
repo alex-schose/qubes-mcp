@@ -861,7 +861,7 @@ class Retention(ModeBase):
         import os
         from unittest import mock
         self.write_log(audit._utc_now_iso())
-        with mock.patch("builtins.open", side_effect=PermissionError(13, "x")):
+        with mock.patch.object(audit, "_open_run", side_effect=PermissionError(13, "x")):
             for n in (0, 5):
                 with self.assertRaises(PermissionError):
                     audit.tail(n)
@@ -1056,9 +1056,11 @@ class TailByCaller(ModeBase):
                     read.append(len(line))
                     yield line
 
+        real_fdopen = os.fdopen
+
         def counting_open(*a, **kw):
-            return Counted(real_open(*a, **kw))
-        with mock.patch("builtins.open", counting_open):
+            return Counted(real_fdopen(*a, **kw))
+        with mock.patch.object(audit.os, "fdopen", counting_open):
             self.assertEqual(len(audit.tail(10)), 10)
         self.assertGreater(sum(read), 0)
         self.assertLessEqual(sum(read), 65536)

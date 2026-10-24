@@ -629,7 +629,7 @@ FAILED_PREFIX = "gate-failed."
 
 def _failure_path(step: str, name: str, uuid: str) -> str:
     key = hashlib.sha256(f"{step}\0{name}\0{uuid}".encode()).hexdigest()[:32]
-    return os.path.join(str(core.RUN_DIR), FAILED_PREFIX + key)
+    return os.path.join(core.state_dir(), FAILED_PREFIX + key)
 
 
 def _failure_key(vm, name: str):
@@ -647,6 +647,7 @@ def _new_failure(step: str, vm, name: str, reason: str) -> bool:
     if uuid is None:
         return True
     path = _failure_path(step, name, uuid)
+    core.state_dir_ready()
     try:
         if core.read_run_file(path, 256) == reason:
             return False

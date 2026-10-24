@@ -32,7 +32,7 @@ from qmcp.core import UMBRELLA, Gone, Refusal, refuse, tags_of, take_queued_lock
 
 CAP_PATH = "/etc/qmcp/pool-cap"
 PRIVATE_CAP_PATH = "/etc/qmcp/private-cap"
-LOCK_PATH = "/run/qmcp/create.lock"
+LOCK_PATH = "/run/qmcp/state/create.lock"
 LOCK_TIMEOUT_S = 120.0
 
 DEFAULT_PRIVATE_BYTES = 2 * 1024 ** 3

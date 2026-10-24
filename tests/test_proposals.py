@@ -42,7 +42,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "dom0"))
 sys.path.insert(0, str(HERE))
 
-from qmcp import audit, budget, cli, core, fleet, projects, proposals, services  # noqa: E402
+from qmcp import anon, audit, budget, cli, core, fleet, projects, proposals, services  # noqa: E402
 from fakequbes import GiB  # noqa: E402
 from test_dom0 import HUB  # noqa: E402
 from test_projects import LEAD, RECORDS, ProjectBase  # noqa: E402
@@ -1232,18 +1232,23 @@ class Install(PBase):
         return next(f for f in findings if f.check == name)
 
     def in_another_group(self, *paths):
-        """From now on, os.stat reports `paths` in a group one past their own."""
-        real, moved = os.stat, {str(x) for x in paths}
+        """From now on, os.stat and os.lstat report `paths` in a group one past
+        their own."""
+        moved = {str(x) for x in paths}
 
-        def other_group(path, *a, **kw):
-            st = real(path, *a, **kw)
-            if str(path) in moved:
-                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
-                                       st.st_gid + 1, st.st_size, st.st_atime, st.st_mtime,
-                                       st.st_ctime))
-            return st
-        os.stat = other_group
-        self.addCleanup(setattr, os, "stat", real)
+        def moving(real):
+            def other_group(path, *a, **kw):
+                st = real(path, *a, **kw)
+                if str(path) in moved:
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                                           st.st_uid, st.st_gid + 1, st.st_size, st.st_atime,
+                                           st.st_mtime, st.st_ctime))
+                return st
+            return other_group
+        for name in ("stat", "lstat"):
+            real = getattr(os, name)
+            setattr(os, name, moving(real))
+            self.addCleanup(setattr, os, name, real)
 
     def test_the_store_check(self):
         self.assertEqual(self.finding("proposal store").status, "pass")
@@ -1312,18 +1317,32 @@ class Install(PBase):
             self.assertEqual(self.finding(name).status, "fail", name)
 
     def test_a_runtime_directory_that_would_close_a_new_lock_fails_the_check(self):
-        # A lock that goes missing is made again by whoever comes first, so the
-        # directory must leave it the services' to open: theirs, writable, setgid.
+        # The services' group's, setgid so a lock root makes again is theirs to
+        # open, and root's alone to write: a group-writable one lets them swap
+        # a subdirectory for a link (1.0.3).
         run = core.RUN_DIR
         self.assertEqual(self.finding("runtime dir").status, "pass")
-        for mode in (0o0770, 0o2750):                  # no setgid; no group write
+        for mode in (0o0750, 0o2770):                  # no setgid; group write
             os.chmod(run, mode)
             self.assertEqual(self.finding("runtime dir").status, "fail", oct(mode))
             self.assertIn(run, self.finding("runtime dir").detail)
-        os.chmod(run, 0o2770)
+        os.chmod(run, 0o2750)
         self.assertEqual(self.finding("runtime dir").status, "pass")
         self.in_another_group(run)
         self.assertEqual(self.finding("runtime dir").status, "fail")
+
+    def test_a_declared_lock_that_went_missing_fails_the_check(self):
+        # Under a 2750 /run/qmcp only root or tmpfiles makes one again: until
+        # then the services refuse what takes it, and the check says so.
+        for path in (anon.LOCK_PATH, anon.HEARTBEAT_PATH):
+            with self.subTest(path=path):
+                saved = pathlib.Path(path).read_bytes()
+                os.unlink(path)
+                r = self.finding("runtime dir")
+                self.assertEqual(r.status, "fail")
+                self.assertIn(os.path.basename(path), r.detail)
+                pathlib.Path(path).write_bytes(saved)
+                os.chmod(path, 0o660)
 
     def test_the_qube_lock_directory_must_be_the_services_to_write(self):
         # Every call that operates a qube takes its lock there: a directory the
@@ -1386,10 +1405,10 @@ class Install(PBase):
                     ("d", REAL["windows"], "2770", "root", "qubes"),
                     # The gate's lock and heartbeat: the timer runs as the
                     # services' user, and a root command takes the lock too.
-                    ("f", "/run/qmcp/gate.lock", "0660", "root", "qubes"),
-                    ("z", "/run/qmcp/gate.lock", "0660", "root", "qubes"),
-                    ("f", "/run/qmcp/gate.last", "0660", "root", "qubes"),
-                    ("z", "/run/qmcp/gate.last", "0660", "root", "qubes")]:
+                    ("f", "/run/qmcp/state/gate.lock", "0660", "root", "qubes"),
+                    ("z", "/run/qmcp/state/gate.lock", "0660", "root", "qubes"),
+                    ("f", "/run/qmcp/state/gate.last", "0660", "root", "qubes"),
+                    ("z", "/run/qmcp/state/gate.last", "0660", "root", "qubes")]:
             self.assertIn(row, rows, row)
 
     def test_the_timer_runs_the_expiry_pass(self):

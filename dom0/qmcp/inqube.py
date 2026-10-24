@@ -95,7 +95,7 @@ class _OneWriter:
     """One prepare or install in a qube at a time. Either may start a halted
     qube and shut it down when it is done, which would stop the other one's
     write part-way (a dpkg run, say), so the second refuses within half a
-    second rather than waiting for it. An flock on a file in /run/qmcp, released with the process.
+    second rather than waiting for it. An flock on a file in /run/qmcp/state, released with the process.
     The refresh never starts or stops a qube, so it takes none.
 
     The file is 0640, in the `qubes` group of the setgid directory, so the
@@ -106,7 +106,8 @@ class _OneWriter:
     writers never hold the lock on two files."""
 
     def __init__(self, name: str) -> None:
-        self.path = os.path.join(core.RUN_DIR, f"{core.INQUBE_LOCK_PREFIX}{name}"
+        core.state_dir_ready()
+        self.path = os.path.join(core.state_dir(), f"{core.INQUBE_LOCK_PREFIX}{name}"
                                                f"{core.INQUBE_LOCK_SUFFIX}")
         self.fd = None
 
@@ -124,7 +125,7 @@ class _OneWriter:
         old = os.umask(0o027)
         try:
             # Never through a link, and only a regular file of this process's
-            # owner: /run/qmcp is the services group's to write in.
+            # owner: /run/qmcp/state is the services group's to write in.
             fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                          0o640)
         except OSError as e:

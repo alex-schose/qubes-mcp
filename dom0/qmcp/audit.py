@@ -150,9 +150,9 @@ def _locked_log(path: str):
         # file whoever creates it must stay group-writable (tmpfiles declares it).
         old = os.umask(0o007)
         try:
-            # O_NOFOLLOW: the RAM chains' directory is the services' group's to
-            # write, and root must never follow a link planted there.
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o660)
+            # The RAM chains' directory is the services' group's to write: root
+            # opens no link and no FIFO planted there, only a plain file.
+            fd = _open_run(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
         finally:
             os.umask(old)
         if os.geteuid() == 0:
@@ -273,7 +273,9 @@ def rotate(path: str | None = None, caller: str = "operator") -> str:
         # the old lock finds the new file at the name): read-only, so cutting
         # its last lines takes root, as removing it does.
         try:
-            os.chmod(aside, st.st_mode & 0o7444)
+            # By the fd: the aside is the inode this rotation holds, and a
+            # chmod by name would follow a link put at that name meanwhile.
+            os.fchmod(f.fileno(), st.st_mode & 0o7444)
         except OSError:
             pass
         return aside
@@ -291,7 +293,7 @@ def rotate(path: str | None = None, caller: str = "operator") -> str:
 #: first failure (root or the services' user: /run/qmcp is setgid qubes) and
 #: removed by the operator, never by qmcp; a reboot or `uninstall.sh` clears
 #: it with the rest of /run/qmcp, so a gap is told until then.
-DROPPED_PATH = "/run/qmcp/audit-dropped"
+DROPPED_PATH = "/run/qmcp/state/audit-dropped"
 #: Below this much free space under the log's directory the services refuse
 #: every state-changing call before it acts, but a kill (which only takes
 #: away, and is logged only when dom0 accepted it): no other change is made
@@ -491,7 +493,8 @@ def counters(calls_dir: str, now: str | None = None) -> list:
         if not fn.endswith(REFUSED_SUFFIX):
             continue
         try:
-            with open(os.path.join(calls_dir, fn), encoding="utf-8") as fh:
+            with os.fdopen(_open_run(os.path.join(calls_dir, fn)),
+                           encoding="utf-8") as fh:
                 # Under the writers' lock, shared: `_update` truncates before
                 # it writes, and an unlocked read could catch the gap.
                 fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
@@ -567,8 +570,7 @@ def dropped(path: str | None = None):
     """(lines not written, first time) from the marker, or None without one;
     (None, None) for a marker that does not read."""
     try:
-        with open(DROPPED_PATH if path is None else path, encoding="utf-8") as fh:
-            rec = _counter(fh.read(4096))
+        rec = _counter(_read_run(DROPPED_PATH if path is None else path))
         return int(rec["count"]), str(rec["first"])
     except FileNotFoundError:
         return None
@@ -581,7 +583,7 @@ def _note_dropped() -> None:
     try:
         old = os.umask(0o007)
         try:
-            fd = os.open(DROPPED_PATH, os.O_RDWR | os.O_CREAT, 0o660)
+            fd = _open_run(DROPPED_PATH, os.O_RDWR | os.O_CREAT)
         finally:
             os.umask(old)
         with os.fdopen(fd, "r+", encoding="utf-8") as fh:
@@ -889,7 +891,7 @@ def _pay_like(mode: str) -> None:
         _tail_state(f)
         old = os.umask(0o007)
         try:
-            fd = os.open(pad, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+            fd = _open_run(pad, os.O_WRONLY | os.O_CREAT)
         finally:
             os.umask(old)
         try:
@@ -1121,10 +1123,22 @@ def unpruned(path: str | None = None) -> list:
     return sorted(n for n in names if n.startswith(base) and n not in ours)
 
 
+def _open_run(path: str, flags: int = os.O_RDONLY) -> int:
+    """`core.open_run_file`: no link, no FIFO, a plain file (imported late:
+    core imports this module)."""
+    from qmcp import core
+    return core.open_run_file(path, flags)
+
+
+def _read_run(path: str) -> str:
+    from qmcp import core
+    return core.read_run_file(path)
+
+
 def _first_record(path: str):
     """The log's first record, or None for an empty one. Raises OSError for
     one that does not read, ValueError for a first line that does not parse."""
-    with open(path, "rb") as fh:
+    with os.fdopen(_open_run(path), "rb") as fh:
         for line in fh:
             if line.strip():
                 try:
@@ -1147,7 +1161,7 @@ def _rotation_due(path: str, now) -> bool:
         return size > 0
     if first is None:
         return False
-    with open(path, "rb") as fh:
+    with os.fdopen(_open_run(path), "rb") as fh:
         lines = sum(1 for line in fh if line.strip())
     if first.get("service") == ROTATE_SERVICE and lines == 1:
         return False            # only the anchor of the last rotation
@@ -1335,39 +1349,59 @@ def status(calls_dir: str, principals, now: str | None = None) -> dict:
     }
 
 
+#: Longer than any record qmcp writes (a refused call's fields are cut to 128
+#: characters each): a longer line is no record, and is not read whole.
+VERIFY_MAX_LINE = 1024 * 1024
+
+
 def verify(path: str | None = None) -> tuple[bool, int, str | None]:
-    """Walk the chain from GENESIS. Returns (ok, entries, first problem)."""
+    """Walk the chain from GENESIS. Returns (ok, entries, first problem).
+    Streams the file a line at a time, so a log grown large, or a line with
+    no end, is never held whole in memory."""
     path = LOG_PATH if path is None else path
     try:
-        # Bytes, decoded line by line: one byte that is not UTF-8 is a broken
-        # chain at its line, not an exception in the caller.
-        with open(path, "rb") as f:
-            lines = [s for s in (ln.strip() for ln in f) if s]
+        f = os.fdopen(_open_run(path), "rb")
     except FileNotFoundError:
         return True, 0, None
     except OSError as e:
-        return False, 0, f"cannot read log: {e.strerror}"
+        return False, 0, f"cannot read log: {e.strerror or type(e).__name__}"
     expected_prev, expected_seq = GENESIS, 1
-    for i, line in enumerate(lines):
-        try:
-            obj = json.loads(line.decode("utf-8"))
-        except UnicodeDecodeError:
-            return False, i + 1, f"line {i + 1} is not UTF-8"
-        except (ValueError, RecursionError):
-            return False, i + 1, f"unparseable line {i + 1}"
-        if not isinstance(obj, dict):
-            return False, i + 1, f"unparseable line {i + 1}"
-        if i == 0 and obj.get("service") == ROTATE_SERVICE:
-            # A rotated log starts on the previous file's head hash.
-            expected_prev = obj.get("prev")
-        if _body_hash(obj) != obj.get("hash"):
-            return False, obj.get("seq", i + 1), f"hash mismatch at seq {obj.get('seq')}"
-        if obj.get("prev") != expected_prev:
-            return False, obj.get("seq", i + 1), f"prev mismatch at seq {obj.get('seq')}"
-        if obj.get("seq") != expected_seq:
-            return False, i + 1, f"seq mismatch at index {i + 1}"
-        expected_prev, expected_seq = obj["hash"], expected_seq + 1
-    return True, len(lines), None
+    i = 0
+    try:
+        with f:
+            # Bytes, decoded line by line: one byte that is not UTF-8 is a
+            # broken chain at its line, not an exception in the caller.
+            while True:
+                raw = f.readline(VERIFY_MAX_LINE + 1)
+                if not raw:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                if len(raw) > VERIFY_MAX_LINE:
+                    return False, i + 1, f"line {i + 1} is too long to be a record"
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except UnicodeDecodeError:
+                    return False, i + 1, f"line {i + 1} is not UTF-8"
+                except (ValueError, RecursionError):
+                    return False, i + 1, f"unparseable line {i + 1}"
+                if not isinstance(obj, dict):
+                    return False, i + 1, f"unparseable line {i + 1}"
+                if i == 0 and obj.get("service") == ROTATE_SERVICE:
+                    # A rotated log starts on the previous file's head hash.
+                    expected_prev = obj.get("prev")
+                if _body_hash(obj) != obj.get("hash"):
+                    return False, obj.get("seq", i + 1), f"hash mismatch at seq {obj.get('seq')}"
+                if obj.get("prev") != expected_prev:
+                    return False, obj.get("seq", i + 1), f"prev mismatch at seq {obj.get('seq')}"
+                if obj.get("seq") != expected_seq:
+                    return False, i + 1, f"seq mismatch at index {i + 1}"
+                expected_prev, expected_seq = obj["hash"], expected_seq + 1
+                i += 1
+    except OSError as e:
+        return False, i, f"cannot read log: {e.strerror or type(e).__name__}"
+    return True, i, None
 
 
 def verify_links(path: str | None = None) -> tuple[bool, str | None]:
@@ -1391,7 +1425,7 @@ def verify_links(path: str | None = None) -> tuple[bool, str | None]:
         if args.get("continues") != os.path.basename(earlier):
             continue
         try:
-            with open(earlier, "rb") as fh:
+            with os.fdopen(_open_run(earlier), "rb") as fh:
                 seq, head = _tail_state(fh)
         except OSError as e:
             return False, f"{os.path.basename(earlier)} cannot be read ({e.strerror})"
@@ -1438,7 +1472,7 @@ def tail(n: int = 20, path: str | None = None, caller: str | None = None) -> lis
     path = LOG_PATH if path is None else path
     out = []
     try:
-        with open(path, "rb") as f:
+        with os.fdopen(_open_run(path), "rb") as f:
             if n <= 0:
                 return []
             for line in _lines_from_the_end(f):

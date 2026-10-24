@@ -666,16 +666,38 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
 
     calls = os.path.join(core.RUN_DIR, "calls")
     qubes_dir = os.path.join(core.RUN_DIR, core.QUBE_LOCK_SUBDIR)
-    run = _safe(lambda: os.stat(core.RUN_DIR))
+    state = core.state_dir()
+    run = _safe(lambda: os.lstat(core.RUN_DIR))
     st = _safe(lambda: os.stat(calls))
     lock = _safe(lambda: os.stat(budget.LOCK_PATH))
+    subdirs = [os.path.join(core.RUN_DIR, d) for d in
+               ("calls", core.QUBE_LOCK_SUBDIR, "open", audit.RAM_SUBDIR, core.STATE_SUBDIR)]
+    linked = [d for d in subdirs if (ls := _safe(lambda d=d: os.lstat(d))) is not None
+              and not stat.S_ISDIR(ls.st_mode)]
     if st is None:
         add("fail", "runtime dir", f"{calls} missing (systemd-tmpfiles --create)")
-    elif not (shared(run) and run.st_mode & stat.S_ISGID):
-        # Where either side makes a lock again that went missing, so it must
-        # stay the services' to open, whoever made it.
-        add("fail", "runtime dir", f"{core.RUN_DIR} is not the services group's, group-writable "
-                                   f"and setgid (2770 root:{SERVICES_GROUP}; systemd-tmpfiles "
+    elif not (run is not None and stat.S_ISDIR(run.st_mode) and run.st_gid == gid
+              and run.st_uid == RUN_DIR_OWNER
+              and run.st_mode & stat.S_ISGID and not run.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        # Readable by the services, setgid so what root makes in it is the
+        # group's, and writable by root alone: renaming or replacing an entry
+        # takes write permission on its parent, so nobody else can swap a
+        # subdirectory for a link that would send root's opens elsewhere.
+        add("fail", "runtime dir", f"{core.RUN_DIR} is not the services group's, setgid and "
+                                   f"writable by root alone (2750 root:{SERVICES_GROUP}; "
+                                   f"systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
+    elif linked:
+        add("fail", "runtime dir", f"not a directory: {', '.join(linked)} (it was replaced: "
+                                   f"remove it, then systemd-tmpfiles --create "
+                                   f"/etc/tmpfiles.d/qmcp.conf)")
+    elif not all((x := _safe(lambda d=d: os.stat(d))) is not None and shared(x)
+                 and x.st_mode & stat.S_ISGID for d in (state, audit.ram_dir())):
+        # The audit-dropped counter, the restore check's failure records and
+        # the in-qube writer locks: made and removed by both sides.
+        # state/: the locks both sides take and what the services make; audit/:
+        # the RAM chains, which only root or tmpfiles makes now.
+        add("fail", "runtime dir", f"{state} or {audit.ram_dir()} is missing, or not the services "
+                                   f"group's, group-writable and setgid (systemd-tmpfiles "
                                    f"--create /etc/tmpfiles.d/qmcp.conf)")
     elif not shared(st):
         add("fail", "runtime dir", f"{calls} is not writable by the services group "
@@ -687,12 +709,12 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
         add("fail", "runtime dir", f"{qubes_dir} is missing, or not the services group's, "
                                    f"group-writable and setgid: every call that operates a qube "
                                    f"refuses (systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
-    elif lock is not None and not shared(lock):
-        add("fail", "runtime dir", f"{budget.LOCK_PATH} is not writable by the services group: "
-                                   f"every create refuses (systemd-tmpfiles --create "
-                                   f"/etc/tmpfiles.d/qmcp.conf)")
-    elif (turn := _safe(lambda: os.stat(core.queue_path(budget.LOCK_PATH)))) is not None \
-            and not shared(turn):
+    elif not shared(lock):
+        # Missing too: in a 2750 /run/qmcp only root or tmpfiles makes it again.
+        add("fail", "runtime dir", f"{budget.LOCK_PATH} is missing or not writable by the "
+                                   f"services group: every create refuses (systemd-tmpfiles "
+                                   f"--create /etc/tmpfiles.d/qmcp.conf)")
+    elif not shared(_safe(lambda: os.stat(core.queue_path(budget.LOCK_PATH)))):
         # The create lock's turnstile: every create passes through it first.
         add("fail", "runtime dir", f"{core.queue_path(budget.LOCK_PATH)} is not writable by the "
                                    f"services group: every create refuses (systemd-tmpfiles "
@@ -756,9 +778,9 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
                                       f"group-writable and setgid (2770 root:{SERVICES_GROUP}): "
                                       f"the hub's proposals cannot be stored, or their decisions "
                                       f"read back")
-    elif lock is not None and not shared(lock):
-        add("fail", "proposal store", f"{proposals.LOCK_PATH} is not writable by the services "
-                                      f"group: every proposal the hub submits is refused "
+    elif not shared(lock):
+        add("fail", "proposal store", f"{proposals.LOCK_PATH} is missing or not writable by the "
+                                      f"services group: every proposal the hub submits is refused "
                                       f"(systemd-tmpfiles --create /etc/tmpfiles.d/qmcp.conf)")
     else:
         try:
@@ -2964,6 +2986,8 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
 #: Declared root:qubes 2770 in tmpfiles: root writes the records and the
 #: expiry pass, which runs as the services' user, unlinks them.
 WINDOW_DIR = "/run/qmcp/open"
+#: Who owns /run/qmcp: root, as tmpfiles makes it (a test sets its own user).
+RUN_DIR_OWNER = 0
 #: The longest window the command writes. There is no indefinite open:
 #: that is `qmcp manage`, which leaves the guarded state altogether.
 WINDOW_MAX_S = 24 * 60 * 60

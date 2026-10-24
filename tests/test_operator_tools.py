@@ -2592,8 +2592,8 @@ class Packages(ToolsBase):
     def test_the_lock_is_never_followed_through_a_link_or_taken_from_another(self):
         target = self.tmp / "elsewhere"
         target.write_text("")
-        link = os.path.join(core.RUN_DIR, f"inqube-{self.TPL}.lock")
-        os.makedirs(core.RUN_DIR, exist_ok=True)
+        link = os.path.join(core.state_dir(), f"inqube-{self.TPL}.lock")
+        os.makedirs(core.state_dir(), exist_ok=True)
         os.symlink(target, link)
         with self.assertRaises(inqube.InQubeError):
             inqube.install(self.app, self.TPL, ["curl"])

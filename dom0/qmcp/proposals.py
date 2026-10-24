@@ -69,7 +69,7 @@ lead a network by itself.
 The store is `/var/lib/qmcp/proposals/`, root:qubes 2770, declared in tmpfiles
 (which the installer installs and applies): the services, a non-root dom0 user
 in `qubes`, write proposals there (0640), and the operator's accept and reject,
-as root, write the decisions beside them. `/run/qmcp/proposals.lock` serialises
+as root, write the decisions beside them. `/run/qmcp/state/proposals.lock` serialises
 submits, rejects and an accept's check and mark. An accept takes the project
 commands' locks first, then the store's, and lets the store's go once the
 proposal is marked: the mark keeps every other accept and reject of that
@@ -89,7 +89,7 @@ import time
 from qmcp import audit, budget, core, firewall, inqube, projects
 
 PROPOSALS_DIR = "/var/lib/qmcp/proposals"
-LOCK_PATH = "/run/qmcp/proposals.lock"
+LOCK_PATH = "/run/qmcp/state/proposals.lock"
 SCHEMA = 1
 
 #: Pending proposals at once, and how long one waits for the operator.
@@ -692,7 +692,8 @@ class Entry:
 
 
 def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as fh:
+    # The store is the services' group's to write: no link, no FIFO.
+    with os.fdopen(core.open_run_file(path), "rb") as fh:
         data = fh.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise ValueError("too large")
@@ -746,7 +747,7 @@ def _probe_claim(entry: Entry, path: str, decision: str) -> None:
             _load_decision(entry, decision)
         return entry.decided
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = core.open_run_file(path)
     except FileNotFoundError:
         if finished():
             return
@@ -812,7 +813,7 @@ class _Locked:
     def __enter__(self):
         old = os.umask(0o007)
         try:
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o660)
+            self.fd = core.open_run_file(self.path, os.O_RDWR | os.O_CREAT)
         except OSError:
             raise Refused("the proposal store is unavailable") from None
         finally:

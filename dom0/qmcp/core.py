@@ -31,6 +31,7 @@ is a lead, and a missing runtime directory refuses the call.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import io
 import json
@@ -533,6 +534,22 @@ def drain_caller(caller: str, timeout: float | None = None) -> int | None:
                             OPERATOR_WAIT_S if timeout is None else timeout, 0.05, True)
 
 
+def open_run_file(path: str, flags: int = os.O_RDONLY, mode: int = 0o660) -> int:
+    """An fd on a file in a directory the services' group may write, opened
+    as root must open one there: never through a link at its name, never
+    blocking on a FIFO, never a terminal, and refused unless it is a plain file
+    (a device or a FIFO planted at the name is not one). `flags` may add
+    O_RDWR, O_WRONLY, O_CREAT, O_TRUNC. Raises OSError."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"{path} is not a plain file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def read_run_file(path: str, limit: int = 4096) -> str:
     """A record under `RUN_DIR`, a directory the services' group may write:
     never through a link, never a FIFO or device (opened non-blocking, then
@@ -541,7 +558,7 @@ def read_run_file(path: str, limit: int = 4096) -> str:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(f"{path} is not a plain file")
+            raise OSError(errno.EINVAL, f"{path} is not a plain file")
         return os.read(fd, limit).decode("utf-8")
     finally:
         os.close(fd)
@@ -684,8 +701,35 @@ def retire_qube_locks(name: str, held=()) -> list:
     return left
 
 
+#: Where the files go that the services' side creates or removes beside the
+#: lock directories: `RUN_DIR` itself is 2750, so nobody but root renames or
+#: replaces what sits in it (a subdirectory swapped for a link would send
+#: root's opens through it); this subdirectory, like calls/ and qubes/, is
+#: 2770. Holds the audit-dropped counter, the restore check's failure records
+#: and the in-qube writer locks.
+STATE_SUBDIR = "state"
+
+
+def state_dir(run_dir: str | None = None) -> str:
+    return os.path.join(str(RUN_DIR if run_dir is None else run_dir), STATE_SUBDIR)
+
+
+def state_dir_ready() -> None:
+    """The state directory, which tmpfiles declares; made here when a boot or
+    a test has not (only root can, in a 2750 RUN_DIR), setgid from RUN_DIR."""
+    d = state_dir()
+    if not os.path.isdir(d):
+        old = os.umask(0o007)
+        try:
+            os.makedirs(d, 0o2770, exist_ok=True)
+        except OSError:
+            pass
+        finally:
+            os.umask(old)
+
+
 #: The in-qube services' writer lock of a qube (`inqube._OneWriter`): one
-#: prepare or install at a time, `<RUN_DIR>/inqube-<name>.lock`.
+#: prepare or install at a time, `<RUN_DIR>/state/inqube-<name>.lock`.
 INQUBE_LOCK_PREFIX = "inqube-"
 INQUBE_LOCK_SUFFIX = ".lock"
 _SLOT_RE = re.compile(r"\A(.+)\.([0-9]{1,2})\Z")
@@ -768,8 +812,9 @@ def sweep_qube_locks(app) -> int:
         for name in sorted(names - live):
             if not retire_qube_locks(name):
                 swept += 1
+        state = state_dir()
         try:
-            files = os.listdir(RUN_DIR)
+            files = os.listdir(state)
         except OSError:
             files = []
         for f in sorted(files):
@@ -777,7 +822,7 @@ def sweep_qube_locks(app) -> int:
                 continue
             name = f[len(INQUBE_LOCK_PREFIX):-len(INQUBE_LOCK_SUFFIX)]
             if valid_qube_name(name) and name not in live \
-                    and _remove_if_free(os.path.join(RUN_DIR, f)) is None:
+                    and _remove_if_free(os.path.join(state, f)) is None:
                 swept += 1
         hub = read_hub()
         if hub is None:

@@ -229,8 +229,10 @@ def export(version: str, path: str | None = None, user: str | None = None) -> st
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        if owner is not None and os.geteuid() == 0:
-            os.chown(path, owner.pw_uid, owner.pw_gid)
+            # By the fd: the file sits in the user's home, and a chown by name
+            # would follow a link that user put at the name meanwhile.
+            if owner is not None and os.geteuid() == 0:
+                os.fchown(fh.fileno(), owner.pw_uid, owner.pw_gid)
     except BaseException:
         try:
             os.unlink(path)

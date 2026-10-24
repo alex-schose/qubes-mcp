@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 1.0.2 — a patch to 1.0.1, which patched 1.0.0, 0.9.39's code released as stable.**
+**Status: 1.0.3 — the third patch to 1.0.0, 0.9.39's code released as stable.**
 Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
@@ -237,7 +237,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.2.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.3.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -294,6 +294,14 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 1.0.2? Install over it. The installer makes `/run/qmcp` root's alone to write
+(2750), moves a count of unwritten audit lines, if there is one, into `/run/qmcp/state/`, where
+the locks both sides take, the gate's heartbeat and the restore check's records now live too,
+and removes 1.0.2's copies at the top. `qmcp check` now fails on a
+group-writable `/run/qmcp`, a subdirectory that is not a directory, or a lock tmpfiles declares
+that is missing. To roll back, install 1.0.2 over this one: its tmpfiles file makes `/run/qmcp`
+2770 again, and a count in `state/` is read by nothing older until a boot clears it.
 
 Coming from 1.0.1? Install over it. The in-qube services do not change, so no
 template reads as behind. `qmcp check` now also fails on a model qube that dom0's

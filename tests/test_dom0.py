@@ -38,12 +38,12 @@ class Base(unittest.TestCase):
         self._saved = []
         for mod, attr, value in [
             (core, "HUB_PATH", self.tmp / "hub"),
-            (audit, "DROPPED_PATH", str(self.tmp / "run" / "audit-dropped")),
+            (audit, "DROPPED_PATH", str(self.tmp / "run" / "state" / "audit-dropped")),
             (core, "MODE_PATH", self.tmp / "mode"),
             (core, "RUN_DIR", self.tmp / "run"),
             (budget, "CAP_PATH", self.tmp / "pool-cap"),
             (budget, "PRIVATE_CAP_PATH", self.tmp / "private-cap"),
-            (budget, "LOCK_PATH", self.tmp / "run" / "create.lock"),
+            (budget, "LOCK_PATH", self.tmp / "run" / "state" / "create.lock"),
             (budget, "LOCK_TIMEOUT_S", 0.5),
             (core, "QUBE_WAIT_S", 0.3),
             (core, "OPERATOR_WAIT_S", 0.3),
@@ -67,15 +67,16 @@ class Base(unittest.TestCase):
             (gateways, "GATEWAYS_PATH", self.tmp / "gateways.json"),
             (projects, "LOCK_PATH", self.tmp / "run" / "projects.lock"),
             (proposals, "PROPOSALS_DIR", self.tmp / "proposals"),
-            (proposals, "LOCK_PATH", self.tmp / "run" / "proposals.lock"),
+            (proposals, "LOCK_PATH", self.tmp / "run" / "state" / "proposals.lock"),
             (proposals, "BUS_DIR", self.tmp / "no-session"),
             (fleet, "WINDOW_DIR", self.tmp / "run" / "open"),
             (fleet, "SEAL_DROPIN", self.tmp / "10-qmcp-seal.conf"),
-            (anon, "LOCK_PATH", self.tmp / "run" / "gate.lock"),
-            (anon, "HEARTBEAT_PATH", self.tmp / "run" / "gate.last"),
+            (anon, "LOCK_PATH", self.tmp / "run" / "state" / "gate.lock"),
+            (anon, "HEARTBEAT_PATH", self.tmp / "run" / "state" / "gate.last"),
             # The files the fixtures make are this user's group, as tmpfiles makes
             # them the services' group on a real dom0.
             (fleet, "SERVICES_GROUP", grp.getgrgid(os.getegid()).gr_name),
+            (fleet, "RUN_DIR_OWNER", float(os.getuid())),
         ]:
             self._saved.append((mod, attr, getattr(mod, attr)))
             setattr(mod, attr, value if isinstance(value, float) else str(value))
@@ -90,8 +91,11 @@ class Base(unittest.TestCase):
         (self.tmp / "run" / "calls").mkdir(parents=True)
         (self.tmp / "run" / "open").mkdir()
         (self.tmp / "run" / "qubes").mkdir()
-        for d in ("run", "run/calls", "run/open", "run/qubes"):  # as tmpfiles makes them
+        (self.tmp / "run" / "state").mkdir()
+        (self.tmp / "run" / "audit").mkdir()
+        for d in ("run/calls", "run/open", "run/qubes", "run/state", "run/audit"):  # as tmpfiles does
             os.chmod(self.tmp / d, 0o2770)
+        os.chmod(self.tmp / "run", 0o2750)          # nobody but root swaps what is in it
         (self.tmp / "lib" / "removed").mkdir(parents=True)        # as tmpfiles makes it
         os.chmod(self.tmp / "lib" / "removed", 0o2770)
         (self.tmp / "proposals").mkdir(mode=0o2770)
@@ -99,9 +103,10 @@ class Base(unittest.TestCase):
         # As the installer and tmpfiles leave it: present, group-writable.
         (self.tmp / "audit.log").touch(mode=0o660)
         os.chmod(self.tmp / "audit.log", 0o660)
-        for f in ("gate.lock", "gate.last"):        # tmpfiles declares both
-            (self.tmp / "run" / f).touch(mode=0o660)
-            os.chmod(self.tmp / "run" / f, 0o660)
+        for f in ("gate.lock", "gate.last", "create.lock", "create.queue",
+                  "proposals.lock"):                # tmpfiles declares them
+            (self.tmp / "run" / "state" / f).touch(mode=0o660)
+            os.chmod(self.tmp / "run" / "state" / f, 0o660)
         (self.tmp / "hub").write_text(HUB + "\n")
         (self.tmp / "pool-cap").write_text(str(1000 * GiB) + "\n")
         (self.tmp / "private-cap").write_text(str(20 * GiB) + "\n")
@@ -818,7 +823,7 @@ class Writes(Base):
         box, 2026-10-18). The pass removes it once qubesd no longer lists the
         name, and leaves a live qube's, one a prepare holds, and a FIFO."""
         import fcntl
-        run = pathlib.Path(core.RUN_DIR)
+        run = pathlib.Path(core.state_dir())
         for f in ("inqube-gone-tpl.lock", "inqube-ai-work.lock", "inqube-gone-held.lock",
                   "inqube-not a name.lock", "inqube-gone-tpl.other"):
             (run / f).touch()
@@ -884,7 +889,7 @@ class Writes(Base):
         held through every try is another writer's."""
         import fcntl
         import threading
-        path = pathlib.Path(core.RUN_DIR) / "inqube-ai-tpl-z.lock"
+        path = pathlib.Path(core.state_dir()) / "inqube-ai-tpl-z.lock"
         path.touch(mode=0o640)
         fd = os.open(path, os.O_RDONLY)
         self.addCleanup(os.close, fd)

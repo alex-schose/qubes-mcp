@@ -88,7 +88,7 @@ from qmcp import audit, core, gateways, projects
 
 POLICY_DIR = "/etc/qubes/policy.d"
 POLICY_RUN_DIR = "/run/qubes/policy.d"
-LOCK_PATH = "/run/qmcp/gate.lock"
+LOCK_PATH = "/run/qmcp/state/gate.lock"
 #: How long a run that kills then waits, in all and across every project it
 #: stops, for the locks of the qubes it stops, so a start that was already past
 #: its check when the badge went on has landed, and is killed again. The first
@@ -98,7 +98,7 @@ KILL_LOCK_WAIT_S = 5.0
 #: requires it recent. Only the timer's runs write it (its unit sets HEARTBEAT_ENV),
 #: so a check or a window refresh, which run the gate too, cannot hide a timer
 #: that stopped.
-HEARTBEAT_PATH = "/run/qmcp/gate.last"
+HEARTBEAT_PATH = "/run/qmcp/state/gate.last"
 HEARTBEAT_ENV = "QMCP_GATE_HEARTBEAT"
 #: How old the heartbeat may be while an anonymous project exists (four timer runs).
 HEARTBEAT_MAX_S = 60
@@ -779,7 +779,7 @@ class _GateLock:
     def __enter__(self) -> bool:
         old = os.umask(0o007)
         try:
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o660)
+            self.fd = core.open_run_file(self.path, os.O_RDWR | os.O_CREAT)
         finally:
             os.umask(old)
         deadline = time.monotonic() + self.wait
@@ -878,7 +878,9 @@ def subjects(records: dict) -> list:
 def _beat(path: str | None = None) -> None:
     old = os.umask(0o007)
     try:
-        with open(HEARTBEAT_PATH if path is None else path, "w", encoding="ascii") as fh:
+        fd = core.open_run_file(HEARTBEAT_PATH if path is None else path,
+                                os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
             fh.write(f"{time.time():.0f}\n")
     except OSError:
         pass                    # `qmcp check` reports a heartbeat that does not move

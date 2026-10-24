@@ -399,7 +399,8 @@ class Locked:
 
     def __enter__(self):
         import time
-        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        from qmcp import core
+        self.fd = core.open_run_file(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         deadline = time.monotonic() + self.timeout
         while True:
             try:

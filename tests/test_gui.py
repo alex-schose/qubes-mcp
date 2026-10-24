@@ -260,8 +260,8 @@ class GuiBase(ProjectBase):
         # parser where updates go, as test_anon.py has it, and notifies nobody.
         self.notices = []
         for mod, attr, value in [
-            (anon, "LOCK_PATH", str(self.tmp / "run" / "gate.lock")),
-            (anon, "HEARTBEAT_PATH", str(self.tmp / "run" / "gate.last")),
+            (anon, "LOCK_PATH", str(self.tmp / "run" / "state" / "gate.lock")),
+            (anon, "HEARTBEAT_PATH", str(self.tmp / "run" / "state" / "gate.last")),
             (anon, "RETRY_WAIT_S", 0.0),
             (anon, "load_policy", lambda: policy_view(self.app, "sys-whonix")),
             (anon, "notify", lambda text: self.notices.append(text) or True),
