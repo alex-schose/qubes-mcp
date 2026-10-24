@@ -219,6 +219,8 @@ def _first_rule(policy, rules, service, source, target):
     else:
         return "deny", None
     act = type(rule.action).__name__.lower()
+    if act == "deny" and not rule.action.notify:
+        act += " notify=no"
     if act == "allow":
         user = getattr(rule.action, "user", None)
         tgt = getattr(rule.action, "target", None)
@@ -387,8 +389,8 @@ def _cases() -> list[Case]:
         "model-p06", "deny", "deny")
     add("a stopped member copies nothing into its slot", "qubes.Filecopy", "w-p06-blocked",
         "w-p06-a", "deny", "deny")
-    add("a stopped member gets no clock through @default", "qubes.GetDate", "w-p06-blocked",
-        "@default", "deny", "deny")
+    add("a stopped member's clock request gets no notice", "qubes.GetDate", "w-p06-blocked",
+        "@default", "deny notify=no", "deny notify=no")
     # --- the restore check: a held qube is refused both ways, by any service
     for svc, lead_out in (("qmcp.RunInAIManaged", "allow user=root"),
                           ("qmcp.CopyToAIManaged", "allow user=root"),
@@ -407,8 +409,8 @@ def _cases() -> list[Case]:
         "w-p01-a", "deny", "deny")
     add("a held member copies nothing into its sink", "qubes.Filecopy", "w-p01-held",
         "sink-p01", "deny", "deny")
-    add("a held member gets no clock through @default", "qubes.GetDate", "w-p01-held",
-        "@default", "deny", "deny")
+    add("a held member's clock request gets no notice", "qubes.GetDate", "w-p01-held",
+        "@default", "deny notify=no", "deny notify=no")
     for svc in ("qubes.Filecopy", "qubes.OpenInVM", "qubes.OpenURL", "qubes.ClipboardPaste"):
         add("hub dialog into a hidden qube", svc, HUB, "w-p05-hidden", "deny", "deny")
         add("hub dialog into a hidden sink", svc, HUB, "sink-p07-hidden", "deny", "deny")
@@ -460,7 +462,30 @@ def _cases() -> list[Case]:
         add("ai policy api via @default", m, "ai-work", "@default", "deny", "deny")
     # Services Qubes redirects from @default to dom0: the D2 deny only sees a
     # dom0 target, so these are checked as @default requests.
-    add("ai desktop notification", "qubes.Notifications", "ai-work", "@default", "deny", "deny")
+    # Desktop notifications: AI space and the hub send them to dom0 through
+    # @default, and to no qube; a stopped or held qube's are refused with no
+    # "Denied" notice (A0).
+    for src in ("ai-work", "lead-p01", "w-p01-a", "ai-tpl-g", "ai-gw", "w-p07-hidden", HUB):
+        add("desktop notification", "qubes.Notifications", src, "@default",
+            "allow target=dom0", "allow target=dom0")
+    for src in ("ai-work", "lead-p01"):
+        for tgt in ("ai-work2", "personal", "dom0"):
+            if src != tgt:
+                add("ai notification addressed to a qube", "qubes.Notifications", src, tgt,
+                    "deny", "deny")
+    for src in ("w-p01-blocked", "lead-p06-blocked", "w-p01-held", "lead-p08-held"):
+        for tgt in ("@default", "personal"):
+            add("a stopped or held qube's notification, no notice", "qubes.Notifications",
+                src, tgt, "deny notify=no", "deny notify=no")
+        add("a stopped or held qube's notification to dom0", "qubes.Notifications", src,
+            "dom0", "deny", "deny")
+    # Window icons: AI space and the hub stay denied sending them to dom0's GUI
+    # (nothing needs to), but with no "Denied" notice at start. A stopped or
+    # held qube's is denied with no notice too (A0), as its GetDate/Notifications.
+    for src in ("ai-work", "lead-p01", "w-p01-a", "ai-tpl-g", "ai-gw", "w-p07-hidden", HUB,
+                "w-p01-blocked", "lead-p06-blocked", "w-p01-held", "lead-p08-held"):
+        add("window icon to dom0, no notice", "qubes.WindowIconUpdater", src, "dom0",
+            "deny notify=no", "deny notify=no")
     add("ai admin via @default", "admin.vm.List", "ai-work", "@default", "deny", "deny")
     add("ai unknown via @default", "qubes.SomethingNew", "ai-work", "@default", "deny", "allow")
     for svc in WRAPPERS:

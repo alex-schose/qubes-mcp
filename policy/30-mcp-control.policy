@@ -50,7 +50,18 @@
 # not match @adminvm): in anonymous mode that covers the hub, whose own lines
 # below would otherwise let it act. Every qube of a hidden anonymous project
 # wears qmcp-hubblind, and the hub reaches none of them, by any service. These
-# sit above every allow in this file.
+# sit above every allow in this file. The first lines refuse the desktop
+# notifications, the clock request (qubes.GetDate) and the window icon
+# (qubes.WindowIconUpdater) of a stopped qube, or of a held one
+# (qmcp-quarantine, below), without the "Denied" notice one started by hand
+# would raise at its start (GetDate and notifications reach dom0 through
+# @default, the window icon direct to @adminvm).
+qubes.Notifications        *  @tag:qmcp-blocked     @anyvm              deny  notify=no
+qubes.Notifications        *  @tag:qmcp-quarantine  @anyvm              deny  notify=no
+qubes.GetDate              *  @tag:qmcp-blocked     @anyvm              deny  notify=no
+qubes.GetDate              *  @tag:qmcp-quarantine  @anyvm              deny  notify=no
+qubes.WindowIconUpdater    *  @tag:qmcp-blocked     @adminvm            deny  notify=no
+qubes.WindowIconUpdater    *  @tag:qmcp-quarantine  @adminvm            deny  notify=no
 *                          *  @anyvm           @tag:qmcp-blocked        deny
 *                          *  @tag:qmcp-blocked  @adminvm               deny
 *                          *  @tag:qmcp-blocked  @anyvm                 deny
@@ -364,18 +375,26 @@ qmcp.RunInAIManaged        *  @tag:ai-managed  @anyvm                   deny
 qmcp.CopyToAIManaged       *  @tag:ai-managed  @anyvm                   deny
 
 # D2. AI space talks to dom0 only through the services a qube needs to boot and
-# report itself. These five allows are Qubes' own defaults for them, owned
-# here because the deny after them refuses every other service addressed to
-# dom0, including every Admin API call and the policy API. Qubes also
-# redirects two services from @default to dom0: qubes.GetDate stays (Qubes'
-# own rule already refuses Whonix qubes), qubes.Notifications does not, so no
-# AI qube can put a desktop notification in front of the operator.
+# report itself, and its desktop notifications. These allows are Qubes' own
+# defaults for them, owned here because the deny after them refuses every
+# other service addressed to dom0, including every Admin API call and the
+# policy API. Qubes redirects two services from @default to dom0:
+# qubes.GetDate (Qubes' own rule already refuses Whonix qubes) and
+# qubes.Notifications. dom0's notification proxy names the sending qube on
+# every notification and shows its body as plain text; it does not limit how
+# many a qube sends (qvm-kill the qube it names). A notification addressed to
+# any other qube is refused. A stopped or held qube's is refused in A0.
+qubes.Notifications        *  @tag:ai-managed  @default                 allow  target=dom0
 qubes.Notifications        *  @tag:ai-managed  @anyvm                   deny
 qubes.FeaturesRequest      *  @tag:ai-managed  @adminvm                 allow
 qubes.NotifyTools          *  @tag:ai-managed  @adminvm                 allow
 qubes.NotifyUpdates        *  @tag:ai-managed  @adminvm                 allow
 qubes.SyncAppMenus         *  @tag:ai-managed  @adminvm                 allow
 qubes.GetRandomizedTime    *  @tag:ai-managed  @adminvm                 allow
+# The window-icon updater stays denied for AI space (nothing in AI space needs
+# to hand dom0's GUI a window icon to parse), but with no "Denied" notice: an
+# AI qube's gui agent calls it several times at every start.
+qubes.WindowIconUpdater    *  @tag:ai-managed  @adminvm                 deny  notify=no
 *                          *  @tag:ai-managed  @adminvm                 deny
 
 # D3. AI space never calls the Admin API on a qube, except a lead's firewall
@@ -598,7 +617,9 @@ qubes.Filecopy             *  @tag:ai-managed  @anyvm                   ask
 
 # Background services the hub qube needs, and the dialogs the operator uses
 # from a terminal in it. An agent cannot reach these through any qmcp tool.
+# The hub's desktop notifications go to dom0 as AI space's do (D2).
 qubes.GetDate                  *  mcp-control  @default     allow  target=dom0
+qubes.Notifications            *  mcp-control  @default     allow  target=dom0
 qubes.GetDate                  *  mcp-control  @adminvm     allow
 qubes.GetImageRGBA             *  mcp-control  @adminvm     allow
 qubes.WaitForSession           *  mcp-control  @adminvm     allow
@@ -616,6 +637,9 @@ admin.vm.device.usb.Attach     *  mcp-control  mcp-control  ask  target=@adminvm
 admin.vm.device.usb.Detach     *  mcp-control  mcp-control  ask  target=@adminvm
 admin.vm.device.usb.Available  *  mcp-control  @adminvm     ask  target=@adminvm
 qubes.USB                      *  mcp-control  sys-usb      ask
+# The hub's gui agent calls the window-icon updater at every start; it stays
+# denied, with no "Denied" notice (as for AI space, D2).
+qubes.WindowIconUpdater        *  mcp-control  @adminvm     deny  notify=no
 
 # =========================================================================
 # H. THE HUB'S CATCH-ALLS: everything not allowed above is refused

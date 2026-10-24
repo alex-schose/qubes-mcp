@@ -18,7 +18,7 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 1.0.3 — the third patch to 1.0.0, 0.9.39's code released as stable.**
+**Status: 1.1.0 — AI space and the hub may put desktop notifications in front of you.**
 Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
@@ -135,6 +135,14 @@ entry. 0.9.17 replaced the tier model of 0.9.0–0.9.16.
   manage, revoke and package install need a second tick. The hub learns
   only whether it was accepted, rejected, expired or failed; dom0 announces
   each proposal with a desktop notification whose text the hub cannot choose.
+- **Desktop notifications.** Any qube in AI space, and the hub, may put a
+  desktop notification in front of you (`notify-send` in the qube), as any
+  qube may under Qubes' default policy. Qubes' proxy in dom0 names the
+  sending qube on each one (`<name>: ` before its title, the qube's label as
+  its icon) and shows its body as plain text; qmcp's own have the title
+  `qubes-mcp`, with no qube's name before it. Nothing limits how many a qube
+  sends: `qvm-kill` one that floods you. A qube the anonymity gate stopped,
+  or one held for your review, sends none.
 - **Anonymous projects.** dom0's anonymity gate judges each one every 15
   seconds and after every `qmcp` command that changes qubes, projects or gateways: its networks
   and its lead's are anonymising gateways still on the network recorded for
@@ -237,7 +245,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.0.3.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.1.0.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -247,7 +255,7 @@ sudo bash /tmp/qubes-mcp/deploy/install.sh
 The installer runs every preflight check before it changes anything: its
 options, the fleet's shape, and the policy, which it validates with qrexec's own
 parser against your policy directory, including that no file sorting earlier
-overrides its 54 checked claims. It installs the anonymity gate's timer as
+overrides its 62 checked claims. It installs the anonymity gate's timer as
 your dom0 user, keeps it stopped while it changes things, installs the policy
 after the code, starts the timer again and ends with `qmcp check`. Options: `--hub NAME`,
 `--birth-egress QUBE`, `--pool-cap BYTES`, `--private-cap BYTES`, `--gate-user
@@ -294,6 +302,15 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 1.0.3? Install over it. **This release widens what AI space and the hub may do:**
+each may now put a desktop notification in front of you, where 1.0.3 refused it, and Qubes
+showed a "Denied: qubes.Notifications" notice at every start of an AI qube. The five
+"Denied: qubes.WindowIconUpdater" notices every start also raised are gone too — that
+service stays refused, now without the notice. Each notification comes through
+Qubes' notification proxy, which names the qube that sent it. A qube that was running when you
+installed, the hub included, sends none until it restarts. The in-qube services do not change, so no template reads as behind. To roll back,
+install 1.0.3 over this one.
 
 Coming from 1.0.2? Install over it. The installer makes `/run/qmcp` root's alone to write
 (2750), moves a count of unwritten audit lines, if there is one, into `/run/qmcp/state/`, where

@@ -19,11 +19,65 @@ those versions are a record laid over it rather than a rebase.
 
 Up to 0.9.39, while the major version was `0`, a breaking change took a patch
 bump and was labelled **BREAKING** in its entry, as SemVer allows for `0.y.z`.
-From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how.
+From 1.0.0 the version says what an update asks of you; 1.0.0's entry says how, and 1.1.0's
+entry amends it: from 1.1.0 a widening of what AI space or the hub may do is a minor, named as
+such.
 
 ## [Unreleased]
 
 Nothing — the working tree is the last released version.
+
+## [1.1.0] — 2026-10-24
+
+A minor, and **a widening of what AI space and the hub may do**: each may put a desktop
+notification in front of the operator.
+
+### Added
+
+- **Desktop notifications from AI space and the hub.** The rulebook allows `qubes.Notifications`
+  from any qube in AI space and from the hub through `@default`, which Qubes sends to dom0, as
+  Qubes' own default policy does for any qube; addressed to another qube it is refused. 1.0.3
+  refused them all, and Qubes showed a "Denied: qubes.Notifications" notice at every start of an
+  AI qube, whose notification agent asks when its session starts (measured on the development
+  box with a Debian 13 template; the `qubes.WindowIconUpdater` notices such a start also
+  raised are silenced the same way, below). Qubes' notification proxy in dom0 names the sender
+  on every one (application `Qube: <name>`, the qube's label as icon, `<name>: ` before the
+  title), shows the body as plain text and replaces control and bidi characters; qmcp's own
+  notifications have the title `qubes-mcp` with no qube's name before it. The proxy sets no rate
+  limit: a compromised qube can flood the desktop, and `qvm-kill` on the qube it names stops
+  it. Both are residual risks in `CLAUDE.md`.
+- **A stopped or held qube's notifications are refused without a notice.** The rulebook refuses
+  `qubes.Notifications` from a qube the anonymity gate stopped (`qmcp-blocked`) or one held for
+  review (`qmcp-quarantine`) with `notify=no`, ahead of the lines that refuse it everything
+  else, so starting one by hand raises no "Denied" notice for it. `qmcp check` and the installer now
+  check 62 claims of the rulebook against files that sort earlier, the stopped or held
+  notification among them.
+- **No `Denied` popups at an AI qube's or the hub's start.** `qubes.WindowIconUpdater` stays
+  refused from AI space and the hub — nothing there sends a window icon for dom0's GUI to
+  parse — but now with `notify=no`, so the five `Denied: qubes.WindowIconUpdater` notices
+  Qubes raised at every start are gone. The rulebook's precedence check confirms qmcp's deny
+  still outranks Qubes' own default, which allows the icon updater for any qube. A stopped or
+  held qube's `qubes.GetDate` and `qubes.WindowIconUpdater` are refused with `notify=no` too,
+  as its notifications already were, so starting one by hand to review it raises no notice at
+  all. These six decisions are among the 62 the installer and `qmcp check` verify.
+
+### Changed
+
+- **The versioning rule (1.0.0's entry) is amended.** AI agents are the API's consumers, and the
+  version follows semantic versioning for them and for the operator. **Patch:** a fix,
+  including a security fix that takes something away from AI space. **Minor:** an addition,
+  including a widening of what AI space or the hub may do, which the release notes name as
+  such. **Major:** a change that breaks how AI space or the operator uses qmcp for any reason
+  but a fix: a tool, command, option or record removed or changed in shape, a refusal that is
+  not a fix, or an update that needs the operator to act beyond the README's "Updating" steps.
+  The anti-goals never change, not even in a major.
+
+### Upgrading
+
+Install over 1.0.3 and follow the README's "Updating" steps. The in-qube services do not
+change, so no template reads as behind. A qube that was running when you installed, the hub
+included, sends no notification until it restarts (measured for the hub and for an AI qube on the
+development box). To roll back, install 1.0.3 over it.
 
 ## [1.0.3] — 2026-10-24
 
@@ -183,7 +237,8 @@ need a model qube, which that machine did not have.
   only enforcement point and qrexec's caller the only identity; the hub asks and only the operator
   decides; nothing relays between a principal and dom0, and nothing writes the policy at run time.
   The anti-goals never change, not even in a major. A change that widens what AI space or the hub may do, or drops a
-  property of the trust model, takes a major version, and its entry says so first.
+  property of the trust model, takes a major version, and its entry says so first. (Amended in
+  1.1.0: a widening is a minor, named as such; see that entry.)
 - **Each release installs over the one before it** with `deploy/install.sh`, and its entry here
   (and the README's "Coming from" note) says what that update asks of you. From an older release,
   read each entry in between.

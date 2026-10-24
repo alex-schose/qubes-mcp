@@ -226,7 +226,7 @@ PROBES = [
     ("open a URL in the hub", "mcp-control", "qubes.OpenURL"),
     ("copy a file to the hub", "mcp-control", "qubes.Filecopy"),
     ("drive qmcp exec in another AI qube", "{peer}", "qmcp.RunInAIManaged"),
-    ("a dom0 desktop notification through @default", "@default", "qubes.Notifications"),
+    ("a desktop notification addressed to another AI qube", "{peer}", "qubes.Notifications"),
     ("a TCP connection into another AI qube", "{peer}", "qubes.ConnectTCP+22"),
     ("a TCP connection into a model qube", "{model}", "qubes.ConnectTCP+11434"),
 ]
