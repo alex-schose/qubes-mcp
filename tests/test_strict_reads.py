@@ -802,6 +802,11 @@ QUBE_PROPERTIES = frozenset({
 #: (module, function) whose `try` reads a qube property and does not re-raise,
 #: with the reason its answer on failure is the restrictive one, or is reported.
 ALLOWED_TRY = {
+    ("fleet.py", "_off_a_proxy"): "revoke only takes authority away and stays open: a network "
+                                  "that does not read is left as it is, a clear that fails is "
+                                  "reported, and qmcp check names a qube still on a proxy",
+    ("fleet.py", "_move"): "a provides_network write for --proxy that fails is reported as a "
+                           "failed step, with the command that finishes it",
     ("anon.py", "_power"): "a state that does not read is `unknown`, and only `Halted` is down",
     ("inqube.py", "halted"): "a state that does not read is not halted: a copy's label claims "
                              "less",
@@ -899,6 +904,7 @@ def lenient_reads(tree) -> list:
 #: an allowance covers the trys its reason was written for, not a new one
 #: added beside them, which needs its own look (and a count raised here).
 ALLOWED_TRY_COUNT = {
+    ("fleet.py", "_off_a_proxy"): 2,
     ("anon.py", "block"): 2,
     ("birth.py", "resolve_egress"): 2,
     ("inqube.py", "refresh"): 2,

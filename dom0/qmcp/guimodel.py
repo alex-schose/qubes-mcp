@@ -464,12 +464,14 @@ def add_dump(key, sink_name=None) -> list:
     return argv
 
 
-def move(qube, target, confirm=False) -> list:
+def move(qube, target, confirm=False, proxy=False) -> list:
     if target != "none":
         _key(target)
     argv = write_cmd("project", "move", _qube(qube, "the qube to move"), target)
     if confirm:
         argv.append("--yes")
+    if proxy:
+        argv.append("--proxy")
     return argv
 
 
@@ -789,7 +791,7 @@ QUBE_FIELDS = (
     ("netvm", "Network"), ("power", "Power"), ("open", "Open window"),
     ("slot", "Slot badges"), ("lead", "Lead badge"),
     ("model", "Model qube of"), ("owner", "Created by"), ("gateway", "Provides network"),
-    ("dvmt", "Disposable template"), ("badges", "Badges"),
+    ("proxy", "Project proxy"), ("dvmt", "Disposable template"), ("badges", "Badges"),
 )
 #: Every field of a `project list` row.
 PROJECT_FIELDS = (
@@ -1055,7 +1057,7 @@ def unread_row(row) -> bool:
     its tags, class or role. The window places it by none of them and offers
     nothing on it: a failed read is never state."""
     return fleet.UNREADABLE in (row.get("state"), row.get("klass"), row.get("gateway"),
-                                row.get("dvmt"))
+                                row.get("proxy"), row.get("dvmt"))
 
 
 def badges(row) -> dict:
@@ -1218,6 +1220,8 @@ def classify(row, records, hub=None, by_name=None, review=None):
         return _model_place(row, b, records, by_name)
     if b["member"]:
         slot = next(iter(b["member"]))
+        if row.get("proxy") is True:
+            return slot, "proxy", None
         return slot, ("hub's qube" if slot == projects.HUB_SLOT else "worker"), None
     if row.get("gateway"):
         return "gateways", "gateway", None
@@ -1501,7 +1505,7 @@ def details(node: Node, project_rows=None, fleet_rows=None, gate=None, hub=None,
                  if str(node.data.get("role") or "").startswith("model qube") else [])
         return ([("Role", esc(node.data.get("role")))] + ([("Why", esc(why[1]))] if why else [])
                 + restored_section(node.data, restored)
-                + anonymity_notes(node.data) + notes + rows)
+                + anonymity_notes(node.data) + proxy_notes(node.data, fleet_rows) + notes + rows)
     if node.kind == "project":
         out = [(label, field_text(key, node.data.get(key))) for key, label in PROJECT_FIELDS]
         shared = model_shared(node.data, fleet_rows)
@@ -1521,6 +1525,25 @@ def details(node: Node, project_rows=None, fleet_rows=None, gate=None, hub=None,
     if node.kind == "hub":
         return [("Hub", esc(node.data.get("name")))]
     return []
+
+
+PROXY_NOTE = ("It provides network to its own slot's members only. AI has root in it, so "
+              "the firewall rules of every qube behind it are carried out by AI: what bounds "
+              "them is the rules of the topmost proxy of its chain, carried out by the "
+              "enrolled gateway above that one.")
+BEHIND_PROXY_NOTE = ("Its network {net} is a project proxy that AI has root in, so its own "
+                     "firewall rules are advisory: what bounds it is the rules of the topmost "
+                     "proxy of {net}'s chain, carried out by the enrolled gateway above that one.")
+
+
+def proxy_notes(row, fleet_rows=None) -> list:
+    """What a project proxy means, on the proxy and on each qube behind it."""
+    out = [("Proxy", esc(PROXY_NOTE))] if row.get("proxy") is True else []
+    net = row.get("netvm")
+    up = next((r for r in fleet_rows or () if r.get("name") == net), None) if net else None
+    if up is not None and up.get("proxy") is True:
+        out.append(("Behind a proxy", esc(BEHIND_PROXY_NOTE.format(net=net))))
+    return out
 
 
 #: The selection's changes that only take authority away, and whose command

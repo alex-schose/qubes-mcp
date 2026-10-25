@@ -37,7 +37,9 @@ LABELS = frozenset({"red", "orange", "yellow", "green", "gray", "blue", "purple"
 
 #: What the hub may change on a managed qube. `template`,
 #: `name`, `default_dispvm` and `provides_network` are operator-only, and netvm
-#: may only be cleared.
+#: may only be cleared. A principal makes a proxy only by spawning one
+#: (`provides_network` at birth, `PROXY_KLASSES`), never by setting it later:
+#: qubesd accepts the flip even on a running qube.
 SETTABLE_PROPS = frozenset({"label", "memory", "maxmem", "vcpus", "netvm"})
 
 #: The only feature keys the hub may set. Each changes nothing
@@ -54,6 +56,8 @@ LIFECYCLE_ACTIONS = frozenset({"start", "shutdown", "kill", "pause", "unpause", 
 SPAWN_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVMTemplate", "DispVM"})
 #: A lead builds workloads only: disposable templates are never project members.
 LEAD_SPAWN_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVM"})
+#: The classes a spawn may make a project proxy of (`provides_network`).
+PROXY_KLASSES = frozenset({"AppVM", "StandaloneVM"})
 #: The classes that join a slot.
 WORKLOAD_KLASSES = frozenset({"AppVM", "StandaloneVM", "DispVM"})
 
@@ -182,7 +186,7 @@ def _project_badges(who, project=None) -> set:
     return who.project.badges()
 
 
-def _recheck(app, call, template=None, netvm=None) -> None:
+def _recheck(app, call, template=None, netvm=None, slot=None) -> None:
     """Under the create lock or a qube's lock, the caller must still be what it
     was: a project command holds the same lock, so a call that waited for one
     must not run on authority it took away. A lead's template and network are checked again
@@ -197,9 +201,16 @@ def _recheck(app, call, template=None, netvm=None) -> None:
     if who.kind != call.principal.kind or who.slot != call.principal.slot:
         raise core.Refusal(core.NOT_AUTHORIZED)
     call.principal = who
-    if netvm is not None and not gateways.is_enrolled(netvm):
+    # A network that is not enrolled can only be a proxy of the slot the new
+    # qube joins: the caller's `_same_network` judges it again under this lock
+    # (`_birth_netvm` re-runs `_proxy_netvm`), on the record as it is now. A
+    # network that was listed (or, for the hub, enrolled) when the call was
+    # judged and is not enrolled now is refused as such.
+    proxy = netvm is not None and not gateways.is_enrolled(netvm) and slot is not None \
+        and (who.is_hub() or netvm not in who.project.named_networks())
+    if netvm is not None and not proxy and not gateways.is_enrolled(netvm):
         raise refuse("netvm must be an enrolled gateway")
-    if netvm is not None and who.is_hub() and _hub_mode():
+    if netvm is not None and not proxy and who.is_hub() and _hub_mode():
         try:
             g = gateways.load()[netvm]
         except (gateways.GatewaysUnreadable, KeyError):
@@ -218,8 +229,64 @@ def _recheck(app, call, template=None, netvm=None) -> None:
     if not who.is_hub():
         if template is not None and template not in who.project.templates:
             raise refuse("template is not on this project's approved list")
-        if netvm is not None and netvm not in who.project.named_networks():
+        if netvm is not None and not proxy and netvm not in who.project.named_networks():
             raise refuse("netvm must be one of this project's worker networks")
+
+
+def _netvm_refusal(who) -> core.Refusal:
+    """One answer for a network that is neither one the caller may use nor a
+    sound proxy of the slot: a name that does not exist, a qube of another
+    slot and a broken chain read alike, so a create is no oracle."""
+    return refuse("netvm must be an enrolled gateway" if who.is_hub()
+                  else "netvm must be one of this project's worker networks")
+
+
+def _hub_roots(app, call) -> frozenset:
+    """Where a chain of p00's proxies may end: the hub's own birth network (the
+    one its spawns get, `birth.resolve_egress`), in anonymous mode only when it
+    is an anonymising gateway still on its recorded network; else nowhere but
+    on no network. A proxy never lets the hub reach a gateway it could not
+    put a qube on directly."""
+    caller_vm = core.lookup(app, call.caller)
+    if caller_vm is None:
+        return frozenset()
+    resolved, rule = birth.resolve_egress(app, caller_vm, None, False)
+    if rule == "unresolved" or resolved is None:
+        return frozenset()
+    if _hub_mode():
+        try:
+            g = gateways.load()[resolved]
+        except (gateways.GatewaysUnreadable, KeyError):
+            return frozenset()
+        router = core.lookup(app, resolved)
+        try:
+            now = None if router is None else core.netvm_of(router)
+        except core.Unreadable:
+            return frozenset()
+        if not g.anonymising or g.upstream is None or now != g.upstream:
+            return frozenset()
+    return frozenset({resolved})
+
+
+def _proxy_netvm(app, call, name, slot, project, refusal: core.Refusal) -> str:
+    """`name` as the network of a new qube joining `slot` (None: the new qube
+    joins no slot, so no proxy may serve it): a sound proxy of that slot,
+    `core.proxy_problem`, whose chain ends on a network the slot may use (a
+    project's worker list, p00's `_hub_roots`) or on none. The first read is
+    one by-name member read, so a name outside the slot answers as one that
+    does not exist; what the chain holds is never said."""
+    if slot is None or not isinstance(name, str):
+        raise refusal
+    core._resolve_member(app, name, slot, refusal)
+    if slot == projects.HUB_SLOT:
+        roots = _hub_roots(app, call)
+    elif project is None:
+        raise refusal
+    else:
+        roots = frozenset(project.named_networks()) & gateways.enrolled_names()
+    if core.proxy_problem(app, name, slot, roots) is not None:
+        raise refusal
+    return name
 
 
 # ------------------------------------------------------------------ reads
@@ -566,6 +633,33 @@ def svc_set_feature(app, call, req):
     return {"ok": True, "feature": feature, "value": readback}
 
 
+def _start_chain_open(app, vm) -> None:
+    """qubesd starts a qube's network before the qube: a start must not wake a
+    project proxy above it that is held for review or stopped by the gate,
+    which no service would start directly. Its own refusal for a stopped one,
+    the hold's for a held one; a read that fails refuses as a held one."""
+    seen = set()
+    try:
+        here = core.netvm_of(vm)
+        for _ in range(core.PROXY_DEPTH):
+            if here is None or here in seen:
+                return
+            seen.add(here)
+            up = core.lookup(app, here)
+            if up is None:
+                return
+            tags = core.tags_of(up)
+            if core.PROXY not in tags:
+                return
+            if tags & {projects.BLOCKED, projects.STOPPED}:
+                raise core.Refusal(core.BLOCKED_REFUSAL)
+            if core.QUARANTINE in tags:
+                raise core.Refusal(core.QUARANTINE_REFUSAL)
+            here = core.netvm_of(up)
+    except core.Unreadable:
+        raise core.Refusal(core.QUARANTINE_REFUSAL) from None
+
+
 def svc_lifecycle(app, call, req):
     name, action = _string(req, "name"), _string(req, "action")
     call.summary.update({"name": _clip(name), "action": _clip(action)})
@@ -617,6 +711,8 @@ def svc_lifecycle(app, call, req):
     # again right before waking it.
     if action in ("start", "unpause") and projects.BLOCKED in core.tags_of(vm):
         raise core.Refusal(core.BLOCKED_REFUSAL)
+    if action == "start":
+        _start_chain_open(app, vm)
     try:
         if action == "remove":
             del app.domains[name]
@@ -704,19 +800,21 @@ def _claim_name(app, call, name) -> None:
 
 def _not_a_gateway(vm, what: str) -> None:
     """A qube spawned from a network-providing template provides network too,
-    and the policy cannot see that: refuse it outright."""
-    if core.is_gateway(vm):
+    and the policy cannot see that: refuse it outright, a proxy included."""
+    if core.is_netvm(vm):
         raise refuse(f"a {what} that provides network cannot be spawned from")
 
 
-def _lead_netvm(app, req, project, source_vm, authoritative: bool):
+def _lead_netvm(app, call, req, project, source_vm, authoritative: bool):
     """A lead's create is born on its project's worker networks, never on the
     lead's own network. A clone source or a disposable template answers for
     itself, and its network must be on the list (or none). A spawn from a
     TemplateVM takes the requested listed network, or the list's first.
     Requests are judged against the list, which the lead knows, and the
-    registry, before any lookup; every listed network must be enrolled. After
-    birth a network can only be cleared, never moved."""
+    registry, before any lookup; every listed network must be enrolled. A
+    name off the list may still be one of the project's proxies
+    (`_proxy_netvm`), looked up only as one of its members. After birth a
+    network can only be cleared, never moved."""
     named = project.named_networks()
     enrolled = gateways.enrolled_names()
     specified = "netvm" in req
@@ -728,21 +826,32 @@ def _lead_netvm(app, req, project, source_vm, authoritative: bool):
             src = _name_of(source_vm.netvm)
         except Exception:
             raise refuse("birth egress could not be resolved") from None
-        if src is not None and src not in named:
-            raise refuse("the source's network is not one of this project's worker networks")
+        proxy = src is not None and src not in named
+        if proxy:
+            # A proxy serves members only: a clone's source is one, a
+            # disposable template never is.
+            refusal = refuse("the source's network is not one of this project's worker networks")
+            try:
+                member = core.is_member(source_vm, project.slot)
+            except core.Unreadable:
+                member = False
+            if not member:
+                raise refusal
+            _proxy_netvm(app, call, src, project.slot, project, refusal)
         if specified:
             if requested is None:
                 return None
             if requested != src:
                 raise refuse("netvm must match the inherited birth egress")
-        if src is not None and src not in enrolled:
+        if src is not None and not proxy and src not in enrolled:
             raise refuse("birth egress could not be resolved")
         return src
     if specified:
         if requested is None:
             return None
         if requested not in named:
-            raise refuse("netvm must be one of this project's worker networks")
+            return _proxy_netvm(app, call, requested, project.slot, project, refuse(
+                "netvm must be one of this project's worker networks"))
         if requested not in enrolled:
             raise refuse("netvm must be an enrolled gateway")
         return requested
@@ -752,21 +861,40 @@ def _lead_netvm(app, req, project, source_vm, authoritative: bool):
     return default
 
 
-def _birth_netvm(app, call, req, source_vm, authoritative: bool):
+def _birth_netvm(app, call, req, source_vm, authoritative: bool, slot=None, project=None):
     """The netvm a create must use (the birth chain in birth.py), honouring an explicit
     `netvm` in the request: for the hub, null is always allowed (offline
     cannot leak); a name must be an enrolled gateway AND equal the inherited
     answer. A lead's request is judged by `_lead_netvm`. Both are
     judged from the registry file and the chain, never by looking the name up,
-    so it is no oracle."""
+    so it is no oracle; but a name that is not enrolled may be a proxy of
+    `slot`, the slot the new qube joins (`project`: its record, for a slot
+    other than p00), looked up only as one of that slot's members
+    (`_proxy_netvm`)."""
     if not call.principal.is_hub():
-        return _lead_netvm(app, req, call.principal.project, source_vm, authoritative)
+        return _lead_netvm(app, call, req, call.principal.project, source_vm, authoritative)
     specified = "netvm" in req
     requested = req.get("netvm")
     if specified and requested is not None and not isinstance(requested, str):
         raise refuse("netvm must be a qube name or null")
     if specified and requested is None:
         return None                         # no network: nothing to resolve or read
+    refusal = _netvm_refusal(call.principal)
+    if authoritative and slot is not None:
+        # A source on one of its slot's proxies answers for itself too.
+        try:
+            src = _name_of(source_vm.netvm)
+        except Exception:
+            raise refuse("birth egress could not be resolved") from None
+        if src is not None and not gateways.is_enrolled(src):
+            _proxy_netvm(app, call, src, slot, project,
+                         refuse("birth egress could not be resolved"))
+            if specified and requested != src:
+                raise refuse("netvm must match the inherited birth egress")
+            return src
+    if specified and not authoritative and slot is not None \
+            and isinstance(requested, str) and not gateways.is_enrolled(requested):
+        return _proxy_netvm(app, call, requested, slot, project, refusal)
     caller_vm = core.lookup(app, call.caller)
     if caller_vm is None:
         # The hub exists, so a failed lookup is a read that failed, never "no
@@ -862,6 +990,8 @@ def svc_spawn(app, call, req):
                          "klass": _clip(klass), "label": _clip(label),
                          "netvm": _clip(req.get("netvm")),
                          "private_size": _clip(req.get("private_size"))})
+    if "provides_network" in req:
+        call.summary["provides_network"] = _clip(req.get("provides_network"))
     who = call.principal
     # The name is judged on its shape alone, before anything is looked up.
     err = _create_name_refusal(name, who)
@@ -874,14 +1004,22 @@ def svc_spawn(app, call, req):
         raise refuse(f"klass must be one of: {sorted(klasses)}")
     if not isinstance(label, str) or label not in LABELS:
         raise refuse(f"label must be one of: {sorted(LABELS)}")
+    proxy = req.get("provides_network", False)
+    if not isinstance(proxy, bool):
+        raise refuse("provides_network must be true or false")
+    if proxy and klass not in PROXY_KLASSES:
+        raise refuse(f"only {' or '.join(sorted(PROXY_KLASSES))} can provide network")
+    badge = _slot_badge(who, "AppVM" if klass == "DispVMTemplate" else klass,
+                        klass == "DispVMTemplate")
+    slot = None if badge is None else projects.slot_badge_parts(badge)[1]
     private_size = _private_size(req)
     tpl = _spawn_template(app, call, template, klass)
     _claim_name(app, call, name)
-    netvm = _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM"))
+    netvm = _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM"), slot=slot)
 
     budget.check_private_size(private_size)
     call.fds.append(budget.acquire_create_lock())
-    _recheck(app, call, template=template, netvm=netvm)
+    _recheck(app, call, template=template, netvm=netvm, slot=slot)
     who = call.principal
     _claim_name(app, call, name)
     # The template is looked up and judged again under the lock, as a clone's
@@ -889,8 +1027,8 @@ def svc_spawn(app, call, req):
     # landed while this call waited must not be built on. Its tags below come
     # from this read.
     tpl = _spawn_template(app, call, template, klass)
-    _same_network(netvm, _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM")),
-                  "template")
+    _same_network(netvm, _birth_netvm(app, call, req, tpl, authoritative=(klass == "DispVM"),
+                                      slot=slot), "template")
     budget.check_private_size(private_size)
     estimate = budget.estimate_new_private(private_size)
     if klass == "StandaloneVM":
@@ -906,7 +1044,7 @@ def svc_spawn(app, call, req):
     # call waited, and a read that fails refuses here, before anything is made.
     tpl_tags = core.tags_of(tpl)
     _reviewed(tpl)
-    extra = _project_badges(who)
+    extra = _project_badges(who) | ({core.PROXY} if proxy else set())
     # Read BEFORE the copy, and again after it (`inqube.after_copy`): the root
     # copied is the one the template had when it last stopped.
     tpl_halted = klass != "StandaloneVM" or inqube.halted(tpl)
@@ -935,7 +1073,7 @@ def svc_spawn(app, call, req):
         step = "default_dispvm pin"
         _pin_default_dispvm(vm)
         step = "network check"
-        if core.is_gateway(vm):
+        if core.is_netvm(vm):
             raise RuntimeError("the new qube provides network")
         if klass == "DispVMTemplate":
             step = "disposable template flag"
@@ -950,6 +1088,13 @@ def svc_spawn(app, call, req):
         step = "birth stamp"
         birth.stamp(birth.TagIO.for_vm(vm), tpl_tags, call.caller,
                     _slot_badge(who, create_klass, klass == "DispVMTemplate"), extra)
+        if proxy:
+            # Last, after the proxy badge: a qube that provides network
+            # without it is a gateway, which the check fails in AI space.
+            step = "provides_network"
+            vm.provides_network = True
+            if not core.is_netvm(vm):
+                raise RuntimeError("provides_network did not read back")
     except Exception as e:
         raise _rollback(app, call, name, step, e)
     if private_size is not None:
@@ -1026,7 +1171,7 @@ def _clone_network(who, project, netvm) -> None:
     networks, as the project's members do (a lead's clone is judged by
     `_lead_netvm`)."""
     if who.is_hub() and project is not None and netvm is not None \
-            and netvm not in project.named_networks():
+            and gateways.is_enrolled(netvm) and netvm not in project.named_networks():
         raise refuse("the source's network is not one of this project's worker networks")
 
 
@@ -1060,6 +1205,10 @@ def svc_clone(app, call, req):
     # qube may still be spawned FROM; see the residuals in CLAUDE.md for what a
     # spawn carries over. The hub may clone a template it manages.
     src = _reach(call, source, core.operand, app, source, who)
+    if core.is_netvm(src):
+        # A proxy is born, never copied: its copy would provide network
+        # without the badge that makes it one.
+        raise refuse("a qube that provides network is not cloned; spawn a new proxy")
     src_is_template = core.is_template(src)
     if src_is_template and not who.is_hub():
         # Templates and disposable templates are never project members.
@@ -1072,11 +1221,11 @@ def svc_clone(app, call, req):
     _claim_name(app, call, name)
     # A clone is the same kind of qube as its source, so the source always
     # answers for its own network — a cloned template stays off the network.
-    netvm = _birth_netvm(app, call, {}, src, authoritative=True)
+    netvm = _birth_netvm(app, call, {}, src, authoritative=True, slot=slot, project=project)
     _clone_network(who, project, netvm)
 
     call.fds.append(budget.acquire_create_lock())
-    _recheck(app, call, netvm=netvm)
+    _recheck(app, call, netvm=netvm, slot=slot)
     who = call.principal
     _claim_name(app, call, name)
     # Under the lock everything about the source is read again: a move, a
@@ -1094,7 +1243,8 @@ def svc_clone(app, call, req):
             or (now is not None and now.label != project.label):
         raise refuse("the source moved while this call waited; try again")
     project = now
-    _same_network(netvm, _birth_netvm(app, call, {}, src, authoritative=True), "source")
+    _same_network(netvm, _birth_netvm(app, call, {}, src, authoritative=True, slot=slot,
+                                      project=project), "source")
     _clone_network(who, project, netvm)
     _check_budget(app, call, _estimate(budget.persistent_bytes, src),
                   project if who.is_hub() else None)
@@ -1120,7 +1270,7 @@ def svc_clone(app, call, req):
         step = "default_dispvm pin"
         _pin_default_dispvm(vm)
         step = "network check"
-        if core.is_gateway(vm):
+        if core.is_netvm(vm):
             raise RuntimeError("the new qube provides network")
         step = "label"
         restored.label(vm)

@@ -991,9 +991,11 @@ class LeadChangeKeepsTheListUntilTheDemotion(ProjectBase):
 
 class RevokeKillsWhateverFailsAfter(ProjectBase):
     def test_a_failed_pin_or_read_back_still_kills_and_says_so(self):
-        # The read-back after the discards is the fifth tag read of a revoke.
+        # The read-back after the discards is the sixth tag read of a revoke:
+        # since 1.2.0 `revoke` reads the tags once first, to know whether the
+        # qube is a project proxy, revoked under the create lock too.
         for fail, why in ((lambda a: a.fail.add("set.default_dispvm"), "could not be pinned"),
-                          (lambda a: a.fail_reads("tag.List:ai-osint-w2", "ok ok ok ok fail"),
+                          (lambda a: a.fail_reads("tag.List:ai-osint-w2", "ok ok ok ok ok fail"),
                            "badges were taken off, but")):
             a = self.app
             w = a.domains["ai-osint-w2"]

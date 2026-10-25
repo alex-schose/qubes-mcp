@@ -12,7 +12,8 @@ of principal call the services:
 A qube is in AI space when it carries the umbrella tag `ai-managed`. Inside AI
 space it is MANAGED (operable by its principal, templates included for the
 hub) or GUARDED (`qmcp-guarded`, or a gateway: listed, read and referenced,
-never operated). Everything a principal may not see answers exactly like a
+never operated). A qube that provides network is a gateway unless it wears
+`qmcp-proxy`: a project's own proxy, managed like any member (`PROXY`). Everything a principal may not see answers exactly like a
 qube that does not exist, at the same cost.
 
 Every check here fails closed. A read of a qube that fails is never an
@@ -68,6 +69,19 @@ OPEN_FW = "qmcp-open-fw"
 #: badges it is outside `scope.TAG_VOCABULARY`.
 QUARANTINE = "qmcp-quarantine"
 ID_FEATURE = "qmcp-id"
+
+#: A project proxy (1.2.0): a member of one slot that provides network to
+#: that slot's members only. dom0 puts it on when the qube becomes one (a
+#: principal's spawn with `provides_network`, or `qmcp project move --proxy`),
+#: before `provides_network` is set; nothing in AI space can tag. A qube that
+#: provides network without it is a gateway, guarded whatever it carries.
+#: `qmcp check` proves the rest (`fleet` check 3): one slot, not a lead, its
+#: clients all of that slot, its own network an enrolled gateway on the slot's
+#: list, another proxy of the slot, or none.
+PROXY = "qmcp-proxy"
+#: How far up a chain of proxies a check walks before it calls the chain broken.
+#: qubesd refuses loops; this bounds a walk over a fleet read that changed under it.
+PROXY_DEPTH = 16
 
 #: A value that could not be read, where one is shown: never a qube name or a
 #: state, so nothing that reads it can take it for none.
@@ -914,16 +928,68 @@ def klass_of(vm) -> str:
 NO_NETWORK_CLASSES = frozenset({"AdminVM", "RemoteVM"})
 
 
-def is_gateway(vm) -> bool:
-    """A qube that provides network. Raises `Unreadable` when that cannot be
-    read: the caller decides which answer is the restrictive one. dom0 and a
-    RemoteVM have no such property and are no gateway."""
+def is_netvm(vm) -> bool:
+    """A qube that provides network, a project proxy included. Raises
+    `Unreadable` when that cannot be read: the caller decides which answer is
+    the restrictive one. dom0 and a RemoteVM have no such property."""
     if klass_of(vm) in NO_NETWORK_CLASSES:
         return False
     try:
         return bool(vm.provides_network)
     except Exception:
         raise Unreadable(f"cannot read whether {name_of(vm)} provides network") from None
+
+
+def is_gateway(vm, tags=None) -> bool:
+    """A qube that provides network and is no project proxy: a router, which
+    AI space never operates. A proxy is one only in the form dom0 makes it
+    (`proxy_form`); a stray badge, on a qube outside AI space, in no slot or
+    two, or on a lead, exempts nothing. `tags`, when the caller read them
+    already. Raises `Unreadable` when either read fails."""
+    if not is_netvm(vm):
+        return False
+    return not proxy_form(tags_of(vm) if tags is None else tags)
+
+
+def proxy_form(tags) -> bool:
+    """The badges of a project proxy as dom0 makes one: `PROXY` and the
+    umbrella on a member of exactly one slot that is no lead."""
+    return (PROXY in tags and UMBRELLA in tags and len(projects.member_slots(tags)) == 1
+            and projects.LEAD not in tags and not projects.lead_slots(tags))
+
+
+def proxy_problem(app, name, slot: str, roots) -> str | None:
+    """Why the qube `name` cannot be the network of a qube of `slot`, or None:
+    it must be a proxy of `slot` in AI space (a member, not a lead) that
+    provides network, and so must every qube above it, up to one on a network
+    in `roots` (what that slot may use: its worker list, or for p00 the
+    enrolled gateways) or on none. A read that fails is a problem, never an
+    answer."""
+    seen, here = set(), name
+    for _ in range(PROXY_DEPTH):
+        if here in seen:
+            return f"the chain above {name} loops at {here}"
+        seen.add(here)
+        vm = lookup(app, here)
+        try:
+            if vm is None:
+                return f"{here} does not exist"
+            tags = tags_of(vm)
+            if not proxy_form(tags) or projects.member_slots(tags) != {slot}:
+                return f"{here} is not a proxy of {slot}"
+            if tags & {QUARANTINE, projects.BLOCKED, projects.STOPPED}:
+                # A start of a qube behind it would start it: qubesd starts
+                # a client's network first.
+                return f"{here} is held or stopped"
+            if not is_netvm(vm):
+                return f"{here} does not provide network"
+            up = netvm_of(vm)
+        except Unreadable as e:
+            return str(e)
+        if up is None or up in roots:
+            return None
+        here = up
+    return f"the chain above {name} is longer than {PROXY_DEPTH}"
 
 
 def is_dvmt(vm) -> bool:
@@ -1003,10 +1069,12 @@ def service_qubes_of(vm) -> list:
 
 
 def is_guarded(vm, tags=None) -> bool:
-    """Guarded = badged by the operator, or a gateway (always guarded). A read
-    that fails counts as guarded, so it never makes a qube operable."""
+    """Guarded = badged by the operator, or a gateway (always guarded; a
+    project proxy is no gateway). A read that fails counts as guarded, so it
+    never makes a qube operable."""
     try:
-        return GUARDED in (tags_of(vm) if tags is None else tags) or is_gateway(vm)
+        tags = tags_of(vm) if tags is None else tags
+        return GUARDED in tags or is_gateway(vm, tags)
     except Unreadable:
         return True
 

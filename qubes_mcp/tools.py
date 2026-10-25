@@ -408,9 +408,21 @@ def _qubes_list(args: dict) -> dict:
       on the project's list; a DispVM keeps its disposable template's, which
       must be on the list. A lead's own network is never used. Pass null for
       no network. That is always allowed, except that a lead's DispVM still
-      needs its disposable template on a listed network, or on none. After
-      birth a qube's network can only be cleared (netvm null), never moved to
-      another one.
+      needs its disposable template on a listed network, or on none. An
+      AppVM or a StandaloneVM may also be born on one of its own slot's
+      project proxies (p00's for the hub, the project's for a lead), whatever
+      the inherited value: any other name answers as one that does not exist.
+      After birth a qube's network can only be cleared (netvm null), never
+      moved to another one.
+    - provides_network: true makes the new AppVM or StandaloneVM a project
+      proxy: it provides network to its own slot's members only, which may
+      then be born on it, and it sits on a network as any new qube does (an
+      enrolled gateway, another proxy of the slot, or none for an internal
+      network). This is the only way to make one; nothing sets it later. The
+      firewall rules of a qube behind a proxy are carried out by the proxy,
+      which you have root in, so they are advisory, as are a lower proxy's own
+      in a chain: what bounds the qubes behind it is the rules of the chain's
+      topmost proxy, carried out by the enrolled gateway above it.
     - private_size: optional, in bytes. Grows the persistent private volume
       beyond the Qubes default. It counts against the caller's disk budget
       (see qubes_get_pool_stats), and a size above the operator's per-qube
@@ -438,12 +450,17 @@ def _qubes_list(args: dict) -> dict:
                                            "a name must equal the inherited one."),
         "private_size": _prop(["integer", "null"], "Size of the private volume in bytes; "
                                                    "omit for the Qubes default.", default=None),
+        "provides_network": _prop("boolean", "Make the new AppVM or StandaloneVM a project "
+                                             "proxy for its own slot's members.",
+                                  default=False),
     }, required=("name", "template"))
 def _qubes_spawn(args: dict) -> dict:
     payload = {"name": args["name"], "template": args["template"],
                "klass": args["klass"], "label": args["label"]}
     if "netvm" in args:
         payload["netvm"] = args["netvm"]
+    if args["provides_network"]:
+        payload["provides_network"] = True
     if args["private_size"] is not None:
         payload["private_size"] = args["private_size"]
     return qrexec.call_qmcp("qmcp.SpawnAIManagedQube", payload, timeout=CREATE_TIMEOUT,
@@ -693,7 +710,9 @@ def _qubes_firewall_get(args: dict) -> dict:
     `rules` is the whole new ruleset: rule lines in the Qubes Admin API
     grammar, separated by newlines. With reload (the default) the rules are
     also applied at once in the qube's netvm; pass reload=false when that netvm
-    is not running yet: the rules are saved and apply when it starts.
+    is not running yet: the rules are saved and apply when it starts. Behind a
+    project proxy the rules are carried out by that proxy, which AI has root
+    in, so they are advisory there.
 
     Returns {"ok": true, "reloaded": <bool>}, with a "warning" when the rules
     were saved but the reload failed (they apply when the netvm next loads

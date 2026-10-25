@@ -1059,6 +1059,13 @@ class MoveForm(Form):
         self.confirm = _check(esc("yes, move it: what it holds goes with it"))
         self.confirm.connect("toggled", self.update)
         self.row("Confirm", self.confirm)
+        # The operator's way to make an existing qube a project proxy.
+        self.proxy = _check(esc("make it the slot's project proxy: it provides network to "
+                                "that slot's members only, and AI manages it"))
+        self.proxy.set_active(row.get("proxy") is True)
+        self.proxy.set_sensitive(row.get("proxy") is not True)
+        self.proxy.connect("toggled", self.update)
+        self.row("Proxy", self.proxy)
         self.netinfo = _label(esc(""), wrap=True)
         _named(self.netinfo, esc("network fit"))
         self.row("Network", self.netinfo)
@@ -1092,7 +1099,10 @@ class MoveForm(Form):
         self.confirm.set_sensitive(needs)
         if needs and not self.confirm.get_active():
             raise gm.FormError(tick)
-        return gm.move(self.row_data.get("name"), target, confirm=needs)
+        proxy = self.proxy.get_active() and self.row_data.get("proxy") is not True
+        if proxy and target in (None, "none"):
+            raise gm.FormError("a project proxy is a member of one slot: pick p00 or a project")
+        return gm.move(self.row_data.get("name"), target, confirm=needs, proxy=proxy)
 
 
 class RevokeForm(Form):

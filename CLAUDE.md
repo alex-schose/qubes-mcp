@@ -8,7 +8,7 @@ qubes they touch; running a command, copying a file out and reading or writing
 a firewall go straight to the qube or the Admin API, decided by the qrexec
 policy in dom0.
 
-**This file describes the code at this version (1.1.0). Read it first in any
+**This file describes the code at this version (1.2.0). Read it first in any
 session opened in this directory.** The release history is in `CHANGELOG.md`.
 
 ## Trust model
@@ -55,7 +55,9 @@ These are load-bearing. Do not change them without the operator's sign-off.
 - **Two states.** A qube in AI space is **managed** (the hub may operate it) or
   **guarded** (listed, read and used as a reference — spawned from — but never
   operated). Guarded means the tag `qmcp-guarded`, or providing network: a
-  gateway is guarded whatever it carries, and nothing is spawned from one.
+  gateway is guarded whatever it carries, and nothing is spawned from one. A
+  project proxy (`qmcp-proxy`, see "Project proxies") is the one qube that
+  provides network and is managed: a member of its slot, never a gateway.
 - **A guarded qube is sealed, and the operator may open it for a while.** Being
   guarded is a refusal, not a state the hub can change: the rulebook denies it
   every service into such a qube but reading its firewall rules and its dialog
@@ -96,7 +98,9 @@ These are load-bearing. Do not change them without the operator's sign-off.
   in the dom0 library, and a `try` that swallows such a read unless it is
   listed with the reason its answer is restrictive or its failure reported.
 - **Networks are the operator's.** A qube in AI space is given a network only
-  if it is a gateway the operator enrolled (`qmcp gateway enroll`), or none.
+  if it is a gateway the operator enrolled (`qmcp gateway enroll`), one of its
+  own slot's project proxies, whose chain ends on such a gateway or on no
+  network, or none.
   Whether a name is enrolled is read from the registry file, never by looking
   that name up. A lead's own firewall is the operator's too: dom0 writes it
   from the lead's model endpoint, and neither the hub nor the lead can write
@@ -565,6 +569,54 @@ and a project gets a lead on another network only by a new lead, which can
 take what it needs from the old one kept as a worker. An enrolled gateway that
 stops qualifying is refused by the operator's commands and fails `qmcp check`;
 the services still place new qubes on it until it is fixed or removed.
+
+**Project proxies (1.2.0).** A project may have qubes of its own that provide
+network to its members: a VPN or SOCKS client, an intercepting proxy, a
+private network with no way out. AI makes one by spawning an AppVM or a
+StandaloneVM with `provides_network`; the operator makes an existing managed
+qube one with `qmcp project move QUBE TARGET --proxy` (the window's Move form
+has the tick). Either way dom0 puts `qmcp-proxy` on it with its slot's badges
+and sets `provides_network` last. Nothing sets it on an existing qube through a
+service, since qubesd takes that change even on a running qube, and a proxy is
+never cloned. A proxy:
+
+- serves its own slot's members only, and is no lead, model qube or enrolled
+  gateway, and never itself a disposable or a template;
+- sits on an enrolled gateway its slot may use (one on the project's list; for
+  p00, any enrolled one, though the hub puts a qube behind a p00 proxy only
+  when the chain ends on the hub's own birth network, so a proxy never opens
+  the hub a gateway it could not use directly), on another proxy of its slot,
+  chained to any depth, or on none, which makes it an internal network;
+- is managed like any member: the hub and its lead run commands in it as root
+  and write its firewall.
+
+A Qubes firewall rule is carried out by the qube above the one it is set on,
+so behind a proxy a qube's own rules are carried out by AI: measured on Qubes
+4.3.2, two `nft` commands as root in the proxy lift them. They are advisory
+there, and so are a lower proxy's own rules in a chain, which the proxy above
+it carries out. What bounds a chain and everything behind it is the rules of
+its topmost proxy, carried out by the enrolled gateway above it (which AI
+writes too, inside the gateway's own rules, as for any worker): measured over
+IPv4, those rules held for a client one and two hops down, and a proxy that
+stopped translating its clients' addresses cut them off rather than letting
+them past (IPv6 through a proxy was not measured). qubesd refuses a loop, a network
+that does not provide network, and turning a proxy off while a qube sits on
+it. A qube is born on a proxy only when the spawn names one of its slot's
+proxies (any other name answers as one that does not exist) or a clone's
+source sits on one, and `qmcp check`'s
+project-proxies item fails on every qube that wears the badge and breaks one
+of the rules above, or serves a qube outside its slot or a lead. A proxy that
+serves anyone does not move out of its slot, and is not revoked; a qube on a
+proxy moves only within that proxy's slot, and a revoke clears its network
+before it leaves AI space; `qmcp project delete` removes clients before their
+proxies. The badge exempts a qube from being a gateway only in the form dom0
+makes (in AI space, one slot, no lead): anywhere else it exempts nothing. A
+proxy held for review or stopped by the gate serves no new qube, and the
+lifecycle service starts no qube behind one, since qubesd starts a qube's
+network first (an exec or a copy into a halted qube behind it still does: see
+the residual risks);
+a disposable template, which is no member, on a proxy is never built on. In an anonymous project a proxy is a member the gate judges like any
+other, so the chain still ends on a listed anonymising gateway, or on none.
 
 **Model qubes.** A project's lead may use a self-hosted model instead of a
 remote endpoint: a **model qube**, guarded and with no network, which the lead
@@ -1125,8 +1177,9 @@ checked again under the create lock, where the birth network is worked out
 again from what is read there: a create whose network changed while it waited
 is refused (try again). A spawn may ask for `netvm: null`, which is always
 allowed. Otherwise the hub's may name only the netvm it would get anyway, and
-a lead's spawn from a TemplateVM any of its project's worker networks; any
-other name is refused. A qube whose
+a lead's spawn from a TemplateVM any of its project's worker networks; either
+may also name a project proxy of the slot the new qube joins, and a clone of a
+qube on one stays on it (see "Project proxies"); any other name is refused. A qube whose
 network cannot be proven is rolled back before the call returns: a fresh qube
 before its first boot; a preloaded disposable, already running on its
 template's network, is killed.
@@ -1310,7 +1363,7 @@ and that the model lines sit between the denies that guard them.
 | `qmcp project dump NAME` | Create a dump sink for a project, or for p00 (`hub-dump`). A dump sink is always a fresh qube: a qube of that name refuses it, and one that wears no dump badge is named as a `project dump` that did not finish, to remove (`qvm-remove`) before running the command again. |
 | `qmcp project unblock NAME` | Clear the anonymity gate's stop once a fresh run finds the project sound; `autostart` stays off. `p00` (or `hub`): the hub's stop, and every qube under the hub's check, once the gate finds the hub sound; in normal mode it takes off the stop badges anonymous mode left (`qmcp-blocked`, `qmcp-stopped`), with no gate run. A qube that cannot be looked up, whose badges do not read back off, or in normal mode whose tags cannot be read, is named as not unblocked, and the command exits 1. Root. |
 | `qmcp gate [--json]` | First judge every anonymous project now, and in anonymous mode the hub (its verdict has `hub` and `offenders`), and stop what is not sound, then hold for review every qube wearing `ai-managed`, `ai-dump` or a qmcp badge whose `qmcp-id` label is missing or not its own UUID (the restore check; what it holds, and each owner badge it takes off, keeps or fails to decide, goes to standard error) (the timer runs this). Prints only what is not sound and what it did, unless `--json`. Exit 0 all sound, 1 one is not, 3 one could not be judged, or the restore check could not run, a hold, an owner-badge decision or a read in it failed, or a hold was made while a call kept the qube's lock past both its waits (said on standard error, as is a qube that a call already running removed, before or after the hold's own write). Runs as any member of `qubes`. |
-| `qmcp project move QUBE TARGET` | Move a managed AppVM or StandaloneVM into p00, a project, or no slot. Its network does not change, so a project takes it only with no network or on one of its worker networks; out of one slot into another needs `--yes`, and so does a move into, out of or between anonymous projects, which says first what the qube carries with it. A move is refused if the anonymous project it goes into would be unsound or, in anonymous mode, if the hub's check would stop more qubes or the moved qube itself. A qube the gate stopped does not move. A qube that is not shut down (running, paused, or its power state does not read) moves from one slot to another only once it is: refused, never killed, since a kill loses what is being written; between p00 and no slot, both the hub's, it moves running. Such a move puts `qmcp-blocked` on the qube first (the rulebook refuses every call into it), requires it to read Halted for 10 s, a start admitted just before having time to show, changes the slot badges, and takes the block off last; a start that shows refuses the move, one that lands after the badges changed undoes it, and a step that fails half-way leaves the block on and says so. |
+| `qmcp project move QUBE TARGET [--proxy]` | Move a managed AppVM or StandaloneVM into p00, a project, or no slot. With `--proxy` it also becomes that slot's project proxy (see "Project proxies"): never into no slot, never a lead or a model qube, and a qube that already provides network is a gateway and refused (leave the flag off in Qubes; `--proxy` sets it). A proxy that serves anyone does not leave its slot, and a qube on a proxy moves only within its slot. Its network does not change, so a project takes it only with no network, on one of its worker networks or on one of its proxies; out of one slot into another needs `--yes`, and so does a move into, out of or between anonymous projects, which says first what the qube carries with it. A move is refused if the anonymous project it goes into would be unsound or, in anonymous mode, if the hub's check would stop more qubes or the moved qube itself. A qube the gate stopped does not move. A qube that is not shut down (running, paused, or its power state does not read) moves from one slot to another only once it is: refused, never killed, since a kill loses what is being written; between p00 and no slot, both the hub's, it moves running. Such a move puts `qmcp-blocked` on the qube first (the rulebook refuses every call into it), requires it to read Halted for 10 s, a start admitted just before having time to show, changes the slot badges, and takes the block off last; a start that shows refuses the move, one that lands after the badges changed undoes it, and a step that fails half-way leaves the block on and says so. |
 | `qmcp project delete NAME --yes` | Remove the lead and every member, keep the dump sink and the model qube without the slot's badge, strip every badge of the slot, free it. A member of another slot too, a template, a disposable template, a gateway, a model qube, a guarded qube, a dump sink or the hub is kept without the slot's badges. Given a slot with no record, finish a delete that stopped half-way. Without `--yes` it prints, by name, what it would remove, keep and strip, and changes nothing; that needs no root. |
 | `qmcp proposal list [--json]` / `show N [--json]` | The hub's proposals, newest first; one proposal with its stored options, the command it is the options of (an edit shows its project before and after instead; a lead-firewall proposal adds the lead's model and rules now and after), why it needs the second tick, the plan of a delete, and its decision and report once decided. Reads, as any member of `qubes`. |
 | `qmcp proposal accept N --sha256 F [--yes TICK]` | Run proposal `N`'s command as the operator, if its stored file still hashes to `F`; `--yes TICK` is the second tick, the tick `show` gave for the reasons it showed, refused if those reasons have changed. Expiry is judged once the locks are held, and the decision is stamped when it is written. A read that the check for a hidden project's names needs and that fails refuses before anything runs, and the proposal stays pending. Root. |
@@ -1900,6 +1953,7 @@ changes nothing.
 | `tests/test_dom0.py` | anywhere with python3-qrexec | the dom0 library against `tests/fakequbes.py`, a fake qubesadmin that copies tags, features and properties on disposables, and on a hand clone (`clone_vm`, tags one by one in sorted order), as the platform does, and copies a root as its qube last stopped |
 | `tests/test_projects.py` | anywhere with python3-qrexec | projects against the same fake: who is a lead, what a lead sees and does (and at what cost), what the hub's creates join, where a clone lands, standalone workers and leads, and every `qmcp project` command but `firewall` (`test_gateways.py`, `test_models.py`) and `unblock` (`test_anon.py`, `test_mode.py`), and the project check |
 | `tests/test_gateways.py` | anywhere with python3-qrexec | the gateway registry, the networks AI space may use, leads' firewalls and their proposal, against the same fake |
+| `tests/test_proxies.py` | anywhere with python3-qrexec | project proxies against the same fake: what a spawn with `provides_network` makes and in what order, which names a create may be born on and that every other one answers alike, re-checks under the create lock, the hub's p00 roots, `project move --proxy` and its refusals, the delete order, every failure of the check's project-proxies item, the anonymity gate, and the qubesd refusals the fake was taught (measured) |
 | `tests/test_models.py` | anywhere with python3-qrexec | model qubes and model endpoints against the same fake: the one command and the order it changes authority in, each refusal, sharing, creates and lead changes, the check's findings, what the lead and the hub are told, the record, proposals, and the DNS rule an address endpoint no longer gets |
 | `tests/test_anon.py` | anywhere with python3-qrexec | anonymous projects against the same fake, with dom0's update question asked of qrexec's real parser: each gate condition broken on its own from a sound project, the block in its order, a read that fails once and twice, unblock, hub-blind services answering as for a missing name (`test_dom0.py` pins the cost), the commands' refusals, and proposals |
 | `tests/test_mode.py` | anywhere with python3-qrexec | anonymous mode against the same fake, with the update question asked of qrexec's real parser (and of our rulebook, for a stopped qube): the mode file, the updates tick, the hub's check and what each violation stops, unblock p00, the hub's creates and proposals in the mode, and moves into, out of and between anonymous projects |
@@ -1940,6 +1994,24 @@ real dom0's policy set.
   desktop notifications every AI qube has, and every create it makes stays inside its name
   space, templates, networks and quota. Give each project its own model
   key with a spend limit.
+- **Behind a project proxy, a qube's firewall rules are advisory.** AI has
+  root in the proxy, which carries them out; the chain's topmost proxy's rules and the
+  enrolled gateway's above it are what bound it (in a chain, the topmost
+  proxy's). The proxy also sees, and can change, all its clients' traffic,
+  and can let its clients reach each other (measured: root in the qube
+  reached alone did not open it; root in the proxy and in that qube did),
+  which is inside one project, where copies need no dialog either.
+- **A held proxy still starts when a qube behind it does.** qubesd starts a
+  qube's network before the qube, and the rulebook's exec and copy into a
+  project's halted member start it (no `autostart=no`), so a principal can
+  wake a proxy held for review through one of its clients. The hold still
+  refuses every call into and out of the proxy itself; a stopped one's
+  clients are stopped with it. An enrolled gateway held after a restore has
+  always started the same way when an AI qube behind it starts.
+- **Revoking a proxy waits for creates.** It takes the create lock, so no
+  create puts a qube on the proxy while it is checked; a principal that keeps
+  creates in flight can make the revoke refuse ("a create is in progress")
+  until they stop, and the operator runs it again.
 - **Qubes' own open dialogs still reach across projects.** This rulebook
   leaves `qubes.OpenInVM` and `qubes.OpenURL` from AI space to Qubes' default
   policy, which asks: a worker or a lead can put a dialog in front of you that

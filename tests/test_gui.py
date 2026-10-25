@@ -586,7 +586,8 @@ SAMPLES = {
                      dict(key="osint", lead_source="template", lead_origin="ai-debian-13",
                           lead_class="standalone")],
     gm.add_dump: [dict(key="other", sink_name="other-sink")],
-    gm.move: [dict(qube="ai-work2", target="osint", confirm=True)],
+    gm.move: [dict(qube="ai-work2", target="osint", confirm=True),
+              dict(qube="ai-work2", target="osint", proxy=True)],
     gm.delete_plan: [dict(key="osint")],
     gm.delete_project: [dict(key="osint")],
     gm.guard_qube: [dict(qube="x1")],
@@ -4247,7 +4248,8 @@ class Widgets(GuiBase):
             gm.add_dump: (self.gui.DumpForm(self.win, "osint", "osint-dump"), {
                 "key": "key", "sink_name": "sink_name"}),
             gm.move: (self.gui.MoveForm(self.win, row, self.win.records), {
-                "qube": "row_data", "target": "target", "confirm": "confirm"}),
+                "qube": "row_data", "target": "target", "confirm": "confirm",
+                "proxy": "proxy"}),
             gm.role: (self.gui.RevokeForm(self.win, "ai-work2"), {
                 "action": "build", "qube": "qube_name", "keep_running": "keep",
                 "remove": "remove"}),
@@ -5078,6 +5080,10 @@ class Widgets(GuiBase):
         f = self.gui.MoveForm(self.win, self.node("qube:ai-osint-w1").data, self.win.records)
         f.target.set_active_id("other")
         f.confirm.set_active(True)
+        forms.append(f)
+        f = self.gui.MoveForm(self.win, self.node("qube:ai-osint-w1").data, self.win.records)
+        f.target.set_active_id("osint")
+        f.proxy.set_active(True)
         forms.append(f)
         f = self.gui.RevokeForm(self.win, "ai-work")
         f.keep.set_active(True)

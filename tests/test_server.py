@@ -547,6 +547,23 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("netvm", explicit)
         self.assertIsNone(explicit["netvm"])
 
+    def test_provides_network_is_a_boolean_sent_only_when_true(self):
+        self.assertIs(self.validate("qubes_spawn", {"name": "ai-a", "template": "t"})
+                      ["provides_network"], False)
+        self.assert_rejected("qubes_spawn", {"name": "ai-a", "template": "t",
+                                             "provides_network": "yes"}, "provides_network")
+        sent = []
+        with mock.patch.object(tools.qrexec, "call_qmcp",
+                               lambda svc, payload, **kw: sent.append(payload) or {"ok": True}):
+            tools.TOOLS["qubes_spawn"].handler({"name": "ai-a", "template": "t", "klass": "AppVM",
+                                                "label": "gray", "private_size": None,
+                                                "provides_network": False})
+            tools.TOOLS["qubes_spawn"].handler({"name": "ai-a", "template": "t", "klass": "AppVM",
+                                                "label": "gray", "private_size": None,
+                                                "provides_network": True})
+        self.assertNotIn("provides_network", sent[0])
+        self.assertIs(sent[1]["provides_network"], True)
+
     def test_input_is_not_modified(self):
         arguments = {"name": "ai-a", "cmd": ["id"]}
         self.validate("qubes_run", arguments)

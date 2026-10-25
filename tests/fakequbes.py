@@ -348,7 +348,23 @@ class FakeVM:
         if key == "label":
             value = FakeLabel(value) if isinstance(value, str) else value
         if key in ("netvm", "default_dispvm", "template") and isinstance(value, str):
-            value = self.app.domains[value]
+            value = self.app.domains[value] if value else None
+        if key == "netvm" and value is not None:
+            # qubesd 4.3.2, measured on the development box 2026-10-25:
+            # a netvm must provide network, and no chain may loop.
+            if not value._props.get("provides_network"):
+                raise Injected(f"QubesValueError: The {value.name} qube does not provide network")
+            up, seen = value, set()
+            while up is not None and up.name not in seen:
+                if up is self:
+                    raise Injected("QubesValueError: Loops in network are unsupported")
+                seen.add(up.name)
+                up = up._props.get("netvm")
+        if key == "provides_network" and not value and any(
+                v._props.get("netvm") is self for v in self.app.domains._vms.values()):
+            # Measured too: un-proxying a qube something still sits on.
+            raise Injected("QubesValueError: The qube is still used by other qubes, change "
+                           "theirs 'netvm' first")
         self._props[key] = value
         self.__dict__["_defaults"].discard(key)
         # qubesd applied it, and the reply was lost.
@@ -637,6 +653,10 @@ class FakeDomains:
         vm = self._vms[name]
         if vm.is_running():
             raise Injected("QubesVMNotHaltedError")
+        if any(v._props.get("netvm") is vm for v in self._vms.values()):
+            # qubesd 4.3.2, measured on the development box 2026-10-25: a
+            # network still in use, halted or not, is not removed.
+            raise Injected(f"QubesVMInUseError: Domain is in use: '{name}'")
         self._drop(name)
 
     def clear_cache(self):

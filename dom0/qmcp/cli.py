@@ -358,7 +358,7 @@ def cmd_project(args) -> int:
         elif what == "dump":
             report = fleet.add_dump(app, args.name, args.sink_name)
         elif what == "move":
-            report = fleet.move(app, args.name, args.target, confirm=args.yes)
+            report = fleet.move(app, args.name, args.target, confirm=args.yes, proxy=args.proxy)
         elif what == "unblock":
             report = fleet.unblock(app, args.name)
         elif what == "audit":
@@ -1087,6 +1087,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--yes", action="store_true",
                    help="confirm moving a qube out of one slot into another, or into or out of "
                         "an anonymous project")
+    q.add_argument("--proxy", action="store_true",
+                   help="make it the slot's project proxy: it provides network to that slot's "
+                        "members only, and AI manages it")
     q = psub.add_parser("audit", help="where a project's audit lines go: disk, ram (gone at "
                                       "shutdown) or off; the lines already on disk stay there "
                                       "(root)")
@@ -1281,6 +1284,8 @@ def operator_line(args):
     elif w == "move":
         summary = {"qube": str(args.name)[:128], "target": str(args.target)[:128],
                    "yes": bool(args.yes)}
+        if args.proxy:
+            summary["proxy"] = True
     return f"qmcp project {w}", summary
 
 

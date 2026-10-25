@@ -18,14 +18,15 @@ running a command, copying a file out and the firewall go to the qube or the
 Admin API under dom0's qrexec policy. The hub, and each lead, can do what dom0
 allows it, and nothing more.
 
-**Status: 1.1.0 — AI space and the hub may put desktop notifications in front of you.**
+**Status: 1.2.0 — a project may have proxies of its own, which its AI builds and runs.**
 Besides the hub, up to 15
 projects, each with its own lead agent that creates and runs its own workers
 inside the project's names, templates, networks and disk quota, and sees
 nothing outside it; a copy out of the project needs the operator's dialog.
 A worker or a lead may be a **standalone**: its own copy of a template's
 root, so the tools installed in it stay across restarts.
-Every network an AI qube is given is a gateway the operator enrolled, and a
+Every network an AI qube is given is a gateway the operator enrolled, or a
+project proxy of its own slot whose chain ends on one (or on no network), and a
 lead's firewall, which dom0 writes to allow its model endpoint (and DNS for a
 host name), nothing else, is the operator's. A lead can instead use a
 self-hosted model in a **model qube** with no network, which, while it is
@@ -118,6 +119,15 @@ entry. 0.9.17 replaced the tier model of 0.9.0–0.9.16.
   it, which must be enrolled; inside that, the hub and the lead narrow each
   worker's reach with its firewall rules. The lead's own reach is its
   firewall, which is yours.
+- **Project proxies.** A project, or p00, may have qubes that provide network
+  to its own members only: a VPN client, a SOCKS or intercepting proxy, or an
+  internal network with no way out. The hub or the lead spawns one
+  (`qubes_spawn` with `provides_network`), or you make an existing managed
+  qube one (`qmcp project move QUBE PROJECT --proxy`). AI has root in it, so
+  the firewall rules of the qubes behind it are advisory, and so are a lower
+  proxy's in a chain: what bounds them is the rules of the chain's topmost
+  proxy, carried out by the enrolled gateway above it, and that gateway's own. A lead never sits behind one, and none serves another slot;
+  `qmcp check` fails if one does.
 - **Proposals.** The hub cannot create a project, change or remove a lead,
   delete a project, change a project's templates, networks or quota, change
   a lead's firewall, open a guarded qube, bring a qube into AI space or take
@@ -245,7 +255,7 @@ network will do; Qubes' stock `default-dvm` does.
 
 ```sh
 qvm-run --dispvm=default-dvm --pass-io \
-  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.1.0.tar.gz' \
+  'curl -fsSL https://github.com/alex-schose/qubes-mcp/archive/refs/tags/v1.2.0.tar.gz' \
   > /tmp/qmcp.tgz
 rm -rf /tmp/qubes-mcp && mkdir /tmp/qubes-mcp
 tar -xzf /tmp/qmcp.tgz -C /tmp/qubes-mcp --strip-components=1
@@ -302,6 +312,17 @@ the timers and the boot unit run. Each form shows the command it will run (`sudo
 window runs nothing but the `qmcp` command.
 Text that AI chose, such as a name in the audit log, is shown escaped:
 `\u202e`, never a reversed line.
+
+Coming from 1.1.0? Install over it. **This release widens what AI space and the hub may do:**
+the hub and each lead may now make project proxies, qubes of their own slot that provide
+network to that slot's members, and put qubes behind them. Nothing changes until one does: no
+qube becomes a proxy by the update. You can make one yourself with `qmcp project move QUBE
+PROJECT --proxy` or the Move form's tick. The in-qube services and the rulebook do not change,
+so no template reads as behind. To roll back, first remove every
+proxy: clear the network of each qube behind one (`qvm-prefs Q netvm ''`), then remove the
+proxy, or turn it into a plain member (`qvm-prefs P provides_network False`, `qvm-tags P del
+qmcp-proxy`). 1.1.0 reads any qube that provides network as a gateway, seals it from AI and
+fails `qmcp check` on it and on the qubes behind it. Then install 1.1.0 over this one.
 
 Coming from 1.0.3? Install over it. **This release widens what AI space and the hub may do:**
 each may now put a desktop notification in front of you, where 1.0.3 refused it, and Qubes

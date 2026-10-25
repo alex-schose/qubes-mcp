@@ -380,6 +380,10 @@ def evaluate(app, p, registry: dict, policy_view, by_name: dict, tags_by: dict) 
         if net is not None:
             if projects.lead_badge(p.slot) in tags_by[name]:
                 router_ok(net, f"the lead {name}")
+            elif net in names and core.PROXY in tags_by[net]:
+                # One of the project's own proxies: a member, judged here
+                # itself, so the chain ends on a listed router or on none.
+                pass
             elif net not in listed:
                 v.fail("networks", f"the member {name} is on {net}, which the project does not "
                                    f"list")
@@ -563,7 +567,9 @@ def evaluate_hub(app, hub, records: dict, registry: dict, policy_view, by_name: 
                 v.fail("templates", detail, name)
             continue
         net = core.netvm_of(vm)
-        if net is not None:
+        if net is not None and not (net in subjects and net != hub
+                                    and core.PROXY in tags_by[net]):
+            # A p00 proxy is a subject too, judged here itself.
             router_ok(net, name)
         target = update_target(policy, info, name)
         if target is not None:

@@ -27,6 +27,65 @@ such.
 
 Nothing — the working tree is the last released version.
 
+## [1.2.0] — 2026-10-25
+
+A minor, and **a widening of what AI space and the hub may do**: each may make project proxies
+and put its qubes behind them.
+
+### Added
+
+- **Project proxies.** A qube in p00 or a project may provide network to that slot's members:
+  a VPN or SOCKS client, an intercepting proxy, or an internal network with no way out. The hub
+  or a lead makes one by spawning an AppVM or a StandaloneVM with `provides_network`
+  (`qubes_spawn`); the operator makes an existing managed qube one with `qmcp project move QUBE
+  TARGET --proxy`, or the window's Move form. dom0 puts the new badge `qmcp-proxy` on it with
+  its slot's badges, then sets `provides_network`. A proxy is managed like any member, sits on
+  an enrolled gateway its slot may use, on another proxy of its slot, or on no network, and
+  serves its own slot's members only. It is never a lead, a model qube, an enrolled gateway, a
+  disposable or a template, and it is never cloned. `provides_network` is still not a property
+  a principal may set later: qubesd accepts that change even on a running qube.
+- **A create may be born on a proxy.** `qubes_spawn`'s `netvm` (and a clone's inherited one) may
+  be a proxy of the slot the new qube joins, whose chain ends on a network that slot may use: a
+  project's worker list, or for p00 the hub's own birth network, so a proxy never gives the hub
+  a gateway it could not put a qube on directly. Any other name gets the same refusal as before,
+  for one that exists or not. The chain is judged again under the create lock.
+- **`qmcp check` judges every proxy** (item "project proxies"): one slot, its network, every qube
+  on it a member of that slot and no lead. A qube on a proxy no longer fails "AI networks";
+  a qube that provides network without the badge is still a gateway outside the guarded state.
+  The anonymity gate judges a member on its project's proxy through that proxy, itself a member.
+- **The window** shows a proxy's role, what it means on the proxy and on each qube behind it,
+  and offers the tick in the Move form; the `list` rows carry a `proxy` field.
+
+### Changed
+
+- **A qube that provides network is a gateway unless it wears `qmcp-proxy`.** Everything that
+  held for a gateway still does (guarded, never spawned from, the enroll check); a proxy is a
+  member instead. A model qube and a lead's source still refuse any qube that provides network.
+- **`qmcp project delete`** removes a project's qubes before the proxies they sit on, as qubesd
+  needs.
+- **`qmcp revoke`** (and an accepted `qube-revoke`) clears the network of a qube on a proxy before
+  it leaves AI space, and refuses a proxy that still serves anyone.
+- **A proxy held for review or stopped by the gate** serves no new qube, and the lifecycle service
+  refuses to start a qube behind one (qubesd would start it first). An exec or a copy into a
+  halted qube behind a held proxy still starts it; that is a residual risk in `CLAUDE.md`.
+
+Measured on Qubes 4.3.2 on the development box before the design was settled: an AppVM on an
+AI-managed Debian 13 template and a standalone both route clients; root in a proxy lifts its
+clients' Qubes firewall rules with two `nft` commands; the rules of the chain's topmost proxy,
+carried out by the router above, still bound its clients at one hop and two; a proxy that stops
+translating addresses cuts its clients off (all over IPv4; IPv6 through a proxy not measured); qubesd refuses loops, a network that does not provide network,
+and un-proxying a qube in use. These are in `CLAUDE.md` under "Project proxies" and the residual
+risks.
+
+### Upgrading
+
+Install over 1.1.0 and follow the README's "Updating" steps. The in-qube services and the
+rulebook do not change, and no qube becomes a proxy by the update. To roll back, first clear the
+network of every qube behind a proxy, then remove each proxy or make it a plain member
+(`qvm-prefs P provides_network False`, `qvm-tags P del qmcp-proxy`): 1.1.0 reads any qube that
+provides network as a gateway, seals it from AI and fails `qmcp check` on it and its clients.
+Then install 1.1.0 over it.
+
 ## [1.1.0] — 2026-10-24
 
 A minor, and **a widening of what AI space and the hub may do**: each may put a desktop

@@ -13,6 +13,7 @@ project records, or take their lock, which needs root.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -434,7 +435,9 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
     add("fail" if tiered else "pass", "tier tags",
         f"still tiered: {', '.join(tiered)} (run qmcp migrate)" if tiered else "none left")
 
-    # 3. gateways are always guarded: the policy cannot see provides_network
+    # 3. gateways are always guarded: the policy cannot see provides_network.
+    # A qube wearing `qmcp-proxy` is no gateway (`core.is_gateway`); the
+    # project-proxies item judges it.
     loose, role_unread = [], []
     for vm in vms:
         if core.UMBRELLA not in T(vm) or core.GUARDED in T(vm):
@@ -483,12 +486,15 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
             except (core.Unreadable, NetvmUnreadable):
                 net_unread.append(f"the network, or whether it provides network, of {vm.name}")
                 continue
-            if net is not None and net not in registry:
+            if net is not None and net not in registry \
+                    and not (net in tags_by and core.PROXY in tags_by[net]):
                 loose.append(f"{vm.name} on {net}")
         judged("AI networks", loose, net_unread,
-               f"AI qubes on a network that is not enrolled: {', '.join(sorted(loose))} (enroll "
-               f"it with qmcp gateway enroll NAME, or clear the qube's network)",
-               "every AI qube's network (gateways aside) is an enrolled gateway, or none")
+               f"AI qubes on a network that is neither enrolled nor a project proxy: "
+               f"{', '.join(sorted(loose))} (enroll it with qmcp gateway enroll NAME, or clear "
+               f"the qube's network)",
+               "every AI qube's network (gateways aside) is an enrolled gateway, a project "
+               "proxy (judged under project proxies), or none")
 
     # 3c. open windows. The badge is the whole gate — the services it
     # opens run inside the target qube, or are qubesd's own, so no dom0 code
@@ -950,6 +956,7 @@ def check(app, policy_dir: str | None = None, lib_dir: str | None = None,
                                    policy=loaded_policy, system_info=loaded_si))
     out.extend(lead_firewall_findings(app, by_name, records))
     out.extend(anonymity_findings(app, vms, records, tags_by, registry, hub))
+    out.extend(proxy_findings(vms, records, registry, tags_by))
     inqube.findings(vms, records, tags_by, add, os.path.join(lib_dir, "template-rpc"))
     quotas = sum(p.quota for p in records.values() if p.quota)
     cap = budget.read_cap()
@@ -1001,6 +1008,88 @@ def _netvm(vm):
     except Exception:
         raise NetvmUnreadable(core.name_of(vm)) from None
     return None if ref is None else str(getattr(ref, "name", ref))
+
+
+def proxy_findings(vms, records, registry, tags_by) -> list:
+    """`qmcp check`'s project-proxies item. A proxy carries out its clients'
+    firewall rules and AI has root in it, so what bounds them is the proxy's
+    own network: every qube wearing `qmcp-proxy` must be a member of exactly
+    one slot, an AppVM or a StandaloneVM, no lead, model qube or enrolled
+    gateway; its own network an enrolled gateway the slot may use (a
+    project's worker list; any enrolled one for p00), another proxy of the
+    slot, or none; and every qube on it a member of that slot that is no
+    lead. A read that fails is an error, never a pass. `records` None: the
+    records did not read, and the item says so."""
+    out: list = []
+    add = lambda *a: out.append(Finding(*a))  # noqa: E731
+    proxies = sorted(vm.name for vm in vms if core.PROXY in tags_by[vm.name])
+    clients: dict = {}
+    bad, cannot = [], []
+    nets = {}
+    for vm in vms:
+        try:
+            nets[vm.name] = _netvm(vm)
+        except NetvmUnreadable:
+            cannot.append(f"the network of {vm.name}")
+            continue
+        clients.setdefault(nets[vm.name], []).append(vm.name)
+    by_name = {vm.name: vm for vm in vms}
+    enrolled = set(registry or ())
+    for name in proxies:
+        vm, tags = by_name[name], tags_by[name]
+        slots = projects.member_slots(tags)
+        try:
+            klass = core.klass_of(vm)
+            dvmt = core.is_dvmt(vm)
+        except core.Unreadable as e:
+            cannot.append(str(e).removeprefix("cannot read "))
+            continue
+        why = []
+        if core.UMBRELLA not in tags:
+            why.append("is outside AI space")
+        if klass not in WORKLOAD_KLASSES or dvmt:
+            why.append(f"is a {'disposable template' if dvmt else klass}")
+        if projects.LEAD in tags or projects.lead_slots(tags):
+            why.append("is a lead")
+        if projects.model_slots(tags):
+            why.append("is a model qube")
+        if name in enrolled:
+            why.append("is an enrolled gateway")
+        if len(slots) != 1:
+            why.append(f"is a member of {', '.join(sorted(slots)) or 'no slot'}, not of one")
+        if records is None and slots - {projects.HUB_SLOT}:
+            cannot.append(f"the project record of {name}'s slot")
+        elif len(slots) == 1:
+            slot = next(iter(slots))
+            p = None if slot == projects.HUB_SLOT else (records or {}).get(slot)
+            allowed = enrolled if slot == projects.HUB_SLOT \
+                else set(p.named_networks()) & enrolled if p is not None else set()
+            if name in nets:
+                up = nets[name]
+                if up is not None and up not in allowed and not (
+                        up in tags_by and core.PROXY in tags_by[up]
+                        and projects.member_slots(tags_by[up]) == {slot}):
+                    why.append(f"is on {up}, which is neither a network {slot} may use nor "
+                               f"one of its proxies")
+            for c in sorted(clients.get(name, ())):
+                ct = tags_by.get(c, set())
+                if core.UMBRELLA not in ct or projects.member_slots(ct) != {slot}:
+                    why.append(f"serves {c}, which is not a member of {slot} alone")
+                elif projects.LEAD in ct or projects.lead_slots(ct):
+                    why.append(f"serves the lead {c}")
+        if why:
+            bad.append(f"{name} {'; '.join(why)}")
+    note = f"; cannot read {', '.join(sorted(set(cannot)))}" if cannot else ""
+    if bad:
+        add("fail", "project proxies", "; ".join(bad) + note)
+    elif cannot:
+        add("error", "project proxies", note[2:])
+    elif proxies:
+        add("pass", "project proxies",
+            f"{len(proxies)} proxy(ies), each serving its own slot's members alone")
+    else:
+        add("pass", "project proxies", "none")
+    return out
 
 
 def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=None,
@@ -1108,7 +1197,9 @@ def project_findings(vms, by_name: dict, records: dict, prefix: str, registry=No
                         unread.append(f"cannot read the network or class of {p.label}'s member "
                                       f"{vm.name}")
                         continue
-                    if net is not None and net not in p.named_networks() and not disposable:
+                    if net is not None and net not in p.named_networks() and not disposable \
+                            and not (net in tags_by and core.PROXY in tags_by[net]
+                                     and _member(tags_by[net], p.slot)):
                         net_warn.append(f"{p.label}: member {vm.name} is on {net}, not on the list")
         for name in names:
             vm = by_name.get(name)
@@ -1552,7 +1643,7 @@ def _gateway_refusal(by_name: dict, name: str, hub) -> str | None:
     vm = by_name.get(name)
     if vm is None or core.klass_of(vm) == "AdminVM":
         return "no such qube"
-    if not core.is_gateway(vm):
+    if not core.is_netvm(vm):
         return "does not provide network"
     # A hub file that cannot be read means it is not known whether this qube is
     # the hub, which must refuse rather than enroll it: `read_hub` answers None
@@ -1568,6 +1659,8 @@ def _gateway_refusal(by_name: dict, name: str, hub) -> str | None:
         tags = _tags(vm)
     except core.Gone:
         return "no such qube"
+    if core.PROXY in tags:
+        return "is a project proxy, which a project's AI operates"
     if projects.DROP_BOX in tags or projects.LEAD in tags or projects.member_slots(tags) \
             or projects.lead_slots(tags):
         return "is a drop box, a lead or a project's member"
@@ -1889,7 +1982,7 @@ def _model_qube_refusal(by_name: dict, name: str, hub) -> str | None:
         return f"is a {klass}; a model qube is an AppVM or a StandaloneVM"
     if core.is_dvmt(vm):
         return "is a disposable template"
-    if core.is_gateway(vm):
+    if core.is_netvm(vm):
         return "provides network"
     try:
         tags = _tags(vm)
@@ -2328,6 +2421,18 @@ def _network_enrolled(vm, name) -> None:
     except NetvmUnreadable:
         raise RoleError(f"'{name}''s network cannot be read; try again") from None
     if net is not None and not _is_gateway(vm):
+        # On a proxy of the one slot it is a member of: the project-proxies
+        # item of `qmcp check` judges that proxy, as it judges every one.
+        try:
+            ref = vm.netvm
+        except Exception:
+            raise RoleError(f"'{name}''s network cannot be read; try again") from None
+        try:
+            mine, up = projects.member_slots(_tags(vm)), _tags(ref)
+        except core.Unreadable as e:
+            raise RoleError(f"{e}; try again") from None
+        if core.PROXY in up and len(mine) == 1 and projects.member_slots(up) == mine:
+            return
         try:
             enrolled = net in gateways.load()
         except gateways.GatewaysUnreadable as e:
@@ -2726,7 +2831,7 @@ def _model_qube_kind(vm):
     False for any other kind, None when that cannot be read."""
     try:
         return core.klass_of(vm) in ("AppVM", "StandaloneVM") and not core.is_dvmt(vm) \
-            and not core.is_gateway(vm)
+            and not core.is_netvm(vm)
     except core.Unreadable:
         return None
 
@@ -2769,10 +2874,28 @@ def revoke(app, name, shutdown: bool = True, from_hub: bool = False, remove: boo
     """`qmcp revoke`, under the qube's lock (`_revoke`). `remove`: then remove
     it (`--remove`, or an accepted `qube-revoke` with `remove`): the hub's way
     to have a qube without an owner badge removed, besides deleting a project
-    it is a member of (the services refuse such a remove)."""
-    out = _with_qube_lock(name, False,
-                          lambda held: _revoke(app, name, shutdown, from_hub, remove),
-                          settle=lambda: _settle_kill(app, name) if shutdown else "")
+    it is a member of (the services refuse such a remove).
+
+    A project proxy is revoked under the project locks too (the create lock
+    first, as a move takes them), so no create puts a qube on it between the
+    check that nothing sits on it and its badges coming off."""
+    try:
+        target = _vm(app, name)
+        proxy = target is not None and core.PROXY in _tags(target)
+    except core.Unreadable:
+        proxy = False               # `_revoke` reads it again, and refuses what it must
+    lock = _Exclusive() if proxy else contextlib.nullcontext()
+    try:
+        lock.__enter__()
+    except ProjectError as e:
+        raise RoleError(str(e)) from None
+    try:
+        out = _with_qube_lock(name, False,
+                              lambda held: _revoke(app, name, shutdown, from_hub, remove,
+                                                   project_locked=proxy),
+                              settle=lambda: _settle_kill(app, name) if shutdown else "")
+    finally:
+        lock.__exit__(None, None, None)
     if remove:
         # Removed: its lock file and turnstile go too, as for every remove qmcp
         # makes, once this command has let the lock go (a file a call holds by
@@ -2879,7 +3002,7 @@ def _ref_name(ref):
 
 
 def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
-            remove: bool = False) -> str:
+            remove: bool = False, project_locked: bool = True) -> str:
     """Strip every AI-space badge, pin default_dispvm, and kill the qube if it
     runs, unless `shutdown` is false. `remove`: then remove it; every refusal
     of it is read first (`_remove_refusal`), so a refused remove changes
@@ -2908,6 +3031,15 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
             raise RoleError(f"the hub could run commands in '{name}', so a hub's proposal to "
                             f"revoke it kills it: propose it without shutdown false")
     _not_in_a_slot(vm, name, "revoke")
+    if core.PROXY in before and not project_locked:
+        raise RoleError(f"'{name}' became a project proxy while this command started; run it "
+                        f"again; nothing was changed")
+    served = _proxy_clients(app, name) if core.PROXY in before else []
+    if served:
+        # Left serving them, out of AI space, it would carry AI qubes' traffic
+        # with no proxy check over it; the operator clears them first.
+        raise RoleError(f"'{name}' is a proxy that serves {', '.join(served)}: clear their "
+                        f"networks first (qvm-prefs QUBE netvm ''); nothing was changed")
     if remove:
         if not shutdown:
             raise RoleError("--remove kills the qube first: it cannot be left running")
@@ -2928,6 +3060,13 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
             mark_kill_pending(name, None, vm)
         except OSError as e:
             early.append(f"its window could not be marked for a kill ({type(e).__name__})")
+    # On a project proxy, which AI has root in: its network is cleared before
+    # it leaves AI space, so no qube outside it is ever carried by one. A read
+    # that fails does not stop the revoke, which only takes authority away;
+    # `qmcp check` names a qube still on a proxy.
+    cleared, problem = _off_a_proxy(vm, name)
+    if problem:
+        early.append(problem)
     for t in sorted((t for t in _read_tags(vm) if birth.controlled(t)), key=_removal_order):
         vm.tags.discard(t)
     # Whatever fails after the badges came off, the kill still happens: a
@@ -2949,7 +3088,7 @@ def _revoke(app, name, shutdown: bool = True, from_hub: bool = False,
         clear_window(name)
         dropped = owed
     msg = f"{name}: revoked" + ("; the kill its seal could not make is dropped" if dropped
-                                else "")
+                                else "") + (f"; {cleared}" if cleared else "")
     if shutdown:
         # Killed, never asked: a guest the hub ran as root can ignore a
         # shutdown request, and a paused one refuses it, and either would run
@@ -3662,6 +3801,7 @@ def listing(app, everything: bool = False) -> list:
             "open": _window_field(vm.name, tags),
             "owner": UNREADABLE if tags is None else _owner(tags),
             "gateway": _shown(lambda: core.is_gateway(vm)),
+            "proxy": UNREADABLE if tags is None else core.PROXY in tags,
             "dvmt": _shown(lambda: core.is_dvmt(vm)),
             "badges": None if tags is None else
             sorted(t for t in tags if birth.controlled(t) or t == projects.DROP_BOX),
@@ -4282,12 +4422,14 @@ WORKLOAD_KLASSES = ("AppVM", "StandaloneVM")
 LEAD_CLASSES = ("appvm", "standalone")
 
 
-def _workload(vm) -> bool:
+def _workload(vm, proxy_ok: bool = False) -> bool:
     """An AppVM or a StandaloneVM that is no template, disposable template or
     gateway: a qube the operator's commands take as a lead's source or move
-    between slots. Raises Unreadable."""
+    between slots. One that provides network, a project proxy included, is
+    none, so no lead is ever made from a proxy; `proxy_ok`, for a move, lets a
+    proxy through (a gateway still is none). Raises Unreadable."""
     return core.klass_of(vm) in WORKLOAD_KLASSES and not core.is_template(vm) \
-        and not core.is_gateway(vm)
+        and not (core.is_gateway(vm) if proxy_ok else core.is_netvm(vm))
 
 
 def _hubs_own_qube(app, name, what: str):
@@ -4427,9 +4569,51 @@ def _removal_order(tag: str) -> tuple:
     no longer in AI space. Within the routed group the sort puts `qmcp-open`
     (exec) before `qmcp-open-fw` (the firewall writes), which is the order
     authority runs in."""
-    if projects.slot_badge_parts(tag) is not None or tag in (core.OPEN, core.OPEN_FW):
+    if projects.slot_badge_parts(tag) is not None or tag in (core.OPEN, core.OPEN_FW, core.PROXY):
+        # `qmcp-proxy` too: left alone outside AI space it would exempt
+        # nothing (`core.proxy_form`), but it goes with the slot it names.
         return (0, tag)
     return (1, tag) if tag == core.UMBRELLA else (2, tag)
+
+
+def _proxy_clients(app, name) -> list:
+    """The qubes whose network is `name`; one whose network does not read is
+    named as such, never taken for none."""
+    out = []
+    for other in app.domains:
+        try:
+            if _netvm(other) == name:
+                out.append(other.name)
+        except NetvmUnreadable:
+            out.append(f"{other.name} (network unreadable)")
+    return sorted(out)
+
+
+def _off_a_proxy(vm, name) -> tuple:
+    """Clear the qube's network, read back, when it is a project proxy.
+    (what it did, the problem it met), each a sentence for the report or None."""
+    unread = (None, f"its network could not be read: make sure it is not on a project proxy "
+                    f"(qmcp check names one)")
+    try:
+        ref = vm.netvm
+    except Exception:
+        return unread
+    if ref is None:
+        return None, None
+    try:
+        tags = _tags(ref)
+    except core.Unreadable:
+        return unread
+    if core.PROXY not in tags:
+        return None, None
+    try:
+        vm.netvm = None
+        if _netvm(vm) is not None:
+            raise NetvmUnreadable(name)
+    except Exception:
+        return None, (f"its network {ref.name}, a project proxy, could not be cleared: clear "
+                      f"it (qvm-prefs {name} netvm '')")
+    return f"its network {ref.name}, a project proxy, was cleared", None
 
 
 HELD_WHY = "is held for your review: it came back from a backup or was copied by hand (qmcp restored)"
@@ -5764,7 +5948,7 @@ def move_warnings(records: dict, current: set, slot) -> list:
     return out
 
 
-def move(app, name: str, target: str, confirm: bool = False) -> list:
+def move(app, name: str, target: str, confirm: bool = False, proxy: bool = False) -> list:
     """Move one of AI space's AppVMs or StandaloneVMs into p00, a project, or no
     slot. Moving a standalone the operator built into a project is the
     operator's approval of its OS, as approving a template is. Its network
@@ -5775,14 +5959,21 @@ def move(app, name: str, target: str, confirm: bool = False) -> list:
     The anonymity gate judges the project a qube moves into, and the hub in
     anonymous mode, as the move would leave them: the move is refused if the
     project would be unsound, or if the hub's check would stop more qubes or
-    the moved qube itself."""
-    return _run(_move_locked, app, name, target, confirm)
+    the moved qube itself.
+
+    `proxy` makes the qube its slot's project proxy as well (the operator's
+    way to make an existing qube one): `qmcp-proxy` goes on with the slot's badges, and
+    `provides_network` is set last. A proxy stays one: it moves only while
+    nothing sits on it, and never to no slot. A qube on a proxy moves only
+    within that proxy's slot."""
+    return _run(_move_locked, app, name, target, confirm, proxy)
 
 
-def _move_locked(report, app, name, target, confirm):
+def _move_locked(report, app, name, target, confirm, proxy=False):
     """`_move` under the qube's lock, taken inside the project locks (the
     create lock first, then a qube's, as a clone takes them)."""
-    _project_qube_lock(name, True, lambda held: _move(report, app, name, target, confirm))
+    _project_qube_lock(name, True,
+                       lambda held: _move(report, app, name, target, confirm, proxy))
 
 
 def _project_qube_lock(name, must: bool, fn):
@@ -5791,16 +5982,21 @@ def _project_qube_lock(name, must: bool, fn):
     return _with_qube_lock(name, must, fn, error=ProjectError)
 
 
-def _move(report, app, name, target, confirm):
+def _move(report, app, name, target, confirm, proxy=False):
     records = _load_records()
     mode = anonymous_mode()
     vm = _vm(app, name)
     tags = set() if vm is None else _tags(vm)
     if core.UMBRELLA not in tags:
         raise ProjectError(f"no qube '{name}' in AI space")
-    if not _workload(vm) or core.GUARDED in tags:
+    if not _workload(vm, proxy_ok=True) or core.GUARDED in tags:
         raise ProjectError(f"'{name}' is not a managed AppVM or StandaloneVM; templates and "
-                           f"gateways join no slot")
+                           f"gateways join no slot (to make a proxy, leave provides_network "
+                           f"off: --proxy sets it)")
+    was_proxy = core.PROXY in tags
+    if (proxy or was_proxy) and target == "none":
+        raise ProjectError(f"'{name}' {'is' if was_proxy else 'would be'} a project proxy, "
+                           f"which is a member of one slot; it never goes to no slot")
     if projects.LEAD in tags or projects.lead_slots(tags):
         raise ProjectError(f"'{name}' is a lead; use qmcp project lead")
     if projects.model_slots(tags) and target != "none":
@@ -5810,6 +6006,8 @@ def _move(report, app, name, target, confirm):
                            f"project unblock)")
     if _held(tags):
         raise ProjectError(f"'{name}' {HELD_WHY}")
+    if proxy and (projects.LEAD in tags or projects.model_slots(tags)):
+        raise ProjectError(f"'{name}' is a lead or a model qube, which is never a proxy")
     if target == "none":
         slot, p = None, None
     elif target == projects.HUB_SLOT:
@@ -5817,14 +6015,28 @@ def _move(report, app, name, target, confirm):
     else:
         p = _project(records, target)
         slot = p.slot
-        try:
-            net = _netvm(vm)
-        except NetvmUnreadable:
-            raise ProjectError(f"the network of '{name}' cannot be read") from None
-        if net is not None and net not in p.named_networks():
-            raise ProjectError(f"'{name}' is on {net}, which is not one of {p.label}'s worker networks")
+    try:
+        net = _netvm(vm)
+    except NetvmUnreadable:
+        raise ProjectError(f"the network of '{name}' cannot be read") from None
+    up_tags = set()
+    if net is not None:
+        up = _vm(app, net)
+        up_tags = set() if up is None else _tags(up)
+    if core.PROXY in up_tags:
+        # A proxy serves its own slot's members alone.
+        if projects.member_slots(up_tags) != ({slot} if slot is not None else set()):
+            raise ProjectError(f"'{name}' is on {net}, a proxy of another slot; clear its "
+                               f"network first (qvm-prefs {name} netvm '')")
+    elif p is not None and net is not None and net not in p.named_networks():
+        raise ProjectError(f"'{name}' is on {net}, which is not one of {p.label}'s worker networks")
     current = projects.member_slots(tags)
     moving = current != ({slot} if slot is not None else set())
+    if was_proxy and moving:
+        served = _proxy_clients(app, name)
+        if served:
+            raise ProjectError(f"'{name}' is a proxy that serves {', '.join(sorted(served))}; "
+                               f"move or clear those first")
     # p00 and no slot are both the hub's, so a move between them carries
     # nothing across; any other slot change does.
     crossing = moving and not _hub_only(current | {slot})
@@ -5846,7 +6058,8 @@ def _move(report, app, name, target, confirm):
     want_anon = (p.badges() if p is not None and p.anonymous else set()) \
         | ({projects.ANON} if mode else set())
     after = (tags - {projects.member_badge(s) for s in current} - anon_badges) \
-        | ({projects.member_badge(slot)} if slot is not None else set()) | want_anon
+        | ({projects.member_badge(slot)} if slot is not None else set()) | want_anon \
+        | ({core.PROXY} if proxy else set())
     _gate_the_move(app, records, name, after, p if p is not None and p.anonymous else None, mode)
     for line in warnings:
         report.append(f"{name}: {line}")
@@ -5854,7 +6067,7 @@ def _move(report, app, name, target, confirm):
     # either end: the badges that keep the hub out go on first, the old slot's
     # badge comes off before the new one goes on, and the hidden badge comes
     # off last.
-    add_first = want_anon - tags
+    add_first = (want_anon | ({core.PROXY} if proxy else set())) - tags
     remove_last = (tags & anon_badges) - want_anon
     leaving = current - ({slot} if slot is not None else set())
     if crossing:
@@ -5922,6 +6135,20 @@ def _move(report, app, name, target, confirm):
                     f"shut it down (qvm-shutdown {name}), then move it again"
                     + _unblock_after_move(vm, name))
         return
+    if proxy:
+        # Last, once the badge and the slot's are on: a qube that provides
+        # network without the badge is a gateway, which `qmcp check` fails.
+        try:
+            if not core.is_netvm(vm):
+                vm.provides_network = True
+                if not core.is_netvm(vm):
+                    raise core.Unreadable("provides_network did not read back")
+        except Exception as e:
+            report.fail(f"{name}: put in {slot} with {core.PROXY}, but provides_network could "
+                        f"not be set ({type(e).__name__}); set it yourself (qvm-prefs {name} "
+                        f"provides_network True)" + held)
+            return
+        report.append(f"{name}: a proxy of {slot}, providing network to its members only")
     if crossing:
         unblocked = _unblock_after_move(vm, name)
         if unblocked:
@@ -6017,6 +6244,28 @@ def _slot_members(app, slot: str) -> tuple:
     return sorted(members), sorted(kept), sorted(unread)
 
 
+def _clients_first(app, names) -> list:
+    """`names` in an order qubesd can remove them in: a qube before the proxy it
+    sits on, since qubesd refuses to remove a network still in use. A network
+    that cannot be read keeps the qube where it stands; qubesd's own refusal,
+    reported, is then the worst case."""
+    left, out = list(names), []
+    nets = {}
+    for name in left:
+        try:
+            vm = _vm(app, name)
+            nets[name] = None if vm is None else _netvm(vm)
+        except (NetvmUnreadable, core.Unreadable):
+            nets[name] = None
+    while left:
+        used = {nets[n] for n in left}
+        ready = [n for n in left if n not in used] or left[:1]
+        for n in ready:
+            left.remove(n)
+        out.extend(ready)
+    return out
+
+
 def delete_plan(app, records: dict, key: str) -> tuple:
     """What `qmcp project delete KEY --yes` would do, changing nothing: (it can
     run, the plan in words). Reads the records, the qubes and the hub file only, so it
@@ -6095,7 +6344,7 @@ def _delete_project(report, app, key):
     # only loses this slot's badges, below (`_kept_with_slot`).
     members, kept, _ = _slot_members(app, p.slot)
     kept = dict(kept)
-    for name in members:
+    for name in _clients_first(app, members):
         err = _remove_qube_locked(app, name)
         report.append(f"{p.slot}: removed {name}") if not err else \
             _not_removed(report, p.slot, name, err)
